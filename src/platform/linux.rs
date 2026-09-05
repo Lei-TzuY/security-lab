@@ -10,11 +10,12 @@ pub(crate) fn run(
 #[cfg(target_arch = "x86_64")]
 mod x86_64 {
     use crate::{ChildOutcome, PolicyError, ResourceLimits, SandboxError, SandboxPolicy};
+    use std::ffi::CString;
     use std::fs;
     use std::io;
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::PermissionsExt;
-    use std::os::unix::process::{CommandExt, ExitStatusExt};
-    use std::process::Command;
+    use std::ptr;
 
     const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
     const SECCOMP_MODE_FILTER: libc::c_ulong = 2;
@@ -26,53 +27,175 @@ mod x86_64 {
     const BPF_JMP_JEQ_K: u16 = 0x15;
     const BPF_RET_K: u16 = 0x06;
 
-    // Linux UAPI CLOSE_RANGE_CLOEXEC. Defining the flag locally keeps the
-    // enforcement contract explicit instead of depending on libc exposing a
-    // particular header version.
     const CLOSE_RANGE_CLOEXEC: libc::c_uint = 1 << 2;
     const FIRST_NON_STDIO_FD: libc::c_uint = 3;
 
+    const PHASE_CHDIR: u32 = 1;
+    const PHASE_FD_SANITIZE: u32 = 2;
+    const PHASE_RLIMIT_CPU: u32 = 3;
+    const PHASE_RLIMIT_AS: u32 = 4;
+    const PHASE_RLIMIT_FSIZE: u32 = 5;
+    const PHASE_RLIMIT_NOFILE: u32 = 6;
+    const PHASE_NO_NEW_PRIVS: u32 = 7;
+    const PHASE_SECCOMP: u32 = 8;
+    const PHASE_EXECVE: u32 = 9;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct LaunchErrorRecord {
+        errno: i32,
+        phase: u32,
+    }
+
+    struct SharedLaunchState {
+        record: *mut LaunchErrorRecord,
+    }
+
+    impl SharedLaunchState {
+        fn new() -> Result<Self, SandboxError> {
+            let length = std::mem::size_of::<LaunchErrorRecord>();
+            let mapping = unsafe {
+                libc::mmap(
+                    ptr::null_mut(),
+                    length,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            if mapping == libc::MAP_FAILED {
+                return Err(SandboxError::SetupFailed(format!(
+                    "cannot allocate shared launch state: {}",
+                    io::Error::last_os_error()
+                )));
+            }
+
+            let record = mapping.cast::<LaunchErrorRecord>();
+            unsafe {
+                ptr::write_volatile(
+                    record,
+                    LaunchErrorRecord {
+                        errno: 0,
+                        phase: 0,
+                    },
+                );
+            }
+            Ok(Self { record })
+        }
+
+        fn snapshot(&self) -> LaunchErrorRecord {
+            unsafe { ptr::read_volatile(self.record) }
+        }
+    }
+
+    impl Drop for SharedLaunchState {
+        fn drop(&mut self) {
+            unsafe {
+                libc::munmap(
+                    self.record.cast::<libc::c_void>(),
+                    std::mem::size_of::<LaunchErrorRecord>(),
+                );
+            }
+        }
+    }
+
+    struct PreparedLaunch {
+        executable: CString,
+        working_dir: CString,
+        _args: Vec<CString>,
+        _environment: Vec<CString>,
+        argv: Vec<*const libc::c_char>,
+        envp: Vec<*const libc::c_char>,
+    }
+
+    impl PreparedLaunch {
+        fn new(policy: &SandboxPolicy) -> Result<Self, SandboxError> {
+            let executable = cstring_bytes(
+                "executable",
+                policy.executable.as_os_str().as_bytes(),
+            )?;
+            let working_dir = cstring_bytes(
+                "working_dir",
+                policy.working_dir.as_os_str().as_bytes(),
+            )?;
+
+            let mut args = Vec::with_capacity(policy.args.len());
+            for arg in &policy.args {
+                args.push(cstring_bytes("argument", arg.as_bytes())?);
+            }
+
+            let mut environment = Vec::with_capacity(policy.environment.len());
+            for (key, value) in &policy.environment {
+                let entry = format!("{key}={value}");
+                environment.push(cstring_bytes("environment entry", entry.as_bytes())?);
+            }
+
+            let mut argv = Vec::with_capacity(args.len() + 2);
+            argv.push(executable.as_ptr());
+            argv.extend(args.iter().map(|arg| arg.as_ptr()));
+            argv.push(ptr::null());
+
+            let mut envp = Vec::with_capacity(environment.len() + 1);
+            envp.extend(environment.iter().map(|entry| entry.as_ptr()));
+            envp.push(ptr::null());
+
+            Ok(Self {
+                executable,
+                working_dir,
+                _args: args,
+                _environment: environment,
+                argv,
+                envp,
+            })
+        }
+    }
+
+    struct CompiledSeccomp {
+        filter: Vec<libc::sock_filter>,
+        error_exit_syscall: libc::c_long,
+    }
+
     pub(crate) fn run(policy: &SandboxPolicy) -> Result<ChildOutcome, SandboxError> {
         preflight(policy)?;
-        let limits = policy.limits;
-        let filter = compile_seccomp(policy)?;
+        let prepared = PreparedLaunch::new(policy)?;
+        let seccomp = compile_seccomp(policy)?;
+        let launch_state = SharedLaunchState::new()?;
 
-        let mut command = Command::new(&policy.executable);
-        command
-            .args(&policy.args)
-            .env_clear()
-            .envs(&policy.environment)
-            .current_dir(&policy.working_dir);
-
-        // SAFETY: the closure performs only direct libc syscalls and accesses
-        // data prepared in the parent. Descriptor sanitization uses CLOEXEC
-        // rather than closing descriptors immediately so std::process::Command's
-        // private child-error pipe remains usable until a successful exec.
-        // No fallback path exists if any step fails: Command::spawn returns the
-        // pre-exec error to the parent.
-        unsafe {
-            command.pre_exec(move || {
-                sanitize_inherited_fds()?;
-                apply_resource_limits(limits)?;
-                apply_no_new_privs()?;
-                install_seccomp(&filter)?;
-                Ok(())
-            });
+        let pid = unsafe { libc::fork() };
+        if pid == -1 {
+            return Err(SandboxError::SetupFailed(format!(
+                "fork failed closed: {}",
+                io::Error::last_os_error()
+            )));
         }
 
-        let status = command
-            .status()
-            .map_err(|err| SandboxError::SetupFailed(format!("launch failed closed: {err}")))?;
-
-        if let Some(code) = status.code() {
-            Ok(ChildOutcome::Exited(code))
-        } else if let Some(signal) = status.signal() {
-            Ok(ChildOutcome::Signaled(signal))
-        } else {
-            Err(SandboxError::SetupFailed(
-                "child returned neither an exit code nor a signal".to_owned(),
-            ))
+        if pid == 0 {
+            unsafe {
+                child_exec(
+                    &prepared,
+                    policy.limits,
+                    &seccomp,
+                    launch_state.record,
+                )
+            }
         }
+
+        let status = wait_for_child(pid)?;
+        let launch_error = launch_state.snapshot();
+        if launch_error.phase != 0 {
+            return Err(SandboxError::SetupFailed(format_launch_error(launch_error)));
+        }
+
+        decode_wait_status(status)
+    }
+
+    fn cstring_bytes(label: &str, bytes: &[u8]) -> Result<CString, SandboxError> {
+        CString::new(bytes).map_err(|_| {
+            SandboxError::InvalidPolicy(PolicyError::new(format!(
+                "{label} must not contain NUL bytes"
+            )))
+        })
     }
 
     fn preflight(policy: &SandboxPolicy) -> Result<(), SandboxError> {
@@ -113,8 +236,6 @@ mod x86_64 {
     }
 
     fn ensure_fd_sanitization_supported() -> Result<(), SandboxError> {
-        // Probe a range that cannot contain a normal userspace descriptor. A
-        // supporting kernel returns success without changing process state.
         let result = unsafe {
             libc::syscall(
                 libc::SYS_close_range,
@@ -140,7 +261,23 @@ mod x86_64 {
         }
     }
 
-    fn compile_seccomp(policy: &SandboxPolicy) -> Result<Vec<libc::sock_filter>, SandboxError> {
+    fn compile_seccomp(policy: &SandboxPolicy) -> Result<CompiledSeccomp, SandboxError> {
+        let error_exit_syscall = if policy.seccomp.allowed_syscalls.contains("exit") {
+            libc::SYS_exit
+        } else if policy.seccomp.allowed_syscalls.contains("exit_group") {
+            libc::SYS_exit_group
+        } else {
+            return Err(SandboxError::InvalidPolicy(PolicyError::new(
+                "seccomp allowlist must include exit or exit_group so launch failures can terminate after filter installation",
+            )));
+        };
+
+        if !policy.seccomp.allowed_syscalls.contains("execve") {
+            return Err(SandboxError::InvalidPolicy(PolicyError::new(
+                "seccomp allowlist must include execve so the requested child can start",
+            )));
+        }
+
         let mut numbers = Vec::with_capacity(policy.seccomp.allowed_syscalls.len());
         for name in &policy.seccomp.allowed_syscalls {
             let number = syscall_number(name).ok_or_else(|| {
@@ -153,13 +290,6 @@ mod x86_64 {
         numbers.sort_unstable();
         numbers.dedup();
 
-        if !policy.seccomp.allowed_syscalls.contains("execve") {
-            return Err(SandboxError::InvalidPolicy(PolicyError::new(
-                "seccomp allowlist must include execve so the requested child can start",
-            )));
-        }
-
-        // seccomp_data offsets are stable UAPI: nr @ 0, arch @ 4.
         let mut filter = Vec::with_capacity(5 + numbers.len() * 2);
         filter.push(stmt(BPF_LD_W_ABS, 4));
         filter.push(jump(BPF_JMP_JEQ_K, AUDIT_ARCH_X86_64, 1, 0));
@@ -170,14 +300,29 @@ mod x86_64 {
             filter.push(stmt(BPF_RET_K, SECCOMP_RET_ALLOW));
         }
         filter.push(stmt(BPF_RET_K, SECCOMP_RET_ERRNO | (libc::EPERM as u32)));
-        Ok(filter)
+
+        if filter.len() > u16::MAX as usize {
+            return Err(SandboxError::InvalidPolicy(PolicyError::new(
+                "seccomp program is too large",
+            )));
+        }
+
+        Ok(CompiledSeccomp {
+            filter,
+            error_exit_syscall,
+        })
     }
 
-    unsafe fn sanitize_inherited_fds() -> io::Result<()> {
-        // Mark every non-stdio descriptor CLOEXEC atomically in the child. The
-        // descriptors remain open during pre-exec setup, which preserves the
-        // standard library's setup-error transport, but none survive a
-        // successful exec into the target image.
+    unsafe fn child_exec(
+        prepared: &PreparedLaunch,
+        limits: ResourceLimits,
+        seccomp: &CompiledSeccomp,
+        launch_error: *mut LaunchErrorRecord,
+    ) -> ! {
+        if libc::chdir(prepared.working_dir.as_ptr()) == -1 {
+            child_fail(launch_error, PHASE_CHDIR, seccomp.error_exit_syscall);
+        }
+
         if libc::syscall(
             libc::SYS_close_range,
             FIRST_NON_STDIO_FD,
@@ -185,50 +330,53 @@ mod x86_64 {
             CLOSE_RANGE_CLOEXEC,
         ) == -1
         {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(())
+            child_fail(
+                launch_error,
+                PHASE_FD_SANITIZE,
+                seccomp.error_exit_syscall,
+            );
         }
-    }
 
-    unsafe fn apply_resource_limits(limits: ResourceLimits) -> io::Result<()> {
-        set_limit(libc::RLIMIT_CPU, limits.cpu_seconds)?;
-        set_limit(libc::RLIMIT_AS, limits.address_space_bytes)?;
-        set_limit(libc::RLIMIT_FSIZE, limits.file_size_bytes)?;
-        set_limit(libc::RLIMIT_NOFILE, limits.open_files)?;
-        Ok(())
-    }
+        set_limit_or_fail(
+            libc::RLIMIT_CPU,
+            limits.cpu_seconds,
+            launch_error,
+            PHASE_RLIMIT_CPU,
+            seccomp.error_exit_syscall,
+        );
+        set_limit_or_fail(
+            libc::RLIMIT_AS,
+            limits.address_space_bytes,
+            launch_error,
+            PHASE_RLIMIT_AS,
+            seccomp.error_exit_syscall,
+        );
+        set_limit_or_fail(
+            libc::RLIMIT_FSIZE,
+            limits.file_size_bytes,
+            launch_error,
+            PHASE_RLIMIT_FSIZE,
+            seccomp.error_exit_syscall,
+        );
+        set_limit_or_fail(
+            libc::RLIMIT_NOFILE,
+            limits.open_files,
+            launch_error,
+            PHASE_RLIMIT_NOFILE,
+            seccomp.error_exit_syscall,
+        );
 
-    unsafe fn set_limit(resource: libc::c_uint, value: u64) -> io::Result<()> {
-        let limit = libc::rlimit {
-            rlim_cur: value as libc::rlim_t,
-            rlim_max: value as libc::rlim_t,
-        };
-        if libc::setrlimit(resource as _, &limit) == -1 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(())
-        }
-    }
-
-    unsafe fn apply_no_new_privs() -> io::Result<()> {
         if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == -1 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(())
+            child_fail(
+                launch_error,
+                PHASE_NO_NEW_PRIVS,
+                seccomp.error_exit_syscall,
+            );
         }
-    }
 
-    unsafe fn install_seccomp(filter: &[libc::sock_filter]) -> io::Result<()> {
-        if filter.len() > u16::MAX as usize {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "seccomp program is too large",
-            ));
-        }
         let program = libc::sock_fprog {
-            len: filter.len() as u16,
-            filter: filter.as_ptr() as *mut libc::sock_filter,
+            len: seccomp.filter.len() as u16,
+            filter: seccomp.filter.as_ptr() as *mut libc::sock_filter,
         };
         if libc::prctl(
             libc::PR_SET_SECCOMP,
@@ -236,10 +384,100 @@ mod x86_64 {
             &program as *const libc::sock_fprog,
         ) == -1
         {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(())
+            child_fail(launch_error, PHASE_SECCOMP, seccomp.error_exit_syscall);
         }
+
+        libc::execve(
+            prepared.executable.as_ptr(),
+            prepared.argv.as_ptr(),
+            prepared.envp.as_ptr(),
+        );
+        child_fail(launch_error, PHASE_EXECVE, seccomp.error_exit_syscall)
+    }
+
+    unsafe fn set_limit_or_fail(
+        resource: libc::c_uint,
+        value: u64,
+        launch_error: *mut LaunchErrorRecord,
+        phase: u32,
+        error_exit_syscall: libc::c_long,
+    ) {
+        let limit = libc::rlimit {
+            rlim_cur: value as libc::rlim_t,
+            rlim_max: value as libc::rlim_t,
+        };
+        if libc::setrlimit(resource as _, &limit) == -1 {
+            child_fail(launch_error, phase, error_exit_syscall);
+        }
+    }
+
+    unsafe fn child_fail(
+        launch_error: *mut LaunchErrorRecord,
+        phase: u32,
+        error_exit_syscall: libc::c_long,
+    ) -> ! {
+        let errno = *libc::__errno_location();
+        ptr::write_volatile(ptr::addr_of_mut!((*launch_error).errno), errno);
+        ptr::write_volatile(ptr::addr_of_mut!((*launch_error).phase), phase);
+
+        loop {
+            libc::syscall(error_exit_syscall, 127 as libc::c_int);
+        }
+    }
+
+    fn wait_for_child(pid: libc::pid_t) -> Result<libc::c_int, SandboxError> {
+        loop {
+            let mut status = 0;
+            let result = unsafe { libc::waitpid(pid, &mut status, 0) };
+            if result == pid {
+                return Ok(status);
+            }
+            if result == -1 {
+                let err = io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                return Err(SandboxError::SetupFailed(format!(
+                    "waitpid failed: {err}"
+                )));
+            }
+        }
+    }
+
+    fn decode_wait_status(status: libc::c_int) -> Result<ChildOutcome, SandboxError> {
+        if libc::WIFEXITED(status) {
+            Ok(ChildOutcome::Exited(libc::WEXITSTATUS(status)))
+        } else if libc::WIFSIGNALED(status) {
+            Ok(ChildOutcome::Signaled(libc::WTERMSIG(status)))
+        } else {
+            Err(SandboxError::SetupFailed(format!(
+                "child returned unsupported wait status 0x{status:x}"
+            )))
+        }
+    }
+
+    fn format_launch_error(record: LaunchErrorRecord) -> String {
+        let phase = match record.phase {
+            PHASE_CHDIR => "chdir",
+            PHASE_FD_SANITIZE => "inherited-FD sanitization",
+            PHASE_RLIMIT_CPU => "RLIMIT_CPU",
+            PHASE_RLIMIT_AS => "RLIMIT_AS",
+            PHASE_RLIMIT_FSIZE => "RLIMIT_FSIZE",
+            PHASE_RLIMIT_NOFILE => "RLIMIT_NOFILE",
+            PHASE_NO_NEW_PRIVS => "PR_SET_NO_NEW_PRIVS",
+            PHASE_SECCOMP => "seccomp installation",
+            PHASE_EXECVE => "execve",
+            _ => "unknown launch phase",
+        };
+        let errno = if record.errno == 0 {
+            libc::EIO
+        } else {
+            record.errno
+        };
+        format!(
+            "child {phase} failed closed: {}",
+            io::Error::from_raw_os_error(errno)
+        )
     }
 
     const fn stmt(code: u16, k: u32) -> libc::sock_filter {

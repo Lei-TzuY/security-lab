@@ -10,12 +10,12 @@ Delivered strict policy validation, environment/cwd control, four rlimits, `PR_S
 
 ### Slice 2A — inherited descriptor sanitization
 
-**Current implementation target.** Atomically mark every inherited descriptor >= 3 `CLOEXEC` before target exec, prove descriptor non-leakage, and preserve fail-closed setup reporting.
+**Status: complete on `main`.** Atomically mark every inherited descriptor >= 3 `CLOEXEC` before target exec, prove descriptor non-leakage, and preserve fail-closed setup reporting.
 
 ### Slice 2B — owned launch/error protocol
 
-Replace or isolate the standard-library fork/exec management channel so setup and exec failures remain precisely observable even when the target seccomp policy denies ordinary `write`.
+**Current implemented slice.** Own the Linux x86_64 `fork`/setup/seccomp/`execve`/`waitpid` lifecycle. Precompute target argv/environment in the trusted parent, transport child setup errors through a shared anonymous launch-state page rather than a pipe, and prove that a post-seccomp `execve` failure remains precisely observable even when the target policy denies `write`. The policy must name `execve` and at least one of `exit`/`exit_group`; the launcher never silently widens the seccomp allowlist.
 
 ### Slice 2C — filesystem and identity boundary
 
-Add testable user/mount namespace isolation, UID/GID mapping and capability dropping, a minimal root/mount policy, and TOCTOU-resistant executable selection. Promote only mechanisms that can be enforced and proven in CI; unsupported kernels/configurations must fail or skip explicitly rather than pretending isolation.
+**Next architectural frontier.** Add testable user/mount namespace isolation, UID/GID mapping and capability dropping, a minimal root/mount policy, and TOCTOU-resistant executable selection. Promote only mechanisms that can be enforced and proven in CI; unsupported kernels/configurations must fail or skip explicitly rather than pretending isolation.

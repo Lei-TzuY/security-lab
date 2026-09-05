@@ -222,9 +222,7 @@ impl FromStr for SandboxPolicy {
 
             match key {
                 "filesystem.root" => set_once(&mut root_dir, value.to_owned(), line_no, key)?,
-                "filesystem.scratch" => {
-                    set_once(&mut scratch_dir, value.to_owned(), line_no, key)?
-                }
+                "filesystem.scratch" => set_once(&mut scratch_dir, value.to_owned(), line_no, key)?,
                 "filesystem.scratch_bytes" => set_once(
                     &mut scratch_bytes,
                     parse_u64(value, line_no, key)?,

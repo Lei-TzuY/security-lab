@@ -829,12 +829,7 @@ mod x86_64 {
                     if libc::close(fd) == -1 {
                         let errno = *libc::__errno_location();
                         if errno != libc::EBADF {
-                            child_fail_errno(
-                                launch_error,
-                                PHASE_STDIO,
-                                errno,
-                                error_exit_syscall,
-                            );
+                            child_fail_errno(launch_error, PHASE_STDIO, errno, error_exit_syscall);
                         }
                     }
                 }

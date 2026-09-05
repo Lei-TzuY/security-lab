@@ -129,10 +129,7 @@ mod x86_64 {
             filter.push(jump(BPF_JMP_JEQ_K, number, 0, 1));
             filter.push(stmt(BPF_RET_K, SECCOMP_RET_ALLOW));
         }
-        filter.push(stmt(
-            BPF_RET_K,
-            SECCOMP_RET_ERRNO | (libc::EPERM as u32),
-        ));
+        filter.push(stmt(BPF_RET_K, SECCOMP_RET_ERRNO | (libc::EPERM as u32)));
         Ok(filter)
     }
 

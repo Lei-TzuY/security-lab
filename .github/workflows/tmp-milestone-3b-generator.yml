@@ -1,0 +1,34 @@
+name: construct milestone 3B candidate
+
+on:
+  push:
+    branches:
+      - tmp-3b-generator
+
+permissions:
+  contents: write
+
+jobs:
+  construct:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: stable
+          components: rustfmt
+      - name: Materialize deadline candidate
+        run: python3 .github/tmp-milestone-3b-generate.py
+      - name: Format Rust sources
+        run: cargo fmt --all
+      - name: Remove construction files and commit candidate tree
+        run: |
+          rm .github/tmp-milestone-3b-generate.py
+          rm .github/workflows/tmp-milestone-3b-generator.yml
+          git config user.name "LeiZ"
+          git config user.email "52287354+Lei-TzuY@users.noreply.github.com"
+          git add -A
+          git commit -m "feat: enforce launcher-owned wall-clock deadline"
+          git push origin HEAD:tmp-3b-generator

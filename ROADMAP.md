@@ -78,7 +78,7 @@ Boundary: 4B proves **host network namespace separation**, not a full network-po
 
 ### Slice 4C — isolated IPC namespace baseline
 
-**Current verified candidate.** Add `CLONE_NEWIPC` to the existing mandatory namespace transition and prove a real host SysV IPC object is invisible from the target namespace.
+**Status: complete on `main`.** Adds `CLONE_NEWIPC` to the mandatory namespace transition and proves a real host SysV IPC object is invisible from the target namespace.
 
 Acceptance evidence is executable:
 
@@ -91,10 +91,26 @@ Acceptance evidence is executable:
 
 Boundary: 4C establishes SysV IPC/POSIX message-queue namespace separation. It does not revoke pipes, sockets, or other descriptor-based IPC deliberately exposed through the existing stdio/descriptor policy.
 
+### Slice 4D — owned UTS identity
+
+**Current verified candidate.** Make sandbox nodename identity explicit and launcher-owned rather than inheriting the host hostname into an otherwise isolated environment.
+
+Acceptance evidence is executable:
+
+- policy requires `identity.hostname`; validation permits 1–63 ASCII bytes containing letters, digits, `-`, and `.`, with an alphanumeric first/last byte, and rejects missing/duplicate/empty/oversized/invalid values;
+- `CLONE_NEWUTS` joins the existing mandatory user/mount/PID/network/IPC namespace transition;
+- the trusted launcher owns pre-fork hostname bytes and calls `sethostname` after UID/GID mapping but before capability clearing and target seccomp;
+- a raw target explicitly granted `uname` observes exactly the configured nodename;
+- the trusted parent reads `/proc/sys/kernel/hostname` before and after sandbox execution and proves the host nodename remains unchanged;
+- the target is not granted a launcher-only hostname mutation path, and no domainname/NIS-domain policy is claimed;
+- all Milestones 1–4C regressions, stable quality checks, and the full Rust 1.74 suite remain green.
+
+Boundary: 4D owns the sandbox UTS **nodename** only. It is not a general machine-identity service and does not claim configurable domainname.
+
 ### Milestone 4 promotion rule
 
-After 4C integrates, do not farm additional SysV keys, queue variants, or duplicate namespace probes. Return to 4A when real unprivileged cgroup-v2 delegation becomes available; otherwise promote to the next independently executable isolation/control-plane frontier. A strong candidate is an owned UTS identity slice that sets a launcher-controlled hostname in `CLONE_NEWUTS` and proves the target observes that value while the host hostname remains unchanged.
+After 4D integrates, do not farm hostname aliases, punctuation variants, or domainname copies. Return to 4A only when real unprivileged cgroup-v2 delegation becomes available. Otherwise select a materially different executable boundary after architecture audit; high-value candidates include enforcing/observing an empty supplementary-group set or introducing narrowly-scoped seccomp syscall-argument filtering with deterministic allow/deny evidence.
 
 ## Later frontiers
 
-External asynchronous cancellation, selected-handle passing, syscall-argument filtering, UTS isolation, broader persistent-volume policy, and controlled networking remain separate evidence-backed frontiers. Do not add configuration-only names without executable kernel behavior and integration evidence.
+External asynchronous cancellation, selected-handle passing, syscall-argument filtering, supplementary-group isolation, broader persistent-volume policy, and controlled networking remain separate evidence-backed frontiers. Do not add configuration-only names without executable kernel behavior and integration evidence.

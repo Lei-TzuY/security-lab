@@ -13,7 +13,9 @@ mod pid_lifecycle;
 
 #[cfg(target_arch = "x86_64")]
 mod x86_64 {
-    use super::pid_lifecycle::{self, LaunchErrorRecord, SharedTargetLifecycle, TargetLifecycleRecord};
+    use super::pid_lifecycle::{
+        self, LaunchErrorRecord, SharedTargetLifecycle, TargetLifecycleRecord,
+    };
     use crate::policy::{StdioMode, StdioPolicy};
     use crate::{
         CapturedOutput, ChildOutcome, PolicyError, ResourceLimits, RunReport, SandboxError,
@@ -669,7 +671,11 @@ mod x86_64 {
             );
         }
 
-        if libc::syscall(libc::SYS_unshare, libc::CLONE_NEWUSER | libc::CLONE_NEWNS | libc::CLONE_NEWPID) == -1 {
+        if libc::syscall(
+            libc::SYS_unshare,
+            libc::CLONE_NEWUSER | libc::CLONE_NEWNS | libc::CLONE_NEWPID,
+        ) == -1
+        {
             child_fail(launch_error, PHASE_NAMESPACE, seccomp.error_exit_syscall);
         }
 

@@ -8,6 +8,7 @@ const MAX_ARGS: usize = 64;
 const MAX_ARG_BYTES: usize = 4096;
 const MAX_ENV: usize = 64;
 const MAX_ENV_VALUE_BYTES: usize = 8192;
+const MAX_HOSTNAME_BYTES: usize = 63;
 const MAX_SYSCALLS: usize = 128;
 const MIN_SCRATCH_BYTES: u64 = 4096;
 const MAX_SCRATCH_BYTES: u64 = 1024 * 1024 * 1024;
@@ -50,6 +51,8 @@ pub struct SeccompPolicy {
 pub struct SandboxPolicy {
     /// Host path pinned as the sandbox filesystem root before fork.
     pub root_dir: PathBuf,
+    /// Launcher-owned hostname installed inside the sandbox UTS namespace.
+    pub hostname: String,
     /// Absolute path interpreted inside `root_dir`.
     pub executable: PathBuf,
     pub args: Vec<String>,
@@ -114,6 +117,7 @@ impl Error for PolicyError {}
 impl SandboxPolicy {
     pub fn validate(&self) -> Result<(), PolicyError> {
         validate_absolute_path("filesystem.root", &self.root_dir)?;
+        validate_hostname(&self.hostname)?;
         validate_absolute_path("executable", &self.executable)?;
         validate_absolute_path("working_dir", &self.working_dir)?;
 
@@ -293,6 +297,7 @@ impl FromStr for SandboxPolicy {
 
     fn from_str(input: &str) -> Result<Self, Self::Err> {
         let mut root_dir = None;
+        let mut hostname = None;
         let mut executable = None;
         let mut args = Vec::new();
         let mut environment = BTreeMap::new();
@@ -326,6 +331,7 @@ impl FromStr for SandboxPolicy {
 
             match key {
                 "filesystem.root" => set_once(&mut root_dir, value.to_owned(), line_no, key)?,
+                "identity.hostname" => set_once(&mut hostname, value.to_owned(), line_no, key)?,
                 "filesystem.scratch" => set_once(&mut scratch_dir, value.to_owned(), line_no, key)?,
                 "filesystem.scratch_bytes" => set_once(
                     &mut scratch_bytes,
@@ -444,6 +450,7 @@ impl FromStr for SandboxPolicy {
 
         let policy = Self {
             root_dir: PathBuf::from(required(root_dir, "filesystem.root")?),
+            hostname: required(hostname, "identity.hostname")?,
             executable: PathBuf::from(required(executable, "executable")?),
             args,
             environment,
@@ -529,6 +536,29 @@ fn validate_absolute_path(label: &str, path: &Path) -> Result<(), PolicyError> {
     Ok(())
 }
 
+fn validate_hostname(hostname: &str) -> Result<(), PolicyError> {
+    let bytes = hostname.as_bytes();
+    if bytes.is_empty() || bytes.len() > MAX_HOSTNAME_BYTES {
+        return Err(PolicyError::new(format!(
+            "identity.hostname must contain between 1 and {MAX_HOSTNAME_BYTES} bytes"
+        )));
+    }
+    if !bytes
+        .iter()
+        .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-' || *byte == b'.')
+    {
+        return Err(PolicyError::new(
+            "identity.hostname may contain only ASCII letters, digits, '-' and '.'",
+        ));
+    }
+    if matches!(bytes.first(), Some(b'-' | b'.')) || matches!(bytes.last(), Some(b'-' | b'.')) {
+        return Err(PolicyError::new(
+            "identity.hostname must start and end with an ASCII letter or digit",
+        ));
+    }
+    Ok(())
+}
+
 fn valid_env_key(key: &str) -> bool {
     let mut bytes = key.bytes();
     matches!(bytes.next(), Some(b'A'..=b'Z' | b'a'..=b'z' | b'_'))
@@ -541,6 +571,7 @@ mod tests {
 
     const VALID: &str = r#"
         filesystem.root = /
+        identity.hostname = security-lab
         filesystem.scratch = /scratch
         filesystem.scratch_bytes = 16777216
         executable = /bin/echo
@@ -561,6 +592,7 @@ mod tests {
     fn parses_complete_policy() {
         let policy: SandboxPolicy = VALID.parse().unwrap();
         assert_eq!(policy.root_dir, PathBuf::from("/"));
+        assert_eq!(policy.hostname, "security-lab");
         assert_eq!(policy.scratch_dir, Some(PathBuf::from("/scratch")));
         assert_eq!(policy.scratch_bytes, Some(16 * 1024 * 1024));
         assert_eq!(policy.executable, PathBuf::from("/bin/echo"));
@@ -680,6 +712,39 @@ mod tests {
     #[test]
     fn rejects_missing_security_field() {
         let text = VALID.replace("filesystem.root = /", "");
+        assert!(text.parse::<SandboxPolicy>().is_err());
+    }
+
+    #[test]
+    fn rejects_missing_hostname() {
+        let text = VALID.replace("identity.hostname = security-lab\n", "");
+        let err = text.parse::<SandboxPolicy>().unwrap_err();
+        assert!(err.to_string().contains("identity.hostname"));
+    }
+
+    #[test]
+    fn rejects_invalid_hostname() {
+        for hostname in ["-bad", "bad_underscore", "bad.", ""] {
+            let text = VALID.replace(
+                "identity.hostname = security-lab",
+                &format!("identity.hostname = {hostname}"),
+            );
+            assert!(
+                text.parse::<SandboxPolicy>().is_err(),
+                "accepted {hostname:?}"
+            );
+        }
+        let oversized = "a".repeat(MAX_HOSTNAME_BYTES + 1);
+        let text = VALID.replace(
+            "identity.hostname = security-lab",
+            &format!("identity.hostname = {oversized}"),
+        );
+        assert!(text.parse::<SandboxPolicy>().is_err());
+    }
+
+    #[test]
+    fn rejects_duplicate_hostname() {
+        let text = format!("{VALID}\nidentity.hostname = duplicate");
         assert!(text.parse::<SandboxPolicy>().is_err());
     }
 

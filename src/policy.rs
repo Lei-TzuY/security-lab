@@ -13,6 +13,8 @@ const MIN_SCRATCH_BYTES: u64 = 4096;
 const MAX_SCRATCH_BYTES: u64 = 1024 * 1024 * 1024;
 const MIN_CAPTURE_BYTES: u64 = 1;
 const MAX_CAPTURE_BYTES: u64 = 16 * 1024 * 1024;
+const MIN_WALL_CLOCK_MILLISECONDS: u64 = 1;
+const MAX_WALL_CLOCK_MILLISECONDS: u64 = 24 * 60 * 60 * 1000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResourceLimits {
@@ -68,6 +70,9 @@ pub struct SandboxPolicy {
     /// Maximum number of stdout bytes retained by the parent when stdout is
     /// `Capture`. Excess output is drained and discarded rather than retained.
     pub stdout_capture_bytes: Option<u64>,
+    /// Optional launcher-owned wall-clock deadline measured from PID 1
+    /// beginning supervision of the direct target.
+    pub wall_clock_milliseconds: Option<u64>,
     pub limits: ResourceLimits,
     pub seccomp: SeccompPolicy,
 }
@@ -198,6 +203,15 @@ impl SandboxPolicy {
             }
         }
 
+        if let Some(milliseconds) = self.wall_clock_milliseconds {
+            if !(MIN_WALL_CLOCK_MILLISECONDS..=MAX_WALL_CLOCK_MILLISECONDS).contains(&milliseconds)
+            {
+                return Err(PolicyError::new(format!(
+                    "limit.wall_clock_milliseconds must be between {MIN_WALL_CLOCK_MILLISECONDS} and {MAX_WALL_CLOCK_MILLISECONDS}"
+                )));
+            }
+        }
+
         if self.args.len() > MAX_ARGS {
             return Err(PolicyError::new(format!(
                 "too many arguments: {} > {MAX_ARGS}",
@@ -290,6 +304,7 @@ impl FromStr for SandboxPolicy {
         let mut stderr = None;
         let mut stdout_redirect = None;
         let mut stdout_capture_bytes = None;
+        let mut wall_clock_milliseconds = None;
         let mut cpu_seconds = None;
         let mut address_space_bytes = None;
         let mut file_size_bytes = None;
@@ -344,6 +359,12 @@ impl FromStr for SandboxPolicy {
                 }
                 "stdio.stdout_capture_bytes" => set_once(
                     &mut stdout_capture_bytes,
+                    parse_u64(value, line_no, key)?,
+                    line_no,
+                    key,
+                )?,
+                "limit.wall_clock_milliseconds" => set_once(
+                    &mut wall_clock_milliseconds,
                     parse_u64(value, line_no, key)?,
                     line_no,
                     key,
@@ -436,6 +457,7 @@ impl FromStr for SandboxPolicy {
             },
             stdout_redirect: stdout_redirect.map(PathBuf::from),
             stdout_capture_bytes,
+            wall_clock_milliseconds,
             limits: ResourceLimits {
                 cpu_seconds: required(cpu_seconds, "limit.cpu_seconds")?,
                 address_space_bytes: required(address_space_bytes, "limit.address_space_bytes")?,
@@ -548,6 +570,7 @@ mod tests {
         assert_eq!(policy.stdio.stderr, StdioMode::Inherit);
         assert_eq!(policy.stdout_redirect, None);
         assert_eq!(policy.stdout_capture_bytes, None);
+        assert_eq!(policy.wall_clock_milliseconds, None);
         assert_eq!(
             policy.environment.get("LANG").map(String::as_str),
             Some("C")
@@ -578,6 +601,36 @@ mod tests {
         let policy: SandboxPolicy = text.parse().unwrap();
         assert_eq!(policy.stdio.stdout, StdioMode::Capture);
         assert_eq!(policy.stdout_capture_bytes, Some(4096));
+    }
+
+    #[test]
+    fn parses_wall_clock_deadline() {
+        let text = format!("{VALID}\nlimit.wall_clock_milliseconds = 1500");
+        let policy: SandboxPolicy = text.parse().unwrap();
+        assert_eq!(policy.wall_clock_milliseconds, Some(1500));
+    }
+
+    #[test]
+    fn rejects_zero_wall_clock_deadline() {
+        let text = format!("{VALID}\nlimit.wall_clock_milliseconds = 0");
+        assert!(text.parse::<SandboxPolicy>().is_err());
+    }
+
+    #[test]
+    fn rejects_oversized_wall_clock_deadline() {
+        let text = format!(
+            "{VALID}\nlimit.wall_clock_milliseconds = {}",
+            MAX_WALL_CLOCK_MILLISECONDS + 1
+        );
+        assert!(text.parse::<SandboxPolicy>().is_err());
+    }
+
+    #[test]
+    fn rejects_duplicate_wall_clock_deadline() {
+        let text = format!(
+            "{VALID}\nlimit.wall_clock_milliseconds = 1000\nlimit.wall_clock_milliseconds = 2000"
+        );
+        assert!(text.parse::<SandboxPolicy>().is_err());
     }
 
     #[test]

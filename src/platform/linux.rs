@@ -15,6 +15,7 @@ mod pid_lifecycle;
 mod x86_64 {
     use super::pid_lifecycle::{
         self, LaunchErrorRecord, SharedTargetLifecycle, TargetLifecycleRecord,
+        TargetSupervisionPhases,
     };
     use crate::policy::{StdioMode, StdioPolicy};
     use crate::{
@@ -92,6 +93,10 @@ mod x86_64 {
     const PHASE_PROCESS_TREE_KILL: u32 = 31;
     const PHASE_PROCESS_TREE_REAP: u32 = 32;
     const PHASE_PID_INIT_WAIT: u32 = 33;
+    const PHASE_DEADLINE_PIDFD: u32 = 34;
+    const PHASE_DEADLINE_TIMERFD: u32 = 35;
+    const PHASE_DEADLINE_TIMER_ARM: u32 = 36;
+    const PHASE_DEADLINE_POLL: u32 = 37;
 
     #[repr(C)]
     struct OpenHow {
@@ -357,10 +362,12 @@ mod x86_64 {
         target_lifecycle: *mut TargetLifecycleRecord,
         capture_read_fd: RawFd,
         capture_write_fd: RawFd,
+        wall_clock_milliseconds: u64,
     }
 
     pub(crate) fn run_report(policy: &SandboxPolicy) -> Result<RunReport, SandboxError> {
         ensure_fd_sanitization_supported()?;
+        ensure_deadline_support(policy.wall_clock_milliseconds)?;
         let prepared = PreparedLaunch::new(policy)?;
         let seccomp = compile_seccomp(policy)?;
         let launch_state = SharedLaunchState::new()?;
@@ -387,6 +394,7 @@ mod x86_64 {
             target_lifecycle: lifecycle.raw(),
             capture_read_fd,
             capture_write_fd,
+            wall_clock_milliseconds: policy.wall_clock_milliseconds.unwrap_or(0),
         };
 
         let pid = unsafe { libc::fork() };
@@ -442,7 +450,15 @@ mod x86_64 {
             Some(result) => Some(result?),
             None => None,
         };
-        let outcome = decode_wait_status(lifecycle_record.status)?;
+        let outcome = match lifecycle_record.timed_out {
+            0 => decode_wait_status(lifecycle_record.status)?,
+            1 => ChildOutcome::TimedOut,
+            value => {
+                return Err(SandboxError::SetupFailed(format!(
+                    "PID namespace lifecycle published invalid timeout flag {value}"
+                )));
+            }
+        };
         Ok(RunReport {
             outcome,
             stdout,
@@ -612,6 +628,62 @@ mod x86_64 {
         }
     }
 
+    fn ensure_deadline_support(deadline: Option<u64>) -> Result<(), SandboxError> {
+        if deadline.is_none() {
+            return Ok(());
+        }
+
+        let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, libc::getpid(), 0u32) };
+        if pidfd == -1 {
+            return Err(deadline_support_error(
+                "pidfd_open",
+                io::Error::last_os_error(),
+            ));
+        }
+        if unsafe { libc::close(pidfd as RawFd) } == -1 {
+            return Err(SandboxError::SetupFailed(format!(
+                "cannot close wall-clock deadline pidfd probe: {}",
+                io::Error::last_os_error()
+            )));
+        }
+
+        let timerfd = unsafe {
+            libc::syscall(
+                libc::SYS_timerfd_create,
+                libc::CLOCK_MONOTONIC,
+                libc::TFD_CLOEXEC,
+            )
+        };
+        if timerfd == -1 {
+            return Err(deadline_support_error(
+                "timerfd_create(CLOCK_MONOTONIC)",
+                io::Error::last_os_error(),
+            ));
+        }
+        if unsafe { libc::close(timerfd as RawFd) } == -1 {
+            return Err(SandboxError::SetupFailed(format!(
+                "cannot close wall-clock deadline timerfd probe: {}",
+                io::Error::last_os_error()
+            )));
+        }
+        Ok(())
+    }
+
+    fn deadline_support_error(mechanism: &str, error: io::Error) -> SandboxError {
+        if matches!(
+            error.raw_os_error(),
+            Some(libc::ENOSYS | libc::EINVAL | libc::EPERM | libc::EACCES)
+        ) {
+            SandboxError::UnsupportedPlatform(format!(
+                "wall-clock deadline requires {mechanism}: {error}"
+            ))
+        } else {
+            SandboxError::SetupFailed(format!(
+                "cannot verify wall-clock deadline mechanism {mechanism}: {error}"
+            ))
+        }
+    }
+
     fn compile_seccomp(policy: &SandboxPolicy) -> Result<CompiledSeccomp, SandboxError> {
         let error_exit_syscall = if policy.seccomp.allowed_syscalls.contains("exit") {
             libc::SYS_exit
@@ -676,6 +748,7 @@ mod x86_64 {
             target_lifecycle,
             capture_read_fd,
             capture_write_fd,
+            wall_clock_milliseconds,
         } = control;
         if capture_read_fd >= FIRST_NON_STDIO_FD as RawFd && libc::close(capture_read_fd) == -1 {
             child_fail(
@@ -884,10 +957,17 @@ mod x86_64 {
         pid_lifecycle::become_direct_target_or_reap(
             target_lifecycle,
             launch_error,
-            PHASE_TARGET_FORK,
-            PHASE_PROCESS_TREE_KILL,
-            PHASE_PROCESS_TREE_REAP,
-            PHASE_FD_SANITIZE,
+            wall_clock_milliseconds,
+            TargetSupervisionPhases {
+                fork: PHASE_TARGET_FORK,
+                kill: PHASE_PROCESS_TREE_KILL,
+                reap: PHASE_PROCESS_TREE_REAP,
+                close: PHASE_FD_SANITIZE,
+                pidfd: PHASE_DEADLINE_PIDFD,
+                timerfd: PHASE_DEADLINE_TIMERFD,
+                timer_arm: PHASE_DEADLINE_TIMER_ARM,
+                poll: PHASE_DEADLINE_POLL,
+            },
         );
 
         apply_stdio_policy_or_fail(
@@ -1328,6 +1408,10 @@ mod x86_64 {
             PHASE_PROCESS_TREE_KILL => "process-tree termination",
             PHASE_PROCESS_TREE_REAP => "process-tree reaping",
             PHASE_PID_INIT_WAIT => "PID namespace init wait",
+            PHASE_DEADLINE_PIDFD => "wall-clock deadline pidfd supervision",
+            PHASE_DEADLINE_TIMERFD => "wall-clock deadline timer creation",
+            PHASE_DEADLINE_TIMER_ARM => "wall-clock deadline timer arming",
+            PHASE_DEADLINE_POLL => "wall-clock deadline supervision poll",
             _ => "unknown launch phase",
         };
         format!(

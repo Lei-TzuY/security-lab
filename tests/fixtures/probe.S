@@ -7,6 +7,7 @@
 #
 # argv[1] mode:
 #   A allowed write
+#   B assert 64-bit masked seccomp argument filtering on lseek offset
 #   F forbidden getpid; exits 77 only when seccomp returns -EPERM
 #   E validate sanitized environment
 #   C validate working directory against argv[2]
@@ -38,6 +39,8 @@ _start:
     movzbl (%rdi), %eax
     cmp $65, %al
     je .allowed
+    cmp $66, %al
+    je .seccomp_argument_filter
     cmp $70, %al
     je .forbidden
     cmp $69, %al
@@ -94,6 +97,49 @@ _start:
     syscall
     test %rax, %rax
     js .fail3
+    xor %edi, %edi
+    jmp .exit
+
+.seccomp_argument_filter:
+    mov $257, %eax
+    mov $-100, %edi
+    lea probe_path(%rip), %rsi
+    xor %edx, %edx
+    xor %r10d, %r10d
+    syscall
+    test %rax, %rax
+    js .fail29
+    mov %rax, %r12
+
+    mov $8, %eax
+    mov %r12, %rdi
+    movabs $0x0000000112345678, %rsi
+    xor %edx, %edx
+    syscall
+    test %rax, %rax
+    js .fail29
+
+    mov $8, %eax
+    mov %r12, %rdi
+    movabs $0x0000000112345679, %rsi
+    xor %edx, %edx
+    syscall
+    cmp $-1, %rax
+    jne .fail29
+
+    mov $8, %eax
+    mov %r12, %rdi
+    movabs $0x0000000212345678, %rsi
+    xor %edx, %edx
+    syscall
+    cmp $-1, %rax
+    jne .fail29
+
+    mov $3, %eax
+    mov %r12, %rdi
+    syscall
+    test %rax, %rax
+    js .fail29
     xor %edi, %edi
     jmp .exit
 
@@ -763,6 +809,9 @@ _start:
     jmp .exit
 .fail28:
     mov $28, %edi
+    jmp .exit
+.fail29:
+    mov $29, %edi
 
 .exit:
     mov $60, %eax
@@ -777,6 +826,8 @@ allowed_env:
     .asciz "SANDBOX_ALLOWED=yes"
 sandbox_root:
     .asciz "/"
+probe_path:
+    .asciz "/probe"
 forbidden_create:
     .asciz "/root-write-must-fail"
 scratch_create:

@@ -1,17 +1,18 @@
-# Milestones 1–4B threat model
+# Milestones 1–4C threat model
 
 ## Purpose
 
-`security-lab` is an educational, correctness-first Linux sandbox. Milestone 1 established syscall/resource/environment controls; Milestone 2 sealed descriptor, launch, filesystem/identity, stdio, redirection, and bounded-capture authority; Milestone 3 sealed PID-tree lifecycle ownership plus a policy-owned monotonic wall-clock deadline. The current Milestone 4B candidate adds an isolated Linux network namespace baseline. Every claimed property must correspond to a kernel mechanism and executable evidence.
+`security-lab` is an educational, correctness-first Linux sandbox. Milestone 1 established syscall/resource/environment controls; Milestone 2 sealed descriptor, launch, filesystem/identity, stdio, redirection, and bounded-capture authority; Milestone 3 sealed PID-tree lifecycle ownership plus a policy-owned monotonic wall-clock deadline; Milestone 4B added an isolated network namespace baseline. The current Milestone 4C candidate adds an isolated IPC namespace baseline. Every claimed property must correspond to a kernel mechanism and executable evidence.
 
 ## Protected boundary
 
-The trusted host parent launches one direct target through launcher-owned bootstrap and namespace-init processes. On supported Linux x86_64, the launcher constrains initial filesystem visibility/mutability, namespace identity, network-namespace membership, capabilities, target syscalls, selected resources, environment, cwd, inherited descriptors, stdio, bounded capture, process-tree lifecycle, and—when declared—a wall-clock execution deadline while preserving fail-closed launch/lifecycle reporting.
+The trusted host parent launches one direct target through launcher-owned bootstrap and namespace-init processes. On supported Linux x86_64, the launcher constrains initial filesystem visibility/mutability, namespace identity, network- and IPC-namespace membership, capabilities, target syscalls, selected resources, environment, cwd, inherited descriptors, stdio, bounded capture, process-tree lifecycle, and—when declared—a wall-clock execution deadline while preserving fail-closed launch/lifecycle reporting.
 
 ## Security properties claimed
 
 - **Pinned root/cwd/target:** configured sandbox paths are fail-closed; the initial executable is pinned and launched with `execveat(AT_EMPTY_PATH)`.
-- **User/mount/PID/network namespace isolation:** namespace UID/GID 0 map only to the launching effective UID/GID; mount propagation is private; launcher-owned PID 1 parents the direct target as PID 2; the target executes in a distinct network namespace rather than the host network namespace.
+- **User/mount/PID/network/IPC namespace isolation:** namespace UID/GID 0 map only to the launching effective UID/GID; mount propagation is private; launcher-owned PID 1 parents the direct target as PID 2; the target executes in distinct network and IPC namespaces rather than sharing those host namespaces.
+- **SysV IPC visibility boundary:** message-queue keys/IDs are resolved in the target IPC namespace. Host SysV queues are not discoverable by the same key from the target after `CLONE_NEWIPC`.
 - **No implicit network attachment:** the launcher creates `CLONE_NEWNET` but does not create a veth, install routes, configure DNS, or connect the namespace to a host bridge. Host loopback is therefore not the target's loopback stack.
 - **Filesystem mutability/path boundary:** the revalidated root is recursively cloned/read-only, optional scratch is private `nosuid,nodev,noexec` tmpfs, and the target is chrooted into the constructed root.
 - **Inherited-FD minimization / explicit stdio:** arbitrary inherited descriptors >= 3 do not survive target exec; stdio disposition is explicit; launcher-owned redirect/capture sources are tightly remapped and closed.
@@ -26,17 +27,23 @@ The trusted host parent launches one direct target through launcher-owned bootst
 
 ## Network namespace semantics
 
-The launcher calls `unshare(CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWNET)` in one fail-closed namespace transition. If that transition is denied or unsupported, launch fails rather than retrying without `CLONE_NEWNET`.
+The launcher calls `unshare(CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWNET | CLONE_NEWIPC)` in one fail-closed namespace transition. If that transition is denied or unsupported, launch fails rather than retrying without any requested mandatory namespace boundary.
 
 The launcher does not configure the new network namespace. The target therefore does not share host routes, interfaces, or host loopback listeners. This is a **network isolation baseline**, not an endpoint-routing policy. If future work adds controlled connectivity, that must introduce explicit topology/route/endpoint policy plus executable interop evidence rather than weakening this invariant implicitly.
 
-The target later drops effective/permitted/inheritable capabilities before exec. Target socket creation/connect remains independently controlled by seccomp. Explicitly inherited stdio objects remain an intentional exception: if the policy exposes an already-open socket via `stdio.* = inherit`, network namespace creation does not retroactively revoke that object capability.
+The target later drops effective/permitted/inheritable capabilities before exec. Target socket creation/connect and SysV IPC syscalls remain independently controlled by seccomp. Explicitly inherited stdio objects remain an intentional exception: namespace creation does not retroactively revoke an already-open socket, pipe, or other descriptor capability exposed through `stdio.* = inherit`.
+
+## IPC namespace semantics
+
+`CLONE_NEWIPC` separates SysV IPC objects and the POSIX message-queue namespace from the host. The executable regression uses a host-created SysV message queue because its key lookup gives a direct positive/negative visibility oracle: the host proves the key maps to a queue ID, while the target with an explicit `msgget` grant must receive `ENOENT` for the same key. `EPERM` is not accepted as evidence.
+
+This baseline does not claim a general IPC policy. Pipes, Unix sockets, eventfds, memfds, or other objects deliberately exposed through inherited descriptors remain object capabilities governed by the descriptor/stdio policy rather than by `CLONE_NEWIPC`.
 
 ## Deadline and lifecycle orchestration
 
 Potentially allocating policy data, argv/envp, seccomp instructions, pinned descriptors, shared lifecycle state, and capture-pipe creation occur before the initial host `fork`.
 
-The launcher creates user/mount/PID/network namespaces and filesystem state, then forks launcher-owned namespace PID 1. PID 1 forks the direct target as PID 2. The target alone receives target stdio/rlimit/capability/seccomp setup; PID 1 closes inherited descriptors >= 3 so it cannot keep launcher capture writers alive.
+The launcher creates user/mount/PID/network/IPC namespaces and filesystem state, then forks launcher-owned namespace PID 1. PID 1 forks the direct target as PID 2. The target alone receives target stdio/rlimit/capability/seccomp setup; PID 1 closes inherited descriptors >= 3 so it cannot keep launcher capture writers alive.
 
 If no deadline is declared, PID 1 uses the existing blocking direct-target wait. If a deadline is declared, PID 1 opens a pidfd for the already-forked target, creates a `TFD_CLOEXEC` timerfd using `CLOCK_MONOTONIC`, arms it for the validated interval, and polls the pidfd and timerfd. These descriptors are created after target fork and are never inherited by the target.
 
@@ -56,7 +63,8 @@ This sandbox is **not** a production multi-tenant container boundary. It does no
 - cgroup-backed aggregate CPU, physical-memory, I/O, or process accounting;
 - deliberate selected non-stdio descriptor passing or a general arbitrary FD-remapping language;
 - persistence of private-scratch redirect output after the mount namespace disappears;
-- IPC, UTS, or cgroup namespaces;
+- a general policy that forbids all IPC object types or revokes descriptor-based IPC deliberately exposed to the target;
+- UTS or cgroup namespaces;
 - a device namespace, syscall argument filtering, persistent data-volume policy, or immutable/cryptographic root-subtree snapshot;
 - persistent executable allowlisting, multi-architecture seccomp, side-channel resistance, or protection from sufficiently privileged external ptrace/signal interference.
 
@@ -82,6 +90,7 @@ Evidence includes:
 
 - exact allowed/denied syscall behavior and fail-closed malformed policy handling;
 - a host `127.0.0.1` TCP listener that is first proven reachable from the host process, followed by a raw sandbox target explicitly granted `socket`, `connect`, `close`, and `exit` attempting the same port. The raw target accepts only `ECONNREFUSED`, `ENETUNREACH`, or `EHOSTUNREACH`; seccomp `EPERM` and successful host-listener reachability both fail the test;
+- a host-created SysV message queue whose explicit key is first proven visible from the host; a raw target explicitly granted `msgget` must receive `ENOENT` for that same key inside the IPC namespace. Seeing the host queue or receiving seccomp `EPERM` fails the test;
 - all Milestones 1–3B descriptor, stdio, filesystem, capability, rlimit, launch-error, capture, PID identity, descendant cleanup, timeout, and exit-vs-signal regressions;
 - a raw deadline target that writes an exact stdout marker, forks a descendant that remains in `pause()`, and is preempted by a 1,000 ms policy deadline while a fast target under 5,000 ms still preserves `Exited(42)`.
 
@@ -89,10 +98,10 @@ CI explicitly enables the user-namespace settings required by its disposable Ubu
 
 ## Failure semantics
 
-Invalid policy is rejected before launch. Namespace creation, deadline support preflight, pidfd creation, timer creation/arming, supervision poll, namespace/bootstrap/init forks, descriptor cleanup, capture reads, mount/capability/seccomp setup, process-tree kill/reap, lifecycle publication, and target exec failures are terminal. A failed network-namespace transition is part of the same mandatory namespace failure path and never falls back to the host network namespace.
+Invalid policy is rejected before launch. Namespace creation, deadline support preflight, pidfd creation, timer creation/arming, supervision poll, namespace/bootstrap/init forks, descriptor cleanup, capture reads, mount/capability/seccomp setup, process-tree kill/reap, lifecycle publication, and target exec failures are terminal. A failed network/IPC namespace transition is part of the same mandatory namespace failure path and never falls back to the corresponding host namespace.
 
 ## Phase promotion
 
 Milestone 3 is sealed: the launcher owns PID namespace init, descendant cleanup, bounded runtime termination, and explicit timeout reporting.
 
-Milestone 4A cgroup-v2 aggregate process accounting is blocked by missing unprivileged delegation on the current GitHub-hosted runner. The independently verifiable Milestone 4B frontier therefore establishes host-network-namespace separation first. After 4B integrates, do not farm additional unreachable errno variants. The next network step should be a coherent controlled-connectivity hypothesis (explicit topology/route/endpoint policy with real positive and negative connectivity evidence), or return to 4A once delegated cgroup-v2 evidence becomes available.
+Milestone 4A cgroup-v2 aggregate process accounting remains blocked by missing unprivileged delegation on the current GitHub-hosted runner. Milestone 4B is complete on `main` with host-network-namespace separation. The current 4C frontier adds independent IPC-namespace separation with a real SysV visibility oracle. After 4C integrates, do not farm additional IPC-key variants; either return to 4A when delegated cgroup-v2 evidence becomes available, or promote to another independently executable namespace/control-plane frontier such as an owned UTS identity boundary.

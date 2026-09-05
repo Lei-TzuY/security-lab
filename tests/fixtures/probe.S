@@ -28,6 +28,7 @@
 #   Z fork a live descendant that must be killed/reaped by namespace init
 #   Q emit a marker, fork a descendant, then remain live past the policy deadline
 #   K assert host loopback listener is unreachable from the target network namespace
+#   L assert host SysV message queue key is invisible in the target IPC namespace
 
 _start:
     mov 16(%rsp), %rdi
@@ -78,6 +79,8 @@ _start:
     je .deadline_tree
     cmp $75, %al
     je .network_isolation
+    cmp $76, %al
+    je .ipc_isolation
     jmp .fail2
 
 .allowed:
@@ -621,6 +624,34 @@ _start:
     xor %edi, %edi
     jmp .exit
 
+.ipc_isolation:
+    mov 24(%rsp), %rdi
+    test %rdi, %rdi
+    je .fail2
+    xor %r12d, %r12d
+.ipc_key_parse_loop:
+    movzbl (%rdi), %eax
+    test %al, %al
+    je .ipc_key_parsed
+    sub $48, %eax
+    cmp $9, %eax
+    ja .fail2
+    imul $10, %r12d, %r12d
+    add %eax, %r12d
+    inc %rdi
+    jmp .ipc_key_parse_loop
+.ipc_key_parsed:
+    test %r12d, %r12d
+    je .fail2
+    mov $68, %eax
+    mov %r12d, %edi
+    xor %esi, %esi
+    syscall
+    cmp $-2, %rax
+    jne .fail27
+    xor %edi, %edi
+    jmp .exit
+
 .str_eq:
 .str_eq_loop:
     movzbl (%rdi), %eax
@@ -707,6 +738,9 @@ _start:
     jmp .exit
 .fail26:
     mov $26, %edi
+    jmp .exit
+.fail27:
+    mov $27, %edi
 
 .exit:
     mov $60, %eax

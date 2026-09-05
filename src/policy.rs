@@ -228,8 +228,13 @@ impl FromStr for SandboxPolicy {
                         allowed_syscalls: names,
                     });
                 }
-                _ if key.starts_with("env.") => {
-                    let env_key = &key[4..];
+                _ => {
+                    let Some(env_key) = key.strip_prefix("env.") else {
+                        return Err(PolicyError::at(
+                            line_no,
+                            format!("unknown policy key: {key}"),
+                        ));
+                    };
                     if !valid_env_key(env_key) {
                         return Err(PolicyError::at(
                             line_no,
@@ -246,12 +251,6 @@ impl FromStr for SandboxPolicy {
                         ));
                     }
                 }
-                _ => {
-                    return Err(PolicyError::at(
-                        line_no,
-                        format!("unknown policy key: {key}"),
-                    ))
-                }
             }
         }
 
@@ -262,10 +261,7 @@ impl FromStr for SandboxPolicy {
             working_dir: PathBuf::from(required(working_dir, "working_dir")?),
             limits: ResourceLimits {
                 cpu_seconds: required(cpu_seconds, "limit.cpu_seconds")?,
-                address_space_bytes: required(
-                    address_space_bytes,
-                    "limit.address_space_bytes",
-                )?,
+                address_space_bytes: required(address_space_bytes, "limit.address_space_bytes")?,
                 file_size_bytes: required(file_size_bytes, "limit.file_size_bytes")?,
                 open_files: required(open_files, "limit.open_files")?,
             },
@@ -301,12 +297,19 @@ fn parse_u64(value: &str, line: usize, key: &str) -> Result<u64, PolicyError> {
 
 fn validate_absolute_path(label: &str, path: &Path) -> Result<(), PolicyError> {
     if !path.is_absolute() {
-        return Err(PolicyError::new(format!("{label} must be an absolute path")));
+        return Err(PolicyError::new(format!(
+            "{label} must be an absolute path"
+        )));
     }
     if path.as_os_str().as_encoded_bytes().contains(&0) {
-        return Err(PolicyError::new(format!("{label} must not contain NUL bytes")));
+        return Err(PolicyError::new(format!(
+            "{label} must not contain NUL bytes"
+        )));
     }
-    if path.components().any(|component| component == Component::ParentDir) {
+    if path
+        .components()
+        .any(|component| component == Component::ParentDir)
+    {
         return Err(PolicyError::new(format!(
             "{label} must not contain '..' components"
         )));
@@ -341,7 +344,10 @@ mod tests {
         let policy: SandboxPolicy = VALID.parse().unwrap();
         assert_eq!(policy.executable, PathBuf::from("/bin/echo"));
         assert_eq!(policy.args, ["hello"]);
-        assert_eq!(policy.environment.get("LANG").map(String::as_str), Some("C"));
+        assert_eq!(
+            policy.environment.get("LANG").map(String::as_str),
+            Some("C")
+        );
         assert!(policy.seccomp.allowed_syscalls.contains("execve"));
     }
 

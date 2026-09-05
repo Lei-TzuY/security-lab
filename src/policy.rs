@@ -11,6 +11,9 @@ const MAX_ENV_VALUE_BYTES: usize = 8192;
 const MAX_HOSTNAME_BYTES: usize = 63;
 const MAX_SYSCALLS: usize = 128;
 const MAX_SECCOMP_ARG_RULES: usize = 64;
+const MAX_SELECTED_HANDLES: usize = 16;
+const MIN_SELECTED_TARGET_FD: u32 = 3;
+const MAX_SELECTED_TARGET_FD: u32 = 63;
 const MIN_SCRATCH_BYTES: u64 = 4096;
 const MAX_SCRATCH_BYTES: u64 = 1024 * 1024 * 1024;
 const MIN_CAPTURE_BYTES: u64 = 1;
@@ -80,6 +83,10 @@ pub struct SandboxPolicy {
     pub scratch_bytes: Option<u64>,
     /// Explicit disposition for descriptors 0, 1, and 2.
     pub stdio: StdioPolicy,
+    /// Explicit non-stdio descriptor capabilities keyed by target descriptor.
+    /// Each value is an already-open descriptor in the launcher process that
+    /// is pinned before fork and remapped only into the direct target.
+    pub selected_handles: BTreeMap<u32, u32>,
     /// Sandbox path used only when stdout disposition is `Redirect`. The path
     /// must be strictly beneath the declared private scratch directory.
     pub stdout_redirect: Option<PathBuf>,
@@ -280,6 +287,31 @@ impl SandboxPolicy {
             ));
         }
 
+        if self.selected_handles.len() > MAX_SELECTED_HANDLES {
+            return Err(PolicyError::new(format!(
+                "too many selected handles: {} > {MAX_SELECTED_HANDLES}",
+                self.selected_handles.len()
+            )));
+        }
+        for (target_fd, source_fd) in &self.selected_handles {
+            if !(MIN_SELECTED_TARGET_FD..=MAX_SELECTED_TARGET_FD).contains(target_fd) {
+                return Err(PolicyError::new(format!(
+                    "selected handle target fd must be between {MIN_SELECTED_TARGET_FD} and {MAX_SELECTED_TARGET_FD}: {target_fd}"
+                )));
+            }
+            if u64::from(*target_fd) >= self.limits.open_files {
+                return Err(PolicyError::new(format!(
+                    "selected handle target fd {target_fd} must be below limit.open_files {}",
+                    self.limits.open_files
+                )));
+            }
+            if *source_fd > i32::MAX as u32 {
+                return Err(PolicyError::new(format!(
+                    "selected handle source fd exceeds the Linux descriptor range: {source_fd}"
+                )));
+            }
+        }
+
         if self.seccomp.allowed_syscalls.is_empty() {
             return Err(PolicyError::new("seccomp allowlist must not be empty"));
         }
@@ -362,6 +394,7 @@ impl FromStr for SandboxPolicy {
         let mut stdin = None;
         let mut stdout = None;
         let mut stderr = None;
+        let mut selected_handles = BTreeMap::new();
         let mut stdout_redirect = None;
         let mut stdout_capture_bytes = None;
         let mut wall_clock_milliseconds = None;
@@ -456,6 +489,24 @@ impl FromStr for SandboxPolicy {
                     line_no,
                     key,
                 )?,
+                _ if key.starts_with("handle.") => {
+                    let target_text = key.strip_prefix("handle.").expect("prefix checked above");
+                    let target_fd = target_text.parse::<u32>().map_err(|_| {
+                        PolicyError::at(line_no, "selected handle key must be handle.<target_fd>")
+                    })?;
+                    let source_fd = value.parse::<u32>().map_err(|_| {
+                        PolicyError::at(
+                            line_no,
+                            "selected handle source fd must be an unsigned integer",
+                        )
+                    })?;
+                    if selected_handles.insert(target_fd, source_fd).is_some() {
+                        return Err(PolicyError::at(
+                            line_no,
+                            format!("duplicate selected handle target fd: {target_fd}"),
+                        ));
+                    }
+                }
                 "seccomp.allow" => {
                     if seccomp_allow.is_some() {
                         return Err(PolicyError::at(line_no, "duplicate seccomp.allow"));
@@ -553,6 +604,7 @@ impl FromStr for SandboxPolicy {
                 stdout: required(stdout, "stdio.stdout")?,
                 stderr: required(stderr, "stdio.stderr")?,
             },
+            selected_handles,
             stdout_redirect: stdout_redirect.map(PathBuf::from),
             stdout_capture_bytes,
             wall_clock_milliseconds,
@@ -732,6 +784,7 @@ mod tests {
         assert_eq!(policy.stdio.stdin, StdioMode::Closed);
         assert_eq!(policy.stdio.stdout, StdioMode::Inherit);
         assert_eq!(policy.stdio.stderr, StdioMode::Inherit);
+        assert!(policy.selected_handles.is_empty());
         assert_eq!(policy.stdout_redirect, None);
         assert_eq!(policy.stdout_capture_bytes, None);
         assert_eq!(policy.wall_clock_milliseconds, None);
@@ -976,6 +1029,45 @@ mod tests {
             "seccomp.allow = execveat,read,write,exit\n        seccomp.arg.exit.0 = 0xff:0x00",
         );
         assert!(exit_rule.parse::<SandboxPolicy>().is_err());
+    }
+
+    #[test]
+    fn parses_selected_handle_mapping() {
+        let text = format!("{VALID}\nhandle.9 = 200");
+        let policy: SandboxPolicy = text.parse().unwrap();
+        assert_eq!(policy.selected_handles.get(&9), Some(&200));
+    }
+
+    #[test]
+    fn rejects_duplicate_selected_handle_target() {
+        let text = format!("{VALID}\nhandle.9 = 200\nhandle.9 = 201");
+        assert!(text.parse::<SandboxPolicy>().is_err());
+    }
+
+    #[test]
+    fn rejects_selected_handle_target_outside_owned_range_or_rlimit() {
+        for mapping in ["handle.2 = 200", "handle.64 = 200", "handle.32 = 200"] {
+            let text = format!("{VALID}\n{mapping}");
+            assert!(
+                text.parse::<SandboxPolicy>().is_err(),
+                "accepted invalid mapping {mapping}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_selected_handle_source_outside_linux_fd_range() {
+        let text = format!("{VALID}\nhandle.9 = {}", u32::MAX);
+        assert!(text.parse::<SandboxPolicy>().is_err());
+    }
+
+    #[test]
+    fn rejects_too_many_selected_handles() {
+        let mut text = VALID.to_owned();
+        for target_fd in 3..20 {
+            text.push_str(&format!("\nhandle.{target_fd} = 200"));
+        }
+        assert!(text.parse::<SandboxPolicy>().is_err());
     }
 
     #[test]

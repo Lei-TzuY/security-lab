@@ -5,13 +5,41 @@ use security_lab::{
     SeccompPolicy, StdioMode, StdioPolicy,
 };
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::CString;
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::{symlink, PermissionsExt};
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::process::{self, Command};
 use std::sync::OnceLock;
 
 const SCRATCH_BYTES: u64 = 16 * 1024 * 1024;
+
+struct TestFd(RawFd);
+
+impl TestFd {
+    fn raw(&self) -> RawFd {
+        self.0
+    }
+}
+
+impl Drop for TestFd {
+    fn drop(&mut self) {
+        unsafe {
+            libc::close(self.0);
+        }
+    }
+}
+
+fn duplicate_fd_at_least(fd: RawFd, minimum: RawFd, label: &str) -> TestFd {
+    let duplicated = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, minimum) };
+    assert!(
+        duplicated >= minimum,
+        "failed to duplicate {label} at or above {minimum}: {}",
+        std::io::Error::last_os_error()
+    );
+    TestFd(duplicated)
+}
 
 fn fixture_root() -> &'static Path {
     static ROOT: OnceLock<PathBuf> = OnceLock::new();
@@ -56,6 +84,7 @@ fn policy(mode: &str, extra_args: &[&str], syscalls: &[&str]) -> SandboxPolicy {
             stdout: StdioMode::Inherit,
             stderr: StdioMode::Inherit,
         },
+        selected_handles: BTreeMap::new(),
         stdout_redirect: None,
         stdout_capture_bytes: None,
         wall_clock_milliseconds: None,
@@ -69,6 +98,65 @@ fn policy(mode: &str, extra_args: &[&str], syscalls: &[&str]) -> SandboxPolicy {
             allowed_syscalls: syscall_set(syscalls),
             argument_rules: BTreeMap::new(),
         },
+    }
+}
+
+#[test]
+fn selected_nonstdio_handle_is_exposed_only_at_declared_destination() {
+    let mut pipe = [-1; 2];
+    assert_eq!(
+        unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) },
+        0,
+        "create selected-handle pipe"
+    );
+    let read_end = TestFd(pipe[0]);
+    let write_end = TestFd(pipe[1]);
+    let source = duplicate_fd_at_least(read_end.raw(), 200, "selected source");
+    drop(read_end);
+
+    let marker = b"selected-handle-ok";
+    let written = unsafe {
+        libc::write(
+            write_end.raw(),
+            marker.as_ptr().cast::<libc::c_void>(),
+            marker.len(),
+        )
+    };
+    assert_eq!(written, marker.len() as isize, "write selected marker");
+    drop(write_end);
+
+    let null_path = CString::new("/dev/null").unwrap();
+    let null_fd = unsafe { libc::open(null_path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+    assert!(null_fd >= 0, "open undeclared descriptor fixture");
+    let null_fd = TestFd(null_fd);
+    let undeclared = duplicate_fd_at_least(null_fd.raw(), 220, "undeclared descriptor");
+    drop(null_fd);
+
+    let source_text = source.raw().to_string();
+    let undeclared_text = undeclared.raw().to_string();
+    let mut selected = policy(
+        "G",
+        &[source_text.as_str(), undeclared_text.as_str()],
+        &["execveat", "read", "fcntl", "exit"],
+    );
+    selected.selected_handles.insert(9, source.raw() as u32);
+
+    assert_eq!(run(&selected).unwrap(), ChildOutcome::Exited(0));
+}
+
+#[test]
+fn selected_handle_rejects_directory_source() {
+    let directory = std::fs::File::open(fixture_root()).expect("open directory descriptor");
+    let mut selected = policy("A", &[], &["execveat", "write", "exit"]);
+    selected
+        .selected_handles
+        .insert(9, directory.as_raw_fd() as u32);
+
+    match run(&selected).unwrap_err() {
+        SandboxError::InvalidPolicy(error) => {
+            assert!(error.to_string().contains("directory descriptor"));
+        }
+        other => panic!("unexpected directory-source result: {other}"),
     }
 }
 

@@ -168,7 +168,10 @@ fn exec_failure_is_reported_without_target_write_permission() {
 
     match result {
         Err(SandboxError::SetupFailed(message)) => {
-            assert!(message.contains("execve"), "unexpected launch error: {message}");
+            assert!(
+                message.contains("execve"),
+                "unexpected launch error: {message}"
+            );
         }
         other => panic!("expected precise execve setup failure, got {other:?}"),
     }

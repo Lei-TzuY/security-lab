@@ -351,6 +351,14 @@ mod x86_64 {
         error_exit_syscall: libc::c_long,
     }
 
+    #[derive(Clone, Copy)]
+    struct ChildControl {
+        launch_error: *mut LaunchErrorRecord,
+        target_lifecycle: *mut TargetLifecycleRecord,
+        capture_read_fd: RawFd,
+        capture_write_fd: RawFd,
+    }
+
     pub(crate) fn run_report(policy: &SandboxPolicy) -> Result<RunReport, SandboxError> {
         ensure_fd_sanitization_supported()?;
         let prepared = PreparedLaunch::new(policy)?;
@@ -374,6 +382,12 @@ mod x86_64 {
         };
         let capture_read_fd = capture.as_ref().map_or(-1, |pipe| pipe.read_fd.raw());
         let capture_write_fd = capture.as_ref().map_or(-1, |pipe| pipe.write_fd.raw());
+        let child_control = ChildControl {
+            launch_error: launch_state.record,
+            target_lifecycle: lifecycle.raw(),
+            capture_read_fd,
+            capture_write_fd,
+        };
 
         let pid = unsafe { libc::fork() };
         if pid == -1 {
@@ -390,10 +404,7 @@ mod x86_64 {
                     policy.stdio,
                     policy.limits,
                     &seccomp,
-                    launch_state.record,
-                    lifecycle.raw(),
-                    capture_read_fd,
-                    capture_write_fd,
+                    child_control,
                 )
             }
         }
@@ -658,11 +669,14 @@ mod x86_64 {
         stdio: StdioPolicy,
         limits: ResourceLimits,
         seccomp: &CompiledSeccomp,
-        launch_error: *mut LaunchErrorRecord,
-        target_lifecycle: *mut TargetLifecycleRecord,
-        capture_read_fd: RawFd,
-        capture_write_fd: RawFd,
+        control: ChildControl,
     ) -> ! {
+        let ChildControl {
+            launch_error,
+            target_lifecycle,
+            capture_read_fd,
+            capture_write_fd,
+        } = control;
         if capture_read_fd >= FIRST_NON_STDIO_FD as RawFd && libc::close(capture_read_fd) == -1 {
             child_fail(
                 launch_error,

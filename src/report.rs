@@ -1,6 +1,6 @@
 use std::fmt;
 
-/// Observable terminal status of a sandboxed child.
+/// Observable terminal status of the direct sandbox target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChildOutcome {
     Exited(i32),
@@ -26,10 +26,13 @@ pub struct CapturedOutput {
     pub truncated: bool,
 }
 
-/// Detailed result for callers that need launcher-owned captured output.
+/// Detailed result for callers that need launcher-owned captured output or process-tree lifecycle evidence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunReport {
+    /// Terminal status of the direct target, not of the namespace init.
     pub outcome: ChildOutcome,
     /// Present exactly when stdout was configured as `capture`.
     pub stdout: Option<CapturedOutput>,
+    /// Additional orphaned descendants reaped by the launcher-owned PID 1 after the direct target terminated.
+    pub reaped_descendants: u32,
 }

@@ -24,6 +24,8 @@
 #   T assert stdin/stderr are closed while stdout is inherited and writable
 #   U assert stdout is redirected to a private scratch file and is readable there
 #   V emit 256 KiB through stdout to exercise bounded launcher-owned capture
+#   Y assert direct target is PID 2 with launcher-owned namespace init as PID 1
+#   Z fork a live descendant that must be killed/reaped by namespace init
 
 _start:
     mov 16(%rsp), %rdi
@@ -66,6 +68,10 @@ _start:
     je .stdio_stdout_redirect
     cmp $86, %al
     je .stdio_stdout_capture_stress
+    cmp $89, %al
+    je .pid_namespace_identity
+    cmp $90, %al
+    je .live_descendant
     jmp .fail2
 
 .allowed:
@@ -490,6 +496,31 @@ _start:
     xor %edi, %edi
     jmp .exit
 
+.pid_namespace_identity:
+    mov $39, %eax
+    syscall
+    cmp $2, %rax
+    jne .fail23
+    mov $110, %eax
+    syscall
+    cmp $1, %rax
+    jne .fail23
+    xor %edi, %edi
+    jmp .exit
+
+.live_descendant:
+    mov $57, %eax
+    syscall
+    test %rax, %rax
+    js .fail24
+    jz .descendant_pause
+    xor %edi, %edi
+    jmp .exit
+.descendant_pause:
+    mov $34, %eax
+    syscall
+    jmp .descendant_pause
+
 .str_eq:
 .str_eq_loop:
     movzbl (%rdi), %eax
@@ -564,6 +595,12 @@ _start:
     jmp .exit
 .fail22:
     mov $22, %edi
+    jmp .exit
+.fail23:
+    mov $23, %edi
+    jmp .exit
+.fail24:
+    mov $24, %edi
 
 .exit:
     mov $60, %eax

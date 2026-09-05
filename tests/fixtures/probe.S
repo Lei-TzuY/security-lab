@@ -27,6 +27,7 @@
 #   Y assert direct target is PID 2 with launcher-owned namespace init as PID 1
 #   Z fork a live descendant that must be killed/reaped by namespace init
 #   Q emit a marker, fork a descendant, then remain live past the policy deadline
+#   K assert host loopback listener is unreachable from the target network namespace
 
 _start:
     mov 16(%rsp), %rdi
@@ -75,6 +76,8 @@ _start:
     je .live_descendant
     cmp $81, %al
     je .deadline_tree
+    cmp $75, %al
+    je .network_isolation
     jmp .fail2
 
 .allowed:
@@ -553,6 +556,71 @@ _start:
     syscall
     jmp .deadline_descendant_pause
 
+.network_isolation:
+    mov 24(%rsp), %rdi
+    test %rdi, %rdi
+    je .fail2
+    xor %r12d, %r12d
+.network_port_parse_loop:
+    movzbl (%rdi), %eax
+    test %al, %al
+    je .network_port_parsed
+    sub $48, %eax
+    cmp $9, %eax
+    ja .fail2
+    imul $10, %r12d, %r12d
+    add %eax, %r12d
+    cmp $65535, %r12d
+    ja .fail2
+    inc %rdi
+    jmp .network_port_parse_loop
+.network_port_parsed:
+    test %r12d, %r12d
+    je .fail2
+    movw $2, network_addr(%rip)
+    rolw $8, %r12w
+    movw %r12w, network_addr+2(%rip)
+    movl $0x0100007f, network_addr+4(%rip)
+
+    mov $41, %eax
+    mov $2, %edi
+    mov $1, %esi
+    xor %edx, %edx
+    syscall
+    test %rax, %rax
+    js .fail26
+    mov %rax, %r13
+
+    mov $42, %eax
+    mov %r13, %rdi
+    lea network_addr(%rip), %rsi
+    mov $16, %edx
+    syscall
+    test %rax, %rax
+    jns .network_unexpected_reachability
+    cmp $-111, %rax
+    je .network_isolated
+    cmp $-101, %rax
+    je .network_isolated
+    cmp $-113, %rax
+    je .network_isolated
+    jmp .fail26
+
+.network_unexpected_reachability:
+    mov $3, %eax
+    mov %r13, %rdi
+    syscall
+    jmp .fail26
+
+.network_isolated:
+    mov $3, %eax
+    mov %r13, %rdi
+    syscall
+    test %rax, %rax
+    js .fail26
+    xor %edi, %edi
+    jmp .exit
+
 .str_eq:
 .str_eq_loop:
     movzbl (%rdi), %eax
@@ -636,6 +704,9 @@ _start:
     jmp .exit
 .fail25:
     mov $25, %edi
+    jmp .exit
+.fail26:
+    mov $26, %edi
 
 .exit:
     mov $60, %eax
@@ -685,5 +756,8 @@ cap_data:
     .skip 24
 redirect_buffer:
     .skip 1
+.balign 16
+network_addr:
+    .skip 16
 
 .section .note.GNU-stack,"",@progbits

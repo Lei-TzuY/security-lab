@@ -5,6 +5,7 @@ use security_lab::{
     StdioMode, StdioPolicy,
 };
 use std::collections::{BTreeMap, BTreeSet};
+use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{self, Command};
@@ -67,6 +68,30 @@ fn policy(mode: &str, extra_args: &[&str], syscalls: &[&str]) -> SandboxPolicy {
             allowed_syscalls: syscall_set(syscalls),
         },
     }
+}
+
+#[test]
+fn network_namespace_cannot_reach_host_loopback_listener() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind host loopback listener");
+    let address = listener.local_addr().expect("read host listener address");
+
+    // Prove the host-side endpoint is genuinely reachable before using it
+    // as the cross-namespace isolation oracle.
+    let host_client =
+        TcpStream::connect(address).expect("host loopback listener must be reachable");
+    let (host_peer, _) = listener.accept().expect("accept host reachability probe");
+    drop(host_peer);
+    drop(host_client);
+
+    let port = address.port().to_string();
+    let mut isolated = policy(
+        "K",
+        &[port.as_str()],
+        &["execveat", "socket", "connect", "close", "exit"],
+    );
+    isolated.wall_clock_milliseconds = Some(2000);
+
+    assert_eq!(run(&isolated).unwrap(), ChildOutcome::Exited(0));
 }
 
 #[test]

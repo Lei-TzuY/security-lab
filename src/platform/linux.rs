@@ -760,7 +760,7 @@ mod x86_64 {
 
         if libc::syscall(
             libc::SYS_unshare,
-            libc::CLONE_NEWUSER | libc::CLONE_NEWNS | libc::CLONE_NEWPID,
+            libc::CLONE_NEWUSER | libc::CLONE_NEWNS | libc::CLONE_NEWPID | libc::CLONE_NEWNET,
         ) == -1
         {
             child_fail(launch_error, PHASE_NAMESPACE, seccomp.error_exit_syscall);
@@ -1375,7 +1375,7 @@ mod x86_64 {
 
     fn format_launch_error(record: LaunchErrorRecord) -> String {
         let phase = match record.phase {
-            PHASE_NAMESPACE => "user/mount namespace creation",
+            PHASE_NAMESPACE => "user/mount/PID/network namespace creation",
             PHASE_SETGROUPS => "setgroups deny",
             PHASE_UID_MAP => "uid_map",
             PHASE_GID_MAP => "gid_map",
@@ -1448,6 +1448,8 @@ mod x86_64 {
             "rt_sigprocmask" => libc::SYS_rt_sigprocmask,
             "rt_sigreturn" => libc::SYS_rt_sigreturn,
             "ioctl" => libc::SYS_ioctl,
+            "socket" => libc::SYS_socket,
+            "connect" => libc::SYS_connect,
             "pread64" => libc::SYS_pread64,
             "access" => libc::SYS_access,
             "mremap" => libc::SYS_mremap,

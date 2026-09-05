@@ -83,7 +83,10 @@ fn policy(mode: &str, extra_args: &[&str], extra_syscalls: &[&str]) -> SandboxPo
 
 #[test]
 fn allowed_operation_succeeds() {
-    assert_eq!(run(&policy("allowed", &[], &[])).unwrap(), ChildOutcome::Exited(0));
+    assert_eq!(
+        run(&policy("allowed", &[], &[])).unwrap(),
+        ChildOutcome::Exited(0)
+    );
 }
 
 #[test]
@@ -137,12 +140,7 @@ fn child_exit_code_is_surfaced() {
 #[test]
 fn child_signal_is_surfaced() {
     assert_eq!(
-        run(&policy(
-            "signal-term",
-            &[],
-            &["getpid", "gettid", "tgkill"]
-        ))
-        .unwrap(),
+        run(&policy("signal-term", &[], &["getpid", "gettid", "tgkill"])).unwrap(),
         ChildOutcome::Signaled(libc::SIGTERM)
     );
 }

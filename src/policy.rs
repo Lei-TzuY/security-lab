@@ -10,6 +10,7 @@ const MAX_ENV: usize = 64;
 const MAX_ENV_VALUE_BYTES: usize = 8192;
 const MAX_HOSTNAME_BYTES: usize = 63;
 const MAX_SYSCALLS: usize = 128;
+const MAX_SECCOMP_ARG_RULES: usize = 64;
 const MIN_SCRATCH_BYTES: u64 = 4096;
 const MAX_SCRATCH_BYTES: u64 = 1024 * 1024 * 1024;
 const MIN_CAPTURE_BYTES: u64 = 1;
@@ -40,11 +41,23 @@ pub struct StdioPolicy {
     pub stderr: StdioMode,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SeccompArgRule {
+    /// Bits of the selected 64-bit syscall argument that participate in the
+    /// equality test. Zero masks are invalid because they constrain nothing.
+    pub mask: u64,
+    /// Expected value after masking. Bits outside `mask` must be zero.
+    pub value: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SeccompPolicy {
     /// Syscall names allowed by the policy. Every other syscall is denied with
     /// `EPERM` by the Linux x86_64 enforcement layer.
     pub allowed_syscalls: BTreeSet<String>,
+    /// Optional masked-equality constraints keyed by syscall name and argument
+    /// index (0 through 5). Rules only narrow syscalls already in the allowlist.
+    pub argument_rules: BTreeMap<String, BTreeMap<u8, SeccompArgRule>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -277,14 +290,56 @@ impl SandboxPolicy {
             )));
         }
         for name in &self.seccomp.allowed_syscalls {
-            if name.is_empty()
-                || !name
-                    .bytes()
-                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
-            {
+            if !valid_syscall_name(name) {
                 return Err(PolicyError::new(format!(
                     "invalid syscall name syntax: {name:?}"
                 )));
+            }
+        }
+
+        let argument_rule_count = self
+            .seccomp
+            .argument_rules
+            .values()
+            .map(BTreeMap::len)
+            .sum::<usize>();
+        if argument_rule_count > MAX_SECCOMP_ARG_RULES {
+            return Err(PolicyError::new(format!(
+                "too many seccomp argument rules: {argument_rule_count} > {MAX_SECCOMP_ARG_RULES}"
+            )));
+        }
+        for (syscall, rules) in &self.seccomp.argument_rules {
+            if !valid_syscall_name(syscall) {
+                return Err(PolicyError::new(format!(
+                    "invalid seccomp argument-rule syscall name: {syscall:?}"
+                )));
+            }
+            if !self.seccomp.allowed_syscalls.contains(syscall) {
+                return Err(PolicyError::new(format!(
+                    "seccomp argument rule for {syscall} requires that syscall in seccomp.allow"
+                )));
+            }
+            if matches!(syscall.as_str(), "execveat" | "exit" | "exit_group") {
+                return Err(PolicyError::new(format!(
+                    "seccomp argument rules may not constrain launcher-critical syscall {syscall}"
+                )));
+            }
+            for (argument_index, rule) in rules {
+                if *argument_index > 5 {
+                    return Err(PolicyError::new(format!(
+                        "seccomp argument index for {syscall} must be between 0 and 5"
+                    )));
+                }
+                if rule.mask == 0 {
+                    return Err(PolicyError::new(format!(
+                        "seccomp argument mask for {syscall}.{argument_index} must not be zero"
+                    )));
+                }
+                if rule.value & !rule.mask != 0 {
+                    return Err(PolicyError::new(format!(
+                        "seccomp argument value for {syscall}.{argument_index} sets bits outside its mask"
+                    )));
+                }
             }
         }
 
@@ -314,7 +369,9 @@ impl FromStr for SandboxPolicy {
         let mut address_space_bytes = None;
         let mut file_size_bytes = None;
         let mut open_files = None;
-        let mut seccomp = None;
+        let mut seccomp_allow = None;
+        let mut seccomp_argument_rules: BTreeMap<String, BTreeMap<u8, SeccompArgRule>> =
+            BTreeMap::new();
 
         for (index, raw_line) in input.lines().enumerate() {
             let line_no = index + 1;
@@ -400,7 +457,7 @@ impl FromStr for SandboxPolicy {
                     key,
                 )?,
                 "seccomp.allow" => {
-                    if seccomp.is_some() {
+                    if seccomp_allow.is_some() {
                         return Err(PolicyError::at(line_no, "duplicate seccomp.allow"));
                     }
                     let mut names = BTreeSet::new();
@@ -418,9 +475,43 @@ impl FromStr for SandboxPolicy {
                             ));
                         }
                     }
-                    seccomp = Some(SeccompPolicy {
-                        allowed_syscalls: names,
-                    });
+                    seccomp_allow = Some(names);
+                }
+                _ if key.starts_with("seccomp.arg.") => {
+                    let spec = key
+                        .strip_prefix("seccomp.arg.")
+                        .expect("prefix checked above");
+                    let (syscall, index_text) = spec.rsplit_once('.').ok_or_else(|| {
+                        PolicyError::at(
+                            line_no,
+                            "seccomp argument key must be seccomp.arg.<syscall>.<0..5>",
+                        )
+                    })?;
+                    if !valid_syscall_name(syscall) {
+                        return Err(PolicyError::at(
+                            line_no,
+                            format!("invalid seccomp argument-rule syscall name: {syscall:?}"),
+                        ));
+                    }
+                    let argument_index = index_text.parse::<u8>().map_err(|_| {
+                        PolicyError::at(line_no, "seccomp argument index must be between 0 and 5")
+                    })?;
+                    if argument_index > 5 {
+                        return Err(PolicyError::at(
+                            line_no,
+                            "seccomp argument index must be between 0 and 5",
+                        ));
+                    }
+                    let rule = parse_seccomp_arg_rule(value, line_no, key)?;
+                    let syscall_rules = seccomp_argument_rules
+                        .entry(syscall.to_owned())
+                        .or_default();
+                    if syscall_rules.insert(argument_index, rule).is_some() {
+                        return Err(PolicyError::at(
+                            line_no,
+                            format!("duplicate seccomp argument rule: {syscall}.{argument_index}"),
+                        ));
+                    }
                 }
                 _ => {
                     let Some(env_key) = key.strip_prefix("env.") else {
@@ -471,7 +562,10 @@ impl FromStr for SandboxPolicy {
                 file_size_bytes: required(file_size_bytes, "limit.file_size_bytes")?,
                 open_files: required(open_files, "limit.open_files")?,
             },
-            seccomp: required(seccomp, "seccomp.allow")?,
+            seccomp: SeccompPolicy {
+                allowed_syscalls: required(seccomp_allow, "seccomp.allow")?,
+                argument_rules: seccomp_argument_rules,
+            },
         };
         policy.validate()?;
         Ok(policy)
@@ -499,6 +593,37 @@ fn parse_u64(value: &str, line: usize, key: &str) -> Result<u64, PolicyError> {
     value
         .parse::<u64>()
         .map_err(|_| PolicyError::at(line, format!("{key} must be an unsigned integer")))
+}
+
+fn parse_seccomp_arg_rule(
+    value: &str,
+    line: usize,
+    key: &str,
+) -> Result<SeccompArgRule, PolicyError> {
+    let (mask, expected) = value.split_once(':').ok_or_else(|| {
+        PolicyError::at(line, format!("{key} must be formatted as <mask>:<value>"))
+    })?;
+    Ok(SeccompArgRule {
+        mask: parse_u64_literal(mask.trim(), line, key)?,
+        value: parse_u64_literal(expected.trim(), line, key)?,
+    })
+}
+
+fn parse_u64_literal(value: &str, line: usize, key: &str) -> Result<u64, PolicyError> {
+    if let Some(hex) = value.strip_prefix("0x") {
+        if hex.is_empty() {
+            return Err(PolicyError::at(
+                line,
+                format!("{key} contains an empty hexadecimal integer"),
+            ));
+        }
+        u64::from_str_radix(hex, 16)
+            .map_err(|_| PolicyError::at(line, format!("{key} contains an invalid integer")))
+    } else {
+        value
+            .parse::<u64>()
+            .map_err(|_| PolicyError::at(line, format!("{key} contains an invalid integer")))
+    }
 }
 
 fn parse_stdio_mode(value: &str, line: usize, key: &str) -> Result<StdioMode, PolicyError> {
@@ -559,6 +684,13 @@ fn validate_hostname(hostname: &str) -> Result<(), PolicyError> {
     Ok(())
 }
 
+fn valid_syscall_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
 fn valid_env_key(key: &str) -> bool {
     let mut bytes = key.bytes();
     matches!(bytes.next(), Some(b'A'..=b'Z' | b'a'..=b'z' | b'_'))
@@ -608,6 +740,7 @@ mod tests {
             Some("C")
         );
         assert!(policy.seccomp.allowed_syscalls.contains("execveat"));
+        assert!(policy.seccomp.argument_rules.is_empty());
     }
 
     #[test]
@@ -786,6 +919,63 @@ mod tests {
     fn rejects_scratch_overlapping_working_directory() {
         let text = VALID.replace("filesystem.scratch = /scratch", "filesystem.scratch = /tmp");
         assert!(text.parse::<SandboxPolicy>().is_err());
+    }
+
+    #[test]
+    fn parses_masked_seccomp_argument_rule() {
+        let text = VALID.replace(
+            "seccomp.allow = execveat,read,write,exit_group",
+            "seccomp.allow = execveat,lseek,exit_group\n        seccomp.arg.lseek.1 = 0xffffffff0000000f:0x0000000100000008",
+        );
+        let policy: SandboxPolicy = text.parse().unwrap();
+        let rule = policy
+            .seccomp
+            .argument_rules
+            .get("lseek")
+            .and_then(|rules| rules.get(&1))
+            .copied()
+            .expect("lseek argument rule");
+        assert_eq!(rule.mask, 0xffff_ffff_0000_000f);
+        assert_eq!(rule.value, 0x0000_0001_0000_0008);
+    }
+
+    #[test]
+    fn rejects_duplicate_seccomp_argument_rule() {
+        let text = VALID.replace(
+            "seccomp.allow = execveat,read,write,exit_group",
+            "seccomp.allow = execveat,lseek,exit_group\n        seccomp.arg.lseek.1 = 0xff:0x08\n        seccomp.arg.lseek.1 = 0xff:0x08",
+        );
+        assert!(text.parse::<SandboxPolicy>().is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_seccomp_argument_rule_shape() {
+        for rule in [
+            "seccomp.arg.lseek.6 = 0xff:0x08",
+            "seccomp.arg.lseek.1 = 0:0",
+            "seccomp.arg.lseek.1 = 0x0f:0x10",
+        ] {
+            let text = VALID.replace(
+                "seccomp.allow = execveat,read,write,exit_group",
+                &format!("seccomp.allow = execveat,lseek,exit_group\n        {rule}"),
+            );
+            assert!(text.parse::<SandboxPolicy>().is_err(), "accepted {rule}");
+        }
+    }
+
+    #[test]
+    fn rejects_argument_rule_for_unallowed_or_launcher_critical_syscall() {
+        let unallowed = format!("{VALID}\nseccomp.arg.lseek.1 = 0xff:0x08");
+        assert!(unallowed.parse::<SandboxPolicy>().is_err());
+
+        let exec_rule = format!("{VALID}\nseccomp.arg.execveat.0 = 0xff:0x00");
+        assert!(exec_rule.parse::<SandboxPolicy>().is_err());
+
+        let exit_rule = VALID.replace(
+            "seccomp.allow = execveat,read,write,exit_group",
+            "seccomp.allow = execveat,read,write,exit\n        seccomp.arg.exit.0 = 0xff:0x00",
+        );
+        assert!(exit_rule.parse::<SandboxPolicy>().is_err());
     }
 
     #[test]

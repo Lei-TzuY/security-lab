@@ -1,8 +1,8 @@
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 
 use security_lab::{
-    run, run_report, ChildOutcome, ResourceLimits, SandboxError, SandboxPolicy, SeccompPolicy,
-    StdioMode, StdioPolicy,
+    run, run_report, ChildOutcome, ResourceLimits, SandboxError, SandboxPolicy, SeccompArgRule,
+    SeccompPolicy, StdioMode, StdioPolicy,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{TcpListener, TcpStream};
@@ -67,6 +67,7 @@ fn policy(mode: &str, extra_args: &[&str], syscalls: &[&str]) -> SandboxPolicy {
         },
         seccomp: SeccompPolicy {
             allowed_syscalls: syscall_set(syscalls),
+            argument_rules: BTreeMap::new(),
         },
     }
 }
@@ -153,6 +154,25 @@ fn uts_namespace_uses_policy_hostname_without_changing_host() {
         "sandbox UTS hostname changed host hostname"
     );
     assert_eq!(result.unwrap(), ChildOutcome::Exited(0));
+}
+
+#[test]
+fn seccomp_argument_filter_checks_full_64_bit_masked_value() {
+    let mut filtered = policy("B", &[], &["execveat", "openat", "lseek", "close", "exit"]);
+    let mut lseek_rules = BTreeMap::new();
+    lseek_rules.insert(
+        1,
+        SeccompArgRule {
+            mask: 0xffff_ffff_0000_000f,
+            value: 0x0000_0001_0000_0008,
+        },
+    );
+    filtered
+        .seccomp
+        .argument_rules
+        .insert("lseek".to_owned(), lseek_rules);
+
+    assert_eq!(run(&filtered).unwrap(), ChildOutcome::Exited(0));
 }
 
 #[test]

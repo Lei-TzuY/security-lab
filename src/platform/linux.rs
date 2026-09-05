@@ -36,8 +36,10 @@ mod x86_64 {
     const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
 
     const BPF_LD_W_ABS: u16 = 0x20;
+    const BPF_ALU_AND_K: u16 = 0x54;
     const BPF_JMP_JEQ_K: u16 = 0x15;
     const BPF_RET_K: u16 = 0x06;
+    const SECCOMP_DATA_ARGS_OFFSET: u32 = 16;
 
     const CLOSE_RANGE_CLOEXEC: libc::c_uint = 1 << 2;
     const FIRST_NON_STDIO_FD: libc::c_uint = 3;
@@ -705,26 +707,52 @@ mod x86_64 {
             )));
         }
 
-        let mut numbers = Vec::with_capacity(policy.seccomp.allowed_syscalls.len());
+        let mut syscalls = Vec::with_capacity(policy.seccomp.allowed_syscalls.len());
         for name in &policy.seccomp.allowed_syscalls {
             let number = syscall_number(name).ok_or_else(|| {
                 SandboxError::InvalidPolicy(PolicyError::new(format!(
                     "unsupported Linux x86_64 syscall name: {name}"
                 )))
             })?;
-            numbers.push(number as u32);
+            syscalls.push((number as u32, name.as_str()));
         }
-        numbers.sort_unstable();
-        numbers.dedup();
+        syscalls.sort_unstable_by_key(|(number, _)| *number);
+        for pair in syscalls.windows(2) {
+            if pair[0].0 == pair[1].0 {
+                return Err(SandboxError::InvalidPolicy(PolicyError::new(format!(
+                    "multiple syscall names resolve to Linux x86_64 number {}",
+                    pair[0].0
+                ))));
+            }
+        }
 
-        let mut filter = Vec::with_capacity(5 + numbers.len() * 2);
-        filter.push(stmt(BPF_LD_W_ABS, 4));
-        filter.push(jump(BPF_JMP_JEQ_K, AUDIT_ARCH_X86_64, 1, 0));
-        filter.push(stmt(BPF_RET_K, SECCOMP_RET_KILL_PROCESS));
-        filter.push(stmt(BPF_LD_W_ABS, 0));
-        for number in numbers {
-            filter.push(jump(BPF_JMP_JEQ_K, number, 0, 1));
-            filter.push(stmt(BPF_RET_K, SECCOMP_RET_ALLOW));
+        let mut filter = vec![
+            stmt(BPF_LD_W_ABS, 4),
+            jump(BPF_JMP_JEQ_K, AUDIT_ARCH_X86_64, 1, 0),
+            stmt(BPF_RET_K, SECCOMP_RET_KILL_PROCESS),
+            stmt(BPF_LD_W_ABS, 0),
+        ];
+
+        for (number, name) in syscalls {
+            let mut checks = Vec::new();
+            if let Some(rules) = policy.seccomp.argument_rules.get(name) {
+                for (argument_index, rule) in rules {
+                    append_seccomp_argument_checks(
+                        &mut checks,
+                        *argument_index,
+                        rule.mask,
+                        rule.value,
+                    );
+                }
+            }
+            checks.push(stmt(BPF_RET_K, SECCOMP_RET_ALLOW));
+            if checks.len() > u8::MAX as usize {
+                return Err(SandboxError::InvalidPolicy(PolicyError::new(format!(
+                    "seccomp argument-check block for {name} is too large"
+                ))));
+            }
+            filter.push(jump(BPF_JMP_JEQ_K, number, 0, checks.len() as u8));
+            filter.extend(checks);
         }
         filter.push(stmt(BPF_RET_K, SECCOMP_RET_ERRNO | (libc::EPERM as u32)));
 
@@ -738,6 +766,39 @@ mod x86_64 {
             filter,
             error_exit_syscall,
         })
+    }
+
+    fn append_seccomp_argument_checks(
+        filter: &mut Vec<libc::sock_filter>,
+        argument_index: u8,
+        mask: u64,
+        value: u64,
+    ) {
+        let argument_offset = SECCOMP_DATA_ARGS_OFFSET + u32::from(argument_index) * 8;
+        append_seccomp_argument_word_check(filter, argument_offset, mask as u32, value as u32);
+        append_seccomp_argument_word_check(
+            filter,
+            argument_offset + 4,
+            (mask >> 32) as u32,
+            (value >> 32) as u32,
+        );
+    }
+
+    fn append_seccomp_argument_word_check(
+        filter: &mut Vec<libc::sock_filter>,
+        offset: u32,
+        mask: u32,
+        value: u32,
+    ) {
+        if mask == 0 {
+            return;
+        }
+        filter.push(stmt(BPF_LD_W_ABS, offset));
+        if mask != u32::MAX {
+            filter.push(stmt(BPF_ALU_AND_K, mask));
+        }
+        filter.push(jump(BPF_JMP_JEQ_K, value, 1, 0));
+        filter.push(stmt(BPF_RET_K, SECCOMP_RET_ERRNO | (libc::EPERM as u32)));
     }
 
     unsafe fn child_exec(

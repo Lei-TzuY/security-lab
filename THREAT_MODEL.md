@@ -1,12 +1,12 @@
-# Milestones 1–5A threat model
+# Milestones 1–6A threat model
 
 ## Purpose
 
-`security-lab` is an educational, correctness-first Linux sandbox. Milestone 1 established syscall/resource/environment controls; Milestone 2 sealed descriptor, launch, filesystem/identity, stdio, redirection, and bounded-capture authority; Milestone 3 sealed PID-tree lifecycle ownership plus a policy-owned monotonic wall-clock deadline; Milestones 4B–4C added isolated network and IPC namespace baselines. Milestone 4D added launcher-owned UTS nodename identity. The current Milestone 5A candidate adds masked numeric syscall-argument constraints to the default-deny seccomp boundary. Every claimed property must correspond to a kernel mechanism and executable evidence.
+`security-lab` is an educational, correctness-first Linux sandbox. Milestone 1 established syscall/resource/environment controls; Milestone 2 sealed ambient descriptor, launch, filesystem/identity, stdio, redirection, and bounded-capture authority; Milestone 3 sealed PID-tree lifecycle ownership plus a policy-owned monotonic wall-clock deadline; Milestones 4B–4D added network/IPC/UTS namespace and identity baselines; and Milestone 5A added masked numeric syscall-argument constraints. The current Milestone 6A candidate adds explicit launch-time selected non-stdio object capabilities without reopening ambient descriptor inheritance. Every claimed property must correspond to a kernel mechanism and executable evidence.
 
 ## Protected boundary
 
-The trusted host parent launches one direct target through launcher-owned bootstrap and namespace-init processes. On supported Linux x86_64, the launcher constrains initial filesystem visibility/mutability, namespace identity including a policy-owned UTS nodename, network/IPC/UTS namespace membership, capabilities, target syscall numbers and selected numeric syscall arguments, selected resources, environment, cwd, inherited descriptors, stdio, bounded capture, process-tree lifecycle, and—when declared—a wall-clock execution deadline while preserving fail-closed launch/lifecycle reporting.
+The trusted host parent launches one direct target through launcher-owned bootstrap and namespace-init processes. On supported Linux x86_64, the launcher constrains initial filesystem visibility/mutability, namespace identity including a policy-owned UTS nodename, network/IPC/UTS namespace membership, capabilities, target syscall numbers and selected numeric syscall arguments, selected resources, environment, cwd, ambient inherited descriptors, explicit selected non-stdio object handles, stdio, bounded capture, process-tree lifecycle, and—when declared—a wall-clock execution deadline while preserving fail-closed launch/lifecycle reporting.
 
 ## Security properties claimed
 
@@ -16,13 +16,14 @@ The trusted host parent launches one direct target through launcher-owned bootst
 - **SysV IPC visibility boundary:** message-queue keys/IDs are resolved in the target IPC namespace. Host SysV queues are not discoverable by the same key from the target after `CLONE_NEWIPC`.
 - **No implicit network attachment:** the launcher creates `CLONE_NEWNET` but does not create a veth, install routes, configure DNS, or connect the namespace to a host bridge. Host loopback is therefore not the target's loopback stack.
 - **Filesystem mutability/path boundary:** the revalidated root is recursively cloned/read-only, optional scratch is private `nosuid,nodev,noexec` tmpfs, and the target is chrooted into the constructed root.
-- **Inherited-FD minimization / explicit stdio:** arbitrary inherited descriptors >= 3 do not survive target exec; stdio disposition is explicit; launcher-owned redirect/capture sources are tightly remapped and closed.
+- **Inherited-FD minimization / explicit handle authority:** undeclared inherited descriptors >= 3 do not survive target exec. Stdio disposition is explicit; launcher-owned redirect/capture sources are tightly remapped and closed; only `handle.<target_fd>` destinations declared by policy are intentionally made visible as additional descriptors.
+- **Selected-object ownership:** each selected source is duplicated and inspected before fork, directory descriptors are rejected, and launcher storage descriptors are kept above every target destination. Host parent, bootstrap, and namespace PID 1 do not retain launcher-owned selected duplicates while the direct target runs.
 - **Bounded retained capture:** `stdio.stdout_capture_bytes` is 1 byte–16 MiB; excess bytes are drained/discarded rather than retained.
 - **Owned PID-tree lifecycle:** namespace PID 1 supervises the direct target and reaps descendants. After the direct target becomes terminal—naturally or by deadline—PID 1 repeatedly kills remaining namespace processes and reaps until `ECHILD`, then publishes readiness.
 - **Optional bounded deadline:** `limit.wall_clock_milliseconds` is either absent or 1–86,400,000 ms. When present, the launcher preflights pidfd/timerfd support and PID 1 arms a one-shot `CLOCK_MONOTONIC` timer after it forks the direct target and closes inherited setup descriptors.
 - **Deterministic timeout race:** each PID1 supervision wake performs `wait4(target, WNOHANG)` first. If target status is already available, natural termination wins. If the timer is readable and the target is not yet waitable, deadline ownership wins from that point forward.
 - **Distinct timeout result:** once deadline ownership wins, PID 1 uses `SIGKILL` to terminate the direct target, but shared lifecycle state marks the event and the host reports `ChildOutcome::TimedOut`.
-- **No target-policy widening:** namespace management, pidfd/timerfd/poll, mounts, capture/remapping, and teardown execute in trusted launcher processes outside target seccomp. `socket` and `connect` are target syscalls only when the policy explicitly names them.
+- **No target-policy widening:** namespace management, pidfd/timerfd/poll, mounts, capture/remapping, selected-handle installation, and teardown execute in trusted launcher processes outside target seccomp. `dup3` used to install a selected target descriptor is not silently added to `seccomp.allow`; subsequent operations on that object still require the target syscalls explicitly granted by policy. `socket` and `connect` are target syscalls only when the policy explicitly names them.
 - **Masked syscall-argument narrowing:** an argument rule applies only to a syscall already in `seccomp.allow`. Linux x86_64 cBPF evaluates the selected `seccomp_data.args[]` slot as two 32-bit words and requires the complete 64-bit `(argument & mask) == value` condition before returning `ALLOW`; a mismatch returns `EPERM`.
 - **Owned launch-error reporting:** pre-exec phase+errno travels through shared anonymous memory and does not depend on target stdout/stderr or a target `write` grant.
 - **Fail-closed enforcement:** failed/unsupported mandatory mechanisms or incomplete lifecycle readiness never trigger unrestricted retry or successful fallback.
@@ -55,6 +56,14 @@ On Linux x86_64 the classic-BPF compiler reads both 32-bit words of each selecte
 
 This mechanism compares numeric syscall arguments only. Classic seccomp cannot safely dereference a pathname, socket-address, or other pointer supplied by the target, so Milestone 5A does not claim pointed-to data inspection, pathname-content policy, range/relational predicates, or elimination of pointer-related TOCTOU hazards.
 
+## Selected handle semantics
+
+Milestone 6A adds launch-time `handle.<target_fd> = <source_fd>` mappings. The source names an already-open descriptor in the trusted calling process; the target destination must be 3–63, must be below `limit.open_files`, and at most 16 mappings are accepted. Before fork, the launcher duplicates each source with `F_DUPFD_CLOEXEC`, rejects directory objects with `fstat`, and stores the duplicate above every target-visible destination. The pinned executable uses the same collision-free storage floor.
+
+After the namespace PID 1 forks the direct target, only that direct target remaps selected sources with `dup3(..., 0)` after stdio setup and before rlimits/capability/seccomp setup. The source-storage duplicates are then closed. The host parent drops its prepared duplicates immediately after fork; bootstrap and namespace PID 1 close all descriptors >= 3 on their non-target paths. Consequently a selected object does not gain hidden launcher/PID1 lifetime ownership while the target runs.
+
+This is an explicit object-capability grant. It preserves the underlying open-file-description authority and state rather than mediating a new pathname lookup. Therefore a selected FD may intentionally expose an object outside the chroot/path namespace, and Milestone 6A does not claim rights attenuation, revocation, pathname confinement of that already-open object, post-launch descriptor transfer, or support for directory handles.
+
 ## Deadline and lifecycle orchestration
 
 Potentially allocating policy data, argv/envp, seccomp instructions, pinned descriptors, shared lifecycle state, and capture-pipe creation occur before the initial host `fork`.
@@ -77,7 +86,7 @@ This sandbox is **not** a production multi-tenant container boundary. It does no
 - an end-to-end API-call latency bound;
 - aggregate process-count accounting or a fork/pid quota;
 - cgroup-backed aggregate CPU, physical-memory, I/O, or process accounting;
-- deliberate selected non-stdio descriptor passing or a general arbitrary FD-remapping language;
+- post-launch descriptor brokering/`SCM_RIGHTS`, selected-handle revocation or rights attenuation, a general arbitrary FD-remapping language, or selected directory handles;
 - persistence of private-scratch redirect output after the mount namespace disappears;
 - a general policy that forbids all IPC object types or revokes descriptor-based IPC deliberately exposed to the target;
 - policy control of UTS domainname/NIS domain or a general machine-identity service;
@@ -95,7 +104,7 @@ Therefore the project does not claim `pids.max` enforcement from root/sudo-only 
 ## Trust assumptions
 
 - The Linux kernel and trusted launcher parent/bootstrap/PID1 control plane are trusted.
-- The policy author is trusted to choose filesystem exposure, stdio exposure, target data/syscall grants, resource ceilings, capture ceilings, and any wall-clock deadline.
+- The policy author is trusted to choose filesystem exposure, stdio exposure, selected already-open object handles, target data/syscall grants, resource ceilings, capture ceilings, and any wall-clock deadline. Selecting a handle intentionally grants the authority already represented by that open file description.
 - Choosing `inherit`, `redirect`, or `capture` intentionally grants their documented descriptor/output channels.
 - A declared deadline intentionally authorizes launcher PID 1 to terminate the direct target and descendants when the timer wins the documented race.
 - Root device/inode revalidation is not a subtree integrity proof.
@@ -111,6 +120,7 @@ Evidence includes:
 - a host-created SysV message queue whose explicit key is first proven visible from the host; a raw target explicitly granted `msgget` must receive `ENOENT` for that same key inside the IPC namespace. Seeing the host queue or receiving seccomp `EPERM` fails the test;
 - required `identity.hostname` parser regressions plus a raw target explicitly granted `uname` observing the exact configured nodename while the trusted parent verifies the host hostname is unchanged before/after execution;
 - masked seccomp argument-rule parser/validator regressions plus a raw `lseek` oracle whose allowed offset matches the declared low/high 64-bit mask while separate low-bit and high-32-bit mismatches both return `EPERM`;
+- selected-handle policy regressions plus a raw pipe oracle in which target fd 9 reads the exact marker while the original selected source descriptor and an unrelated undeclared high descriptor both return `EBADF`; a directory descriptor source is separately rejected before launch;
 - all Milestones 1–3B descriptor, stdio, filesystem, capability, rlimit, launch-error, capture, PID identity, descendant cleanup, timeout, and exit-vs-signal regressions;
 - a raw deadline target that writes an exact stdout marker, forks a descendant that remains in `pause()`, and is preempted by a 1,000 ms policy deadline while a fast target under 5,000 ms still preserves `Exited(42)`.
 
@@ -118,10 +128,10 @@ CI explicitly enables the user-namespace settings required by its disposable Ubu
 
 ## Failure semantics
 
-Invalid policy is rejected before launch. Namespace creation, UTS hostname installation, deadline support preflight, pidfd creation, timer creation/arming, supervision poll, namespace/bootstrap/init forks, descriptor cleanup, capture reads, mount/capability/seccomp setup, process-tree kill/reap, lifecycle publication, and target exec failures are terminal. A failed network/IPC/UTS namespace transition or hostname installation never falls back to the corresponding host namespace/identity.
+Invalid policy is rejected before launch. Namespace creation, UTS hostname installation, selected-source pin/inspection, selected-target remapping, deadline support preflight, pidfd creation, timer creation/arming, supervision poll, namespace/bootstrap/init forks, descriptor cleanup, capture reads, mount/capability/seccomp setup, process-tree kill/reap, lifecycle publication, and target exec failures are terminal. A failed selected-handle setup never silently preserves ambient source descriptors or retries without the declared mapping. A failed network/IPC/UTS namespace transition or hostname installation never falls back to the corresponding host namespace/identity.
 
 ## Phase promotion
 
 Milestone 3 is sealed: the launcher owns PID namespace init, descendant cleanup, bounded runtime termination, and explicit timeout reporting.
 
-Milestone 4A cgroup-v2 aggregate process accounting remains blocked by missing unprivileged delegation on the current GitHub-hosted runner. Milestones 4B–4D are complete on `main`, including network/IPC namespace separation and launcher-owned UTS nodename identity. The current Milestone 5A frontier increases seccomp precision from syscall-number allowlisting to evidence-backed masked equality on full 64-bit numeric arguments. After 5A integrates, do not farm copied predicates across more syscalls. Supplementary-group clearing remains a separate architecture problem under the current unprivileged `setgroups=deny`/`gid_map` flow; other promotions should introduce a materially different object-authority, controlled-connectivity, persistence, or lifecycle boundary.
+Milestone 4A cgroup-v2 aggregate process accounting remains blocked by missing unprivileged delegation on the current GitHub-hosted runner. Milestones 4B–4D and 5A are complete on `main`, including network/IPC/UTS isolation and evidence-backed full-64-bit masked seccomp argument narrowing. The current Milestone 6A frontier turns selected non-stdio descriptors into an explicit launch-time object-capability surface while preserving ambient FD sanitization. After 6A integrates, do not farm more destination-number variants; promote to a materially different controlled-connectivity, persistence, or lifecycle/control-plane boundary. Supplementary-group clearing remains a separate architecture problem under the current unprivileged `setgroups=deny`/`gid_map` flow.

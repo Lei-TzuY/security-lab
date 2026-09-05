@@ -151,6 +151,33 @@ fn bounded_stdout_capture_drains_excess_without_deadlock() {
 }
 
 #[test]
+fn direct_target_is_pid2_under_launcher_owned_namespace_init() {
+    let report = run_report(&policy(
+        "Y",
+        &[],
+        &["execveat", "getpid", "getppid", "exit"],
+    ))
+    .unwrap();
+
+    assert_eq!(report.outcome, ChildOutcome::Exited(0));
+    assert_eq!(report.reaped_descendants, 0);
+}
+
+#[test]
+fn namespace_init_kills_reaps_live_descendant_and_releases_capture() {
+    let mut tree = policy("Z", &[], &["execveat", "fork", "pause", "exit"]);
+    tree.stdio.stdout = StdioMode::Capture;
+    tree.stdout_capture_bytes = Some(1024);
+
+    let report = run_report(&tree).unwrap();
+    assert_eq!(report.outcome, ChildOutcome::Exited(0));
+    assert_eq!(report.reaped_descendants, 1);
+    let stdout = report.stdout.expect("capture result must be present");
+    assert!(stdout.bytes.is_empty());
+    assert!(!stdout.truncated);
+}
+
+#[test]
 fn forbidden_syscall_is_denied_with_eperm() {
     assert_eq!(
         run(&policy("F", &[], &["execveat", "exit"])).unwrap(),

@@ -8,7 +8,14 @@ pub(crate) fn run_report(
 }
 
 #[cfg(target_arch = "x86_64")]
+#[path = "linux_pid_lifecycle.rs"]
+mod pid_lifecycle;
+
+#[cfg(target_arch = "x86_64")]
 mod x86_64 {
+    use super::pid_lifecycle::{
+        self, LaunchErrorRecord, SharedTargetLifecycle, TargetLifecycleRecord,
+    };
     use crate::policy::{StdioMode, StdioPolicy};
     use crate::{
         CapturedOutput, ChildOutcome, PolicyError, ResourceLimits, RunReport, SandboxError,
@@ -80,13 +87,11 @@ mod x86_64 {
     const PHASE_ROOT_REVALIDATE: u32 = 26;
     const PHASE_STDIO_REDIRECT: u32 = 27;
     const PHASE_STDOUT_CAPTURE: u32 = 28;
-
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct LaunchErrorRecord {
-        errno: i32,
-        phase: u32,
-    }
+    const PHASE_PID_INIT_FORK: u32 = 29;
+    const PHASE_TARGET_FORK: u32 = 30;
+    const PHASE_PROCESS_TREE_KILL: u32 = 31;
+    const PHASE_PROCESS_TREE_REAP: u32 = 32;
+    const PHASE_PID_INIT_WAIT: u32 = 33;
 
     #[repr(C)]
     struct OpenHow {
@@ -346,11 +351,24 @@ mod x86_64 {
         error_exit_syscall: libc::c_long,
     }
 
+    #[derive(Clone, Copy)]
+    struct ChildControl {
+        launch_error: *mut LaunchErrorRecord,
+        target_lifecycle: *mut TargetLifecycleRecord,
+        capture_read_fd: RawFd,
+        capture_write_fd: RawFd,
+    }
+
     pub(crate) fn run_report(policy: &SandboxPolicy) -> Result<RunReport, SandboxError> {
         ensure_fd_sanitization_supported()?;
         let prepared = PreparedLaunch::new(policy)?;
         let seccomp = compile_seccomp(policy)?;
         let launch_state = SharedLaunchState::new()?;
+        let lifecycle = SharedTargetLifecycle::new().map_err(|err| {
+            SandboxError::SetupFailed(format!(
+                "cannot allocate shared target lifecycle state: {err}"
+            ))
+        })?;
         let capture = if policy.stdio.stdout == StdioMode::Capture {
             Some(CapturePipe::new(policy.stdout_capture_bytes.ok_or_else(
                 || {
@@ -364,6 +382,12 @@ mod x86_64 {
         };
         let capture_read_fd = capture.as_ref().map_or(-1, |pipe| pipe.read_fd.raw());
         let capture_write_fd = capture.as_ref().map_or(-1, |pipe| pipe.write_fd.raw());
+        let child_control = ChildControl {
+            launch_error: launch_state.record,
+            target_lifecycle: lifecycle.raw(),
+            capture_read_fd,
+            capture_write_fd,
+        };
 
         let pid = unsafe { libc::fork() };
         if pid == -1 {
@@ -380,9 +404,7 @@ mod x86_64 {
                     policy.stdio,
                     policy.limits,
                     &seccomp,
-                    launch_state.record,
-                    capture_read_fd,
-                    capture_write_fd,
+                    child_control,
                 )
             }
         }
@@ -399,21 +421,33 @@ mod x86_64 {
             result
         });
 
-        let status = wait_for_child(pid)?;
+        let bootstrap_status = wait_for_child(pid)?;
         let launch_error = launch_state.snapshot();
         if launch_error.phase != 0 {
             return decode_launch_error(launch_error).map(|outcome| RunReport {
                 outcome,
                 stdout: None,
+                reaped_descendants: 0,
             });
+        }
+
+        let lifecycle_record = lifecycle.snapshot();
+        if lifecycle_record.ready != 1 {
+            return Err(SandboxError::SetupFailed(format!(
+                "PID namespace lifecycle did not publish target status; bootstrap wait status 0x{bootstrap_status:x}"
+            )));
         }
 
         let stdout = match capture_result {
             Some(result) => Some(result?),
             None => None,
         };
-        let outcome = decode_wait_status(status)?;
-        Ok(RunReport { outcome, stdout })
+        let outcome = decode_wait_status(lifecycle_record.status)?;
+        Ok(RunReport {
+            outcome,
+            stdout,
+            reaped_descendants: lifecycle_record.reaped_descendants,
+        })
     }
 
     fn read_capture(fd: RawFd, limit: usize) -> Result<CapturedOutput, SandboxError> {
@@ -635,10 +669,14 @@ mod x86_64 {
         stdio: StdioPolicy,
         limits: ResourceLimits,
         seccomp: &CompiledSeccomp,
-        launch_error: *mut LaunchErrorRecord,
-        capture_read_fd: RawFd,
-        capture_write_fd: RawFd,
+        control: ChildControl,
     ) -> ! {
+        let ChildControl {
+            launch_error,
+            target_lifecycle,
+            capture_read_fd,
+            capture_write_fd,
+        } = control;
         if capture_read_fd >= FIRST_NON_STDIO_FD as RawFd && libc::close(capture_read_fd) == -1 {
             child_fail(
                 launch_error,
@@ -647,7 +685,11 @@ mod x86_64 {
             );
         }
 
-        if libc::syscall(libc::SYS_unshare, libc::CLONE_NEWUSER | libc::CLONE_NEWNS) == -1 {
+        if libc::syscall(
+            libc::SYS_unshare,
+            libc::CLONE_NEWUSER | libc::CLONE_NEWNS | libc::CLONE_NEWPID,
+        ) == -1
+        {
             child_fail(launch_error, PHASE_NAMESPACE, seccomp.error_exit_syscall);
         }
 
@@ -832,6 +874,21 @@ mod x86_64 {
         {
             child_fail(launch_error, PHASE_FD_SANITIZE, seccomp.error_exit_syscall);
         }
+
+        pid_lifecycle::become_pid_namespace_init_or_exit(
+            launch_error,
+            PHASE_PID_INIT_FORK,
+            PHASE_PID_INIT_WAIT,
+            PHASE_FD_SANITIZE,
+        );
+        pid_lifecycle::become_direct_target_or_reap(
+            target_lifecycle,
+            launch_error,
+            PHASE_TARGET_FORK,
+            PHASE_PROCESS_TREE_KILL,
+            PHASE_PROCESS_TREE_REAP,
+            PHASE_FD_SANITIZE,
+        );
 
         apply_stdio_policy_or_fail(
             stdio,
@@ -1266,6 +1323,11 @@ mod x86_64 {
             PHASE_ROOT_REVALIDATE => "filesystem root revalidation in mount namespace",
             PHASE_STDIO_REDIRECT => "owned stdout redirection",
             PHASE_STDOUT_CAPTURE => "bounded stdout capture",
+            PHASE_PID_INIT_FORK => "PID namespace init fork",
+            PHASE_TARGET_FORK => "direct target fork",
+            PHASE_PROCESS_TREE_KILL => "process-tree termination",
+            PHASE_PROCESS_TREE_REAP => "process-tree reaping",
+            PHASE_PID_INIT_WAIT => "PID namespace init wait",
             _ => "unknown launch phase",
         };
         format!(
@@ -1307,6 +1369,9 @@ mod x86_64 {
             "mremap" => libc::SYS_mremap,
             "madvise" => libc::SYS_madvise,
             "getpid" => libc::SYS_getpid,
+            "getppid" => libc::SYS_getppid,
+            "fork" => libc::SYS_fork,
+            "pause" => libc::SYS_pause,
             "sched_yield" => libc::SYS_sched_yield,
             "nanosleep" => libc::SYS_nanosleep,
             "getuid" => libc::SYS_getuid,

@@ -18,14 +18,18 @@ Delivered strict policy validation, environment/cwd control, four rlimits, `PR_S
 
 ### Slice 2C — filesystem and identity boundary
 
-**Current verified candidate.** Add a mandatory `filesystem.root`, pin root/cwd/initial executable with `openat2`, create user+mount namespaces with UID/GID mapping, make mount propagation private, enter the pinned root, reject directory-valued stdio escape handles, clear capability bounding/ambient/current sets, and launch the pinned inode with `execveat(AT_EMPTY_PATH)`. Integration tests must prove host-path hiding, executable symlink-escape rejection, namespace identity/capability reduction, and preservation of all Milestones 1–2B invariants.
-
-The branch implementation has passed the complete locked test suite on Rust 1.74 and stable plus stable rustfmt/Clippy. It becomes **complete on `main` only after PR merge-ref and post-merge main CI remain green.**
+**Status: complete on `main`.** A mandatory `filesystem.root` bounds pathname visibility; root/cwd/initial target selection uses `openat2`; the initial target is inode-pinned for `execveat(AT_EMPTY_PATH)`; user and mount namespaces, UID/GID mapping, private mount propagation, chroot, directory-stdio rejection and capability reduction are enforced and covered by integration tests.
 
 ### Slice 2D — explicit filesystem mutability policy
 
-**Next architectural frontier after 2C integration.** Convert path visibility into a stronger data-plane boundary by investigating an enforceable read-only root with narrowly declared writable scratch/data locations. The design must work within the user/mount namespace model, prove actual write denial/allowance in integration tests, and fail explicitly when required mount semantics are unavailable. Do not claim this slice merely from mount-policy types or configuration fields.
+**Current verified candidate.** The selected root is reopened inside the child's mount namespace and fail-closed revalidated against the pre-fork pinned root, recursively cloned with `open_tree`, made recursively read-only with `mount_setattr`, and attached only inside the private mount namespace. Policy may declare one writable scratch directory plus a bounded tmpfs size; the launcher overlays that location with a private `nosuid,nodev,noexec` tmpfs after the root is read-only.
+
+Acceptance evidence is executable rather than declarative: the raw-syscall target must receive `EROFS` when attempting `O_CREAT` on the ordinary root, must successfully create/write inside the declared scratch mount, and the parent must observe that the scratch write did not modify the host directory. All Milestones 1–2C regressions must remain green. The current branch has passed locked full tests on Rust 1.74 and stable plus stable rustfmt/Clippy. It becomes **complete on `main` only after PR merge-ref and post-merge main CI remain green.**
+
+### Slice 2E — explicit standard/intentional descriptor authority
+
+**Next architectural frontier after 2D integration.** Replace the remaining implicit stdio authority with an explicit policy for descriptor disposition: inherited, redirected, closed, or deliberately passed handles must be named by policy and enforced without reopening ambient parent authority. Acceptance must prove that undeclared descriptors—including stdio when policy closes them—cannot be used by the target, while explicitly passed handles remain usable. Do not weaken the existing `>=3` non-leakage invariant merely to add descriptor passing.
 
 ## Later frontiers
 
-After root mutability is enforceable, prioritize explicit stdio/intentional descriptor authority, then PID/network/process-tree isolation and stronger resource accounting where each mechanism can be demonstrated on the supported CI platform.
+After descriptor authority is explicit, prioritize PID/process-tree isolation, network namespace/policy, and stronger aggregate resource accounting where each mechanism can be demonstrated on the supported CI platform. Keep syscall-argument filtering and stronger filesystem data-mount policy as separate evidence-backed frontiers rather than configuration-only claims.

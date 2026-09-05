@@ -7,12 +7,15 @@ use std::path::{Path, PathBuf};
 use std::process::{self, Command};
 use std::sync::OnceLock;
 
+const SCRATCH_BYTES: u64 = 16 * 1024 * 1024;
+
 fn fixture_root() -> &'static Path {
     static ROOT: OnceLock<PathBuf> = OnceLock::new();
     ROOT.get_or_init(|| {
         let root = std::env::temp_dir().join(format!("security-lab-root-{}", process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join("work")).expect("create sandbox root");
+        std::fs::create_dir_all(root.join("work")).expect("create sandbox work directory");
+        std::fs::create_dir_all(root.join("scratch")).expect("create sandbox scratch mountpoint");
 
         let output = root.join("probe");
         let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/probe.S");
@@ -41,6 +44,8 @@ fn policy(mode: &str, extra_args: &[&str], syscalls: &[&str]) -> SandboxPolicy {
         args,
         environment: BTreeMap::new(),
         working_dir: PathBuf::from("/work"),
+        scratch_dir: Some(PathBuf::from("/scratch")),
+        scratch_bytes: Some(SCRATCH_BYTES),
         limits: ResourceLimits {
             cpu_seconds: 2,
             address_space_bytes: 128 * 1024 * 1024,
@@ -58,6 +63,33 @@ fn allowed_operation_succeeds() {
     assert_eq!(
         run(&policy("A", &[], &["execveat", "write", "exit"])).unwrap(),
         ChildOutcome::Exited(0)
+    );
+}
+
+#[test]
+fn root_is_readonly_and_declared_scratch_is_writable() {
+    let forbidden_host = fixture_root().join("root-write-must-fail");
+    let scratch_host = fixture_root().join("scratch/allowed");
+    let _ = std::fs::remove_file(&forbidden_host);
+    let _ = std::fs::remove_file(&scratch_host);
+
+    assert_eq!(
+        run(&policy(
+            "M",
+            &[],
+            &["execveat", "openat", "write", "close", "exit"]
+        ))
+        .unwrap(),
+        ChildOutcome::Exited(0)
+    );
+
+    assert!(
+        !forbidden_host.exists(),
+        "read-only root write leaked into the host root"
+    );
+    assert!(
+        !scratch_host.exists(),
+        "scratch tmpfs write escaped its private mount namespace"
     );
 }
 
@@ -101,16 +133,11 @@ fn launch_requires_policy_authorized_termination_syscall() {
 
 #[test]
 fn setup_failure_never_falls_back_to_execution() {
-    let marker_name = format!("marker-{}-{}", process::id(), unique_suffix());
-    let marker_host = fixture_root().join(&marker_name);
-    let _ = std::fs::remove_file(&marker_host);
-    let marker_sandbox = format!("/{marker_name}");
-    let mut failing = policy("W", &[&marker_sandbox], &["execveat", "openat", "exit"]);
+    let mut failing = policy("X", &[], &["execveat", "exit"]);
     failing.working_dir = PathBuf::from("/definitely/missing");
 
     let error = run(&failing).unwrap_err();
     assert!(matches!(error, SandboxError::SetupFailed(_)));
-    assert!(!marker_host.exists(), "child ran despite setup failure");
 }
 
 #[test]

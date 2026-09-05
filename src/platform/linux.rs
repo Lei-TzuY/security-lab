@@ -100,6 +100,7 @@ mod x86_64 {
     const PHASE_DEADLINE_TIMER_ARM: u32 = 36;
     const PHASE_DEADLINE_POLL: u32 = 37;
     const PHASE_HOSTNAME: u32 = 38;
+    const PHASE_SELECTED_HANDLES: u32 = 39;
 
     #[repr(C)]
     struct OpenHow {
@@ -152,6 +153,11 @@ mod x86_64 {
         limit: usize,
     }
 
+    struct PreparedSelectedHandle {
+        storage_fd: OwnedFd,
+        target_fd: RawFd,
+    }
+
     impl CapturePipe {
         fn new(limit: u64) -> Result<Self, SandboxError> {
             let mut fds = [-1; 2];
@@ -191,6 +197,62 @@ mod x86_64 {
         }
         drop(fd);
         Ok(OwnedFd(moved))
+    }
+
+    fn move_owned_fd_to_selected_storage(
+        fd: OwnedFd,
+        storage_floor: RawFd,
+        label: &str,
+    ) -> Result<OwnedFd, SandboxError> {
+        if fd.raw() >= storage_floor {
+            return Ok(fd);
+        }
+        let moved = unsafe { libc::fcntl(fd.raw(), libc::F_DUPFD_CLOEXEC, storage_floor) };
+        if moved == -1 {
+            return Err(SandboxError::SetupFailed(format!(
+                "cannot move {label} into the selected-handle storage plane at fd {storage_floor} or above: {}",
+                io::Error::last_os_error()
+            )));
+        }
+        drop(fd);
+        Ok(OwnedFd(moved))
+    }
+
+    fn pin_selected_handle(
+        source_fd: u32,
+        target_fd: u32,
+        storage_floor: RawFd,
+    ) -> Result<PreparedSelectedHandle, SandboxError> {
+        if source_fd > i32::MAX as u32 {
+            return Err(SandboxError::InvalidPolicy(PolicyError::new(format!(
+                "selected handle source fd exceeds the Linux descriptor range: {source_fd}"
+            ))));
+        }
+        let source_fd = source_fd as RawFd;
+        let pinned = unsafe { libc::fcntl(source_fd, libc::F_DUPFD_CLOEXEC, storage_floor) };
+        if pinned == -1 {
+            return Err(SandboxError::SetupFailed(format!(
+                "cannot pin selected handle source fd {source_fd} for target fd {target_fd}: {}",
+                io::Error::last_os_error()
+            )));
+        }
+        let storage_fd = OwnedFd(pinned);
+        let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
+        if unsafe { libc::fstat(storage_fd.raw(), &mut stat) } == -1 {
+            return Err(SandboxError::SetupFailed(format!(
+                "cannot inspect selected handle source fd {source_fd}: {}",
+                io::Error::last_os_error()
+            )));
+        }
+        if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
+            return Err(SandboxError::InvalidPolicy(PolicyError::new(format!(
+                "selected handle source fd {source_fd} is a directory descriptor"
+            ))));
+        }
+        Ok(PreparedSelectedHandle {
+            storage_fd,
+            target_fd: target_fd as RawFd,
+        })
     }
 
     struct SharedLaunchState {
@@ -244,6 +306,7 @@ mod x86_64 {
         root_fd: OwnedFd,
         root_path: CString,
         executable_fd: OwnedFd,
+        selected_handles: Vec<PreparedSelectedHandle>,
         cwd_relative: CString,
         scratch_relative: Option<CString>,
         scratch_options: Option<CString>,
@@ -278,6 +341,30 @@ mod x86_64 {
                 "executable",
             )?;
             validate_executable_fd(executable_fd.raw(), &policy.executable)?;
+            // Keep every launcher-owned source above all target-visible handle
+            // destinations. With no selected handles this floor is only 3, so
+            // existing sandboxes do not gain an unnecessary fd>=64 requirement.
+            let selected_storage_floor = policy
+                .selected_handles
+                .keys()
+                .next_back()
+                .map_or(FIRST_NON_STDIO_FD as RawFd, |target_fd| {
+                    *target_fd as RawFd + 1
+                });
+            let executable_fd = move_owned_fd_to_selected_storage(
+                executable_fd,
+                selected_storage_floor,
+                "pinned executable",
+            )?;
+
+            let mut selected_handles = Vec::with_capacity(policy.selected_handles.len());
+            for (target_fd, source_fd) in &policy.selected_handles {
+                selected_handles.push(pin_selected_handle(
+                    *source_fd,
+                    *target_fd,
+                    selected_storage_floor,
+                )?);
+            }
 
             let cwd_relative = sandbox_relative(&policy.working_dir)?;
             let (scratch_relative, scratch_options) = match (
@@ -341,6 +428,7 @@ mod x86_64 {
                 root_fd,
                 root_path,
                 executable_fd,
+                selected_handles,
                 cwd_relative,
                 scratch_relative,
                 scratch_options,
@@ -422,6 +510,10 @@ mod x86_64 {
                 )
             }
         }
+        // The host parent does not retain launcher-owned duplicates of selected
+        // object capabilities while the target runs. Caller-owned source FDs
+        // remain under caller control.
+        drop(prepared);
 
         let capture_result = capture.map(|pipe| {
             let CapturePipe {
@@ -1056,6 +1148,11 @@ mod x86_64 {
             launch_error,
             seccomp.error_exit_syscall,
         );
+        install_selected_handles_or_fail(
+            &prepared.selected_handles,
+            launch_error,
+            seccomp.error_exit_syscall,
+        );
 
         set_limit_or_fail(
             libc::RLIMIT_CPU,
@@ -1308,6 +1405,29 @@ mod x86_64 {
         }
     }
 
+    unsafe fn install_selected_handles_or_fail(
+        handles: &[PreparedSelectedHandle],
+        launch_error: *mut LaunchErrorRecord,
+        error_exit_syscall: libc::c_long,
+    ) {
+        for handle in handles {
+            if libc::syscall(
+                libc::SYS_dup3,
+                handle.storage_fd.raw(),
+                handle.target_fd,
+                0u32,
+            ) == -1
+            {
+                child_fail(launch_error, PHASE_SELECTED_HANDLES, error_exit_syscall);
+            }
+        }
+        for handle in handles {
+            if libc::close(handle.storage_fd.raw()) == -1 {
+                child_fail(launch_error, PHASE_SELECTED_HANDLES, error_exit_syscall);
+            }
+        }
+    }
+
     unsafe fn set_limit_or_fail(
         resource: libc::c_uint,
         value: u64,
@@ -1492,6 +1612,7 @@ mod x86_64 {
             PHASE_DEADLINE_TIMER_ARM => "wall-clock deadline timer arming",
             PHASE_DEADLINE_POLL => "wall-clock deadline supervision poll",
             PHASE_HOSTNAME => "UTS hostname installation",
+            PHASE_SELECTED_HANDLES => "selected non-stdio handle installation",
             _ => "unknown launch phase",
         };
         format!(

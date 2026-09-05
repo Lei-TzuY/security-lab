@@ -115,7 +115,7 @@ Milestone 4B–4D namespace/identity baselines are sealed on `main`; do not farm
 
 ### Slice 5A — masked seccomp syscall-argument filtering
 
-**Current verified candidate.** Extend default-deny seccomp from syscall-number allowlisting to optional masked equality over selected numeric syscall arguments without widening launcher management authority.
+**Status: complete on `main`.** Extends default-deny seccomp from syscall-number allowlisting to optional masked equality over selected numeric syscall arguments without widening launcher management authority.
 
 Acceptance evidence is executable:
 
@@ -130,8 +130,30 @@ Boundary: 5A is masked equality on numeric syscall argument values. Classic secc
 
 ### Milestone 5 promotion rule
 
-After 5A integrates, do not farm identical argument masks across unrelated syscalls. Promote only when a new policy primitive or cross-layer integration is justified by a concrete authority boundary and executable evidence. Supplementary-group clearing requires a different user-namespace mapping architecture under the current nonprivileged `setgroups=deny` flow; 4A remains blocked on cgroup delegation.
+Milestone 5A is sealed on `main`; do not farm identical argument masks across unrelated syscalls. Further seccomp work needs a materially new predicate model and executable authority boundary rather than copied rules. Supplementary-group clearing requires a different user-namespace mapping architecture under the current nonprivileged `setgroups=deny` flow; 4A remains blocked on cgroup delegation.
+
+## Milestone 6 — explicit object capabilities
+
+### Slice 6A — selected non-stdio handle passing
+
+**Current verified candidate.** Add an explicit launch-time object-capability surface without reopening ambient descriptor inheritance.
+
+Acceptance evidence is executable:
+
+- policy accepts `handle.<target_fd> = <source_fd>` for at most 16 unique target descriptors; target descriptors are restricted to 3–63 and must remain below `limit.open_files`;
+- the launcher duplicates each already-open source before fork with `F_DUPFD_CLOEXEC`, rejects directory descriptor sources with `fstat`, and leaves the caller-owned source descriptor untouched;
+- launcher-owned selected sources and the pinned executable are stored above every target-visible destination using a dynamically derived floor, avoiding destination collisions without imposing an unconditional fd>=64 requirement;
+- after stdio setup, only the direct target installs selected destinations with `dup3(..., 0)` before rlimits/capability/seccomp setup. Host parent, bootstrap, and namespace PID 1 do not retain launcher-owned selected duplicates while the target runs;
+- existing `close_range(..., CLOEXEC)` sanitization remains active, so undeclared inherited descriptors disappear at exec rather than being implicitly preserved;
+- a raw target reads `selected-handle-ok` from declared target fd 9 while both the original high source descriptor and a separate undeclared high descriptor return `EBADF`; a directory source is rejected before launch;
+- all Milestones 1–5A regressions, stable format/Clippy/full tests, and the full Rust 1.74 suite remain green.
+
+Boundary: 6A is a deliberate grant of an already-open kernel object. It does not attenuate the source open-file-description rights/state, mediate pathname access to that object, revoke the handle after launch, transfer new descriptors after launch, or support directory handles/general arbitrary FD remapping.
+
+### Milestone 6 promotion rule
+
+After 6A integrates, do not farm more descriptor numbers or object types merely to repeat the same remap path. Promote to a different executable boundary such as an external cancellation/control-plane primitive, evidence-backed persistent-volume policy, or controlled networking.
 
 ## Later frontiers
 
-External asynchronous cancellation, selected-handle passing, supplementary-group isolation with a viable mapping architecture, broader persistent-volume policy, and controlled networking remain separate evidence-backed frontiers. Do not add configuration-only names without executable kernel behavior and integration evidence.
+External asynchronous cancellation, supplementary-group isolation with a viable mapping architecture, broader persistent-volume policy, and controlled networking remain separate evidence-backed frontiers. Do not add configuration-only names without executable kernel behavior and integration evidence.

@@ -26,13 +26,17 @@ Delivered strict policy validation, environment/cwd control, four rlimits, `PR_S
 
 ### Slice 2E — explicit standard descriptor disposition
 
-The current implementation requires `stdio.stdin`, `stdio.stdout`, and `stdio.stderr` with no implicit default. Each is either `inherit` or `closed`. `inherit` requires the parent descriptor to exist and not be a directory; `closed` ensures the target starts with that descriptor closed. Enforcement happens after all launcher stages that may allocate file descriptors and after the existing >=3 `CLOEXEC` sanitization, so setup cannot silently repopulate closed stdio.
+**Status: complete on `main`.** `stdio.stdin`, `stdio.stdout`, and `stdio.stderr` have no implicit default. Each is explicitly inherited or closed; inherited descriptors must exist and must not be directories, while closed descriptors are actually closed before target exec. Raw target evidence proves all-closed `EBADF` behavior and selective stdout inheritance while the arbitrary-descriptor >=3 non-leakage invariant remains intact.
 
-Acceptance evidence is executable: a raw target with all three descriptors closed observes `EBADF` for 0/1/2, while a selective policy with only stdout inherited observes stdin/stderr closed and successfully writes through fd 1. The exact candidate must keep all Milestones 1–2D regressions green on stable and Rust 1.74, then pass PR merge-ref and post-merge main CI before this slice is considered integrated.
+### Slice 2F-A — launcher-owned stdout redirection
 
-### Slice 2F — owned redirection and deliberate descriptor passing
+**Current verified candidate.** Extend stdout with a third disposition, `redirect`, paired with `stdio.stdout_path`. The path must be strictly beneath the declared private scratch mount. The launcher opens the destination only after the scratch tmpfs exists, uses `openat2` with beneath/no-symlink constraints, normalizes any temporary low-number descriptor above stdio with `F_DUPFD_CLOEXEC`, preserves the existing >=3 `CLOEXEC` sanitization, maps only the owned source to fd 1 with `dup2`, and closes the temporary source before target exec. Launcher management syscalls occur before seccomp and do not widen the target filter.
 
-**Next descriptor frontier after 2E integration.** Add explicit launcher-owned redirection and selected-handle passing without reopening arbitrary ambient authority. A declared handle must remain usable by the target, undeclared parent descriptors must remain absent, and the design must preserve the >=3 non-leakage invariant rather than disabling `close_range` wholesale. Prefer a small typed policy and deterministic pipe/file-descriptor integration evidence over a general-purpose FD remapping surface in the first slice.
+Acceptance evidence is executable: the raw target writes a byte through redirected stdout, reopens `/scratch/stdout.log`, reads the same byte back, and exits successfully; the parent verifies the corresponding host scratch path does not exist. All Milestones 1–2E regressions remain green on stable and Rust 1.74. This slice becomes complete on `main` only after PR merge-ref and post-merge main CI remain green.
+
+### Slice 2F-B — deliberate selected handles / owned capture
+
+**Next descriptor frontier after 2F-A integration.** Add a narrow explicit mechanism for selected non-stdio handles or launcher-owned pipe capture without disabling the arbitrary inherited-FD boundary. The design must safely normalize source descriptors, choose deterministic target fd numbers compatible with `RLIMIT_NOFILE`, avoid collisions with stdio/redirection, close temporary sources, prove declared-handle usability, and independently prove an undeclared inheritable high descriptor remains absent. Avoid a general arbitrary FD remapping language until these invariants are executable and reviewable.
 
 ## Later frontiers
 

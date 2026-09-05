@@ -22,6 +22,7 @@
 #   M assert root is read-only while /scratch is writable
 #   O assert stdin/stdout/stderr are all closed
 #   T assert stdin/stderr are closed while stdout is inherited and writable
+#   U assert stdout is redirected to a private scratch file and is readable there
 
 _start:
     mov 16(%rsp), %rdi
@@ -60,6 +61,8 @@ _start:
     je .stdio_all_closed
     cmp $84, %al
     je .stdio_stdout_only
+    cmp $85, %al
+    je .stdio_stdout_redirect
     jmp .fail2
 
 .allowed:
@@ -429,6 +432,43 @@ _start:
     xor %edi, %edi
     jmp .exit
 
+.stdio_stdout_redirect:
+    mov $1, %eax
+    mov $1, %edi
+    lea redirect_byte(%rip), %rsi
+    mov $1, %edx
+    syscall
+    cmp $1, %rax
+    jne .fail21
+
+    mov $257, %eax
+    mov $-100, %edi
+    lea redirect_path(%rip), %rsi
+    xor %edx, %edx
+    xor %r10d, %r10d
+    syscall
+    test %rax, %rax
+    js .fail21
+    mov %rax, %r12
+
+    xor %eax, %eax
+    mov %r12, %rdi
+    lea redirect_buffer(%rip), %rsi
+    mov $1, %edx
+    syscall
+    cmp $1, %rax
+    jne .fail21
+    cmpb $82, redirect_buffer(%rip)
+    jne .fail21
+
+    mov $3, %eax
+    mov %r12, %rdi
+    syscall
+    test %rax, %rax
+    js .fail21
+    xor %edi, %edi
+    jmp .exit
+
 .str_eq:
 .str_eq_loop:
     movzbl (%rdi), %eax
@@ -497,6 +537,9 @@ _start:
     jmp .exit
 .fail20:
     mov $20, %edi
+    jmp .exit
+.fail21:
+    mov $21, %edi
 
 .exit:
     mov $60, %eax
@@ -520,6 +563,10 @@ scratch_byte:
 stdio_message:
     .ascii "explicit stdout inheritance succeeded\n"
 .set stdio_message_len, . - stdio_message
+redirect_path:
+    .asciz "/scratch/stdout.log"
+redirect_byte:
+    .ascii "R"
 
 .section .bss
 .balign 16
@@ -531,5 +578,7 @@ cap_header:
     .skip 8
 cap_data:
     .skip 24
+redirect_buffer:
+    .skip 1
 
 .section .note.GNU-stack,"",@progbits

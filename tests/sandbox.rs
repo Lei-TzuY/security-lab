@@ -82,6 +82,12 @@ fn malformed_policy_is_rejected() {
 }
 
 #[test]
+fn unknown_syscall_is_rejected_before_execution() {
+    let invalid = policy("A", &[], &["execve", "not_a_real_syscall"]);
+    assert!(matches!(run(&invalid), Err(SandboxError::InvalidPolicy(_))));
+}
+
+#[test]
 fn setup_failure_never_falls_back_to_execution() {
     let marker = std::env::temp_dir().join(format!(
         "security-lab-marker-{}-{}",
@@ -132,6 +138,14 @@ fn environment_is_cleared_then_explicitly_rebuilt() {
 fn working_directory_is_controlled() {
     assert_eq!(
         run(&policy("C", &["/tmp"], &["execve", "getcwd", "exit"])).unwrap(),
+        ChildOutcome::Exited(0)
+    );
+}
+
+#[test]
+fn all_configured_resource_limits_are_observable() {
+    assert_eq!(
+        run(&policy("R", &[], &["execve", "prlimit64", "exit"])).unwrap(),
         ChildOutcome::Exited(0)
     );
 }

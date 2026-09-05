@@ -1,45 +1,40 @@
-# Milestones 1–3A threat model
+# Milestones 1–3B threat model
 
 ## Purpose
 
-`security-lab` is an educational, correctness-first Linux sandbox. Milestone 1 established syscall/resource/environment controls; 2A removed inherited non-stdio descriptor leakage; 2B made launch/error reporting an owned control-plane protocol; 2C added filesystem-path and process-identity isolation; 2D added a recursively read-only root plus bounded private scratch; 2E made standard-descriptor disposition explicit; 2F-A added launcher-owned stdout redirection; 2F-B added bounded launcher-owned stdout capture; and the current 3A candidate adds PID-namespace process-tree lifecycle ownership. Every claimed property must correspond to a kernel mechanism and executable evidence.
+`security-lab` is an educational, correctness-first Linux sandbox. Milestone 1 established syscall/resource/environment controls; Milestone 2 removed ambient descriptor authority, made launch reporting launcher-owned, and added filesystem/identity/stdout boundaries; Milestone 3A added PID-namespace init and descendant lifecycle ownership. The current 3B candidate adds a policy-owned monotonic wall-clock deadline enforced by launcher-owned PID 1. Every claimed property must correspond to a kernel mechanism and executable evidence.
 
 ## Protected boundary
 
-The trusted host parent launches one direct target through launcher-owned bootstrap and namespace-init processes. On supported Linux x86_64, the launcher constrains initial filesystem visibility/mutability, namespace identity, capabilities, syscalls, selected resources, environment, cwd, inherited non-stdio descriptors, explicit standard-descriptor disposition, launcher-owned stdout redirection/capture, and post-target process-tree teardown while preserving fail-closed launch and lifecycle reporting.
+The trusted host parent launches one direct target through launcher-owned bootstrap and namespace-init processes. On supported Linux x86_64, the launcher constrains initial filesystem visibility/mutability, namespace identity, capabilities, target syscalls, selected resources, environment, cwd, inherited descriptors, stdio, bounded capture, process-tree lifecycle, and—when declared—a wall-clock execution deadline while preserving fail-closed launch/lifecycle reporting.
 
 ## Security properties claimed
 
 - **Pinned root/cwd/target:** configured sandbox paths are fail-closed; the initial executable is pinned and launched with `execveat(AT_EMPTY_PATH)`.
-- **Current-mount root revalidation:** after mount-namespace creation the selected root is reopened and must match the pre-fork `(st_dev, st_ino)` pin.
-- **User/mount/PID namespace isolation:** namespace UID/GID 0 map only to the launching effective UID/GID; mount propagation is private; a launcher-owned namespace init runs as PID 1 and the direct target runs as PID 2.
-- **Filesystem mutability:** the revalidated root is recursively cloned/read-only; at most one declared bounded private `nosuid,nodev,noexec` scratch tmpfs is writable.
-- **Filesystem path boundary:** the target is chrooted into the constructed root and switches to a re-pinned cwd.
-- **Inherited-FD minimization:** arbitrary inherited descriptors >= 3 are marked `CLOEXEC` and do not survive successful target exec.
-- **Explicit stdio:** inherited descriptors must exist and not be directories; closed descriptors are explicitly closed. stdout additionally supports launcher-owned redirection and capture.
-- **Owned stdout redirection:** the launcher opens only a path strictly beneath private scratch after scratch exists, normalizes temporary low descriptors with `F_DUPFD_CLOEXEC`, maps only the source to fd 1 using `dup2`, then closes the source.
-- **Bounded owned stdout capture:** capture creates a new pre-fork `pipe2(O_CLOEXEC)` rather than exposing an arbitrary parent descriptor. Both pipe ends are normalized above fd 2 before fork. The direct target maps the write end only to fd 1; bootstrap and PID 1 close descriptors >= 3, so launcher management layers cannot keep the capture writer alive.
-- **Bounded retained memory:** `stdio.stdout_capture_bytes` is limited to 1 byte–16 MiB. At most that many bytes are retained in `CapturedOutput`; additional bytes are drained and discarded and set `truncated = true`.
-- **Pipe-pressure liveness for the direct target:** because the host parent drains before waiting for bootstrap completion, a target that emits more than the kernel pipe capacity is not blocked merely because the retained capture buffer reached its policy ceiling.
-- **Owned PID-tree lifecycle:** namespace PID 1 waits for the direct target, then repeatedly signals remaining namespace processes with `SIGKILL` and reaps children with `wait4` until `ECHILD`. Lifecycle completion is published only after this teardown finishes.
-- **Direct-target outcome preservation:** the host reports the direct target's raw wait status through shared lifecycle state rather than substituting bootstrap/PID1 exit status. Exit-vs-signal semantics therefore remain attached to the policy-selected target.
-- **Descendant-held capture release after target termination:** if a policy-permitted descendant retains stdout when the direct target exits, PID 1 kills/reaps that descendant before publishing completion, allowing the capture pipe to reach EOF without descendant cooperation.
-- **No target-policy widening:** launcher management operations for namespaces, mounts, PID lifecycle, redirection/capture/remapping happen outside the target seccomp filter. The target receives only its named syscall allowlist.
-- **Capability/resource controls:** capability sets are reduced, `no_new_privs` is enabled, configured rlimits are applied, and seccomp remains default-deny.
+- **User/mount/PID namespace isolation:** namespace UID/GID 0 map only to the launching effective UID/GID; mount propagation is private; launcher-owned PID 1 parents the direct target as PID 2.
+- **Filesystem mutability/path boundary:** the revalidated root is recursively cloned/read-only, optional scratch is private `nosuid,nodev,noexec` tmpfs, and the target is chrooted into the constructed root.
+- **Inherited-FD minimization / explicit stdio:** arbitrary inherited descriptors >= 3 do not survive target exec; stdio disposition is explicit; launcher-owned redirect/capture sources are tightly remapped and closed.
+- **Bounded retained capture:** `stdio.stdout_capture_bytes` is 1 byte–16 MiB; excess bytes are drained/discarded rather than retained.
+- **Owned PID-tree lifecycle:** namespace PID 1 supervises the direct target and reaps descendants. After the direct target becomes terminal—naturally or by deadline—PID 1 repeatedly kills remaining namespace processes and reaps until `ECHILD`, then publishes readiness.
+- **Optional bounded deadline:** `limit.wall_clock_milliseconds` is either absent or 1–86,400,000 ms. When present, the launcher preflights pidfd/timerfd support and PID 1 arms a one-shot `CLOCK_MONOTONIC` timer after it forks the direct target and closes its inherited setup descriptors.
+- **Deadline independent of host capture blocking:** the host parent may block draining capture, but timeout enforcement remains live because it executes in PID 1. Deadline teardown closes target-tree writers and allows capture EOF to converge.
+- **Deterministic timeout race:** each PID1 supervision wake performs `wait4(target, WNOHANG)` first. If target status is already available, natural termination wins. If the timer is readable and the target is not yet waitable, deadline ownership wins from that point forward.
+- **Distinct timeout result:** once deadline ownership wins, PID 1 uses `SIGKILL` to terminate the direct target, but shared lifecycle state marks the event and the host reports `ChildOutcome::TimedOut`; it is not misreported as an ordinary target-delivered signal.
+- **No target-policy widening:** `pidfd_open`, timerfd setup, `poll`, namespace management, mounts, capture/remapping, and teardown execute in trusted launcher processes outside the target seccomp filter.
 - **Owned launch-error reporting:** pre-exec phase+errno travels through shared anonymous memory and does not depend on target stdout/stderr or a target `write` grant.
-- **Fail-closed enforcement:** failed or unsupported mandatory enforcement and incomplete PID lifecycle publication never trigger an unrestricted retry or successful fallback.
+- **Fail-closed enforcement:** failed/unsupported mandatory mechanisms, invalid timeout publication, or incomplete lifecycle readiness never trigger unrestricted retry or successful fallback.
 
-## Parent/bootstrap/init/target orchestration
+## Deadline and lifecycle orchestration
 
 Potentially allocating policy data, argv/envp, seccomp instructions, pinned descriptors, shared lifecycle state, and capture-pipe creation occur before the initial host `fork`.
 
-The launcher child creates user, mount, and PID namespaces and completes filesystem construction before entering the new PID namespace. Because `CLONE_NEWPID` affects subsequently created children, it then forks a bootstrap descendant that becomes namespace PID 1. The bootstrap parent closes descriptors >= 3, waits for PID 1, and exits; target status is not inferred from this bootstrap status.
+The launcher creates user/mount/PID namespaces and filesystem state, then forks launcher-owned namespace PID 1. PID 1 forks the direct target as PID 2. The target immediately returns to target-only setup; PID 1 closes inherited descriptors >= 3, so it cannot keep launcher capture writers alive.
 
-Namespace PID 1 forks the direct target as PID 2. PID 1 closes descriptors >= 3 and stays outside target stdio/rlimit/capability/seccomp setup. The direct target alone applies policy stdio, rlimits, capability reduction, `no_new_privs`, seccomp, and pinned `execveat`.
+If no deadline is declared, PID 1 uses the existing blocking direct-target wait. If a deadline is declared, PID 1 opens a pidfd for the already-forked target, creates a `TFD_CLOEXEC` timerfd using `CLOCK_MONOTONIC`, arms it for the validated interval, and polls the pidfd and timerfd. These descriptors are created **after** the target fork, so they are never inherited by the target.
 
-PID 1 waits specifically for the direct target. Only after that target terminates does PID 1 tear down the remaining namespace process tree. It repeats a kill sweep and `wait4(-1, ...)` until `ECHILD`, then writes the direct target status and additional-descendant reap count to shared memory and publishes `ready = 1` last. The host treats any missing readiness publication as setup/lifecycle failure.
+When poll wakes, PID 1 performs exactly one nonblocking target reap check as the race arbiter. An already-waitable target keeps its natural raw wait status. Otherwise a readable timer transfers ownership to the deadline path; PID 1 sends `SIGKILL`, waits specifically for the direct target, then runs the existing kill/reap loop for every remaining descendant. Shared lifecycle state records raw target status, `timed_out`, descendant reap count, and publishes `ready` last.
 
-In the host parent, capture is drained to EOF before waiting for bootstrap. Retention stops at the policy ceiling but draining continues. This ordering prevents direct-target pipe-pressure deadlock. Because bootstrap and PID 1 close capture descriptors, the only remaining writers belong to the target process tree; 3A teardown therefore resolves descendant-held capture writers after direct-target termination.
+The host parent drains captured stdout to EOF before waiting for bootstrap. This does not defeat the deadline: timeout enforcement is independent inside PID 1, and target-tree teardown releases remaining capture writers.
 
 ## Explicit non-goals and limitations
 
@@ -47,27 +42,25 @@ This sandbox is **not** a production multi-tenant container boundary. It does no
 
 - confinement of objects explicitly exposed through `stdio.* = inherit`;
 - stdin/stderr redirect or capture;
-- a total-output byte ceiling for captured stdout. The configured ceiling limits retained parent memory only; excess output is discarded after being read;
-- a wall-clock deadline or cancellation mechanism for a direct target that never terminates. PID-tree cleanup begins only once the direct target has produced a terminal wait status;
-- aggregate process-count accounting or a fork/pid quota. `reaped_descendants` records only additional descendants reaped during teardown, not total historical process creation;
-- deliberate selected non-stdio descriptor passing or a general arbitrary FD remapping language;
+- a total-output byte ceiling for captured stdout;
+- an externally-triggered cancellation handle/API. 3B implements policy-owned deadline expiration only;
+- an end-to-end API-call latency bound. The deadline clock is armed by PID 1 after the direct-target fork and PID1 descriptor cleanup;
+- aggregate process-count accounting or a fork/pid quota. `reaped_descendants` counts additional descendants reaped during teardown, not historical process creation;
+- cgroup-backed aggregate CPU, physical-memory, I/O, or process accounting;
+- deliberate selected non-stdio descriptor passing or a general arbitrary FD-remapping language;
 - persistence of private-scratch redirect output after the mount namespace disappears;
 - network, IPC, UTS, or cgroup namespaces;
-- cgroup-based aggregate memory/CPU/process accounting;
 - a device namespace, network endpoint policy, syscall argument filtering, or persistent data-volume policy;
-- an immutable or cryptographic snapshot of the selected root subtree;
-- a guarantee that inherited supplementary groups are empty;
-- persistent executable allowlisting after the initial pinned transition;
-- multi-architecture seccomp, side-channel resistance, or protection from sufficiently privileged external ptrace/signal interference.
+- an immutable/cryptographic snapshot of the selected root subtree;
+- persistent executable allowlisting, multi-architecture seccomp, side-channel resistance, or protection from sufficiently privileged external ptrace/signal interference.
 
 ## Trust assumptions
 
-- The Linux kernel and trusted launcher parent/bootstrap/init control plane are trusted.
-- The policy author is trusted to choose the filesystem root/scratch, explicit stdio exposure, target data, syscall grants, and realistic resource/capture ceilings.
-- Choosing `inherit` intentionally grants the existing parent descriptor.
-- Choosing `redirect` intentionally grants writes to the declared private-scratch file.
-- Choosing `capture` intentionally creates a launcher-owned stdout channel. Descendants may inherit its writer, but 3A guarantees cleanup only after the direct target terminates; it does not impose a deadline on that target.
-- The selected root contains only content the operator intends to expose; root device/inode revalidation is not a subtree integrity proof.
+- The Linux kernel and trusted launcher parent/bootstrap/PID1 control plane are trusted.
+- The policy author is trusted to choose filesystem exposure, stdio exposure, target data/syscall grants, resource ceilings, capture ceilings, and any wall-clock deadline.
+- A declared deadline intentionally authorizes launcher PID 1 to terminate the direct target and descendants when the timer wins the documented race.
+- Choosing `inherit`, `redirect`, or `capture` intentionally grants their documented descriptor/output channels.
+- Root device/inode revalidation is not a subtree integrity proof.
 
 ## Test strategy and evidence
 
@@ -76,23 +69,21 @@ The integration probe is statically linked with `-nostdlib` and uses raw Linux x
 Evidence includes:
 
 - exact allowed/denied syscall behavior and fail-closed malformed policy handling;
-- inherited high-FD non-leakage;
-- all-closed and selective-inherit stdio behavior;
-- owned stdout redirection with target readback from private scratch and parent verification of no host write-through;
-- exact small stdout capture returning the target bytes with `truncated = false`;
-- a stress target writing 4096 raw 64-byte chunks (**256 KiB**) with a **1 KiB** capture ceiling. The target exits successfully, the parent retains exactly 1 KiB of the expected byte, and `truncated = true`, proving excess output is drained rather than allowed to block on a full pipe;
-- raw `getpid`/`getppid` evidence that the direct target is PID 2 with namespace init as parent PID 1;
-- a raw target that forks a descendant which blocks indefinitely in `pause()` while retaining stdout, then exits. Namespace PID 1 kills and reaps the descendant, `reaped_descendants == 1`, and capture reaches EOF;
-- owned launch-error reporting, filesystem hiding/read-only enforcement, private scratch, namespace UID/GID and capability reduction, environment/cwd, all four rlimits, `RLIMIT_NOFILE`, `no_new_privs`, and exit-vs-signal regressions.
+- zero/oversized/duplicate wall-clock deadline rejection and exact valid parsing;
+- all Milestones 1–3A descriptor, stdio, filesystem, capability, rlimit, launch-error, capture, PID identity, descendant cleanup, and exit-vs-signal regressions;
+- a raw deadline target that writes an exact stdout marker, forks a descendant that remains in `pause()`, and keeps the direct target alive for five seconds. A 1,000 ms policy deadline returns `TimedOut`, reaps one additional descendant, preserves the exact marker, and reaches capture EOF;
+- a raw `exit(42)` target under a 5,000 ms deadline still reports `Exited(42)`, covering the natural-completion side of deadline arbitration.
 
-CI explicitly enables the user-namespace settings required by its disposable Ubuntu runner. The runtime itself never weakens host policy when mandatory primitives are unavailable.
+The five-second path in the timeout fixture is a **test-only fallback** so a broken timeout cannot hang CI indefinitely; the policy deadline must preempt it at one second. It is not used as evidence for the deadline mechanism itself.
+
+CI explicitly enables the user-namespace settings required by its disposable Ubuntu runner. The runtime never weakens host policy when mandatory primitives are unavailable.
 
 ## Failure semantics
 
-Invalid policy is rejected before launch. Pipe creation, endpoint normalization, namespace/bootstrap/init forks, descriptor cleanup, child-side remapping, capture reads, namespace/mount/capability/seccomp setup, process-tree kill/reap, lifecycle publication, and target exec failures are terminal. A capture read error or incomplete PID lifecycle record is not converted into successful execution. No failure path retries the target without the requested restrictions.
+Invalid policy is rejected before launch. Deadline support preflight, pidfd creation, timer creation/arming, supervision poll, namespace/bootstrap/init forks, descriptor cleanup, capture reads, mount/capability/seccomp setup, process-tree kill/reap, lifecycle publication, and target exec failures are terminal. Unsupported pidfd/timerfd primitives when a deadline is requested produce explicit unsupported/setup errors rather than silently running without a deadline. No failure path retries the target with weaker restrictions.
 
 ## Phase promotion
 
-Milestone 2 is sealed: inherited high-FD authority is removed, stdio is explicit, and the launcher owns private-file output plus bounded capture. Milestone 3A adds the next architectural layer by making the launcher own PID namespace init semantics and deterministic descendant cleanup instead of leaving process-tree lifetime implicit.
+Milestone 3A owns PID namespace init and descendant lifecycle. 3B adds bounded runtime ownership: the launcher can now preempt a still-running target tree after a declared monotonic deadline and report that reason separately from target exit/signal.
 
-After 3A integrates, do not farm more PID-number or reap-count variants. The next high-value lifecycle gap is **Milestone 3B — policy-owned wall-clock deadline/cancellation**: the launcher must be able to terminate a direct target that never exits, tear down its PID namespace process tree, preserve an explicit timeout/cancellation result distinct from ordinary target exit/signal, and keep capture/error reporting fail-closed. Aggregate cgroup accounting and network isolation remain separate later frontiers.
+After 3B integrates, do not farm timer units, signal choices, or timeout aliases. The next high-value isolation frontier is **aggregate resource/process accounting**, preferably via cgroup v2 where the supported CI environment can execute and verify the real kernel controller. External asynchronous cancellation remains a separate API/control-plane capability and must not be claimed until it has a real handle/protocol plus race/cleanup evidence.

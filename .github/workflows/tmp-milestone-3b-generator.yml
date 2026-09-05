@@ -19,6 +19,18 @@ jobs:
         with:
           toolchain: stable
           components: rustfmt
+      - name: Correct construction anchor
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('.github/tmp-milestone-3b-generate.py')
+          text = path.read_text()
+          old = r'"    #[test]\nfn forbidden_syscall_is_denied_with_eperm() {"'
+          new = r'"#[test]\nfn forbidden_syscall_is_denied_with_eperm() {"'
+          if text.count(old) != 1:
+              raise SystemExit(f'expected one stale test anchor, got {text.count(old)}')
+          path.write_text(text.replace(old, new, 1))
+          PY
       - name: Materialize deadline candidate
         run: python3 .github/tmp-milestone-3b-generate.py
       - name: Format Rust sources

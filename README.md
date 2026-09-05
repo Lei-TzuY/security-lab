@@ -1,6 +1,6 @@
 # security-lab
 
-`security-lab` is a correctness-first systems-security laboratory. Milestone 1 established a bounded Linux process sandbox; Milestone 2 sealed ambient descriptor, launch, filesystem/identity, stdio, redirection, and bounded-capture authority; Milestone 3 sealed PID-tree lifecycle ownership plus a launcher-owned monotonic wall-clock deadline; Milestones 4B–4C added isolated Linux network and IPC namespace baselines. The current Milestone 4D candidate adds an **owned UTS identity boundary**: policy supplies a validated sandbox hostname, the trusted launcher installs it in a new UTS namespace, and the host hostname remains unchanged. The project is **not** a penetration-testing toolkit, malware framework, container runtime, or production multi-tenant isolation boundary.
+`security-lab` is a correctness-first systems-security laboratory. Milestone 1 established a bounded Linux process sandbox; Milestone 2 sealed ambient descriptor, launch, filesystem/identity, stdio, redirection, and bounded-capture authority; Milestone 3 sealed PID-tree lifecycle ownership plus a launcher-owned monotonic wall-clock deadline; Milestones 4B–4C added isolated Linux network and IPC namespace baselines. Milestone 4D added an **owned UTS identity boundary** with a validated launcher-installed sandbox hostname. The current Milestone 5A candidate adds **masked seccomp syscall-argument filtering**: policy may narrow an already-allowed syscall by numeric 64-bit argument values, and the x86_64 cBPF program enforces those constraints before allowing the call. The project is **not** a penetration-testing toolkit, malware framework, container runtime, or production multi-tenant isolation boundary.
 
 ## Current sandbox pipeline
 
@@ -14,7 +14,7 @@ The Linux x86_64 implementation launches one direct target under an explicit pol
 6. **PID-namespace lifecycle split** forks the first process in the new PID namespace as launcher-owned PID 1. That init forks the direct target as PID 2. PID 1 stays outside target stdio/rlimit/capability/seccomp setup.
 7. **Optional deadline supervision** after forking the target, PID 1 closes inherited setup descriptors, opens a pidfd for the direct target, creates and arms a `CLOCK_MONOTONIC` timerfd, and polls pidfd + timerfd. The timer starts at this supervision point; it is not a claim about total host-side launch latency before the target fork.
 8. **Deterministic deadline race** whenever supervision wakes, PID 1 first performs one `wait4(target, WNOHANG)`. If the direct target is already waitable, natural termination wins. Otherwise, when the timer is readable, deadline ownership begins; PID 1 sends `SIGKILL` to the direct target and the result is reported as `ChildOutcome::TimedOut`, not as an ordinary target signal.
-9. **Target enforcement** the direct target alone applies explicit stdio, rlimits, capability reduction, `no_new_privs`, default-deny seccomp, and pinned `execveat`. Launcher namespace/deadline operations are not silently added to the target syscall allowlist. A policy may explicitly grant target `socket`/`connect`, but those syscalls execute inside the isolated network namespace.
+9. **Target enforcement** the direct target alone applies explicit stdio, rlimits, capability reduction, `no_new_privs`, default-deny seccomp, and pinned `execveat`. Optional `seccomp.arg.<syscall>.<0..5>` rules further narrow already-allowed syscalls with full 64-bit masked-equality checks. Launcher namespace/deadline operations are not silently added to the target syscall allowlist. A policy may explicitly grant target `socket`/`connect`, but those syscalls execute inside the isolated network namespace.
 10. **Owned process-tree teardown** after natural target termination or deadline termination, PID 1 repeatedly sends `SIGKILL` to remaining namespace processes and reaps children with `wait4` until `ECHILD`. It then publishes raw target wait status, timeout ownership, and the number of additional descendants reaped.
 11. **Bounded stdout capture** the host parent drains capture before waiting for bootstrap completion, retains only the declared byte ceiling, and discards excess bytes. A deadline can still fire while that host drain is blocking because deadline enforcement lives in PID 1; killing/reaping the target tree closes remaining capture writers and lets EOF converge.
 12. **Reporting** `run_report()` returns `Exited(code)`, `Signaled(signal)`, or `TimedOut`, plus captured stdout and `reaped_descendants`. The compatibility `run()` path returns the same `ChildOutcome`. The CLI maps `TimedOut` to exit status 124.
@@ -30,6 +30,7 @@ For successful launch on a supported Linux x86_64 host:
 - SysV IPC identifiers/keys are resolved inside the target IPC namespace rather than the host IPC namespace; a host-created message queue is not discoverable by the same key from the target.
 - The target does not share the host network namespace. The launcher does not configure a network attachment in the new namespace, so host loopback listeners are not the target's loopback listeners.
 - Target socket authority remains explicit at the syscall layer: `socket` and `connect` are available only when the policy names them. Network namespace creation is launcher management and does not itself widen target seccomp.
+- A `seccomp.arg.<syscall>.<index>` rule can only narrow a syscall already present in `seccomp.allow`. On Linux x86_64, each rule applies `(argument & mask) == value` to the full 64-bit numeric argument; a mismatch returns `EPERM`.
 - Launcher-owned PID 1 supervises the direct target as PID 2 and owns descendant teardown.
 - If no wall-clock deadline is declared, natural completion semantics remain unchanged.
 - If a wall-clock deadline is declared, the runtime preflights required pidfd/timerfd kernel support before launch. Unsupported or denied mandatory mechanisms return an explicit unsupported/setup failure rather than silently dropping the deadline.
@@ -52,6 +53,8 @@ Standard-descriptor modes are:
 - `capture`: stdout only; requires `stdio.stdout_capture_bytes` in the range 1–16 MiB.
 
 `identity.hostname` is required. It must contain 1–63 ASCII bytes using letters, digits, `-`, or `.`, with an alphanumeric first and last byte. The launcher installs this value as the sandbox UTS nodename before the untrusted target starts.
+
+Optional syscall-argument rules use `seccomp.arg.<syscall>.<0..5> = <mask>:<value>`. Mask/value integers may be decimal or `0x` hexadecimal. The syscall must also appear in `seccomp.allow`, the mask must be non-zero, `value` may not set bits outside the mask, and the launcher-critical `execveat`, `exit`, and `exit_group` syscalls may not receive argument rules. At most 64 argument rules are accepted.
 
 `limit.wall_clock_milliseconds` is optional. When present it must be an integer from 1 through 86,400,000 and enables launcher-owned monotonic deadline enforcement.
 
@@ -99,6 +102,7 @@ Linux x86_64 integration tests prove that:
 - a host `127.0.0.1` TCP listener is first proven reachable from the host process, then a raw sandbox target is explicitly granted `socket`, `connect`, `close`, and `exit` and attempts the same host loopback port from the new network namespace; only network-stack unreachable/refused results are accepted, while seccomp `EPERM` or a successful cross-namespace connection fails the fixture;
 - the host creates a real SysV message queue under an explicit key and proves host lookup returns that queue ID; a raw sandbox target explicitly granted `msgget` looks up the same key inside the new IPC namespace and must receive `ENOENT`. A visible host queue or seccomp `EPERM` fails the fixture;
 - required hostname parsing rejects missing, duplicate, empty, oversized, underscore-containing, and leading/trailing punctuation values; a raw target explicitly granted `uname` observes the exact policy hostname while the trusted parent proves `/proc/sys/kernel/hostname` is byte-for-byte unchanged before and after sandbox execution;
+- a raw target exercises one `lseek` syscall under `seccomp.arg.lseek.1 = 0xffffffff0000000f:0x0000000100000008`: offset `0x0000000112345678` succeeds, while a low masked-bit mismatch (`...79`) and a high-32-bit mismatch (`0x00000002...78`) each receive seccomp `EPERM`, proving both halves of the 64-bit argument are enforced;
 - zero, oversized, and duplicate wall-clock deadline declarations are rejected; a valid millisecond deadline parses exactly;
 - inherited high-FD, stdio, filesystem, scratch, redirection, bounded-capture, capability, rlimit, `no_new_privs`, launch-error, and exit-vs-signal regressions remain active;
 - a raw target observes `getpid() == 2` and `getppid() == 1`;
@@ -130,7 +134,8 @@ This remains an educational sandbox, not a production container boundary. In par
 - the IPC namespace isolates SysV IPC and POSIX message-queue namespace membership, but it does not revoke IPC channels deliberately exposed through inherited file descriptors/sockets/pipes;
 - the UTS slice controls and proves only the sandbox nodename (`identity.hostname`); it does not expose a policy for NIS/domainname or claim a broader machine-identity service;
 - a cgroup namespace is not yet created, and aggregate cgroup controller enforcement remains blocked by missing unprivileged delegation on the current CI runner;
-- there is no device namespace, syscall argument filtering, persistent data-volume policy, or configured network endpoint policy;
+- seccomp argument rules currently support masked equality over the six numeric 64-bit syscall argument slots only. Classic seccomp does not dereference pointers, so this is not pathname/string-content filtering, a pointer-target integrity guarantee, range/relational matching, or a TOCTOU solution;
+- there is no device namespace, persistent data-volume policy, or configured network endpoint policy;
 - root revalidation is an identity check, not an immutable/cryptographic snapshot of the whole subtree;
 - supplementary groups are not claimed to be empty, persistent executable allowlisting is not provided, and multi-architecture seccomp/side-channel resistance are out of scope;
 - `RLIMIT_AS` is not cgroup-like physical-memory accounting, and `RLIMIT_FSIZE` does not limit pipe/terminal/captured output.

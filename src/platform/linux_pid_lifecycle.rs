@@ -224,11 +224,7 @@ unsafe fn fail(launch_error: *mut LaunchErrorRecord, phase: u32) -> ! {
     fail_errno(launch_error, phase, *libc::__errno_location())
 }
 
-unsafe fn fail_errno(
-    launch_error: *mut LaunchErrorRecord,
-    phase: u32,
-    errno: i32,
-) -> ! {
+unsafe fn fail_errno(launch_error: *mut LaunchErrorRecord, phase: u32, errno: i32) -> ! {
     ptr::write_volatile(ptr::addr_of_mut!((*launch_error).errno), errno);
     ptr::write_volatile(ptr::addr_of_mut!((*launch_error).phase), phase);
     raw_exit(127)

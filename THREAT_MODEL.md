@@ -1,17 +1,18 @@
-# Milestones 1–4C threat model
+# Milestones 1–4D threat model
 
 ## Purpose
 
-`security-lab` is an educational, correctness-first Linux sandbox. Milestone 1 established syscall/resource/environment controls; Milestone 2 sealed descriptor, launch, filesystem/identity, stdio, redirection, and bounded-capture authority; Milestone 3 sealed PID-tree lifecycle ownership plus a policy-owned monotonic wall-clock deadline; Milestone 4B added an isolated network namespace baseline. The current Milestone 4C candidate adds an isolated IPC namespace baseline. Every claimed property must correspond to a kernel mechanism and executable evidence.
+`security-lab` is an educational, correctness-first Linux sandbox. Milestone 1 established syscall/resource/environment controls; Milestone 2 sealed descriptor, launch, filesystem/identity, stdio, redirection, and bounded-capture authority; Milestone 3 sealed PID-tree lifecycle ownership plus a policy-owned monotonic wall-clock deadline; Milestones 4B–4C added isolated network and IPC namespace baselines. The current Milestone 4D candidate adds launcher-owned UTS nodename identity. Every claimed property must correspond to a kernel mechanism and executable evidence.
 
 ## Protected boundary
 
-The trusted host parent launches one direct target through launcher-owned bootstrap and namespace-init processes. On supported Linux x86_64, the launcher constrains initial filesystem visibility/mutability, namespace identity, network- and IPC-namespace membership, capabilities, target syscalls, selected resources, environment, cwd, inherited descriptors, stdio, bounded capture, process-tree lifecycle, and—when declared—a wall-clock execution deadline while preserving fail-closed launch/lifecycle reporting.
+The trusted host parent launches one direct target through launcher-owned bootstrap and namespace-init processes. On supported Linux x86_64, the launcher constrains initial filesystem visibility/mutability, namespace identity including a policy-owned UTS nodename, network/IPC/UTS namespace membership, capabilities, target syscalls, selected resources, environment, cwd, inherited descriptors, stdio, bounded capture, process-tree lifecycle, and—when declared—a wall-clock execution deadline while preserving fail-closed launch/lifecycle reporting.
 
 ## Security properties claimed
 
 - **Pinned root/cwd/target:** configured sandbox paths are fail-closed; the initial executable is pinned and launched with `execveat(AT_EMPTY_PATH)`.
-- **User/mount/PID/network/IPC namespace isolation:** namespace UID/GID 0 map only to the launching effective UID/GID; mount propagation is private; launcher-owned PID 1 parents the direct target as PID 2; the target executes in distinct network and IPC namespaces rather than sharing those host namespaces.
+- **User/mount/PID/network/IPC/UTS namespace isolation:** namespace UID/GID 0 map only to the launching effective UID/GID; mount propagation is private; launcher-owned PID 1 parents the direct target as PID 2; the target executes in distinct network, IPC, and UTS namespaces rather than sharing those host namespaces.
+- **Owned UTS nodename:** `identity.hostname` is required and fail-closed validated to 1–63 ASCII bytes. The trusted launcher installs it with `sethostname` inside the new UTS namespace before capability clearing and target seccomp.
 - **SysV IPC visibility boundary:** message-queue keys/IDs are resolved in the target IPC namespace. Host SysV queues are not discoverable by the same key from the target after `CLONE_NEWIPC`.
 - **No implicit network attachment:** the launcher creates `CLONE_NEWNET` but does not create a veth, install routes, configure DNS, or connect the namespace to a host bridge. Host loopback is therefore not the target's loopback stack.
 - **Filesystem mutability/path boundary:** the revalidated root is recursively cloned/read-only, optional scratch is private `nosuid,nodev,noexec` tmpfs, and the target is chrooted into the constructed root.
@@ -27,7 +28,7 @@ The trusted host parent launches one direct target through launcher-owned bootst
 
 ## Network namespace semantics
 
-The launcher calls `unshare(CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWNET | CLONE_NEWIPC)` in one fail-closed namespace transition. If that transition is denied or unsupported, launch fails rather than retrying without any requested mandatory namespace boundary.
+The launcher calls `unshare(CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWNET | CLONE_NEWIPC | CLONE_NEWUTS)` in one fail-closed namespace transition. If that transition is denied or unsupported, launch fails rather than retrying without any mandatory namespace boundary.
 
 The launcher does not configure the new network namespace. The target therefore does not share host routes, interfaces, or host loopback listeners. This is a **network isolation baseline**, not an endpoint-routing policy. If future work adds controlled connectivity, that must introduce explicit topology/route/endpoint policy plus executable interop evidence rather than weakening this invariant implicitly.
 
@@ -39,11 +40,17 @@ The target later drops effective/permitted/inheritable capabilities before exec.
 
 This baseline does not claim a general IPC policy. Pipes, Unix sockets, eventfds, memfds, or other objects deliberately exposed through inherited descriptors remain object capabilities governed by the descriptor/stdio policy rather than by `CLONE_NEWIPC`.
 
+## UTS identity semantics
+
+`identity.hostname` is a required launcher-owned nodename, not a target request to call `sethostname`. The policy parser accepts only 1–63 ASCII bytes containing letters, digits, `-`, or `.`, and rejects leading/trailing `-` or `.`. The parent prepares the bytes before fork. After the combined namespace transition and UID/GID map setup, the trusted launcher calls `sethostname` while it still has the user-namespace authority required for setup; target capabilities are cleared and target seccomp is installed later.
+
+Executable evidence uses raw `uname` in the target to compare `utsname.nodename` with the policy value. The trusted parent independently reads `/proc/sys/kernel/hostname` before and after the run and requires it to remain exactly unchanged. This slice does **not** claim policy control of NIS/domainname or any broader host identity service.
+
 ## Deadline and lifecycle orchestration
 
 Potentially allocating policy data, argv/envp, seccomp instructions, pinned descriptors, shared lifecycle state, and capture-pipe creation occur before the initial host `fork`.
 
-The launcher creates user/mount/PID/network/IPC namespaces and filesystem state, then forks launcher-owned namespace PID 1. PID 1 forks the direct target as PID 2. The target alone receives target stdio/rlimit/capability/seccomp setup; PID 1 closes inherited descriptors >= 3 so it cannot keep launcher capture writers alive.
+The launcher creates user/mount/PID/network/IPC/UTS namespaces, installs the policy UTS nodename, and constructs filesystem state before it forks launcher-owned namespace PID 1. PID 1 forks the direct target as PID 2. The target alone receives target stdio/rlimit/capability/seccomp setup; PID 1 closes inherited descriptors >= 3 so it cannot keep launcher capture writers alive.
 
 If no deadline is declared, PID 1 uses the existing blocking direct-target wait. If a deadline is declared, PID 1 opens a pidfd for the already-forked target, creates a `TFD_CLOEXEC` timerfd using `CLOCK_MONOTONIC`, arms it for the validated interval, and polls the pidfd and timerfd. These descriptors are created after target fork and are never inherited by the target.
 
@@ -64,7 +71,8 @@ This sandbox is **not** a production multi-tenant container boundary. It does no
 - deliberate selected non-stdio descriptor passing or a general arbitrary FD-remapping language;
 - persistence of private-scratch redirect output after the mount namespace disappears;
 - a general policy that forbids all IPC object types or revokes descriptor-based IPC deliberately exposed to the target;
-- UTS or cgroup namespaces;
+- policy control of UTS domainname/NIS domain or a general machine-identity service;
+- a cgroup namespace or aggregate cgroup controller boundary on the current non-delegated runner;
 - a device namespace, syscall argument filtering, persistent data-volume policy, or immutable/cryptographic root-subtree snapshot;
 - persistent executable allowlisting, multi-architecture seccomp, side-channel resistance, or protection from sufficiently privileged external ptrace/signal interference.
 
@@ -91,6 +99,7 @@ Evidence includes:
 - exact allowed/denied syscall behavior and fail-closed malformed policy handling;
 - a host `127.0.0.1` TCP listener that is first proven reachable from the host process, followed by a raw sandbox target explicitly granted `socket`, `connect`, `close`, and `exit` attempting the same port. The raw target accepts only `ECONNREFUSED`, `ENETUNREACH`, or `EHOSTUNREACH`; seccomp `EPERM` and successful host-listener reachability both fail the test;
 - a host-created SysV message queue whose explicit key is first proven visible from the host; a raw target explicitly granted `msgget` must receive `ENOENT` for that same key inside the IPC namespace. Seeing the host queue or receiving seccomp `EPERM` fails the test;
+- required `identity.hostname` parser regressions plus a raw target explicitly granted `uname` observing the exact configured nodename while the trusted parent verifies the host hostname is unchanged before/after execution;
 - all Milestones 1–3B descriptor, stdio, filesystem, capability, rlimit, launch-error, capture, PID identity, descendant cleanup, timeout, and exit-vs-signal regressions;
 - a raw deadline target that writes an exact stdout marker, forks a descendant that remains in `pause()`, and is preempted by a 1,000 ms policy deadline while a fast target under 5,000 ms still preserves `Exited(42)`.
 
@@ -98,10 +107,10 @@ CI explicitly enables the user-namespace settings required by its disposable Ubu
 
 ## Failure semantics
 
-Invalid policy is rejected before launch. Namespace creation, deadline support preflight, pidfd creation, timer creation/arming, supervision poll, namespace/bootstrap/init forks, descriptor cleanup, capture reads, mount/capability/seccomp setup, process-tree kill/reap, lifecycle publication, and target exec failures are terminal. A failed network/IPC namespace transition is part of the same mandatory namespace failure path and never falls back to the corresponding host namespace.
+Invalid policy is rejected before launch. Namespace creation, UTS hostname installation, deadline support preflight, pidfd creation, timer creation/arming, supervision poll, namespace/bootstrap/init forks, descriptor cleanup, capture reads, mount/capability/seccomp setup, process-tree kill/reap, lifecycle publication, and target exec failures are terminal. A failed network/IPC/UTS namespace transition or hostname installation never falls back to the corresponding host namespace/identity.
 
 ## Phase promotion
 
 Milestone 3 is sealed: the launcher owns PID namespace init, descendant cleanup, bounded runtime termination, and explicit timeout reporting.
 
-Milestone 4A cgroup-v2 aggregate process accounting remains blocked by missing unprivileged delegation on the current GitHub-hosted runner. Milestone 4B is complete on `main` with host-network-namespace separation. The current 4C frontier adds independent IPC-namespace separation with a real SysV visibility oracle. After 4C integrates, do not farm additional IPC-key variants; either return to 4A when delegated cgroup-v2 evidence becomes available, or promote to another independently executable namespace/control-plane frontier such as an owned UTS identity boundary.
+Milestone 4A cgroup-v2 aggregate process accounting remains blocked by missing unprivileged delegation on the current GitHub-hosted runner. Milestones 4B and 4C are complete on `main` with network- and IPC-namespace separation. The current 4D frontier owns the sandbox UTS nodename through required policy, trusted `sethostname`, raw `uname` evidence, and host-identity non-mutation evidence. After 4D integrates, do not farm hostname syntax aliases or domainname variants. The next promotion should target a materially different remaining boundary, with supplementary-group isolation and seccomp syscall-argument filtering both requiring architecture review before implementation.

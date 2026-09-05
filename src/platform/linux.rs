@@ -193,7 +193,8 @@ mod x86_64 {
     impl PreparedLaunch {
         fn new(policy: &SandboxPolicy) -> Result<Self, SandboxError> {
             let root_fd = open_root(&policy.root_dir)?;
-            let root_path = cstring_bytes("filesystem.root", policy.root_dir.as_os_str().as_bytes())?;
+            let root_path =
+                cstring_bytes("filesystem.root", policy.root_dir.as_os_str().as_bytes())?;
             let cwd_check = open_beneath_root(
                 root_fd.raw(),
                 &policy.working_dir,
@@ -746,19 +747,11 @@ mod x86_64 {
     ) {
         let mut pinned = std::mem::zeroed::<libc::stat>();
         if libc::fstat(pinned_root_fd, &mut pinned) == -1 {
-            child_fail(
-                launch_error,
-                PHASE_ROOT_REVALIDATE,
-                error_exit_syscall,
-            );
+            child_fail(launch_error, PHASE_ROOT_REVALIDATE, error_exit_syscall);
         }
         let mut current = std::mem::zeroed::<libc::stat>();
         if libc::fstat(current_root_fd, &mut current) == -1 {
-            child_fail(
-                launch_error,
-                PHASE_ROOT_REVALIDATE,
-                error_exit_syscall,
-            );
+            child_fail(launch_error, PHASE_ROOT_REVALIDATE, error_exit_syscall);
         }
         if pinned.st_dev != current.st_dev || pinned.st_ino != current.st_ino {
             child_fail_errno(

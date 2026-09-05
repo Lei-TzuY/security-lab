@@ -20,6 +20,19 @@ pub struct ResourceLimits {
     pub open_files: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StdioMode {
+    Inherit,
+    Closed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StdioPolicy {
+    pub stdin: StdioMode,
+    pub stdout: StdioMode,
+    pub stderr: StdioMode,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SeccompPolicy {
     /// Syscall names allowed by the policy. Every other syscall is denied with
@@ -43,6 +56,8 @@ pub struct SandboxPolicy {
     /// Maximum byte size of the private tmpfs. Must be present exactly when
     /// `scratch_dir` is present.
     pub scratch_bytes: Option<u64>,
+    /// Explicit disposition for descriptors 0, 1, and 2.
+    pub stdio: StdioPolicy,
     pub limits: ResourceLimits,
     pub seccomp: SeccompPolicy,
 }
@@ -201,6 +216,9 @@ impl FromStr for SandboxPolicy {
         let mut working_dir = None;
         let mut scratch_dir = None;
         let mut scratch_bytes = None;
+        let mut stdin = None;
+        let mut stdout = None;
+        let mut stderr = None;
         let mut cpu_seconds = None;
         let mut address_space_bytes = None;
         let mut file_size_bytes = None;
@@ -232,6 +250,24 @@ impl FromStr for SandboxPolicy {
                 "executable" => set_once(&mut executable, value.to_owned(), line_no, key)?,
                 "arg" => args.push(value.to_owned()),
                 "working_dir" => set_once(&mut working_dir, value.to_owned(), line_no, key)?,
+                "stdio.stdin" => set_once(
+                    &mut stdin,
+                    parse_stdio_mode(value, line_no, key)?,
+                    line_no,
+                    key,
+                )?,
+                "stdio.stdout" => set_once(
+                    &mut stdout,
+                    parse_stdio_mode(value, line_no, key)?,
+                    line_no,
+                    key,
+                )?,
+                "stdio.stderr" => set_once(
+                    &mut stderr,
+                    parse_stdio_mode(value, line_no, key)?,
+                    line_no,
+                    key,
+                )?,
                 "limit.cpu_seconds" => set_once(
                     &mut cpu_seconds,
                     parse_u64(value, line_no, key)?,
@@ -313,6 +349,11 @@ impl FromStr for SandboxPolicy {
             working_dir: PathBuf::from(required(working_dir, "working_dir")?),
             scratch_dir: scratch_dir.map(PathBuf::from),
             scratch_bytes,
+            stdio: StdioPolicy {
+                stdin: required(stdin, "stdio.stdin")?,
+                stdout: required(stdout, "stdio.stdout")?,
+                stderr: required(stderr, "stdio.stderr")?,
+            },
             limits: ResourceLimits {
                 cpu_seconds: required(cpu_seconds, "limit.cpu_seconds")?,
                 address_space_bytes: required(address_space_bytes, "limit.address_space_bytes")?,
@@ -347,6 +388,17 @@ fn parse_u64(value: &str, line: usize, key: &str) -> Result<u64, PolicyError> {
     value
         .parse::<u64>()
         .map_err(|_| PolicyError::at(line, format!("{key} must be an unsigned integer")))
+}
+
+fn parse_stdio_mode(value: &str, line: usize, key: &str) -> Result<StdioMode, PolicyError> {
+    match value {
+        "inherit" => Ok(StdioMode::Inherit),
+        "closed" => Ok(StdioMode::Closed),
+        _ => Err(PolicyError::at(
+            line,
+            format!("{key} must be either inherit or closed"),
+        )),
+    }
 }
 
 fn validate_absolute_path(label: &str, path: &Path) -> Result<(), PolicyError> {
@@ -389,6 +441,9 @@ mod tests {
         arg = hello
         env.LANG = C
         working_dir = /tmp
+        stdio.stdin = closed
+        stdio.stdout = inherit
+        stdio.stderr = inherit
         limit.cpu_seconds = 1
         limit.address_space_bytes = 268435456
         limit.file_size_bytes = 1048576
@@ -404,6 +459,9 @@ mod tests {
         assert_eq!(policy.scratch_bytes, Some(16 * 1024 * 1024));
         assert_eq!(policy.executable, PathBuf::from("/bin/echo"));
         assert_eq!(policy.args, ["hello"]);
+        assert_eq!(policy.stdio.stdin, StdioMode::Closed);
+        assert_eq!(policy.stdio.stdout, StdioMode::Inherit);
+        assert_eq!(policy.stdio.stderr, StdioMode::Inherit);
         assert_eq!(
             policy.environment.get("LANG").map(String::as_str),
             Some("C")
@@ -421,6 +479,20 @@ mod tests {
     fn rejects_missing_security_field() {
         let text = VALID.replace("filesystem.root = /", "");
         assert!(text.parse::<SandboxPolicy>().is_err());
+    }
+
+    #[test]
+    fn rejects_missing_stdio_disposition() {
+        let text = VALID.replace("stdio.stderr = inherit\n", "");
+        let err = text.parse::<SandboxPolicy>().unwrap_err();
+        assert!(err.to_string().contains("stdio.stderr"));
+    }
+
+    #[test]
+    fn rejects_unknown_stdio_disposition() {
+        let text = VALID.replace("stdio.stdin = closed", "stdio.stdin = magic");
+        let err = text.parse::<SandboxPolicy>().unwrap_err();
+        assert!(err.to_string().contains("inherit or closed"));
     }
 
     #[test]

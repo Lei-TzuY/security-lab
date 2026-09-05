@@ -1,6 +1,9 @@
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 
-use security_lab::{run, ChildOutcome, ResourceLimits, SandboxError, SandboxPolicy, SeccompPolicy};
+use security_lab::{
+    run, ChildOutcome, ResourceLimits, SandboxError, SandboxPolicy, SeccompPolicy, StdioMode,
+    StdioPolicy,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -46,6 +49,11 @@ fn policy(mode: &str, extra_args: &[&str], syscalls: &[&str]) -> SandboxPolicy {
         working_dir: PathBuf::from("/work"),
         scratch_dir: Some(PathBuf::from("/scratch")),
         scratch_bytes: Some(SCRATCH_BYTES),
+        stdio: StdioPolicy {
+            stdin: StdioMode::Inherit,
+            stdout: StdioMode::Inherit,
+            stderr: StdioMode::Inherit,
+        },
         limits: ResourceLimits {
             cpu_seconds: 2,
             address_space_bytes: 128 * 1024 * 1024,
@@ -107,6 +115,9 @@ fn malformed_policy_is_rejected() {
         filesystem.root = /
         executable = /bin/true
         working_dir = /tmp
+        stdio.stdin = closed
+        stdio.stdout = inherit
+        stdio.stderr = inherit
         limit.cpu_seconds = 1
         limit.address_space_bytes = 100000000
         limit.file_size_bytes = 1000000
@@ -173,6 +184,30 @@ fn inherited_non_stdio_descriptor_does_not_survive_exec() {
     }
 
     assert_eq!(result.unwrap(), ChildOutcome::Exited(0));
+}
+
+#[test]
+fn explicitly_closed_stdio_is_unusable_after_exec() {
+    let mut closed = policy("O", &[], &["execveat", "fcntl", "exit"]);
+    closed.stdio = StdioPolicy {
+        stdin: StdioMode::Closed,
+        stdout: StdioMode::Closed,
+        stderr: StdioMode::Closed,
+    };
+
+    assert_eq!(run(&closed).unwrap(), ChildOutcome::Exited(0));
+}
+
+#[test]
+fn selective_stdout_inheritance_matches_policy() {
+    let mut selective = policy("T", &[], &["execveat", "fcntl", "write", "exit"]);
+    selective.stdio = StdioPolicy {
+        stdin: StdioMode::Closed,
+        stdout: StdioMode::Inherit,
+        stderr: StdioMode::Closed,
+    };
+
+    assert_eq!(run(&selective).unwrap(), ChildOutcome::Exited(0));
 }
 
 #[test]

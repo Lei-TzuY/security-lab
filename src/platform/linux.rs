@@ -9,6 +9,7 @@ pub(crate) fn run(
 
 #[cfg(target_arch = "x86_64")]
 mod x86_64 {
+    use crate::policy::{StdioMode, StdioPolicy};
     use crate::{ChildOutcome, PolicyError, ResourceLimits, SandboxError, SandboxPolicy};
     use std::ffi::CString;
     use std::io;
@@ -301,7 +302,15 @@ mod x86_64 {
         }
 
         if pid == 0 {
-            unsafe { child_exec(&prepared, policy.limits, &seccomp, launch_state.record) }
+            unsafe {
+                child_exec(
+                    &prepared,
+                    policy.stdio,
+                    policy.limits,
+                    &seccomp,
+                    launch_state.record,
+                )
+            }
         }
 
         let status = wait_for_child(pid)?;
@@ -496,6 +505,7 @@ mod x86_64 {
 
     unsafe fn child_exec(
         prepared: &PreparedLaunch,
+        stdio: StdioPolicy,
         limits: ResourceLimits,
         seccomp: &CompiledSeccomp,
         launch_error: *mut LaunchErrorRecord,
@@ -541,8 +551,6 @@ mod x86_64 {
                 seccomp.error_exit_syscall,
             );
         }
-
-        reject_directory_stdio_or_fail(launch_error, seccomp.error_exit_syscall);
 
         let current_root_how = OpenHow {
             flags: (libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
@@ -677,6 +685,8 @@ mod x86_64 {
             child_fail(launch_error, PHASE_FD_SANITIZE, seccomp.error_exit_syscall);
         }
 
+        apply_stdio_policy_or_fail(stdio, launch_error, seccomp.error_exit_syscall);
+
         set_limit_or_fail(
             libc::RLIMIT_CPU,
             limits.cpu_seconds,
@@ -806,21 +816,37 @@ mod x86_64 {
         }
     }
 
-    unsafe fn reject_directory_stdio_or_fail(
+    unsafe fn apply_stdio_policy_or_fail(
+        stdio: StdioPolicy,
         launch_error: *mut LaunchErrorRecord,
         error_exit_syscall: libc::c_long,
     ) {
-        for fd in 0..=2 {
-            let mut stat = std::mem::zeroed::<libc::stat>();
-            if libc::fstat(fd, &mut stat) == -1 {
-                let errno = *libc::__errno_location();
-                if errno == libc::EBADF {
-                    continue;
+        let modes = [stdio.stdin, stdio.stdout, stdio.stderr];
+        for (fd, mode) in modes.into_iter().enumerate() {
+            let fd = fd as RawFd;
+            match mode {
+                StdioMode::Closed => {
+                    if libc::close(fd) == -1 {
+                        let errno = *libc::__errno_location();
+                        if errno != libc::EBADF {
+                            child_fail_errno(launch_error, PHASE_STDIO, errno, error_exit_syscall);
+                        }
+                    }
                 }
-                child_fail_errno(launch_error, PHASE_STDIO, errno, error_exit_syscall);
-            }
-            if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
-                child_fail_errno(launch_error, PHASE_STDIO, libc::EISDIR, error_exit_syscall);
+                StdioMode::Inherit => {
+                    let mut stat = std::mem::zeroed::<libc::stat>();
+                    if libc::fstat(fd, &mut stat) == -1 {
+                        child_fail(launch_error, PHASE_STDIO, error_exit_syscall);
+                    }
+                    if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
+                        child_fail_errno(
+                            launch_error,
+                            PHASE_STDIO,
+                            libc::EISDIR,
+                            error_exit_syscall,
+                        );
+                    }
+                }
             }
         }
     }
@@ -976,7 +1002,7 @@ mod x86_64 {
             PHASE_UID_MAP => "uid_map",
             PHASE_GID_MAP => "gid_map",
             PHASE_MOUNT_PRIVATE => "mount propagation isolation",
-            PHASE_STDIO => "stdio directory escape check",
+            PHASE_STDIO => "explicit stdio disposition",
             PHASE_ROOT_CLONE => "detached root mount clone",
             PHASE_ROOT_READONLY => "recursive read-only root attributes",
             PHASE_ROOT_ATTACH => "read-only root mount attachment",

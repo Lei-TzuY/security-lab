@@ -10,7 +10,9 @@ pub mod report;
 use std::error::Error;
 use std::fmt;
 
-pub use policy::{PolicyError, ResourceLimits, SandboxPolicy, SeccompPolicy};
+pub use policy::{
+    PolicyError, ResourceLimits, SandboxPolicy, SeccompPolicy, StdioMode, StdioPolicy,
+};
 pub use report::ChildOutcome;
 
 #[derive(Debug)]

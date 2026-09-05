@@ -1,12 +1,12 @@
-# Milestones 1–4D threat model
+# Milestones 1–5A threat model
 
 ## Purpose
 
-`security-lab` is an educational, correctness-first Linux sandbox. Milestone 1 established syscall/resource/environment controls; Milestone 2 sealed descriptor, launch, filesystem/identity, stdio, redirection, and bounded-capture authority; Milestone 3 sealed PID-tree lifecycle ownership plus a policy-owned monotonic wall-clock deadline; Milestones 4B–4C added isolated network and IPC namespace baselines. The current Milestone 4D candidate adds launcher-owned UTS nodename identity. Every claimed property must correspond to a kernel mechanism and executable evidence.
+`security-lab` is an educational, correctness-first Linux sandbox. Milestone 1 established syscall/resource/environment controls; Milestone 2 sealed descriptor, launch, filesystem/identity, stdio, redirection, and bounded-capture authority; Milestone 3 sealed PID-tree lifecycle ownership plus a policy-owned monotonic wall-clock deadline; Milestones 4B–4C added isolated network and IPC namespace baselines. Milestone 4D added launcher-owned UTS nodename identity. The current Milestone 5A candidate adds masked numeric syscall-argument constraints to the default-deny seccomp boundary. Every claimed property must correspond to a kernel mechanism and executable evidence.
 
 ## Protected boundary
 
-The trusted host parent launches one direct target through launcher-owned bootstrap and namespace-init processes. On supported Linux x86_64, the launcher constrains initial filesystem visibility/mutability, namespace identity including a policy-owned UTS nodename, network/IPC/UTS namespace membership, capabilities, target syscalls, selected resources, environment, cwd, inherited descriptors, stdio, bounded capture, process-tree lifecycle, and—when declared—a wall-clock execution deadline while preserving fail-closed launch/lifecycle reporting.
+The trusted host parent launches one direct target through launcher-owned bootstrap and namespace-init processes. On supported Linux x86_64, the launcher constrains initial filesystem visibility/mutability, namespace identity including a policy-owned UTS nodename, network/IPC/UTS namespace membership, capabilities, target syscall numbers and selected numeric syscall arguments, selected resources, environment, cwd, inherited descriptors, stdio, bounded capture, process-tree lifecycle, and—when declared—a wall-clock execution deadline while preserving fail-closed launch/lifecycle reporting.
 
 ## Security properties claimed
 
@@ -23,6 +23,7 @@ The trusted host parent launches one direct target through launcher-owned bootst
 - **Deterministic timeout race:** each PID1 supervision wake performs `wait4(target, WNOHANG)` first. If target status is already available, natural termination wins. If the timer is readable and the target is not yet waitable, deadline ownership wins from that point forward.
 - **Distinct timeout result:** once deadline ownership wins, PID 1 uses `SIGKILL` to terminate the direct target, but shared lifecycle state marks the event and the host reports `ChildOutcome::TimedOut`.
 - **No target-policy widening:** namespace management, pidfd/timerfd/poll, mounts, capture/remapping, and teardown execute in trusted launcher processes outside target seccomp. `socket` and `connect` are target syscalls only when the policy explicitly names them.
+- **Masked syscall-argument narrowing:** an argument rule applies only to a syscall already in `seccomp.allow`. Linux x86_64 cBPF evaluates the selected `seccomp_data.args[]` slot as two 32-bit words and requires the complete 64-bit `(argument & mask) == value` condition before returning `ALLOW`; a mismatch returns `EPERM`.
 - **Owned launch-error reporting:** pre-exec phase+errno travels through shared anonymous memory and does not depend on target stdout/stderr or a target `write` grant.
 - **Fail-closed enforcement:** failed/unsupported mandatory mechanisms or incomplete lifecycle readiness never trigger unrestricted retry or successful fallback.
 
@@ -45,6 +46,14 @@ This baseline does not claim a general IPC policy. Pipes, Unix sockets, eventfds
 `identity.hostname` is a required launcher-owned nodename, not a target request to call `sethostname`. The policy parser accepts only 1–63 ASCII bytes containing letters, digits, `-`, or `.`, and rejects leading/trailing `-` or `.`. The parent prepares the bytes before fork. After the combined namespace transition and UID/GID map setup, the trusted launcher calls `sethostname` while it still has the user-namespace authority required for setup; target capabilities are cleared and target seccomp is installed later.
 
 Executable evidence uses raw `uname` in the target to compare `utsname.nodename` with the policy value. The trusted parent independently reads `/proc/sys/kernel/hostname` before and after the run and requires it to remain exactly unchanged. This slice does **not** claim policy control of NIS/domainname or any broader host identity service.
+
+## Seccomp argument semantics
+
+Milestone 5A extends the existing syscall-number allowlist with optional `seccomp.arg.<syscall>.<0..5> = <mask>:<value>` rules. Rules only narrow already-allowed syscalls; they never introduce a syscall that is absent from `seccomp.allow`. Policy validation requires a non-zero mask, requires `value` to contain no bits outside that mask, rejects duplicate syscall/argument pairs, and forbids rules on launcher-critical `execveat`, `exit`, and `exit_group`.
+
+On Linux x86_64 the classic-BPF compiler reads both 32-bit words of each selected 64-bit `seccomp_data.args[]` slot. A masked low-word mismatch or high-word mismatch returns `EPERM`; all declared argument rules for the matched syscall must pass before `ALLOW`. The executable oracle deliberately uses `lseek` argument 1 with mask `0xffffffff0000000f`, proving one matching offset succeeds while independent low-bit and high-32-bit mismatches are denied.
+
+This mechanism compares numeric syscall arguments only. Classic seccomp cannot safely dereference a pathname, socket-address, or other pointer supplied by the target, so Milestone 5A does not claim pointed-to data inspection, pathname-content policy, range/relational predicates, or elimination of pointer-related TOCTOU hazards.
 
 ## Deadline and lifecycle orchestration
 
@@ -73,7 +82,8 @@ This sandbox is **not** a production multi-tenant container boundary. It does no
 - a general policy that forbids all IPC object types or revokes descriptor-based IPC deliberately exposed to the target;
 - policy control of UTS domainname/NIS domain or a general machine-identity service;
 - a cgroup namespace or aggregate cgroup controller boundary on the current non-delegated runner;
-- a device namespace, syscall argument filtering, persistent data-volume policy, or immutable/cryptographic root-subtree snapshot;
+- seccomp predicates beyond masked equality on numeric syscall argument values, including pointer-target/string inspection, range/relational matching, or pathname-content policy;
+- a device namespace, persistent data-volume policy, or immutable/cryptographic root-subtree snapshot;
 - persistent executable allowlisting, multi-architecture seccomp, side-channel resistance, or protection from sufficiently privileged external ptrace/signal interference.
 
 ## Cgroup-v2 blocker evidence
@@ -100,6 +110,7 @@ Evidence includes:
 - a host `127.0.0.1` TCP listener that is first proven reachable from the host process, followed by a raw sandbox target explicitly granted `socket`, `connect`, `close`, and `exit` attempting the same port. The raw target accepts only `ECONNREFUSED`, `ENETUNREACH`, or `EHOSTUNREACH`; seccomp `EPERM` and successful host-listener reachability both fail the test;
 - a host-created SysV message queue whose explicit key is first proven visible from the host; a raw target explicitly granted `msgget` must receive `ENOENT` for that same key inside the IPC namespace. Seeing the host queue or receiving seccomp `EPERM` fails the test;
 - required `identity.hostname` parser regressions plus a raw target explicitly granted `uname` observing the exact configured nodename while the trusted parent verifies the host hostname is unchanged before/after execution;
+- masked seccomp argument-rule parser/validator regressions plus a raw `lseek` oracle whose allowed offset matches the declared low/high 64-bit mask while separate low-bit and high-32-bit mismatches both return `EPERM`;
 - all Milestones 1–3B descriptor, stdio, filesystem, capability, rlimit, launch-error, capture, PID identity, descendant cleanup, timeout, and exit-vs-signal regressions;
 - a raw deadline target that writes an exact stdout marker, forks a descendant that remains in `pause()`, and is preempted by a 1,000 ms policy deadline while a fast target under 5,000 ms still preserves `Exited(42)`.
 
@@ -113,4 +124,4 @@ Invalid policy is rejected before launch. Namespace creation, UTS hostname insta
 
 Milestone 3 is sealed: the launcher owns PID namespace init, descendant cleanup, bounded runtime termination, and explicit timeout reporting.
 
-Milestone 4A cgroup-v2 aggregate process accounting remains blocked by missing unprivileged delegation on the current GitHub-hosted runner. Milestones 4B and 4C are complete on `main` with network- and IPC-namespace separation. The current 4D frontier owns the sandbox UTS nodename through required policy, trusted `sethostname`, raw `uname` evidence, and host-identity non-mutation evidence. After 4D integrates, do not farm hostname syntax aliases or domainname variants. The next promotion should target a materially different remaining boundary, with supplementary-group isolation and seccomp syscall-argument filtering both requiring architecture review before implementation.
+Milestone 4A cgroup-v2 aggregate process accounting remains blocked by missing unprivileged delegation on the current GitHub-hosted runner. Milestones 4B–4D are complete on `main`, including network/IPC namespace separation and launcher-owned UTS nodename identity. The current Milestone 5A frontier increases seccomp precision from syscall-number allowlisting to evidence-backed masked equality on full 64-bit numeric arguments. After 5A integrates, do not farm copied predicates across more syscalls. Supplementary-group clearing remains a separate architecture problem under the current unprivileged `setgroups=deny`/`gid_map` flow; other promotions should introduce a materially different object-authority, controlled-connectivity, persistence, or lifecycle boundary.

@@ -93,7 +93,7 @@ Boundary: 4C establishes SysV IPC/POSIX message-queue namespace separation. It d
 
 ### Slice 4D — owned UTS identity
 
-**Current verified candidate.** Make sandbox nodename identity explicit and launcher-owned rather than inheriting the host hostname into an otherwise isolated environment.
+**Status: complete on `main`.** Makes sandbox nodename identity explicit and launcher-owned rather than inheriting the host hostname into an otherwise isolated environment.
 
 Acceptance evidence is executable:
 
@@ -109,8 +109,29 @@ Boundary: 4D owns the sandbox UTS **nodename** only. It is not a general machine
 
 ### Milestone 4 promotion rule
 
-After 4D integrates, do not farm hostname aliases, punctuation variants, or domainname copies. Return to 4A only when real unprivileged cgroup-v2 delegation becomes available. Otherwise select a materially different executable boundary after architecture audit; high-value candidates include enforcing/observing an empty supplementary-group set or introducing narrowly-scoped seccomp syscall-argument filtering with deterministic allow/deny evidence.
+Milestone 4B–4D namespace/identity baselines are sealed on `main`; do not farm more loopback keys, SysV queue variants, or hostname syntax copies. Milestone 4A remains blocked until the runtime user receives a real delegated writable cgroup-v2 subtree.
+
+## Milestone 5 — syscall semantic precision
+
+### Slice 5A — masked seccomp syscall-argument filtering
+
+**Current verified candidate.** Extend default-deny seccomp from syscall-number allowlisting to optional masked equality over selected numeric syscall arguments without widening launcher management authority.
+
+Acceptance evidence is executable:
+
+- policy accepts `seccomp.arg.<syscall>.<0..5> = <mask>:<value>` using decimal or `0x` hexadecimal integers;
+- rules can only narrow syscalls already present in `seccomp.allow`, masks must be non-zero, values may not set bits outside the mask, duplicate syscall/argument rules are rejected, and no more than 64 rules are accepted;
+- `execveat`, `exit`, and `exit_group` cannot receive argument rules, preserving pinned target start and fail-closed post-filter termination;
+- the Linux x86_64 cBPF compiler checks both 32-bit words of the selected 64-bit `seccomp_data.args[]` slot and requires every declared rule for a matched syscall before returning `ALLOW`;
+- a raw `lseek` target under mask `0xffffffff0000000f` accepts offset `0x0000000112345678`, rejects a low masked-bit mismatch, and separately rejects a high-32-bit mismatch with seccomp `EPERM`;
+- all Milestones 1–4D regressions, stable format/Clippy/full tests, and the full Rust 1.74 suite remain green.
+
+Boundary: 5A is masked equality on numeric syscall argument values. Classic seccomp does not dereference target pointers, so this is not pathname/string-content inspection, range/relational policy, or a pointer TOCTOU solution.
+
+### Milestone 5 promotion rule
+
+After 5A integrates, do not farm identical argument masks across unrelated syscalls. Promote only when a new policy primitive or cross-layer integration is justified by a concrete authority boundary and executable evidence. Supplementary-group clearing requires a different user-namespace mapping architecture under the current nonprivileged `setgroups=deny` flow; 4A remains blocked on cgroup delegation.
 
 ## Later frontiers
 
-External asynchronous cancellation, selected-handle passing, syscall-argument filtering, supplementary-group isolation, broader persistent-volume policy, and controlled networking remain separate evidence-backed frontiers. Do not add configuration-only names without executable kernel behavior and integration evidence.
+External asynchronous cancellation, selected-handle passing, supplementary-group isolation with a viable mapping architecture, broader persistent-volume policy, and controlled networking remain separate evidence-backed frontiers. Do not add configuration-only names without executable kernel behavior and integration evidence.

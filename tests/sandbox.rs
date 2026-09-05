@@ -2,6 +2,7 @@
 
 use security_lab::{run, ChildOutcome, ResourceLimits, SandboxError, SandboxPolicy, SeccompPolicy};
 use std::collections::{BTreeMap, BTreeSet};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command};
 use std::sync::OnceLock;
@@ -102,6 +103,67 @@ fn setup_failure_never_falls_back_to_execution() {
     let error = run(&failing).unwrap_err();
     assert!(matches!(error, SandboxError::SetupFailed(_)));
     assert!(!marker.exists(), "child ran despite setup failure");
+}
+
+#[test]
+fn inherited_non_stdio_descriptor_does_not_survive_exec() {
+    let source = unsafe {
+        libc::open(
+            b"/dev/null\0".as_ptr() as *const libc::c_char,
+            libc::O_RDONLY,
+        )
+    };
+    assert!(source >= 0, "open /dev/null failed");
+    let inherited = unsafe { libc::fcntl(source, libc::F_DUPFD, 200) };
+    unsafe {
+        libc::close(source);
+    }
+    assert!(inherited >= 200, "failed to create inheritable high descriptor");
+
+    let flags = unsafe { libc::fcntl(inherited, libc::F_GETFD) };
+    assert!(flags >= 0);
+    assert_eq!(
+        flags & libc::FD_CLOEXEC,
+        0,
+        "test descriptor must start inheritable"
+    );
+
+    let descriptor = inherited.to_string();
+    let result = run(&policy(
+        "D",
+        &[&descriptor],
+        &["execve", "fcntl", "exit"],
+    ));
+    unsafe {
+        libc::close(inherited);
+    }
+
+    assert_eq!(result.unwrap(), ChildOutcome::Exited(0));
+}
+
+#[test]
+fn exec_failure_is_reported_after_descriptor_sanitization() {
+    let script = std::env::temp_dir().join(format!(
+        "security-lab-missing-interpreter-{}-{}",
+        process::id(),
+        unique_suffix()
+    ));
+    std::fs::write(&script, b"#!/definitely/missing/security-lab-interpreter\n")
+        .expect("write executable fixture");
+    let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&script, permissions).unwrap();
+
+    let mut failing = policy(
+        "A",
+        &[],
+        &["execve", "write", "exit", "exit_group"],
+    );
+    failing.executable = script.clone();
+    let result = run(&failing);
+    let _ = std::fs::remove_file(&script);
+
+    assert!(matches!(result, Err(SandboxError::SetupFailed(_))));
 }
 
 #[test]

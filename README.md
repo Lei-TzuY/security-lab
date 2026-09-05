@@ -8,21 +8,22 @@ The sandbox launches exactly one child process described by an explicit policy. 
 
 1. **Policy layer** (`src/policy.rs`) parses and validates a platform-neutral policy representation. Unknown keys, duplicate singleton keys, missing required security fields, malformed environment names, relative executable/cwd paths, and malformed syscall names fail closed.
 2. **Sandbox setup layer** (`src/platform/linux.rs`) preflights the executable/cwd, applies resource limits, sets Linux `PR_SET_NO_NEW_PRIVS`, and installs a seccomp-BPF filter.
-3. **Child execution** uses the exact executable and argument vector from the policy. The environment is cleared and rebuilt only from policy entries; the working directory is fixed by policy.
+3. **Child execution** starts the exact executable and argument vector from the policy. The environment is cleared and rebuilt only from policy entries; the working directory is fixed by policy.
 4. **Result reporting** (`src/report.rs`) distinguishes normal exit codes from signal termination. Setup/enforcement failures are returned as errors and never trigger an unrestricted retry.
-5. **Tests** exercise allowed execution, syscall denial, malformed policy rejection, fail-closed setup, exit/signal reporting, environment sanitization, cwd control, `RLIMIT_NOFILE`, and `no_new_privs`.
+5. **Tests** use a statically linked, raw-syscall x86_64 fixture (`tests/fixtures/probe.S`) so each security test has a small, auditable syscall profile rather than depending on hidden glibc/Rust-runtime startup behavior.
 
 ## Security invariants
 
 For a successful `run(policy)` on supported Linux x86_64 systems:
 
-- The child executable and argv are exactly those in the validated policy; callers cannot override them at launch time.
+- The **initial child launch** uses exactly the executable path and argv in the validated policy; callers cannot override them at launch time.
 - The inherited environment is discarded before the child starts. Only explicitly listed variables are restored.
 - The child starts in the policy's absolute working directory.
-- `RLIMIT_CPU`, `RLIMIT_AS`, `RLIMIT_FSIZE`, and `RLIMIT_NOFILE` are set to the policy values before `execve`.
-- `PR_SET_NO_NEW_PRIVS=1` is set before `execve`, preventing later `execve` from gaining privilege through set-user-ID/set-group-ID bits or file capabilities.
+- `RLIMIT_CPU`, `RLIMIT_AS`, `RLIMIT_FSIZE`, and `RLIMIT_NOFILE` soft and hard limits are set to the policy values before `execve`.
+- `PR_SET_NO_NEW_PRIVS=1` is set before `execve`, preventing later exec from gaining privilege through set-user-ID/set-group-ID bits or file capabilities.
 - A classic seccomp-BPF filter checks the x86_64 audit architecture, allows only named syscalls in the policy, and returns `EPERM` for every other syscall.
 - If architecture checking fails, the process is killed rather than executing under a filter compiled for the wrong ABI.
+- Unknown Linux x86_64 syscall names are rejected before the child executes.
 - If preflight, rlimit, `no_new_privs`, seccomp installation, or exec setup fails, launch fails. There is no fallback path that reruns the child without restrictions.
 - Unsupported platforms return an explicit `UnsupportedPlatform` error; they are never reported as successfully sandboxed.
 
@@ -52,9 +53,27 @@ The CLI prints `sandbox-result: exited code=N` or `sandbox-result: signaled sign
 
 ### Syscall policy behavior
 
-Milestone 1 deliberately uses an allowlist, not a denylist. The filter is installed before `execve`, so a usable policy must allow `execve` and every syscall needed by the target program and its dynamic loader. Unknown syscall names are rejected by the Linux x86_64 enforcement layer before launch. Any syscall not on the allowlist receives `EPERM`.
+Milestone 1 deliberately uses an allowlist, not a denylist. The filter is installed before the initial `execve`, so a usable policy must allow `execve` and every syscall needed by the target program and, for dynamically linked programs, its loader. Unknown syscall names are rejected by the Linux x86_64 enforcement layer before launch. Any syscall not on the allowlist receives `EPERM`.
 
-This is intentionally unforgiving: if a binary needs a syscall that was not granted, the correct outcome is failure, not silent widening of the policy.
+Because `execve` must be allowed for the initial transition into the target image, **Milestone 1 does not claim that the target is unable to perform a later `execve`**. The launcher controls the initial executable/argv; persistent executable-identity confinement is a later milestone and needs a stronger mechanism than this syscall-number-only filter.
+
+This policy is intentionally unforgiving: if a binary needs a syscall that was not granted, the correct outcome is failure, not silent widening of the policy.
+
+## Test evidence
+
+Linux x86_64 integration tests prove that:
+
+- an `execve/write/exit` profile can complete an allowed operation;
+- raw `getpid` receives `-EPERM` when it is absent from the allowlist;
+- malformed policy and unknown syscall names are rejected;
+- an invalid working directory prevents child execution and never falls back to an unrestricted launch;
+- exit code 42 and SIGTERM termination are reported distinctly;
+- inherited `PATH` is absent while an explicitly granted environment variable is present;
+- the child observes the configured working directory;
+- all four configured rlimits can be read back with the expected soft/hard values, and `RLIMIT_NOFILE` produces `EMFILE` under pressure;
+- the child observes `PR_GET_NO_NEW_PRIVS == 1`.
+
+The fixture is assembled during the supported integration tests with the system `cc` using `-nostdlib -static`; it contains no libc or Rust runtime. A native Linux x86_64 C toolchain is therefore required to run those integration tests locally.
 
 ## Platform support
 
@@ -62,7 +81,7 @@ Real enforcement is implemented only for **Linux x86_64** in Milestone 1. Other 
 
 ## What this is not
 
-This milestone does **not** claim container-grade isolation. In particular, it does not create user/mount/PID/network namespaces, a new root filesystem, bind-mount policy, Landlock rules, cgroups, capability bounding-set management, network policy, filesystem path allowlists, device isolation, or protection from a hostile same-UID parent/debugger. `working_dir` changes the starting directory; it is not filesystem confinement.
+This milestone does **not** claim container-grade isolation. In particular, it does not create user/mount/PID/network namespaces, a new root filesystem, bind-mount policy, Landlock rules, cgroups, capability bounding-set management, network policy, filesystem path allowlists, device isolation, or protection from a hostile same-UID parent/debugger. `working_dir` changes the starting directory; it is not filesystem confinement. It also does not prevent a policy that permits `execve` from using that syscall again after the initial launch.
 
 See [THREAT_MODEL.md](THREAT_MODEL.md) for the complete threat model and limitations.
 

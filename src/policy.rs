@@ -27,9 +27,13 @@ pub struct SeccompPolicy {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxPolicy {
+    /// Host path pinned as the sandbox filesystem root before fork.
+    pub root_dir: PathBuf,
+    /// Absolute path interpreted inside `root_dir`.
     pub executable: PathBuf,
     pub args: Vec<String>,
     pub environment: BTreeMap<String, String>,
+    /// Absolute path interpreted inside `root_dir`.
     pub working_dir: PathBuf,
     pub limits: ResourceLimits,
     pub seccomp: SeccompPolicy,
@@ -71,6 +75,7 @@ impl Error for PolicyError {}
 
 impl SandboxPolicy {
     pub fn validate(&self) -> Result<(), PolicyError> {
+        validate_absolute_path("filesystem.root", &self.root_dir)?;
         validate_absolute_path("executable", &self.executable)?;
         validate_absolute_path("working_dir", &self.working_dir)?;
 
@@ -154,6 +159,7 @@ impl FromStr for SandboxPolicy {
     type Err = PolicyError;
 
     fn from_str(input: &str) -> Result<Self, Self::Err> {
+        let mut root_dir = None;
         let mut executable = None;
         let mut args = Vec::new();
         let mut environment = BTreeMap::new();
@@ -178,6 +184,7 @@ impl FromStr for SandboxPolicy {
             let value = raw_value.trim();
 
             match key {
+                "filesystem.root" => set_once(&mut root_dir, value.to_owned(), line_no, key)?,
                 "executable" => set_once(&mut executable, value.to_owned(), line_no, key)?,
                 "arg" => args.push(value.to_owned()),
                 "working_dir" => set_once(&mut working_dir, value.to_owned(), line_no, key)?,
@@ -255,6 +262,7 @@ impl FromStr for SandboxPolicy {
         }
 
         let policy = Self {
+            root_dir: PathBuf::from(required(root_dir, "filesystem.root")?),
             executable: PathBuf::from(required(executable, "executable")?),
             args,
             environment,
@@ -328,6 +336,7 @@ mod tests {
     use super::*;
 
     const VALID: &str = r#"
+        filesystem.root = /
         executable = /bin/echo
         arg = hello
         env.LANG = C
@@ -336,19 +345,20 @@ mod tests {
         limit.address_space_bytes = 268435456
         limit.file_size_bytes = 1048576
         limit.open_files = 32
-        seccomp.allow = execve,read,write,exit_group
+        seccomp.allow = execveat,read,write,exit_group
     "#;
 
     #[test]
     fn parses_complete_policy() {
         let policy: SandboxPolicy = VALID.parse().unwrap();
+        assert_eq!(policy.root_dir, PathBuf::from("/"));
         assert_eq!(policy.executable, PathBuf::from("/bin/echo"));
         assert_eq!(policy.args, ["hello"]);
         assert_eq!(
             policy.environment.get("LANG").map(String::as_str),
             Some("C")
         );
-        assert!(policy.seccomp.allowed_syscalls.contains("execve"));
+        assert!(policy.seccomp.allowed_syscalls.contains("execveat"));
     }
 
     #[test]
@@ -359,7 +369,13 @@ mod tests {
 
     #[test]
     fn rejects_missing_security_field() {
-        let text = VALID.replace("limit.open_files = 32", "");
+        let text = VALID.replace("filesystem.root = /", "");
+        assert!(text.parse::<SandboxPolicy>().is_err());
+    }
+
+    #[test]
+    fn rejects_relative_root() {
+        let text = VALID.replace("filesystem.root = /", "filesystem.root = sandbox-root");
         assert!(text.parse::<SandboxPolicy>().is_err());
     }
 
@@ -372,8 +388,8 @@ mod tests {
     #[test]
     fn rejects_duplicate_syscall() {
         let text = VALID.replace(
-            "execve,read,write,exit_group",
-            "execve,read,read,exit_group",
+            "execveat,read,write,exit_group",
+            "execveat,read,read,exit_group",
         );
         assert!(text.parse::<SandboxPolicy>().is_err());
     }

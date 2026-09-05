@@ -11,10 +11,10 @@ pub(crate) fn run(
 mod x86_64 {
     use crate::{ChildOutcome, PolicyError, ResourceLimits, SandboxError, SandboxPolicy};
     use std::ffi::CString;
-    use std::fs;
     use std::io;
     use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::io::RawFd;
+    use std::path::{Path, PathBuf};
     use std::ptr;
 
     const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
@@ -30,21 +30,80 @@ mod x86_64 {
     const CLOSE_RANGE_CLOEXEC: libc::c_uint = 1 << 2;
     const FIRST_NON_STDIO_FD: libc::c_uint = 3;
 
-    const PHASE_CHDIR: u32 = 1;
-    const PHASE_FD_SANITIZE: u32 = 2;
-    const PHASE_RLIMIT_CPU: u32 = 3;
-    const PHASE_RLIMIT_AS: u32 = 4;
-    const PHASE_RLIMIT_FSIZE: u32 = 5;
-    const PHASE_RLIMIT_NOFILE: u32 = 6;
-    const PHASE_NO_NEW_PRIVS: u32 = 7;
-    const PHASE_SECCOMP: u32 = 8;
-    const PHASE_EXECVE: u32 = 9;
+    const RESOLVE_NO_XDEV: u64 = 0x01;
+    const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
+    const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+    const RESOLVE_BENEATH: u64 = 0x08;
+    const AT_EMPTY_PATH: libc::c_int = 0x1000;
+
+    const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+    const PR_CAPBSET_DROP: libc::c_int = 24;
+    const PR_CAP_AMBIENT: libc::c_int = 47;
+    const PR_CAP_AMBIENT_CLEAR_ALL: libc::c_ulong = 4;
+
+    const PHASE_NAMESPACE: u32 = 1;
+    const PHASE_SETGROUPS: u32 = 2;
+    const PHASE_UID_MAP: u32 = 3;
+    const PHASE_GID_MAP: u32 = 4;
+    const PHASE_MOUNT_PRIVATE: u32 = 5;
+    const PHASE_STDIO: u32 = 6;
+    const PHASE_ROOT_FCHDIR: u32 = 7;
+    const PHASE_CHROOT: u32 = 8;
+    const PHASE_CWD_FCHDIR: u32 = 9;
+    const PHASE_FD_SANITIZE: u32 = 10;
+    const PHASE_RLIMIT_CPU: u32 = 11;
+    const PHASE_RLIMIT_AS: u32 = 12;
+    const PHASE_RLIMIT_FSIZE: u32 = 13;
+    const PHASE_RLIMIT_NOFILE: u32 = 14;
+    const PHASE_CAP_BOUNDING: u32 = 15;
+    const PHASE_CAP_AMBIENT: u32 = 16;
+    const PHASE_CAP_CURRENT: u32 = 17;
+    const PHASE_NO_NEW_PRIVS: u32 = 18;
+    const PHASE_SECCOMP: u32 = 19;
+    const PHASE_EXECVEAT: u32 = 20;
 
     #[repr(C)]
     #[derive(Clone, Copy)]
     struct LaunchErrorRecord {
         errno: i32,
         phase: u32,
+    }
+
+    #[repr(C)]
+    struct OpenHow {
+        flags: u64,
+        mode: u64,
+        resolve: u64,
+    }
+
+    #[repr(C)]
+    struct CapabilityHeader {
+        version: u32,
+        pid: i32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct CapabilityData {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
+
+    struct OwnedFd(RawFd);
+
+    impl OwnedFd {
+        fn raw(&self) -> RawFd {
+            self.0
+        }
+    }
+
+    impl Drop for OwnedFd {
+        fn drop(&mut self) {
+            unsafe {
+                libc::close(self.0);
+            }
+        }
     }
 
     struct SharedLaunchState {
@@ -95,20 +154,36 @@ mod x86_64 {
     }
 
     struct PreparedLaunch {
-        executable: CString,
-        working_dir: CString,
+        root_fd: OwnedFd,
+        cwd_fd: OwnedFd,
+        executable_fd: OwnedFd,
+        _argv0: CString,
         _args: Vec<CString>,
         _environment: Vec<CString>,
         argv: Vec<*const libc::c_char>,
         envp: Vec<*const libc::c_char>,
+        uid_map: Vec<u8>,
+        gid_map: Vec<u8>,
     }
 
     impl PreparedLaunch {
         fn new(policy: &SandboxPolicy) -> Result<Self, SandboxError> {
-            let executable = cstring_bytes("executable", policy.executable.as_os_str().as_bytes())?;
-            let working_dir =
-                cstring_bytes("working_dir", policy.working_dir.as_os_str().as_bytes())?;
+            let root_fd = open_root(&policy.root_dir)?;
+            let cwd_fd = open_beneath_root(
+                root_fd.raw(),
+                &policy.working_dir,
+                (libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
+                "working directory",
+            )?;
+            let executable_fd = open_beneath_root(
+                root_fd.raw(),
+                &policy.executable,
+                (libc::O_PATH | libc::O_CLOEXEC) as u64,
+                "executable",
+            )?;
+            validate_executable_fd(executable_fd.raw(), &policy.executable)?;
 
+            let argv0 = cstring_bytes("executable", policy.executable.as_os_str().as_bytes())?;
             let mut args = Vec::with_capacity(policy.args.len());
             for arg in &policy.args {
                 args.push(cstring_bytes("argument", arg.as_bytes())?);
@@ -121,7 +196,7 @@ mod x86_64 {
             }
 
             let mut argv = Vec::with_capacity(args.len() + 2);
-            argv.push(executable.as_ptr());
+            argv.push(argv0.as_ptr());
             argv.extend(args.iter().map(|arg| arg.as_ptr()));
             argv.push(ptr::null());
 
@@ -129,13 +204,20 @@ mod x86_64 {
             envp.extend(environment.iter().map(|entry| entry.as_ptr()));
             envp.push(ptr::null());
 
+            let uid_map = format!("0 {} 1\n", unsafe { libc::geteuid() }).into_bytes();
+            let gid_map = format!("0 {} 1\n", unsafe { libc::getegid() }).into_bytes();
+
             Ok(Self {
-                executable,
-                working_dir,
+                root_fd,
+                cwd_fd,
+                executable_fd,
+                _argv0: argv0,
                 _args: args,
                 _environment: environment,
                 argv,
                 envp,
+                uid_map,
+                gid_map,
             })
         }
     }
@@ -146,7 +228,7 @@ mod x86_64 {
     }
 
     pub(crate) fn run(policy: &SandboxPolicy) -> Result<ChildOutcome, SandboxError> {
-        preflight(policy)?;
+        ensure_fd_sanitization_supported()?;
         let prepared = PreparedLaunch::new(policy)?;
         let seccomp = compile_seccomp(policy)?;
         let launch_state = SharedLaunchState::new()?;
@@ -166,7 +248,7 @@ mod x86_64 {
         let status = wait_for_child(pid)?;
         let launch_error = launch_state.snapshot();
         if launch_error.phase != 0 {
-            return Err(SandboxError::SetupFailed(format_launch_error(launch_error)));
+            return decode_launch_error(launch_error);
         }
 
         decode_wait_status(status)
@@ -180,40 +262,100 @@ mod x86_64 {
         })
     }
 
-    fn preflight(policy: &SandboxPolicy) -> Result<(), SandboxError> {
-        let executable = fs::metadata(&policy.executable).map_err(|err| {
-            SandboxError::SetupFailed(format!(
-                "cannot inspect executable {}: {err}",
-                policy.executable.display()
+    fn sandbox_relative(path: &Path) -> Result<CString, SandboxError> {
+        let relative = path.strip_prefix(Path::new("/")).map_err(|_| {
+            SandboxError::InvalidPolicy(PolicyError::new(
+                "sandbox paths must be absolute",
             ))
         })?;
-        if !executable.is_file() {
-            return Err(SandboxError::SetupFailed(format!(
-                "executable is not a regular file: {}",
-                policy.executable.display()
-            )));
-        }
-        if executable.permissions().mode() & 0o111 == 0 {
-            return Err(SandboxError::SetupFailed(format!(
-                "executable has no execute bit: {}",
-                policy.executable.display()
-            )));
-        }
+        let relative = if relative.as_os_str().is_empty() {
+            PathBuf::from(".")
+        } else {
+            relative.to_path_buf()
+        };
+        cstring_bytes("sandbox path", relative.as_os_str().as_bytes())
+    }
 
-        let working_dir = fs::metadata(&policy.working_dir).map_err(|err| {
+    fn open_root(path: &Path) -> Result<OwnedFd, SandboxError> {
+        let path = cstring_bytes("filesystem.root", path.as_os_str().as_bytes())?;
+        let how = OpenHow {
+            flags: (libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
+            mode: 0,
+            resolve: RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS,
+        };
+        match openat2(libc::AT_FDCWD, &path, &how) {
+            Ok(fd) => Ok(OwnedFd(fd)),
+            Err(err) if matches!(err.raw_os_error(), Some(libc::ENOSYS | libc::EINVAL)) => {
+                Err(SandboxError::UnsupportedPlatform(format!(
+                    "filesystem confinement requires Linux openat2 support: {err}"
+                )))
+            }
+            Err(err) => Err(SandboxError::SetupFailed(format!(
+                "cannot pin filesystem.root without symlink traversal: {err}"
+            ))),
+        }
+    }
+
+    fn open_beneath_root(
+        root_fd: RawFd,
+        path: &Path,
+        flags: u64,
+        label: &str,
+    ) -> Result<OwnedFd, SandboxError> {
+        let path = sandbox_relative(path)?;
+        let how = OpenHow {
+            flags,
+            mode: 0,
+            resolve: RESOLVE_BENEATH
+                | RESOLVE_NO_XDEV
+                | RESOLVE_NO_MAGICLINKS
+                | RESOLVE_NO_SYMLINKS,
+        };
+        openat2(root_fd, &path, &how).map(OwnedFd).map_err(|err| {
             SandboxError::SetupFailed(format!(
-                "cannot inspect working directory {}: {err}",
-                policy.working_dir.display()
+                "cannot pin sandbox {label} beneath filesystem.root: {err}"
             ))
-        })?;
-        if !working_dir.is_dir() {
+        })
+    }
+
+    fn openat2(dirfd: RawFd, path: &CString, how: &OpenHow) -> io::Result<RawFd> {
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_openat2,
+                dirfd,
+                path.as_ptr(),
+                how as *const OpenHow,
+                std::mem::size_of::<OpenHow>(),
+            )
+        };
+        if result == -1 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(result as RawFd)
+        }
+    }
+
+    fn validate_executable_fd(fd: RawFd, path: &Path) -> Result<(), SandboxError> {
+        let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
+        if unsafe { libc::fstat(fd, &mut stat) } == -1 {
             return Err(SandboxError::SetupFailed(format!(
-                "working_dir is not a directory: {}",
-                policy.working_dir.display()
+                "cannot inspect pinned executable {}: {}",
+                path.display(),
+                io::Error::last_os_error()
             )));
         }
-
-        ensure_fd_sanitization_supported()?;
+        if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+            return Err(SandboxError::SetupFailed(format!(
+                "sandbox executable is not a regular file: {}",
+                path.display()
+            )));
+        }
+        if stat.st_mode & 0o111 == 0 {
+            return Err(SandboxError::SetupFailed(format!(
+                "sandbox executable has no execute bit: {}",
+                path.display()
+            )));
+        }
         Ok(())
     }
 
@@ -254,9 +396,9 @@ mod x86_64 {
             )));
         };
 
-        if !policy.seccomp.allowed_syscalls.contains("execve") {
+        if !policy.seccomp.allowed_syscalls.contains("execveat") {
             return Err(SandboxError::InvalidPolicy(PolicyError::new(
-                "seccomp allowlist must include execve so the requested child can start",
+                "seccomp allowlist must include execveat so the pinned child can start",
             )));
         }
 
@@ -301,8 +443,74 @@ mod x86_64 {
         seccomp: &CompiledSeccomp,
         launch_error: *mut LaunchErrorRecord,
     ) -> ! {
-        if libc::chdir(prepared.working_dir.as_ptr()) == -1 {
-            child_fail(launch_error, PHASE_CHDIR, seccomp.error_exit_syscall);
+        if libc::syscall(
+            libc::SYS_unshare,
+            libc::CLONE_NEWUSER | libc::CLONE_NEWNS,
+        ) == -1
+        {
+            child_fail(launch_error, PHASE_NAMESPACE, seccomp.error_exit_syscall);
+        }
+
+        write_proc_file_or_fail(
+            b"/proc/self/setgroups\0",
+            b"deny\n",
+            launch_error,
+            PHASE_SETGROUPS,
+            seccomp.error_exit_syscall,
+        );
+        write_proc_file_or_fail(
+            b"/proc/self/uid_map\0",
+            &prepared.uid_map,
+            launch_error,
+            PHASE_UID_MAP,
+            seccomp.error_exit_syscall,
+        );
+        write_proc_file_or_fail(
+            b"/proc/self/gid_map\0",
+            &prepared.gid_map,
+            launch_error,
+            PHASE_GID_MAP,
+            seccomp.error_exit_syscall,
+        );
+
+        if libc::syscall(
+            libc::SYS_mount,
+            ptr::null::<libc::c_char>(),
+            b"/\0".as_ptr().cast::<libc::c_char>(),
+            ptr::null::<libc::c_char>(),
+            (libc::MS_REC | libc::MS_PRIVATE) as libc::c_ulong,
+            ptr::null::<libc::c_void>(),
+        ) == -1
+        {
+            child_fail(
+                launch_error,
+                PHASE_MOUNT_PRIVATE,
+                seccomp.error_exit_syscall,
+            );
+        }
+
+        reject_directory_stdio_or_fail(launch_error, seccomp.error_exit_syscall);
+
+        if libc::syscall(libc::SYS_fchdir, prepared.root_fd.raw()) == -1 {
+            child_fail(
+                launch_error,
+                PHASE_ROOT_FCHDIR,
+                seccomp.error_exit_syscall,
+            );
+        }
+        if libc::syscall(
+            libc::SYS_chroot,
+            b".\0".as_ptr().cast::<libc::c_char>(),
+        ) == -1
+        {
+            child_fail(launch_error, PHASE_CHROOT, seccomp.error_exit_syscall);
+        }
+        if libc::syscall(libc::SYS_fchdir, prepared.cwd_fd.raw()) == -1 {
+            child_fail(
+                launch_error,
+                PHASE_CWD_FCHDIR,
+                seccomp.error_exit_syscall,
+            );
         }
 
         if libc::syscall(
@@ -344,7 +552,9 @@ mod x86_64 {
             seccomp.error_exit_syscall,
         );
 
-        if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == -1 {
+        drop_capabilities_or_fail(launch_error, seccomp.error_exit_syscall);
+
+        if libc::syscall(libc::SYS_prctl, libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == -1 {
             child_fail(launch_error, PHASE_NO_NEW_PRIVS, seccomp.error_exit_syscall);
         }
 
@@ -352,21 +562,94 @@ mod x86_64 {
             len: seccomp.filter.len() as u16,
             filter: seccomp.filter.as_ptr() as *mut libc::sock_filter,
         };
-        if libc::prctl(
+        if libc::syscall(
+            libc::SYS_prctl,
             libc::PR_SET_SECCOMP,
             SECCOMP_MODE_FILTER,
             &program as *const libc::sock_fprog,
+            0,
+            0,
         ) == -1
         {
             child_fail(launch_error, PHASE_SECCOMP, seccomp.error_exit_syscall);
         }
 
-        libc::execve(
-            prepared.executable.as_ptr(),
+        libc::syscall(
+            libc::SYS_execveat,
+            prepared.executable_fd.raw(),
+            b"\0".as_ptr().cast::<libc::c_char>(),
             prepared.argv.as_ptr(),
             prepared.envp.as_ptr(),
+            AT_EMPTY_PATH,
         );
-        child_fail(launch_error, PHASE_EXECVE, seccomp.error_exit_syscall)
+        child_fail(launch_error, PHASE_EXECVEAT, seccomp.error_exit_syscall)
+    }
+
+    unsafe fn write_proc_file_or_fail(
+        path: &'static [u8],
+        data: &[u8],
+        launch_error: *mut LaunchErrorRecord,
+        phase: u32,
+        error_exit_syscall: libc::c_long,
+    ) {
+        let fd = libc::syscall(
+            libc::SYS_openat,
+            libc::AT_FDCWD,
+            path.as_ptr().cast::<libc::c_char>(),
+            libc::O_WRONLY | libc::O_CLOEXEC,
+            0,
+        );
+        if fd == -1 {
+            child_fail(launch_error, phase, error_exit_syscall);
+        }
+
+        let fd = fd as RawFd;
+        let mut offset = 0usize;
+        while offset < data.len() {
+            let written = libc::syscall(
+                libc::SYS_write,
+                fd,
+                data.as_ptr().add(offset),
+                data.len() - offset,
+            );
+            if written == -1 {
+                let errno = *libc::__errno_location();
+                libc::syscall(libc::SYS_close, fd);
+                child_fail_errno(launch_error, phase, errno, error_exit_syscall);
+            }
+            if written == 0 {
+                libc::syscall(libc::SYS_close, fd);
+                child_fail_errno(launch_error, phase, libc::EIO, error_exit_syscall);
+            }
+            offset += written as usize;
+        }
+        if libc::syscall(libc::SYS_close, fd) == -1 {
+            child_fail(launch_error, phase, error_exit_syscall);
+        }
+    }
+
+    unsafe fn reject_directory_stdio_or_fail(
+        launch_error: *mut LaunchErrorRecord,
+        error_exit_syscall: libc::c_long,
+    ) {
+        for fd in 0..=2 {
+            let mut stat = std::mem::zeroed::<libc::stat>();
+            if libc::fstat(fd, &mut stat) == -1 {
+                let errno = *libc::__errno_location();
+                if errno == libc::EBADF {
+                    continue;
+                }
+                child_fail_errno(launch_error, PHASE_STDIO, errno, error_exit_syscall);
+            }
+            if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
+                child_fail_errno(
+                    launch_error,
+                    PHASE_STDIO,
+                    libc::EISDIR,
+                    error_exit_syscall,
+                );
+            }
+        }
     }
 
     unsafe fn set_limit_or_fail(
@@ -385,12 +668,94 @@ mod x86_64 {
         }
     }
 
+    unsafe fn drop_capabilities_or_fail(
+        launch_error: *mut LaunchErrorRecord,
+        error_exit_syscall: libc::c_long,
+    ) {
+        for capability in 0..=64u64 {
+            if libc::syscall(
+                libc::SYS_prctl,
+                PR_CAPBSET_DROP,
+                capability,
+                0,
+                0,
+                0,
+            ) == -1
+            {
+                let errno = *libc::__errno_location();
+                if errno == libc::EINVAL {
+                    break;
+                }
+                child_fail_errno(
+                    launch_error,
+                    PHASE_CAP_BOUNDING,
+                    errno,
+                    error_exit_syscall,
+                );
+            }
+        }
+
+        if libc::syscall(
+            libc::SYS_prctl,
+            PR_CAP_AMBIENT,
+            PR_CAP_AMBIENT_CLEAR_ALL,
+            0,
+            0,
+            0,
+        ) == -1
+        {
+            child_fail(
+                launch_error,
+                PHASE_CAP_AMBIENT,
+                error_exit_syscall,
+            );
+        }
+
+        let mut header = CapabilityHeader {
+            version: LINUX_CAPABILITY_VERSION_3,
+            pid: 0,
+        };
+        let data = [
+            CapabilityData {
+                effective: 0,
+                permitted: 0,
+                inheritable: 0,
+            },
+            CapabilityData {
+                effective: 0,
+                permitted: 0,
+                inheritable: 0,
+            },
+        ];
+        if libc::syscall(
+            libc::SYS_capset,
+            &mut header as *mut CapabilityHeader,
+            data.as_ptr(),
+        ) == -1
+        {
+            child_fail(launch_error, PHASE_CAP_CURRENT, error_exit_syscall);
+        }
+    }
+
     unsafe fn child_fail(
         launch_error: *mut LaunchErrorRecord,
         phase: u32,
         error_exit_syscall: libc::c_long,
     ) -> ! {
-        let errno = *libc::__errno_location();
+        child_fail_errno(
+            launch_error,
+            phase,
+            *libc::__errno_location(),
+            error_exit_syscall,
+        )
+    }
+
+    unsafe fn child_fail_errno(
+        launch_error: *mut LaunchErrorRecord,
+        phase: u32,
+        errno: i32,
+        error_exit_syscall: libc::c_long,
+    ) -> ! {
         ptr::write_volatile(ptr::addr_of_mut!((*launch_error).errno), errno);
         ptr::write_volatile(ptr::addr_of_mut!((*launch_error).phase), phase);
 
@@ -416,6 +781,19 @@ mod x86_64 {
         }
     }
 
+    fn decode_launch_error(record: LaunchErrorRecord) -> Result<ChildOutcome, SandboxError> {
+        let message = format_launch_error(record);
+        if record.phase == PHASE_NAMESPACE
+            && matches!(record.errno, libc::EPERM | libc::EACCES | libc::ENOSYS)
+        {
+            Err(SandboxError::UnsupportedPlatform(format!(
+                "user/mount namespace isolation is unavailable: {message}"
+            )))
+        } else {
+            Err(SandboxError::SetupFailed(message))
+        }
+    }
+
     fn decode_wait_status(status: libc::c_int) -> Result<ChildOutcome, SandboxError> {
         if libc::WIFEXITED(status) {
             Ok(ChildOutcome::Exited(libc::WEXITSTATUS(status)))
@@ -430,25 +808,31 @@ mod x86_64 {
 
     fn format_launch_error(record: LaunchErrorRecord) -> String {
         let phase = match record.phase {
-            PHASE_CHDIR => "chdir",
+            PHASE_NAMESPACE => "user/mount namespace creation",
+            PHASE_SETGROUPS => "setgroups deny",
+            PHASE_UID_MAP => "uid_map",
+            PHASE_GID_MAP => "gid_map",
+            PHASE_MOUNT_PRIVATE => "mount propagation isolation",
+            PHASE_STDIO => "stdio directory escape check",
+            PHASE_ROOT_FCHDIR => "filesystem root pin",
+            PHASE_CHROOT => "chroot",
+            PHASE_CWD_FCHDIR => "working-directory pin",
             PHASE_FD_SANITIZE => "inherited-FD sanitization",
             PHASE_RLIMIT_CPU => "RLIMIT_CPU",
             PHASE_RLIMIT_AS => "RLIMIT_AS",
             PHASE_RLIMIT_FSIZE => "RLIMIT_FSIZE",
             PHASE_RLIMIT_NOFILE => "RLIMIT_NOFILE",
+            PHASE_CAP_BOUNDING => "capability bounding-set drop",
+            PHASE_CAP_AMBIENT => "ambient capability clear",
+            PHASE_CAP_CURRENT => "effective/permitted/inheritable capability clear",
             PHASE_NO_NEW_PRIVS => "PR_SET_NO_NEW_PRIVS",
             PHASE_SECCOMP => "seccomp installation",
-            PHASE_EXECVE => "execve",
+            PHASE_EXECVEAT => "execveat",
             _ => "unknown launch phase",
         };
-        let errno = if record.errno == 0 {
-            libc::EIO
-        } else {
-            record.errno
-        };
         format!(
-            "child {phase} failed closed: {}",
-            io::Error::from_raw_os_error(errno)
+            "launch failed closed during {phase}: {}",
+            io::Error::from_raw_os_error(record.errno)
         )
     }
 
@@ -491,6 +875,8 @@ mod x86_64 {
             "getgid" => libc::SYS_getgid,
             "geteuid" => libc::SYS_geteuid,
             "getegid" => libc::SYS_getegid,
+            "getgroups" => libc::SYS_getgroups,
+            "capget" => libc::SYS_capget,
             "fcntl" => libc::SYS_fcntl,
             "getcwd" => libc::SYS_getcwd,
             "readlink" => libc::SYS_readlink,
@@ -508,6 +894,7 @@ mod x86_64 {
             "prlimit64" => libc::SYS_prlimit64,
             "getrandom" => libc::SYS_getrandom,
             "execve" => libc::SYS_execve,
+            "execveat" => libc::SYS_execveat,
             "exit_group" => libc::SYS_exit_group,
             "statx" => libc::SYS_statx,
             "rseq" => libc::SYS_rseq,

@@ -95,6 +95,44 @@ fn network_namespace_cannot_reach_host_loopback_listener() {
 }
 
 #[test]
+fn ipc_namespace_cannot_observe_host_sysv_message_queue() {
+    let base_key = 0x534c_0000_i32.wrapping_add(((process::id() & 0x0fff) as i32) << 4);
+    let mut created = None;
+    for offset in 0..16_i32 {
+        let key = base_key.wrapping_add(offset) as libc::key_t;
+        let queue_id = unsafe { libc::msgget(key, libc::IPC_CREAT | libc::IPC_EXCL | 0o600) };
+        if queue_id >= 0 {
+            created = Some((key, queue_id));
+            break;
+        }
+        let error = std::io::Error::last_os_error();
+        assert_eq!(
+            error.raw_os_error(),
+            Some(libc::EEXIST),
+            "host msgget failed before finding a free key: {error}"
+        );
+    }
+
+    let (key, queue_id) = created.expect("create host SysV message queue");
+    let host_lookup = unsafe { libc::msgget(key, 0) };
+    assert_eq!(
+        host_lookup, queue_id,
+        "host must observe the queue before it is used as an IPC namespace oracle"
+    );
+
+    let key_text = (key as i64).to_string();
+    let result = run(&policy(
+        "L",
+        &[key_text.as_str()],
+        &["execveat", "msgget", "exit"],
+    ));
+
+    let removed = unsafe { libc::msgctl(queue_id, libc::IPC_RMID, std::ptr::null_mut()) };
+    assert_eq!(removed, 0, "remove host SysV message queue");
+    assert_eq!(result.unwrap(), ChildOutcome::Exited(0));
+}
+
+#[test]
 fn allowed_operation_succeeds() {
     assert_eq!(
         run(&policy("A", &[], &["execveat", "write", "exit"])).unwrap(),

@@ -96,7 +96,7 @@ impl SandboxPolicy {
                         "filesystem.scratch must not replace the sandbox root",
                     ));
                 }
-                if bytes < MIN_SCRATCH_BYTES || bytes > MAX_SCRATCH_BYTES {
+                if !(MIN_SCRATCH_BYTES..=MAX_SCRATCH_BYTES).contains(&bytes) {
                     return Err(PolicyError::new(format!(
                         "filesystem.scratch_bytes must be between {MIN_SCRATCH_BYTES} and {MAX_SCRATCH_BYTES}"
                     )));

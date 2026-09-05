@@ -219,7 +219,8 @@ impl SandboxPolicy {
 
         if self.environment.len() > MAX_ENV {
             return Err(PolicyError::new(format!(
-                "too many environment variables: {} > {MAX_ENV}"
+                "too many environment variables: {} > {MAX_ENV}",
+                self.environment.len()
             )));
         }
         for (key, value) in &self.environment {

@@ -14,6 +14,7 @@
 #   S self-terminate with SIGTERM
 #   N open until RLIMIT_NOFILE produces EMFILE
 #   P assert PR_GET_NO_NEW_PRIVS == 1
+#   R read back all configured resource limits
 #   W create argv[2] marker (used to prove failed setup never executes child)
 
 _start:
@@ -37,6 +38,8 @@ _start:
     je .nofile
     cmp $80, %al
     je .no_new_privs
+    cmp $82, %al
+    je .resource_limits
     cmp $87, %al
     je .write_marker
     jmp .fail2
@@ -155,6 +158,37 @@ _start:
     xor %edi, %edi
     jmp .exit
 
+.resource_limits:
+    mov $0, %esi                 # RLIMIT_CPU
+    mov $2, %r12
+    call .check_one_limit
+    mov $1, %esi                 # RLIMIT_FSIZE
+    mov $1048576, %r12
+    call .check_one_limit
+    mov $7, %esi                 # RLIMIT_NOFILE
+    mov $32, %r12
+    call .check_one_limit
+    mov $9, %esi                 # RLIMIT_AS
+    mov $134217728, %r12
+    call .check_one_limit
+    xor %edi, %edi
+    jmp .exit
+
+# esi=resource, r12=expected soft/hard value.
+.check_one_limit:
+    xor %edi, %edi               # pid 0 = self
+    xor %edx, %edx               # new_limit = NULL
+    lea limit_buffer(%rip), %r10
+    mov $302, %eax               # prlimit64
+    syscall
+    test %rax, %rax
+    js .fail14
+    cmp %r12, limit_buffer(%rip)
+    jne .fail14
+    cmp %r12, limit_buffer+8(%rip)
+    jne .fail14
+    ret
+
 .write_marker:
     mov 24(%rsp), %rsi
     test %rsi, %rsi
@@ -217,6 +251,9 @@ _start:
     jmp .exit
 .fail13:
     mov $13, %edi
+    jmp .exit
+.fail14:
+    mov $14, %edi
 
 .exit:
     mov $60, %eax
@@ -236,3 +273,7 @@ dev_null:
 .balign 16
 cwd_buffer:
     .skip 4096
+limit_buffer:
+    .skip 16
+
+.section .note.GNU-stack,"",@progbits

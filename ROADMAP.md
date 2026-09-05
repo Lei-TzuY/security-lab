@@ -10,12 +10,22 @@ Delivered strict policy validation, environment/cwd control, four rlimits, `PR_S
 
 ### Slice 2A — inherited descriptor sanitization
 
-**Status: complete on `main`.** Atomically mark every inherited descriptor >= 3 `CLOEXEC` before target exec, prove descriptor non-leakage, and preserve fail-closed setup reporting.
+**Status: complete on `main`.** Every inherited descriptor >= 3 is marked `CLOEXEC` before target exec, with deterministic non-leakage evidence and fail-closed setup reporting.
 
 ### Slice 2B — owned launch/error protocol
 
-**Current implemented slice.** Own the Linux x86_64 `fork`/setup/seccomp/`execve`/`waitpid` lifecycle. Precompute target argv/environment in the trusted parent, transport child setup errors through a shared anonymous launch-state page rather than a pipe, and prove that a post-seccomp `execve` failure remains precisely observable even when the target policy denies `write`. The policy must name `execve` and at least one of `exit`/`exit_group`; the launcher never silently widens the seccomp allowlist.
+**Status: complete on `main`.** The Linux x86_64 launcher owns the `fork`/setup/seccomp/exec/wait lifecycle and transports phase-specific launch failures through shared memory without requiring a target `write` grant.
 
 ### Slice 2C — filesystem and identity boundary
 
-**Next architectural frontier.** Add testable user/mount namespace isolation, UID/GID mapping and capability dropping, a minimal root/mount policy, and TOCTOU-resistant executable selection. Promote only mechanisms that can be enforced and proven in CI; unsupported kernels/configurations must fail or skip explicitly rather than pretending isolation.
+**Current verified candidate.** Add a mandatory `filesystem.root`, pin root/cwd/initial executable with `openat2`, create user+mount namespaces with UID/GID mapping, make mount propagation private, enter the pinned root, reject directory-valued stdio escape handles, clear capability bounding/ambient/current sets, and launch the pinned inode with `execveat(AT_EMPTY_PATH)`. Integration tests must prove host-path hiding, executable symlink-escape rejection, namespace identity/capability reduction, and preservation of all Milestones 1–2B invariants.
+
+The branch implementation has passed the complete locked test suite on Rust 1.74 and stable plus stable rustfmt/Clippy. It becomes **complete on `main` only after PR merge-ref and post-merge main CI remain green.**
+
+### Slice 2D — explicit filesystem mutability policy
+
+**Next architectural frontier after 2C integration.** Convert path visibility into a stronger data-plane boundary by investigating an enforceable read-only root with narrowly declared writable scratch/data locations. The design must work within the user/mount namespace model, prove actual write denial/allowance in integration tests, and fail explicitly when required mount semantics are unavailable. Do not claim this slice merely from mount-policy types or configuration fields.
+
+## Later frontiers
+
+After root mutability is enforceable, prioritize explicit stdio/intentional descriptor authority, then PID/network/process-tree isolation and stronger resource accounting where each mechanism can be demonstrated on the supported CI platform.

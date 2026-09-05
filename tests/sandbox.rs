@@ -89,6 +89,14 @@ fn unknown_syscall_is_rejected_before_execution() {
 }
 
 #[test]
+fn launch_requires_policy_authorized_termination_syscall() {
+    let invalid = policy("A", &[], &["execve"]);
+    let error = run(&invalid).unwrap_err();
+    assert!(matches!(error, SandboxError::InvalidPolicy(_)));
+    assert!(error.to_string().contains("exit or exit_group"));
+}
+
+#[test]
 fn setup_failure_never_falls_back_to_execution() {
     let marker = std::env::temp_dir().join(format!(
         "security-lab-marker-{}-{}",
@@ -141,7 +149,7 @@ fn inherited_non_stdio_descriptor_does_not_survive_exec() {
 }
 
 #[test]
-fn exec_failure_is_reported_after_descriptor_sanitization() {
+fn exec_failure_is_reported_without_target_write_permission() {
     let script = std::env::temp_dir().join(format!(
         "security-lab-missing-interpreter-{}-{}",
         process::id(),
@@ -153,12 +161,20 @@ fn exec_failure_is_reported_after_descriptor_sanitization() {
     permissions.set_mode(0o755);
     std::fs::set_permissions(&script, permissions).unwrap();
 
-    let mut failing = policy("A", &[], &["execve", "write", "exit", "exit_group"]);
+    let mut failing = policy("A", &[], &["execve", "exit"]);
     failing.executable = script.clone();
     let result = run(&failing);
     let _ = std::fs::remove_file(&script);
 
-    assert!(matches!(result, Err(SandboxError::SetupFailed(_))));
+    match result {
+        Err(SandboxError::SetupFailed(message)) => {
+            assert!(
+                message.contains("execve"),
+                "unexpected launch error: {message}"
+            );
+        }
+        other => panic!("expected precise execve setup failure, got {other:?}"),
+    }
 }
 
 #[test]

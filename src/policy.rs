@@ -1,0 +1,374 @@
+use std::collections::{BTreeMap, BTreeSet};
+use std::error::Error;
+use std::fmt;
+use std::path::{Component, Path, PathBuf};
+use std::str::FromStr;
+
+const MAX_ARGS: usize = 64;
+const MAX_ARG_BYTES: usize = 4096;
+const MAX_ENV: usize = 64;
+const MAX_ENV_VALUE_BYTES: usize = 8192;
+const MAX_SYSCALLS: usize = 128;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResourceLimits {
+    pub cpu_seconds: u64,
+    pub address_space_bytes: u64,
+    pub file_size_bytes: u64,
+    pub open_files: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeccompPolicy {
+    /// Syscall names allowed by the policy. Every other syscall is denied with
+    /// `EPERM` by the Linux x86_64 enforcement layer.
+    pub allowed_syscalls: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxPolicy {
+    pub executable: PathBuf,
+    pub args: Vec<String>,
+    pub environment: BTreeMap<String, String>,
+    pub working_dir: PathBuf,
+    pub limits: ResourceLimits,
+    pub seccomp: SeccompPolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyError {
+    line: Option<usize>,
+    message: String,
+}
+
+impl PolicyError {
+    fn at(line: usize, message: impl Into<String>) -> Self {
+        Self {
+            line: Some(line),
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn new(message: impl Into<String>) -> Self {
+        Self {
+            line: None,
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for PolicyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(line) = self.line {
+            write!(f, "line {line}: {}", self.message)
+        } else {
+            f.write_str(&self.message)
+        }
+    }
+}
+
+impl Error for PolicyError {}
+
+impl SandboxPolicy {
+    pub fn validate(&self) -> Result<(), PolicyError> {
+        validate_absolute_path("executable", &self.executable)?;
+        validate_absolute_path("working_dir", &self.working_dir)?;
+
+        if self.args.len() > MAX_ARGS {
+            return Err(PolicyError::new(format!(
+                "too many arguments: {} > {MAX_ARGS}",
+                self.args.len()
+            )));
+        }
+        for arg in &self.args {
+            if arg.as_bytes().contains(&0) {
+                return Err(PolicyError::new("arguments must not contain NUL bytes"));
+            }
+            if arg.len() > MAX_ARG_BYTES {
+                return Err(PolicyError::new(format!(
+                    "argument exceeds {MAX_ARG_BYTES} bytes"
+                )));
+            }
+        }
+
+        if self.environment.len() > MAX_ENV {
+            return Err(PolicyError::new(format!(
+                "too many environment variables: {} > {MAX_ENV}",
+                self.environment.len()
+            )));
+        }
+        for (key, value) in &self.environment {
+            if !valid_env_key(key) {
+                return Err(PolicyError::new(format!(
+                    "invalid environment variable name: {key:?}"
+                )));
+            }
+            if value.as_bytes().contains(&0) {
+                return Err(PolicyError::new(format!(
+                    "environment variable {key:?} contains a NUL byte"
+                )));
+            }
+            if value.len() > MAX_ENV_VALUE_BYTES {
+                return Err(PolicyError::new(format!(
+                    "environment variable {key:?} exceeds {MAX_ENV_VALUE_BYTES} bytes"
+                )));
+            }
+        }
+
+        if self.limits.cpu_seconds == 0
+            || self.limits.address_space_bytes == 0
+            || self.limits.file_size_bytes == 0
+            || self.limits.open_files < 3
+        {
+            return Err(PolicyError::new(
+                "resource limits must be non-zero and open_files must be at least 3",
+            ));
+        }
+
+        if self.seccomp.allowed_syscalls.is_empty() {
+            return Err(PolicyError::new("seccomp allowlist must not be empty"));
+        }
+        if self.seccomp.allowed_syscalls.len() > MAX_SYSCALLS {
+            return Err(PolicyError::new(format!(
+                "too many seccomp syscalls: {} > {MAX_SYSCALLS}",
+                self.seccomp.allowed_syscalls.len()
+            )));
+        }
+        for name in &self.seccomp.allowed_syscalls {
+            if name.is_empty()
+                || !name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+            {
+                return Err(PolicyError::new(format!(
+                    "invalid syscall name syntax: {name:?}"
+                )));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl FromStr for SandboxPolicy {
+    type Err = PolicyError;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        let mut executable = None;
+        let mut args = Vec::new();
+        let mut environment = BTreeMap::new();
+        let mut working_dir = None;
+        let mut cpu_seconds = None;
+        let mut address_space_bytes = None;
+        let mut file_size_bytes = None;
+        let mut open_files = None;
+        let mut seccomp = None;
+
+        for (index, raw_line) in input.lines().enumerate() {
+            let line_no = index + 1;
+            let line = raw_line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+
+            let (raw_key, raw_value) = line
+                .split_once('=')
+                .ok_or_else(|| PolicyError::at(line_no, "expected key = value"))?;
+            let key = raw_key.trim();
+            let value = raw_value.trim();
+
+            match key {
+                "executable" => set_once(&mut executable, value.to_owned(), line_no, key)?,
+                "arg" => args.push(value.to_owned()),
+                "working_dir" => set_once(&mut working_dir, value.to_owned(), line_no, key)?,
+                "limit.cpu_seconds" => set_once(
+                    &mut cpu_seconds,
+                    parse_u64(value, line_no, key)?,
+                    line_no,
+                    key,
+                )?,
+                "limit.address_space_bytes" => set_once(
+                    &mut address_space_bytes,
+                    parse_u64(value, line_no, key)?,
+                    line_no,
+                    key,
+                )?,
+                "limit.file_size_bytes" => set_once(
+                    &mut file_size_bytes,
+                    parse_u64(value, line_no, key)?,
+                    line_no,
+                    key,
+                )?,
+                "limit.open_files" => set_once(
+                    &mut open_files,
+                    parse_u64(value, line_no, key)?,
+                    line_no,
+                    key,
+                )?,
+                "seccomp.allow" => {
+                    if seccomp.is_some() {
+                        return Err(PolicyError::at(line_no, "duplicate seccomp.allow"));
+                    }
+                    let mut names = BTreeSet::new();
+                    for name in value.split(',').map(str::trim) {
+                        if name.is_empty() {
+                            return Err(PolicyError::at(
+                                line_no,
+                                "seccomp.allow contains an empty syscall name",
+                            ));
+                        }
+                        if !names.insert(name.to_owned()) {
+                            return Err(PolicyError::at(
+                                line_no,
+                                format!("duplicate syscall in seccomp.allow: {name}"),
+                            ));
+                        }
+                    }
+                    seccomp = Some(SeccompPolicy {
+                        allowed_syscalls: names,
+                    });
+                }
+                _ if key.starts_with("env.") => {
+                    let env_key = &key[4..];
+                    if !valid_env_key(env_key) {
+                        return Err(PolicyError::at(
+                            line_no,
+                            format!("invalid environment variable name: {env_key:?}"),
+                        ));
+                    }
+                    if environment
+                        .insert(env_key.to_owned(), value.to_owned())
+                        .is_some()
+                    {
+                        return Err(PolicyError::at(
+                            line_no,
+                            format!("duplicate environment variable: {env_key}"),
+                        ));
+                    }
+                }
+                _ => {
+                    return Err(PolicyError::at(
+                        line_no,
+                        format!("unknown policy key: {key}"),
+                    ))
+                }
+            }
+        }
+
+        let policy = Self {
+            executable: PathBuf::from(required(executable, "executable")?),
+            args,
+            environment,
+            working_dir: PathBuf::from(required(working_dir, "working_dir")?),
+            limits: ResourceLimits {
+                cpu_seconds: required(cpu_seconds, "limit.cpu_seconds")?,
+                address_space_bytes: required(
+                    address_space_bytes,
+                    "limit.address_space_bytes",
+                )?,
+                file_size_bytes: required(file_size_bytes, "limit.file_size_bytes")?,
+                open_files: required(open_files, "limit.open_files")?,
+            },
+            seccomp: required(seccomp, "seccomp.allow")?,
+        };
+        policy.validate()?;
+        Ok(policy)
+    }
+}
+
+fn set_once<T>(
+    target: &mut Option<T>,
+    value: T,
+    line: usize,
+    key: &str,
+) -> Result<(), PolicyError> {
+    if target.replace(value).is_some() {
+        Err(PolicyError::at(line, format!("duplicate key: {key}")))
+    } else {
+        Ok(())
+    }
+}
+
+fn required<T>(value: Option<T>, key: &str) -> Result<T, PolicyError> {
+    value.ok_or_else(|| PolicyError::new(format!("missing required key: {key}")))
+}
+
+fn parse_u64(value: &str, line: usize, key: &str) -> Result<u64, PolicyError> {
+    value
+        .parse::<u64>()
+        .map_err(|_| PolicyError::at(line, format!("{key} must be an unsigned integer")))
+}
+
+fn validate_absolute_path(label: &str, path: &Path) -> Result<(), PolicyError> {
+    if !path.is_absolute() {
+        return Err(PolicyError::new(format!("{label} must be an absolute path")));
+    }
+    if path.as_os_str().as_encoded_bytes().contains(&0) {
+        return Err(PolicyError::new(format!("{label} must not contain NUL bytes")));
+    }
+    if path.components().any(|component| component == Component::ParentDir) {
+        return Err(PolicyError::new(format!(
+            "{label} must not contain '..' components"
+        )));
+    }
+    Ok(())
+}
+
+fn valid_env_key(key: &str) -> bool {
+    let mut bytes = key.bytes();
+    matches!(bytes.next(), Some(b'A'..=b'Z' | b'a'..=b'z' | b'_'))
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const VALID: &str = r#"
+        executable = /bin/echo
+        arg = hello
+        env.LANG = C
+        working_dir = /tmp
+        limit.cpu_seconds = 1
+        limit.address_space_bytes = 268435456
+        limit.file_size_bytes = 1048576
+        limit.open_files = 32
+        seccomp.allow = execve,read,write,exit_group
+    "#;
+
+    #[test]
+    fn parses_complete_policy() {
+        let policy: SandboxPolicy = VALID.parse().unwrap();
+        assert_eq!(policy.executable, PathBuf::from("/bin/echo"));
+        assert_eq!(policy.args, ["hello"]);
+        assert_eq!(policy.environment.get("LANG").map(String::as_str), Some("C"));
+        assert!(policy.seccomp.allowed_syscalls.contains("execve"));
+    }
+
+    #[test]
+    fn rejects_unknown_key() {
+        let err = format!("{VALID}\nallow_everything = true").parse::<SandboxPolicy>();
+        assert!(err.unwrap_err().to_string().contains("unknown policy key"));
+    }
+
+    #[test]
+    fn rejects_missing_security_field() {
+        let text = VALID.replace("limit.open_files = 32", "");
+        assert!(text.parse::<SandboxPolicy>().is_err());
+    }
+
+    #[test]
+    fn rejects_relative_executable() {
+        let text = VALID.replace("/bin/echo", "bin/echo");
+        assert!(text.parse::<SandboxPolicy>().is_err());
+    }
+
+    #[test]
+    fn rejects_duplicate_syscall() {
+        let text = VALID.replace(
+            "execve,read,write,exit_group",
+            "execve,read,read,exit_group",
+        );
+        assert!(text.parse::<SandboxPolicy>().is_err());
+    }
+}

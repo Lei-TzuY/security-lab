@@ -1,0 +1,18 @@
+[package]
+name = "security-lab"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+description = "Correctness-first systems security laboratory"
+license = "MIT"
+
+[dependencies]
+libc = "0.2"
+
+[[bin]]
+name = "security-lab"
+path = "src/main.rs"
+
+[[bin]]
+name = "fixture-probe"
+path = "src/bin/fixture_probe.rs"

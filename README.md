@@ -89,8 +89,8 @@ See [THREAT_MODEL.md](THREAT_MODEL.md) for the complete threat model and limitat
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets --all-features
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked --all-targets --all-features
 ```
 
-The CI workflow runs those checks on every milestone branch push and pull request.
+`Cargo.lock` is committed. CI pins its action revisions, runs the locked quality/test suite on stable Rust, and separately runs the full locked test suite on the declared Rust 1.74 MSRV.

@@ -73,13 +73,7 @@ mod x86_64 {
 
             let record = mapping.cast::<LaunchErrorRecord>();
             unsafe {
-                ptr::write_volatile(
-                    record,
-                    LaunchErrorRecord {
-                        errno: 0,
-                        phase: 0,
-                    },
-                );
+                ptr::write_volatile(record, LaunchErrorRecord { errno: 0, phase: 0 });
             }
             Ok(Self { record })
         }
@@ -111,14 +105,9 @@ mod x86_64 {
 
     impl PreparedLaunch {
         fn new(policy: &SandboxPolicy) -> Result<Self, SandboxError> {
-            let executable = cstring_bytes(
-                "executable",
-                policy.executable.as_os_str().as_bytes(),
-            )?;
-            let working_dir = cstring_bytes(
-                "working_dir",
-                policy.working_dir.as_os_str().as_bytes(),
-            )?;
+            let executable = cstring_bytes("executable", policy.executable.as_os_str().as_bytes())?;
+            let working_dir =
+                cstring_bytes("working_dir", policy.working_dir.as_os_str().as_bytes())?;
 
             let mut args = Vec::with_capacity(policy.args.len());
             for arg in &policy.args {
@@ -171,14 +160,7 @@ mod x86_64 {
         }
 
         if pid == 0 {
-            unsafe {
-                child_exec(
-                    &prepared,
-                    policy.limits,
-                    &seccomp,
-                    launch_state.record,
-                )
-            }
+            unsafe { child_exec(&prepared, policy.limits, &seccomp, launch_state.record) }
         }
 
         let status = wait_for_child(pid)?;
@@ -330,11 +312,7 @@ mod x86_64 {
             CLOSE_RANGE_CLOEXEC,
         ) == -1
         {
-            child_fail(
-                launch_error,
-                PHASE_FD_SANITIZE,
-                seccomp.error_exit_syscall,
-            );
+            child_fail(launch_error, PHASE_FD_SANITIZE, seccomp.error_exit_syscall);
         }
 
         set_limit_or_fail(
@@ -367,11 +345,7 @@ mod x86_64 {
         );
 
         if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == -1 {
-            child_fail(
-                launch_error,
-                PHASE_NO_NEW_PRIVS,
-                seccomp.error_exit_syscall,
-            );
+            child_fail(launch_error, PHASE_NO_NEW_PRIVS, seccomp.error_exit_syscall);
         }
 
         let program = libc::sock_fprog {
@@ -421,7 +395,7 @@ mod x86_64 {
         ptr::write_volatile(ptr::addr_of_mut!((*launch_error).phase), phase);
 
         loop {
-            libc::syscall(error_exit_syscall, 127 as libc::c_int);
+            libc::syscall(error_exit_syscall, 127);
         }
     }
 
@@ -437,9 +411,7 @@ mod x86_64 {
                 if err.raw_os_error() == Some(libc::EINTR) {
                     continue;
                 }
-                return Err(SandboxError::SetupFailed(format!(
-                    "waitpid failed: {err}"
-                )));
+                return Err(SandboxError::SetupFailed(format!("waitpid failed: {err}")));
             }
         }
     }

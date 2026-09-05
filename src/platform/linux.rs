@@ -43,7 +43,6 @@ mod x86_64 {
 
     const CLOSE_RANGE_CLOEXEC: libc::c_uint = 1 << 2;
     const FIRST_NON_STDIO_FD: libc::c_uint = 3;
-    const FIRST_SELECTED_STORAGE_FD: RawFd = 64;
 
     const RESOLVE_NO_XDEV: u64 = 0x01;
     const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
@@ -202,16 +201,16 @@ mod x86_64 {
 
     fn move_owned_fd_to_selected_storage(
         fd: OwnedFd,
+        storage_floor: RawFd,
         label: &str,
     ) -> Result<OwnedFd, SandboxError> {
-        if fd.raw() >= FIRST_SELECTED_STORAGE_FD {
+        if fd.raw() >= storage_floor {
             return Ok(fd);
         }
-        let moved =
-            unsafe { libc::fcntl(fd.raw(), libc::F_DUPFD_CLOEXEC, FIRST_SELECTED_STORAGE_FD) };
+        let moved = unsafe { libc::fcntl(fd.raw(), libc::F_DUPFD_CLOEXEC, storage_floor) };
         if moved == -1 {
             return Err(SandboxError::SetupFailed(format!(
-                "cannot move {label} into the selected-handle storage plane: {}",
+                "cannot move {label} into the selected-handle storage plane at fd {storage_floor} or above: {}",
                 io::Error::last_os_error()
             )));
         }
@@ -222,6 +221,7 @@ mod x86_64 {
     fn pin_selected_handle(
         source_fd: u32,
         target_fd: u32,
+        storage_floor: RawFd,
     ) -> Result<PreparedSelectedHandle, SandboxError> {
         if source_fd > i32::MAX as u32 {
             return Err(SandboxError::InvalidPolicy(PolicyError::new(format!(
@@ -229,8 +229,7 @@ mod x86_64 {
             ))));
         }
         let source_fd = source_fd as RawFd;
-        let pinned =
-            unsafe { libc::fcntl(source_fd, libc::F_DUPFD_CLOEXEC, FIRST_SELECTED_STORAGE_FD) };
+        let pinned = unsafe { libc::fcntl(source_fd, libc::F_DUPFD_CLOEXEC, storage_floor) };
         if pinned == -1 {
             return Err(SandboxError::SetupFailed(format!(
                 "cannot pin selected handle source fd {source_fd} for target fd {target_fd}: {}",
@@ -342,12 +341,29 @@ mod x86_64 {
                 "executable",
             )?;
             validate_executable_fd(executable_fd.raw(), &policy.executable)?;
-            let executable_fd =
-                move_owned_fd_to_selected_storage(executable_fd, "pinned executable")?;
+            // Keep every launcher-owned source above all target-visible handle
+            // destinations. With no selected handles this floor is only 3, so
+            // existing sandboxes do not gain an unnecessary fd>=64 requirement.
+            let selected_storage_floor = policy
+                .selected_handles
+                .keys()
+                .next_back()
+                .map_or(FIRST_NON_STDIO_FD as RawFd, |target_fd| {
+                    *target_fd as RawFd + 1
+                });
+            let executable_fd = move_owned_fd_to_selected_storage(
+                executable_fd,
+                selected_storage_floor,
+                "pinned executable",
+            )?;
 
             let mut selected_handles = Vec::with_capacity(policy.selected_handles.len());
             for (target_fd, source_fd) in &policy.selected_handles {
-                selected_handles.push(pin_selected_handle(*source_fd, *target_fd)?);
+                selected_handles.push(pin_selected_handle(
+                    *source_fd,
+                    *target_fd,
+                    selected_storage_floor,
+                )?);
             }
 
             let cwd_relative = sandbox_relative(&policy.working_dir)?;

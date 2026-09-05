@@ -1,0 +1,107 @@
+name: probe cgroup v2 delegation
+
+on:
+  push:
+    branches:
+      - tmp-4a-cgroup-probe
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Probe unprivileged cgroup v2 capability
+        shell: bash
+        run: |
+          set -u
+          echo "uid=$(id -u) user=$(id -un)"
+          echo "mount=$(findmnt -n -o FSTYPE,OPTIONS -T /sys/fs/cgroup || true)"
+          echo "fstype=$(stat -fc %T /sys/fs/cgroup 2>/dev/null || true)"
+          rel=$(awk -F: '$1 == "0" { print $3 }' /proc/self/cgroup)
+          cg="/sys/fs/cgroup${rel}"
+          echo "self_cgroup=${rel}"
+          echo "cgroup_dir=${cg}"
+          stat -c 'dir mode=%A owner=%U group=%G' "$cg" || true
+          for f in cgroup.controllers cgroup.subtree_control cgroup.type cgroup.events; do
+            if [[ -e "$cg/$f" ]]; then
+              printf '%s=' "$f"
+              cat "$cg/$f" || true
+            fi
+          done
+
+          if [[ "$(stat -fc %T /sys/fs/cgroup 2>/dev/null || true)" != "cgroup2fs" ]]; then
+            echo "SUPPORTED=no reason=not-cgroup-v2"
+            exit 0
+          fi
+
+          probe="$cg/security-lab-probe-${GITHUB_RUN_ID}-${RANDOM}"
+          mkdir_err=$(mktemp)
+          if ! mkdir "$probe" 2>"$mkdir_err"; then
+            echo "mkdir_error=$(cat "$mkdir_err")"
+            rm -f "$mkdir_err"
+            echo "SUPPORTED=no reason=current-cgroup-not-delegated-for-unprivileged-child-creation"
+            exit 0
+          fi
+          rm -f "$mkdir_err"
+          echo "child_created=yes"
+
+          original_subtree=$(cat "$cg/cgroup.subtree_control" 2>/dev/null || true)
+          enabled_pids_before=no
+          if grep -qw pids <<<"$original_subtree"; then
+            enabled_pids_before=yes
+          fi
+          echo "pids_enabled_before=${enabled_pids_before}"
+
+          enabled_by_probe=no
+          if [[ "$enabled_pids_before" == no ]] && grep -qw pids "$cg/cgroup.controllers" 2>/dev/null; then
+            enable_err=$(mktemp)
+            if printf '+pids\n' >"$cg/cgroup.subtree_control" 2>"$enable_err"; then
+              enabled_by_probe=yes
+              echo "pids_enable=yes"
+            else
+              echo "pids_enable=no error=$(cat "$enable_err")"
+            fi
+            rm -f "$enable_err"
+          fi
+
+          supported=yes
+          reason=ok
+          if [[ ! -e "$probe/pids.max" ]]; then
+            supported=no
+            reason=child-has-no-pids-controller
+          else
+            pids_err=$(mktemp)
+            if ! printf '8\n' >"$probe/pids.max" 2>"$pids_err"; then
+              supported=no
+              reason=pids-max-not-writable
+              echo "pids_max_error=$(cat "$pids_err")"
+            else
+              echo "pids_max=$(cat "$probe/pids.max")"
+            fi
+            rm -f "$pids_err"
+          fi
+
+          if [[ "$supported" == yes ]]; then
+            sleep 30 &
+            child_pid=$!
+            move_err=$(mktemp)
+            if ! printf '%s\n' "$child_pid" >"$probe/cgroup.procs" 2>"$move_err"; then
+              supported=no
+              reason=cannot-attach-process
+              echo "attach_error=$(cat "$move_err")"
+            else
+              echo "attached_pid=${child_pid}"
+              echo "attached_membership=$(cat /proc/$child_pid/cgroup 2>/dev/null || true)"
+            fi
+            rm -f "$move_err"
+            kill "$child_pid" 2>/dev/null || true
+            wait "$child_pid" 2>/dev/null || true
+          fi
+
+          rmdir "$probe" 2>/dev/null || true
+          if [[ "$enabled_by_probe" == yes ]]; then
+            printf -- '-pids\n' >"$cg/cgroup.subtree_control" 2>/dev/null || true
+          fi
+          echo "SUPPORTED=${supported} reason=${reason}"

@@ -540,8 +540,8 @@ mod x86_64 {
         let root_tree_fd = libc::syscall(
             libc::SYS_open_tree,
             prepared.root_fd.raw(),
-            b"\0".as_ptr().cast::<libc::c_char>(),
-            OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC | AT_EMPTY_PATH | AT_RECURSIVE,
+            b".\0".as_ptr().cast::<libc::c_char>(),
+            OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC | AT_RECURSIVE,
         );
         if root_tree_fd == -1 {
             child_fail(launch_error, PHASE_ROOT_CLONE, seccomp.error_exit_syscall);

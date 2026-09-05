@@ -15,10 +15,11 @@
 #   N open until RLIMIT_NOFILE produces EMFILE
 #   P assert PR_GET_NO_NEW_PRIVS == 1
 #   R read back all configured resource limits
-#   W create argv[2] marker (used to prove failed setup never executes child)
+#   W create argv[2] marker
 #   D assert descriptor number in argv[2] is closed after exec
 #   H assert absolute host path argv[2] is hidden by filesystem root
 #   I assert namespace uid/gid are 0 and all capability sets are empty
+#   M assert root is read-only while /scratch is writable
 
 _start:
     mov 16(%rsp), %rdi
@@ -51,6 +52,8 @@ _start:
     je .host_path_hidden
     cmp $73, %al
     je .identity_reduced
+    cmp $77, %al
+    je .mutability
     jmp .fail2
 
 .allowed:
@@ -73,7 +76,6 @@ _start:
     jmp .exit
 
 .environment:
-    # envp begins after argc, argv pointers, and argv NULL terminator.
     mov (%rsp), %rcx
     lea 16(%rsp,%rcx,8), %r8
     xor %r9d, %r9d
@@ -81,9 +83,9 @@ _start:
     mov (%r8), %rdi
     test %rdi, %rdi
     je .env_done
-    cmpl $0x48544150, (%rdi)       # "PATH" little endian
+    cmpl $0x48544150, (%rdi)
     jne .check_allowed_env
-    cmpb $61, 4(%rdi)             # '='
+    cmpb $61, 4(%rdi)
     je .fail4
 .check_allowed_env:
     lea allowed_env(%rip), %rsi
@@ -149,14 +151,14 @@ _start:
     syscall
     test %rax, %rax
     jns .nofile_loop
-    cmp $-24, %rax               # -EMFILE
+    cmp $-24, %rax
     jne .fail12
     xor %edi, %edi
     jmp .exit
 
 .no_new_privs:
     mov $157, %eax
-    mov $39, %edi                # PR_GET_NO_NEW_PRIVS
+    mov $39, %edi
     xor %esi, %esi
     xor %edx, %edx
     xor %r10d, %r10d
@@ -168,27 +170,26 @@ _start:
     jmp .exit
 
 .resource_limits:
-    mov $0, %esi                 # RLIMIT_CPU
+    mov $0, %esi
     mov $2, %r12
     call .check_one_limit
-    mov $1, %esi                 # RLIMIT_FSIZE
+    mov $1, %esi
     mov $1048576, %r12
     call .check_one_limit
-    mov $7, %esi                 # RLIMIT_NOFILE
+    mov $7, %esi
     mov $32, %r12
     call .check_one_limit
-    mov $9, %esi                 # RLIMIT_AS
+    mov $9, %esi
     mov $134217728, %r12
     call .check_one_limit
     xor %edi, %edi
     jmp .exit
 
-# esi=resource, r12=expected soft/hard value.
 .check_one_limit:
-    xor %edi, %edi               # pid 0 = self
-    xor %edx, %edx               # new_limit = NULL
+    xor %edi, %edi
+    xor %edx, %edx
     lea limit_buffer(%rip), %r10
-    mov $302, %eax               # prlimit64
+    mov $302, %eax
     syscall
     test %rax, %rax
     js .fail14
@@ -204,8 +205,8 @@ _start:
     je .fail2
     mov $257, %eax
     mov $-100, %edi
-    mov $577, %edx               # O_WRONLY | O_CREAT | O_TRUNC
-    mov $384, %r10d              # 0600
+    mov $577, %edx
+    mov $384, %r10d
     syscall
     test %rax, %rax
     js .fail6
@@ -229,12 +230,12 @@ _start:
     inc %rdi
     jmp .fd_parse_loop
 .fd_parsed:
-    mov $72, %eax                # fcntl
+    mov $72, %eax
     mov %r12d, %edi
-    mov $1, %esi                 # F_GETFD
+    mov $1, %esi
     xor %edx, %edx
     syscall
-    cmp $-9, %rax                # -EBADF means fd did not survive exec
+    cmp $-9, %rax
     jne .fail15
     xor %edi, %edi
     jmp .exit
@@ -243,31 +244,31 @@ _start:
     mov 24(%rsp), %rsi
     test %rsi, %rsi
     je .fail2
-    mov $257, %eax               # openat
-    mov $-100, %edi              # AT_FDCWD
-    xor %edx, %edx               # O_RDONLY
+    mov $257, %eax
+    mov $-100, %edi
+    xor %edx, %edx
     xor %r10d, %r10d
     syscall
-    cmp $-2, %rax                # -ENOENT proves host path is outside root
+    cmp $-2, %rax
     jne .fail16
     xor %edi, %edi
     jmp .exit
 
 .identity_reduced:
-    mov $102, %eax               # getuid
+    mov $102, %eax
     syscall
     test %rax, %rax
     jne .fail17
-    mov $104, %eax               # getgid
+    mov $104, %eax
     syscall
     test %rax, %rax
     jne .fail17
 
-    movl $0x20080522, cap_header(%rip)  # _LINUX_CAPABILITY_VERSION_3
+    movl $0x20080522, cap_header(%rip)
     movl $0, cap_header+4(%rip)
     lea cap_header(%rip), %rdi
     lea cap_data(%rip), %rsi
-    mov $125, %eax               # capget
+    mov $125, %eax
     syscall
     test %rax, %rax
     js .fail17
@@ -287,16 +288,16 @@ _start:
 
     xor %r12d, %r12d
 .cap_bound_loop:
-    cmp $41, %r12d               # Linux capabilities 0..40 in v3 ABI
+    cmp $41, %r12d
     je .cap_ambient_start
-    mov $157, %eax               # prctl
-    mov $23, %edi                # PR_CAPBSET_READ
+    mov $157, %eax
+    mov $23, %edi
     mov %r12d, %esi
     xor %edx, %edx
     xor %r10d, %r10d
     xor %r8d, %r8d
     syscall
-    test %rax, %rax              # every bounding bit must be clear
+    test %rax, %rax
     jne .fail17
     inc %r12d
     jmp .cap_bound_loop
@@ -306,14 +307,14 @@ _start:
 .cap_ambient_loop:
     cmp $41, %r12d
     je .identity_ok
-    mov $157, %eax               # prctl
-    mov $47, %edi                # PR_CAP_AMBIENT
-    mov $1, %esi                 # PR_CAP_AMBIENT_IS_SET
+    mov $157, %eax
+    mov $47, %edi
+    mov $1, %esi
     mov %r12d, %edx
     xor %r10d, %r10d
     xor %r8d, %r8d
     syscall
-    test %rax, %rax              # no ambient capability may be set
+    test %rax, %rax
     jne .fail17
     inc %r12d
     jmp .cap_ambient_loop
@@ -322,7 +323,44 @@ _start:
     xor %edi, %edi
     jmp .exit
 
-# rdi=a, rsi=b; eax=1 if equal including terminating NUL, else 0.
+.mutability:
+    # Root path must be read-only at the VFS mount layer.
+    mov $257, %eax
+    mov $-100, %edi
+    lea forbidden_create(%rip), %rsi
+    mov $577, %edx
+    mov $384, %r10d
+    syscall
+    cmp $-30, %rax               # -EROFS
+    jne .fail18
+
+    # The explicitly mounted scratch tmpfs must remain writable.
+    mov $257, %eax
+    mov $-100, %edi
+    lea scratch_create(%rip), %rsi
+    mov $577, %edx
+    mov $384, %r10d
+    syscall
+    test %rax, %rax
+    js .fail18
+    mov %rax, %r12
+
+    mov $1, %eax
+    mov %r12, %rdi
+    lea scratch_byte(%rip), %rsi
+    mov $1, %edx
+    syscall
+    cmp $1, %rax
+    jne .fail18
+
+    mov $3, %eax
+    mov %r12, %rdi
+    syscall
+    test %rax, %rax
+    js .fail18
+    xor %edi, %edi
+    jmp .exit
+
 .str_eq:
 .str_eq_loop:
     movzbl (%rdi), %eax
@@ -382,6 +420,9 @@ _start:
     jmp .exit
 .fail17:
     mov $17, %edi
+    jmp .exit
+.fail18:
+    mov $18, %edi
 
 .exit:
     mov $60, %eax
@@ -396,6 +437,12 @@ allowed_env:
     .asciz "SANDBOX_ALLOWED=yes"
 sandbox_root:
     .asciz "/"
+forbidden_create:
+    .asciz "/root-write-must-fail"
+scratch_create:
+    .asciz "/scratch/allowed"
+scratch_byte:
+    .ascii "x"
 
 .section .bss
 .balign 16

@@ -9,6 +9,8 @@ const MAX_ARG_BYTES: usize = 4096;
 const MAX_ENV: usize = 64;
 const MAX_ENV_VALUE_BYTES: usize = 8192;
 const MAX_SYSCALLS: usize = 128;
+const MIN_SCRATCH_BYTES: u64 = 4096;
+const MAX_SCRATCH_BYTES: u64 = 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResourceLimits {
@@ -35,6 +37,12 @@ pub struct SandboxPolicy {
     pub environment: BTreeMap<String, String>,
     /// Absolute path interpreted inside `root_dir`.
     pub working_dir: PathBuf,
+    /// Optional absolute path inside `root_dir` replaced by a private writable
+    /// tmpfs after the root mount tree has been made recursively read-only.
+    pub scratch_dir: Option<PathBuf>,
+    /// Maximum byte size of the private tmpfs. Must be present exactly when
+    /// `scratch_dir` is present.
+    pub scratch_bytes: Option<u64>,
     pub limits: ResourceLimits,
     pub seccomp: SeccompPolicy,
 }
@@ -78,6 +86,33 @@ impl SandboxPolicy {
         validate_absolute_path("filesystem.root", &self.root_dir)?;
         validate_absolute_path("executable", &self.executable)?;
         validate_absolute_path("working_dir", &self.working_dir)?;
+
+        match (&self.scratch_dir, self.scratch_bytes) {
+            (None, None) => {}
+            (Some(path), Some(bytes)) => {
+                validate_absolute_path("filesystem.scratch", path)?;
+                if path == Path::new("/") {
+                    return Err(PolicyError::new(
+                        "filesystem.scratch must not replace the sandbox root",
+                    ));
+                }
+                if bytes < MIN_SCRATCH_BYTES || bytes > MAX_SCRATCH_BYTES {
+                    return Err(PolicyError::new(format!(
+                        "filesystem.scratch_bytes must be between {MIN_SCRATCH_BYTES} and {MAX_SCRATCH_BYTES}"
+                    )));
+                }
+                if self.executable.starts_with(path) || self.working_dir.starts_with(path) {
+                    return Err(PolicyError::new(
+                        "filesystem.scratch must not contain the executable or working_dir",
+                    ));
+                }
+            }
+            _ => {
+                return Err(PolicyError::new(
+                    "filesystem.scratch and filesystem.scratch_bytes must be specified together",
+                ));
+            }
+        }
 
         if self.args.len() > MAX_ARGS {
             return Err(PolicyError::new(format!(
@@ -164,6 +199,8 @@ impl FromStr for SandboxPolicy {
         let mut args = Vec::new();
         let mut environment = BTreeMap::new();
         let mut working_dir = None;
+        let mut scratch_dir = None;
+        let mut scratch_bytes = None;
         let mut cpu_seconds = None;
         let mut address_space_bytes = None;
         let mut file_size_bytes = None;
@@ -185,6 +222,15 @@ impl FromStr for SandboxPolicy {
 
             match key {
                 "filesystem.root" => set_once(&mut root_dir, value.to_owned(), line_no, key)?,
+                "filesystem.scratch" => {
+                    set_once(&mut scratch_dir, value.to_owned(), line_no, key)?
+                }
+                "filesystem.scratch_bytes" => set_once(
+                    &mut scratch_bytes,
+                    parse_u64(value, line_no, key)?,
+                    line_no,
+                    key,
+                )?,
                 "executable" => set_once(&mut executable, value.to_owned(), line_no, key)?,
                 "arg" => args.push(value.to_owned()),
                 "working_dir" => set_once(&mut working_dir, value.to_owned(), line_no, key)?,
@@ -267,6 +313,8 @@ impl FromStr for SandboxPolicy {
             args,
             environment,
             working_dir: PathBuf::from(required(working_dir, "working_dir")?),
+            scratch_dir: scratch_dir.map(PathBuf::from),
+            scratch_bytes,
             limits: ResourceLimits {
                 cpu_seconds: required(cpu_seconds, "limit.cpu_seconds")?,
                 address_space_bytes: required(address_space_bytes, "limit.address_space_bytes")?,
@@ -337,6 +385,8 @@ mod tests {
 
     const VALID: &str = r#"
         filesystem.root = /
+        filesystem.scratch = /scratch
+        filesystem.scratch_bytes = 16777216
         executable = /bin/echo
         arg = hello
         env.LANG = C
@@ -352,6 +402,8 @@ mod tests {
     fn parses_complete_policy() {
         let policy: SandboxPolicy = VALID.parse().unwrap();
         assert_eq!(policy.root_dir, PathBuf::from("/"));
+        assert_eq!(policy.scratch_dir, Some(PathBuf::from("/scratch")));
+        assert_eq!(policy.scratch_bytes, Some(16 * 1024 * 1024));
         assert_eq!(policy.executable, PathBuf::from("/bin/echo"));
         assert_eq!(policy.args, ["hello"]);
         assert_eq!(
@@ -382,6 +434,18 @@ mod tests {
     #[test]
     fn rejects_relative_executable() {
         let text = VALID.replace("/bin/echo", "bin/echo");
+        assert!(text.parse::<SandboxPolicy>().is_err());
+    }
+
+    #[test]
+    fn rejects_incomplete_scratch_policy() {
+        let text = VALID.replace("filesystem.scratch_bytes = 16777216\n", "");
+        assert!(text.parse::<SandboxPolicy>().is_err());
+    }
+
+    #[test]
+    fn rejects_scratch_overlapping_working_directory() {
+        let text = VALID.replace("filesystem.scratch = /scratch", "filesystem.scratch = /tmp");
         assert!(text.parse::<SandboxPolicy>().is_err());
     }
 

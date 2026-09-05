@@ -177,9 +177,7 @@ unsafe fn kill_and_reap_remaining(
             ptr::null_mut::<libc::rusage>(),
         );
         if waited > 0 {
-            if reaped != u32::MAX {
-                reaped += 1;
-            }
+            reaped = reaped.saturating_add(1);
             // Repeat kill before every reap so a racing descendant cannot fork
             // a survivor between the first signal sweep and final ECHILD.
             continue;

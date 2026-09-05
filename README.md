@@ -1,6 +1,6 @@
 # security-lab
 
-`security-lab` is a correctness-first systems-security laboratory. Milestone 1 established a bounded Linux process sandbox; Milestone 2 sealed ambient descriptor, launch, filesystem/identity, stdio, redirection, and bounded-capture authority; Milestone 3 sealed PID-tree lifecycle ownership plus a launcher-owned monotonic wall-clock deadline. The current Milestone 4B candidate adds an **isolated Linux network namespace baseline**: the target no longer shares the host network stack, while target socket syscalls remain governed independently by the explicit seccomp allowlist. The project is **not** a penetration-testing toolkit, malware framework, container runtime, or production multi-tenant isolation boundary.
+`security-lab` is a correctness-first systems-security laboratory. Milestone 1 established a bounded Linux process sandbox; Milestone 2 sealed ambient descriptor, launch, filesystem/identity, stdio, redirection, and bounded-capture authority; Milestone 3 sealed PID-tree lifecycle ownership plus a launcher-owned monotonic wall-clock deadline; Milestone 4B added an isolated Linux network namespace baseline. The current Milestone 4C candidate adds an **isolated Linux IPC namespace baseline** with executable SysV IPC visibility evidence. The project is **not** a penetration-testing toolkit, malware framework, container runtime, or production multi-tenant isolation boundary.
 
 ## Current sandbox pipeline
 
@@ -8,7 +8,7 @@ The Linux x86_64 implementation launches one direct target under an explicit pol
 
 1. **Policy validation** requires a host `filesystem.root`, sandbox-internal executable/cwd paths, explicit stdio disposition, resource limits, environment entries, and a syscall allowlist. Optional scratch, stdout redirection, stdout capture, and `limit.wall_clock_milliseconds` are validated fail-closed. A declared wall-clock deadline must be 1–86,400,000 ms (24 hours).
 2. **Parent preparation** pins the root, cwd, and initial executable before `fork`. `openat2` rejects symlink/magic-link traversal and constrains configured paths beneath the selected root. The target inode is retained for `execveat(AT_EMPTY_PATH)`.
-3. **Owned namespace/filesystem setup** atomically creates user, mount, PID, and network namespaces, maps namespace UID/GID 0 to the launching effective UID/GID, makes mount propagation private, revalidates the selected root by `(st_dev, st_ino)`, recursively clones it, applies recursive `MOUNT_ATTR_RDONLY`, and attaches it only inside the private mount namespace. The launcher does not attach a veth, configure routes, or otherwise connect the new network namespace to the host network stack.
+3. **Owned namespace/filesystem setup** atomically creates user, mount, PID, network, and IPC namespaces, maps namespace UID/GID 0 to the launching effective UID/GID, makes mount propagation private, revalidates the selected root by `(st_dev, st_ino)`, recursively clones it, applies recursive `MOUNT_ATTR_RDONLY`, and attaches it only inside the private mount namespace. The launcher neither attaches the new network namespace to a host network topology nor shares the host SysV IPC/POSIX message-queue namespace with the target.
 4. **Optional writable scratch** overlays one declared sandbox directory with a bounded private `nosuid,nodev,noexec` tmpfs.
 5. **Owned stdout redirection/capture** may map stdout to a private-scratch file or a launcher-created `pipe2(O_CLOEXEC)`. Temporary sources remain launcher-owned and do not survive as extra target descriptors.
 6. **PID-namespace lifecycle split** forks the first process in the new PID namespace as launcher-owned PID 1. That init forks the direct target as PID 2. PID 1 stays outside target stdio/rlimit/capability/seccomp setup.
@@ -25,7 +25,8 @@ The Linux x86_64 implementation launches one direct target under an explicit pol
 For successful launch on a supported Linux x86_64 host:
 
 - Initial target, cwd, scratch, and stdout-redirection paths are fail-closed and bounded by the selected filesystem root.
-- The target receives user/mount/PID/network namespace isolation, private mount propagation, a recursively read-only root, chroot/cwd selection, capability clearing, `no_new_privs`, rlimits, and default-deny seccomp.
+- The target receives user/mount/PID/network/IPC namespace isolation, private mount propagation, a recursively read-only root, chroot/cwd selection, capability clearing, `no_new_privs`, rlimits, and default-deny seccomp.
+- SysV IPC identifiers/keys are resolved inside the target IPC namespace rather than the host IPC namespace; a host-created message queue is not discoverable by the same key from the target.
 - The target does not share the host network namespace. The launcher does not configure a network attachment in the new namespace, so host loopback listeners are not the target's loopback listeners.
 - Target socket authority remains explicit at the syscall layer: `socket` and `connect` are available only when the policy names them. Network namespace creation is launcher management and does not itself widen target seccomp.
 - Launcher-owned PID 1 supervises the direct target as PID 2 and owns descendant teardown.
@@ -92,6 +93,7 @@ Linux x86_64 integration tests prove that:
 
 - exact allowed/denied syscall profiles behave as declared and malformed policies fail closed;
 - a host `127.0.0.1` TCP listener is first proven reachable from the host process, then a raw sandbox target is explicitly granted `socket`, `connect`, `close`, and `exit` and attempts the same host loopback port from the new network namespace; only network-stack unreachable/refused results are accepted, while seccomp `EPERM` or a successful cross-namespace connection fails the fixture;
+- the host creates a real SysV message queue under an explicit key and proves host lookup returns that queue ID; a raw sandbox target explicitly granted `msgget` looks up the same key inside the new IPC namespace and must receive `ENOENT`. A visible host queue or seccomp `EPERM` fails the fixture;
 - zero, oversized, and duplicate wall-clock deadline declarations are rejected; a valid millisecond deadline parses exactly;
 - inherited high-FD, stdio, filesystem, scratch, redirection, bounded-capture, capability, rlimit, `no_new_privs`, launch-error, and exit-vs-signal regressions remain active;
 - a raw target observes `getpid() == 2` and `getppid() == 1`;
@@ -103,7 +105,7 @@ The probe is assembled with `cc -nostdlib -static`, so supported integration tes
 
 ## Platform support
 
-Real enforcement is implemented only for **Linux x86_64**. Required mechanisms include `openat2`, `open_tree`, `mount_setattr`, `move_mount`, tmpfs, user/mount/PID/network namespaces, UID/GID maps, capability operations, `close_range`, `pipe2`, `dup2`, seccomp, `execveat`, shared anonymous mappings, `fork`, `kill`, `wait4`, and `waitpid`. When a wall-clock deadline is declared, `pidfd_open`, `timerfd_create`/`timerfd_settime`, `CLOCK_MONOTONIC`, and `poll` are additionally required.
+Real enforcement is implemented only for **Linux x86_64**. Required mechanisms include `openat2`, `open_tree`, `mount_setattr`, `move_mount`, tmpfs, user/mount/PID/network/IPC namespaces, UID/GID maps, capability operations, `close_range`, `pipe2`, `dup2`, seccomp, `execveat`, shared anonymous mappings, `fork`, `kill`, `wait4`, and `waitpid`. When a wall-clock deadline is declared, `pidfd_open`, `timerfd_create`/`timerfd_settime`, `CLOCK_MONOTONIC`, and `poll` are additionally required.
 
 If mandatory kernel primitives are unavailable or denied, launch returns an explicit unsupported/setup failure rather than dropping the requested boundary. CI enables the required user-namespace settings on its disposable Ubuntu runner so the real enforcement path is exercised rather than skipped.
 
@@ -120,7 +122,8 @@ This remains an educational sandbox, not a production container boundary. In par
 - `reaped_descendants` is not a total process-creation counter or process-limit/accounting mechanism;
 - there is no cgroup aggregate CPU/memory/process accounting or process-count quota. The current GitHub-hosted CI runner exposes cgroup v2 and the `pids` controller but does not delegate a writable child cgroup to the unprivileged workflow user, so cgroup-backed claims remain blocked rather than mocked;
 - deliberate selected non-stdio descriptor passing is not implemented;
-- IPC, UTS, and cgroup namespaces are not yet created;
+- the IPC namespace isolates SysV IPC and POSIX message-queue namespace membership, but it does not revoke IPC channels deliberately exposed through inherited file descriptors/sockets/pipes;
+- UTS and cgroup namespaces are not yet created;
 - there is no device namespace, syscall argument filtering, persistent data-volume policy, or configured network endpoint policy;
 - root revalidation is an identity check, not an immutable/cryptographic snapshot of the whole subtree;
 - supplementary groups are not claimed to be empty, persistent executable allowlisting is not provided, and multi-architecture seccomp/side-channel resistance are out of scope;

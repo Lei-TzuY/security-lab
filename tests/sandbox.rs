@@ -118,7 +118,10 @@ fn inherited_non_stdio_descriptor_does_not_survive_exec() {
     unsafe {
         libc::close(source);
     }
-    assert!(inherited >= 200, "failed to create inheritable high descriptor");
+    assert!(
+        inherited >= 200,
+        "failed to create inheritable high descriptor"
+    );
 
     let flags = unsafe { libc::fcntl(inherited, libc::F_GETFD) };
     assert!(flags >= 0);
@@ -129,11 +132,7 @@ fn inherited_non_stdio_descriptor_does_not_survive_exec() {
     );
 
     let descriptor = inherited.to_string();
-    let result = run(&policy(
-        "D",
-        &[&descriptor],
-        &["execve", "fcntl", "exit"],
-    ));
+    let result = run(&policy("D", &[&descriptor], &["execve", "fcntl", "exit"]));
     unsafe {
         libc::close(inherited);
     }
@@ -154,11 +153,7 @@ fn exec_failure_is_reported_after_descriptor_sanitization() {
     permissions.set_mode(0o755);
     std::fs::set_permissions(&script, permissions).unwrap();
 
-    let mut failing = policy(
-        "A",
-        &[],
-        &["execve", "write", "exit", "exit_group"],
-    );
+    let mut failing = policy("A", &[], &["execve", "write", "exit", "exit_group"]);
     failing.executable = script.clone();
     let result = run(&failing);
     let _ = std::fs::remove_file(&script);

@@ -29,6 +29,7 @@
 #   Q emit a marker, fork a descendant, then remain live past the policy deadline
 #   K assert host loopback listener is unreachable from the target network namespace
 #   L assert host SysV message queue key is invisible in the target IPC namespace
+#   J assert target UTS nodename matches argv[2]
 
 _start:
     mov 16(%rsp), %rdi
@@ -81,6 +82,8 @@ _start:
     je .network_isolation
     cmp $76, %al
     je .ipc_isolation
+    cmp $74, %al
+    je .uts_identity
     jmp .fail2
 
 .allowed:
@@ -652,6 +655,22 @@ _start:
     xor %edi, %edi
     jmp .exit
 
+.uts_identity:
+    mov 24(%rsp), %rsi
+    test %rsi, %rsi
+    je .fail2
+    mov $63, %eax
+    lea uts_buffer(%rip), %rdi
+    syscall
+    test %rax, %rax
+    js .fail28
+    lea uts_buffer+65(%rip), %rdi
+    call .str_eq
+    test %eax, %eax
+    je .fail28
+    xor %edi, %edi
+    jmp .exit
+
 .str_eq:
 .str_eq_loop:
     movzbl (%rdi), %eax
@@ -741,6 +760,9 @@ _start:
     jmp .exit
 .fail27:
     mov $27, %edi
+    jmp .exit
+.fail28:
+    mov $28, %edi
 
 .exit:
     mov $60, %eax
@@ -790,6 +812,9 @@ cap_data:
     .skip 24
 redirect_buffer:
     .skip 1
+.balign 16
+uts_buffer:
+    .skip 512
 .balign 16
 network_addr:
     .skip 16

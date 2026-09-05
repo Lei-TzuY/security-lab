@@ -97,6 +97,7 @@ mod x86_64 {
     const PHASE_DEADLINE_TIMERFD: u32 = 35;
     const PHASE_DEADLINE_TIMER_ARM: u32 = 36;
     const PHASE_DEADLINE_POLL: u32 = 37;
+    const PHASE_HOSTNAME: u32 = 38;
 
     #[repr(C)]
     struct OpenHow {
@@ -252,6 +253,7 @@ mod x86_64 {
         envp: Vec<*const libc::c_char>,
         uid_map: Vec<u8>,
         gid_map: Vec<u8>,
+        hostname: Vec<u8>,
     }
 
     impl PreparedLaunch {
@@ -331,6 +333,7 @@ mod x86_64 {
 
             let uid_map = format!("0 {} 1\n", unsafe { libc::geteuid() }).into_bytes();
             let gid_map = format!("0 {} 1\n", unsafe { libc::getegid() }).into_bytes();
+            let hostname = policy.hostname.as_bytes().to_vec();
 
             Ok(Self {
                 root_fd,
@@ -347,6 +350,7 @@ mod x86_64 {
                 envp,
                 uid_map,
                 gid_map,
+                hostname,
             })
         }
     }
@@ -764,7 +768,8 @@ mod x86_64 {
                 | libc::CLONE_NEWNS
                 | libc::CLONE_NEWPID
                 | libc::CLONE_NEWNET
-                | libc::CLONE_NEWIPC,
+                | libc::CLONE_NEWIPC
+                | libc::CLONE_NEWUTS,
         ) == -1
         {
             child_fail(launch_error, PHASE_NAMESPACE, seccomp.error_exit_syscall);
@@ -791,6 +796,15 @@ mod x86_64 {
             PHASE_GID_MAP,
             seccomp.error_exit_syscall,
         );
+
+        if libc::syscall(
+            libc::SYS_sethostname,
+            prepared.hostname.as_ptr(),
+            prepared.hostname.len(),
+        ) == -1
+        {
+            child_fail(launch_error, PHASE_HOSTNAME, seccomp.error_exit_syscall);
+        }
 
         if libc::syscall(
             libc::SYS_mount,
@@ -1379,7 +1393,7 @@ mod x86_64 {
 
     fn format_launch_error(record: LaunchErrorRecord) -> String {
         let phase = match record.phase {
-            PHASE_NAMESPACE => "user/mount/PID/network/IPC namespace creation",
+            PHASE_NAMESPACE => "user/mount/PID/network/IPC/UTS namespace creation",
             PHASE_SETGROUPS => "setgroups deny",
             PHASE_UID_MAP => "uid_map",
             PHASE_GID_MAP => "gid_map",
@@ -1416,6 +1430,7 @@ mod x86_64 {
             PHASE_DEADLINE_TIMERFD => "wall-clock deadline timer creation",
             PHASE_DEADLINE_TIMER_ARM => "wall-clock deadline timer arming",
             PHASE_DEADLINE_POLL => "wall-clock deadline supervision poll",
+            PHASE_HOSTNAME => "UTS hostname installation",
             _ => "unknown launch phase",
         };
         format!(

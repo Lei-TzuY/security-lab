@@ -12,7 +12,3 @@ libc = "0.2"
 [[bin]]
 name = "security-lab"
 path = "src/main.rs"
-
-[[bin]]
-name = "fixture-probe"
-path = "src/bin/fixture_probe.rs"

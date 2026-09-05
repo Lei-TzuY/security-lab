@@ -24,6 +24,7 @@ pub struct ResourceLimits {
 pub enum StdioMode {
     Inherit,
     Closed,
+    Redirect,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,6 +59,9 @@ pub struct SandboxPolicy {
     pub scratch_bytes: Option<u64>,
     /// Explicit disposition for descriptors 0, 1, and 2.
     pub stdio: StdioPolicy,
+    /// Sandbox path used only when stdout disposition is `Redirect`. The path
+    /// must be strictly beneath the declared private scratch directory.
+    pub stdout_redirect: Option<PathBuf>,
     pub limits: ResourceLimits,
     pub seccomp: SeccompPolicy,
 }
@@ -127,6 +131,38 @@ impl SandboxPolicy {
                     "filesystem.scratch and filesystem.scratch_bytes must be specified together",
                 ));
             }
+        }
+
+        if self.stdio.stdin == StdioMode::Redirect || self.stdio.stderr == StdioMode::Redirect {
+            return Err(PolicyError::new(
+                "redirect is currently supported only for stdio.stdout",
+            ));
+        }
+        match (self.stdio.stdout, &self.stdout_redirect) {
+            (StdioMode::Redirect, Some(path)) => {
+                validate_absolute_path("stdio.stdout_path", path)?;
+                let scratch = self.scratch_dir.as_ref().ok_or_else(|| {
+                    PolicyError::new(
+                        "stdio.stdout = redirect requires a declared filesystem.scratch",
+                    )
+                })?;
+                if path == scratch || !path.starts_with(scratch) {
+                    return Err(PolicyError::new(
+                        "stdio.stdout_path must be strictly beneath filesystem.scratch",
+                    ));
+                }
+            }
+            (StdioMode::Redirect, None) => {
+                return Err(PolicyError::new(
+                    "stdio.stdout = redirect requires stdio.stdout_path",
+                ));
+            }
+            (_, Some(_)) => {
+                return Err(PolicyError::new(
+                    "stdio.stdout_path is only valid when stdio.stdout = redirect",
+                ));
+            }
+            (_, None) => {}
         }
 
         if self.args.len() > MAX_ARGS {
@@ -219,6 +255,7 @@ impl FromStr for SandboxPolicy {
         let mut stdin = None;
         let mut stdout = None;
         let mut stderr = None;
+        let mut stdout_redirect = None;
         let mut cpu_seconds = None;
         let mut address_space_bytes = None;
         let mut file_size_bytes = None;
@@ -268,6 +305,9 @@ impl FromStr for SandboxPolicy {
                     line_no,
                     key,
                 )?,
+                "stdio.stdout_path" => {
+                    set_once(&mut stdout_redirect, value.to_owned(), line_no, key)?
+                }
                 "limit.cpu_seconds" => set_once(
                     &mut cpu_seconds,
                     parse_u64(value, line_no, key)?,
@@ -354,6 +394,7 @@ impl FromStr for SandboxPolicy {
                 stdout: required(stdout, "stdio.stdout")?,
                 stderr: required(stderr, "stdio.stderr")?,
             },
+            stdout_redirect: stdout_redirect.map(PathBuf::from),
             limits: ResourceLimits {
                 cpu_seconds: required(cpu_seconds, "limit.cpu_seconds")?,
                 address_space_bytes: required(address_space_bytes, "limit.address_space_bytes")?,
@@ -394,9 +435,10 @@ fn parse_stdio_mode(value: &str, line: usize, key: &str) -> Result<StdioMode, Po
     match value {
         "inherit" => Ok(StdioMode::Inherit),
         "closed" => Ok(StdioMode::Closed),
+        "redirect" => Ok(StdioMode::Redirect),
         _ => Err(PolicyError::at(
             line,
-            format!("{key} must be either inherit or closed"),
+            format!("{key} must be inherit, closed, or redirect"),
         )),
     }
 }
@@ -462,11 +504,47 @@ mod tests {
         assert_eq!(policy.stdio.stdin, StdioMode::Closed);
         assert_eq!(policy.stdio.stdout, StdioMode::Inherit);
         assert_eq!(policy.stdio.stderr, StdioMode::Inherit);
+        assert_eq!(policy.stdout_redirect, None);
         assert_eq!(
             policy.environment.get("LANG").map(String::as_str),
             Some("C")
         );
         assert!(policy.seccomp.allowed_syscalls.contains("execveat"));
+    }
+
+    #[test]
+    fn parses_stdout_redirect_inside_scratch() {
+        let text = VALID.replace(
+            "stdio.stdout = inherit",
+            "stdio.stdout = redirect\n        stdio.stdout_path = /scratch/stdout.log",
+        );
+        let policy: SandboxPolicy = text.parse().unwrap();
+        assert_eq!(policy.stdio.stdout, StdioMode::Redirect);
+        assert_eq!(
+            policy.stdout_redirect,
+            Some(PathBuf::from("/scratch/stdout.log"))
+        );
+    }
+
+    #[test]
+    fn rejects_redirect_path_outside_scratch() {
+        let text = VALID.replace(
+            "stdio.stdout = inherit",
+            "stdio.stdout = redirect\n        stdio.stdout_path = /tmp/stdout.log",
+        );
+        assert!(text.parse::<SandboxPolicy>().is_err());
+    }
+
+    #[test]
+    fn rejects_redirect_without_path() {
+        let text = VALID.replace("stdio.stdout = inherit", "stdio.stdout = redirect");
+        assert!(text.parse::<SandboxPolicy>().is_err());
+    }
+
+    #[test]
+    fn rejects_redirect_on_stdin() {
+        let text = VALID.replace("stdio.stdin = closed", "stdio.stdin = redirect");
+        assert!(text.parse::<SandboxPolicy>().is_err());
     }
 
     #[test]
@@ -492,7 +570,7 @@ mod tests {
     fn rejects_unknown_stdio_disposition() {
         let text = VALID.replace("stdio.stdin = closed", "stdio.stdin = magic");
         let err = text.parse::<SandboxPolicy>().unwrap_err();
-        assert!(err.to_string().contains("inherit or closed"));
+        assert!(err.to_string().contains("inherit, closed, or redirect"));
     }
 
     #[test]

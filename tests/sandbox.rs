@@ -54,6 +54,7 @@ fn policy(mode: &str, extra_args: &[&str], syscalls: &[&str]) -> SandboxPolicy {
             stdout: StdioMode::Inherit,
             stderr: StdioMode::Inherit,
         },
+        stdout_redirect: None,
         limits: ResourceLimits {
             cpu_seconds: 2,
             address_space_bytes: 128 * 1024 * 1024,
@@ -98,6 +99,26 @@ fn root_is_readonly_and_declared_scratch_is_writable() {
     assert!(
         !scratch_host.exists(),
         "scratch tmpfs write escaped its private mount namespace"
+    );
+}
+
+#[test]
+fn owned_stdout_redirect_is_usable_and_private() {
+    let host_redirect = fixture_root().join("scratch/stdout.log");
+    let _ = std::fs::remove_file(&host_redirect);
+
+    let mut redirected = policy(
+        "U",
+        &[],
+        &["execveat", "write", "openat", "read", "close", "exit"],
+    );
+    redirected.stdio.stdout = StdioMode::Redirect;
+    redirected.stdout_redirect = Some(PathBuf::from("/scratch/stdout.log"));
+
+    assert_eq!(run(&redirected).unwrap(), ChildOutcome::Exited(0));
+    assert!(
+        !host_redirect.exists(),
+        "owned stdout redirection leaked into the host scratch directory"
     );
 }
 

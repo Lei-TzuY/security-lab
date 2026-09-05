@@ -75,6 +75,7 @@ mod x86_64 {
     const PHASE_SECCOMP: u32 = 24;
     const PHASE_EXECVEAT: u32 = 25;
     const PHASE_ROOT_REVALIDATE: u32 = 26;
+    const PHASE_STDIO_REDIRECT: u32 = 27;
 
     #[repr(C)]
     #[derive(Clone, Copy)]
@@ -182,6 +183,7 @@ mod x86_64 {
         cwd_relative: CString,
         scratch_relative: Option<CString>,
         scratch_options: Option<CString>,
+        stdout_redirect_relative: Option<CString>,
         _argv0: CString,
         _args: Vec<CString>,
         _environment: Vec<CString>,
@@ -239,6 +241,11 @@ mod x86_64 {
                     )));
                 }
             };
+            let stdout_redirect_relative = policy
+                .stdout_redirect
+                .as_ref()
+                .map(|path| sandbox_relative(path))
+                .transpose()?;
 
             let argv0 = cstring_bytes("executable", policy.executable.as_os_str().as_bytes())?;
             let mut args = Vec::with_capacity(policy.args.len());
@@ -271,6 +278,7 @@ mod x86_64 {
                 cwd_relative,
                 scratch_relative,
                 scratch_options,
+                stdout_redirect_relative,
                 _argv0: argv0,
                 _args: args,
                 _environment: environment,
@@ -648,6 +656,17 @@ mod x86_64 {
             }
         }
 
+        let stdout_redirect_fd = if let Some(path) = &prepared.stdout_redirect_relative {
+            open_stdout_redirect_or_fail(
+                root_tree_fd,
+                path,
+                launch_error,
+                seccomp.error_exit_syscall,
+            )
+        } else {
+            -1
+        };
+
         let cwd_how = OpenHow {
             flags: (libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
             mode: 0,
@@ -685,7 +704,12 @@ mod x86_64 {
             child_fail(launch_error, PHASE_FD_SANITIZE, seccomp.error_exit_syscall);
         }
 
-        apply_stdio_policy_or_fail(stdio, launch_error, seccomp.error_exit_syscall);
+        apply_stdio_policy_or_fail(
+            stdio,
+            stdout_redirect_fd,
+            launch_error,
+            seccomp.error_exit_syscall,
+        );
 
         set_limit_or_fail(
             libc::RLIMIT_CPU,
@@ -747,6 +771,58 @@ mod x86_64 {
             EXECVEAT_AT_EMPTY_PATH,
         );
         child_fail(launch_error, PHASE_EXECVEAT, seccomp.error_exit_syscall)
+    }
+
+    unsafe fn open_stdout_redirect_or_fail(
+        root_tree_fd: RawFd,
+        path: &CString,
+        launch_error: *mut LaunchErrorRecord,
+        error_exit_syscall: libc::c_long,
+    ) -> RawFd {
+        let how = OpenHow {
+            flags: (libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_CLOEXEC) as u64,
+            mode: 0o600,
+            resolve: RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS,
+        };
+        let fd = libc::syscall(
+            libc::SYS_openat2,
+            root_tree_fd,
+            path.as_ptr(),
+            &how as *const OpenHow,
+            std::mem::size_of::<OpenHow>(),
+        );
+        if fd == -1 {
+            child_fail(
+                launch_error,
+                PHASE_STDIO_REDIRECT,
+                error_exit_syscall,
+            );
+        }
+        move_fd_above_stdio_or_fail(
+            fd as RawFd,
+            launch_error,
+            PHASE_STDIO_REDIRECT,
+            error_exit_syscall,
+        )
+    }
+
+    unsafe fn move_fd_above_stdio_or_fail(
+        fd: RawFd,
+        launch_error: *mut LaunchErrorRecord,
+        phase: u32,
+        error_exit_syscall: libc::c_long,
+    ) -> RawFd {
+        if fd >= FIRST_NON_STDIO_FD as RawFd {
+            return fd;
+        }
+        let moved = libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, FIRST_NON_STDIO_FD as libc::c_int);
+        if moved == -1 {
+            child_fail(launch_error, phase, error_exit_syscall);
+        }
+        if libc::close(fd) == -1 {
+            child_fail(launch_error, phase, error_exit_syscall);
+        }
+        moved
     }
 
     unsafe fn revalidate_root_identity_or_fail(
@@ -818,6 +894,7 @@ mod x86_64 {
 
     unsafe fn apply_stdio_policy_or_fail(
         stdio: StdioPolicy,
+        stdout_redirect_fd: RawFd,
         launch_error: *mut LaunchErrorRecord,
         error_exit_syscall: libc::c_long,
     ) {
@@ -847,7 +924,35 @@ mod x86_64 {
                         );
                     }
                 }
+                StdioMode::Redirect => {
+                    if fd != libc::STDOUT_FILENO
+                        || stdout_redirect_fd < FIRST_NON_STDIO_FD as RawFd
+                    {
+                        child_fail_errno(
+                            launch_error,
+                            PHASE_STDIO_REDIRECT,
+                            libc::EINVAL,
+                            error_exit_syscall,
+                        );
+                    }
+                    if libc::dup2(stdout_redirect_fd, fd) == -1 {
+                        child_fail(
+                            launch_error,
+                            PHASE_STDIO_REDIRECT,
+                            error_exit_syscall,
+                        );
+                    }
+                }
             }
+        }
+        if stdout_redirect_fd >= FIRST_NON_STDIO_FD as RawFd
+            && libc::close(stdout_redirect_fd) == -1
+        {
+            child_fail(
+                launch_error,
+                PHASE_STDIO_REDIRECT,
+                error_exit_syscall,
+            );
         }
     }
 
@@ -1023,6 +1128,7 @@ mod x86_64 {
             PHASE_SECCOMP => "seccomp installation",
             PHASE_EXECVEAT => "execveat",
             PHASE_ROOT_REVALIDATE => "filesystem root revalidation in mount namespace",
+            PHASE_STDIO_REDIRECT => "owned stdout redirection",
             _ => "unknown launch phase",
         };
         format!(

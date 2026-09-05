@@ -73,6 +73,7 @@ mod x86_64 {
     const PHASE_NO_NEW_PRIVS: u32 = 23;
     const PHASE_SECCOMP: u32 = 24;
     const PHASE_EXECVEAT: u32 = 25;
+    const PHASE_ROOT_REVALIDATE: u32 = 26;
 
     #[repr(C)]
     #[derive(Clone, Copy)]
@@ -175,6 +176,7 @@ mod x86_64 {
 
     struct PreparedLaunch {
         root_fd: OwnedFd,
+        root_path: CString,
         executable_fd: OwnedFd,
         cwd_relative: CString,
         scratch_relative: Option<CString>,
@@ -191,6 +193,7 @@ mod x86_64 {
     impl PreparedLaunch {
         fn new(policy: &SandboxPolicy) -> Result<Self, SandboxError> {
             let root_fd = open_root(&policy.root_dir)?;
+            let root_path = cstring_bytes("filesystem.root", policy.root_dir.as_os_str().as_bytes())?;
             let cwd_check = open_beneath_root(
                 root_fd.raw(),
                 &policy.working_dir,
@@ -208,30 +211,32 @@ mod x86_64 {
             validate_executable_fd(executable_fd.raw(), &policy.executable)?;
 
             let cwd_relative = sandbox_relative(&policy.working_dir)?;
-            let (scratch_relative, scratch_options) =
-                match (&policy.scratch_dir, policy.scratch_bytes) {
-                    (Some(path), Some(bytes)) => {
-                        let scratch_check = open_beneath_root(
-                            root_fd.raw(),
-                            path,
-                            (libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
-                            "scratch directory",
-                        )?;
-                        drop(scratch_check);
-                        let relative = sandbox_relative(path)?;
-                        let options = cstring_bytes(
-                            "scratch mount options",
-                            format!("size={bytes},mode=0700").as_bytes(),
-                        )?;
-                        (Some(relative), Some(options))
-                    }
-                    (None, None) => (None, None),
-                    _ => {
-                        return Err(SandboxError::InvalidPolicy(PolicyError::new(
-                            "filesystem.scratch and filesystem.scratch_bytes must be specified together",
-                        )));
-                    }
-                };
+            let (scratch_relative, scratch_options) = match (
+                &policy.scratch_dir,
+                policy.scratch_bytes,
+            ) {
+                (Some(path), Some(bytes)) => {
+                    let scratch_check = open_beneath_root(
+                        root_fd.raw(),
+                        path,
+                        (libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
+                        "scratch directory",
+                    )?;
+                    drop(scratch_check);
+                    let relative = sandbox_relative(path)?;
+                    let options = cstring_bytes(
+                        "scratch mount options",
+                        format!("size={bytes},mode=0700").as_bytes(),
+                    )?;
+                    (Some(relative), Some(options))
+                }
+                (None, None) => (None, None),
+                _ => {
+                    return Err(SandboxError::InvalidPolicy(PolicyError::new(
+                        "filesystem.scratch and filesystem.scratch_bytes must be specified together",
+                    )));
+                }
+            };
 
             let argv0 = cstring_bytes("executable", policy.executable.as_os_str().as_bytes())?;
             let mut args = Vec::with_capacity(policy.args.len());
@@ -259,6 +264,7 @@ mod x86_64 {
 
             Ok(Self {
                 root_fd,
+                root_path,
                 executable_fd,
                 cwd_relative,
                 scratch_relative,
@@ -537,9 +543,36 @@ mod x86_64 {
 
         reject_directory_stdio_or_fail(launch_error, seccomp.error_exit_syscall);
 
+        let current_root_how = OpenHow {
+            flags: (libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
+            mode: 0,
+            resolve: RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS,
+        };
+        let current_root_fd = libc::syscall(
+            libc::SYS_openat2,
+            libc::AT_FDCWD,
+            prepared.root_path.as_ptr(),
+            &current_root_how as *const OpenHow,
+            std::mem::size_of::<OpenHow>(),
+        );
+        if current_root_fd == -1 {
+            child_fail(
+                launch_error,
+                PHASE_ROOT_REVALIDATE,
+                seccomp.error_exit_syscall,
+            );
+        }
+        let current_root_fd = current_root_fd as RawFd;
+        revalidate_root_identity_or_fail(
+            prepared.root_fd.raw(),
+            current_root_fd,
+            launch_error,
+            seccomp.error_exit_syscall,
+        );
+
         let root_tree_fd = libc::syscall(
             libc::SYS_open_tree,
-            prepared.root_fd.raw(),
+            current_root_fd,
             b".\0".as_ptr().cast::<libc::c_char>(),
             OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC | AT_RECURSIVE,
         );
@@ -574,7 +607,7 @@ mod x86_64 {
             libc::SYS_move_mount,
             root_tree_fd,
             b"\0".as_ptr().cast::<libc::c_char>(),
-            prepared.root_fd.raw(),
+            current_root_fd,
             b"\0".as_ptr().cast::<libc::c_char>(),
             MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_EMPTY_PATH,
         ) == -1
@@ -703,6 +736,38 @@ mod x86_64 {
             EXECVEAT_AT_EMPTY_PATH,
         );
         child_fail(launch_error, PHASE_EXECVEAT, seccomp.error_exit_syscall)
+    }
+
+    unsafe fn revalidate_root_identity_or_fail(
+        pinned_root_fd: RawFd,
+        current_root_fd: RawFd,
+        launch_error: *mut LaunchErrorRecord,
+        error_exit_syscall: libc::c_long,
+    ) {
+        let mut pinned = std::mem::zeroed::<libc::stat>();
+        if libc::fstat(pinned_root_fd, &mut pinned) == -1 {
+            child_fail(
+                launch_error,
+                PHASE_ROOT_REVALIDATE,
+                error_exit_syscall,
+            );
+        }
+        let mut current = std::mem::zeroed::<libc::stat>();
+        if libc::fstat(current_root_fd, &mut current) == -1 {
+            child_fail(
+                launch_error,
+                PHASE_ROOT_REVALIDATE,
+                error_exit_syscall,
+            );
+        }
+        if pinned.st_dev != current.st_dev || pinned.st_ino != current.st_ino {
+            child_fail_errno(
+                launch_error,
+                PHASE_ROOT_REVALIDATE,
+                libc::ESTALE,
+                error_exit_syscall,
+            );
+        }
     }
 
     unsafe fn write_proc_file_or_fail(
@@ -938,6 +1003,7 @@ mod x86_64 {
             PHASE_NO_NEW_PRIVS => "PR_SET_NO_NEW_PRIVS",
             PHASE_SECCOMP => "seccomp installation",
             PHASE_EXECVEAT => "execveat",
+            PHASE_ROOT_REVALIDATE => "filesystem root revalidation in mount namespace",
             _ => "unknown launch phase",
         };
         format!(

@@ -1,0 +1,29 @@
+name: construct milestone 4C claims sync
+
+on:
+  push:
+    branches:
+      - tmp-4c-claims-generator
+
+permissions:
+  contents: write
+
+jobs:
+  construct:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Materialize IPC claims sync
+        run: python3 .github/tmp-milestone-4c-claims.py
+      - name: Remove construction files and commit claims tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm .github/tmp-milestone-4c-claims.py
+          rm .github/workflows/tmp-milestone-4c-claims.yml
+          git add -A
+          git diff --cached --check
+          git config user.name "LeiZ"
+          git config user.email "52287354+Lei-TzuY@users.noreply.github.com"
+          git commit -m "docs: synchronize IPC namespace guarantees"
+          git push origin HEAD:tmp-4c-claims-generator

@@ -13,7 +13,7 @@ use std::fmt;
 pub use policy::{
     PolicyError, ResourceLimits, SandboxPolicy, SeccompPolicy, StdioMode, StdioPolicy,
 };
-pub use report::ChildOutcome;
+pub use report::{CapturedOutput, ChildOutcome, RunReport};
 
 #[derive(Debug)]
 pub enum SandboxError {
@@ -47,12 +47,18 @@ impl From<PolicyError> for SandboxError {
     }
 }
 
+/// Validate and execute exactly the invocation described by `policy`,
+/// returning terminal status plus any launcher-owned captured output.
+pub fn run_report(policy: &SandboxPolicy) -> Result<RunReport, SandboxError> {
+    policy.validate()?;
+    platform::run_report(policy)
+}
+
 /// Validate and execute exactly the invocation described by `policy`.
 ///
-/// There is deliberately no API for caller-supplied executable or argument
-/// overrides. A setup error is terminal; execution never retries without the
-/// requested restrictions.
+/// This status-only compatibility API still drains any configured capture pipe
+/// through `run_report`, then discards the retained bytes. A setup error is
+/// terminal; execution never retries without the requested restrictions.
 pub fn run(policy: &SandboxPolicy) -> Result<ChildOutcome, SandboxError> {
-    policy.validate()?;
-    platform::run(policy)
+    Ok(run_report(policy)?.outcome)
 }

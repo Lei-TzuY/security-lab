@@ -1,97 +1,86 @@
-# Milestones 1–2F-A threat model
+# Milestones 1–2F-B threat model
 
 ## Purpose
 
-`security-lab` is an educational, correctness-first Linux sandbox. Milestone 1 established syscall/resource/environment controls; 2A removed inherited non-stdio descriptor leakage; 2B made launch/error reporting an owned control-plane protocol; 2C added filesystem-path and process-identity isolation; 2D added a recursively read-only root plus optional bounded private scratch; 2E made standard-descriptor disposition explicit; and 2F-A adds a launcher-owned stdout file redirection path inside that private scratch. Every claimed property must correspond to a kernel mechanism and executable evidence.
+`security-lab` is an educational, correctness-first Linux sandbox. Milestone 1 established syscall/resource/environment controls; 2A removed inherited non-stdio descriptor leakage; 2B made launch/error reporting an owned control-plane protocol; 2C added filesystem-path and process-identity isolation; 2D added a recursively read-only root plus bounded private scratch; 2E made standard-descriptor disposition explicit; 2F-A added launcher-owned stdout redirection; and the current 2F-B candidate adds bounded launcher-owned stdout capture. Every claimed property must correspond to a kernel mechanism and executable evidence.
 
 ## Protected boundary
 
-The trusted parent launches one child under a trusted policy. The target may be buggy or intentionally attempt operations outside its grant. On supported Linux x86_64, the launcher constrains initial filesystem visibility and mutability, namespace identity, capabilities, syscalls, selected resources, environment, working directory, inherited non-stdio descriptors, standard-descriptor disposition, and the first launcher-owned stdout destination while preserving fail-closed launch reporting.
+The trusted parent launches one direct child under a trusted policy. On supported Linux x86_64, the launcher constrains initial filesystem visibility/mutability, namespace identity, capabilities, syscalls, selected resources, environment, cwd, inherited non-stdio descriptors, explicit standard-descriptor disposition, launcher-owned stdout redirection, and bounded retained stdout capture while preserving fail-closed launch reporting.
 
 ## Security properties claimed
 
-- **Pinned root/cwd/target:** `filesystem.root` is opened without symlink traversal. Sandbox-internal executable, cwd, optional scratch, and optional stdout-redirection paths are validated with fail-closed path rules.
-- **Current-mount root revalidation:** after creating the child mount namespace, the configured root is reopened there and its `(st_dev, st_ino)` must match the pre-fork root pin or launch fails closed.
-- **Initial executable identity:** the executable inode is pinned before `fork` and launched with `execveat(AT_EMPTY_PATH)`.
-- **User/mount namespace isolation:** the child creates new user and mount namespaces. Namespace UID/GID 0 map only to the launching effective UID/GID.
-- **Private mount propagation:** propagation is made recursively private before the sandbox mount tree is constructed.
-- **Recursively read-only root:** the revalidated root is recursively cloned with `open_tree`, receives recursive `MOUNT_ATTR_RDONLY`, and is attached only inside the child mount namespace.
-- **Explicit writable scratch:** policy may declare one existing scratch path plus size ceiling. That location is overlaid with a private `nosuid,nodev,noexec` tmpfs bounded by `filesystem.scratch_bytes`.
-- **Filesystem path boundary:** the target is chrooted into the constructed root and switches to a cwd re-pinned from that mount tree.
-- **Inherited non-stdio descriptor minimization:** arbitrary inherited descriptors >= 3 are marked `CLOEXEC`, so they do not survive successful target exec.
-- **Explicit stdio disposition:** stdin/stdout/stderr have no implicit default. Inherited stdio must exist and must not be a directory; closed stdio is explicitly closed before target exec.
-- **Owned stdout redirection:** `stdio.stdout = redirect` requires a `stdio.stdout_path` strictly beneath the declared private scratch path. The launcher opens the file with `openat2` only after the private tmpfs is mounted, using no-symlink and beneath constraints. If the temporary file descriptor occupies 0/1/2, it is first moved above stdio using `F_DUPFD_CLOEXEC`; the source remains `CLOEXEC` through descriptor sanitization, is mapped only to fd 1 with `dup2`, and is then closed.
-- **No target-policy widening for redirection:** launcher `openat2`, `fcntl`, and `dup2` operations occur before target seccomp installation. The target still receives exactly its policy-named syscall allowlist.
-- **Capability reduction:** capability bounding and ambient sets are cleared, and effective/permitted/inheritable sets are zeroed.
-- **No privilege gain across exec:** `PR_SET_NO_NEW_PRIVS` is enabled before target exec.
-- **Environment minimization:** only policy environment entries appear in target `envp`.
-- **Resource ceilings:** configured CPU-time, address-space, regular-file-size, and open-file limits are applied as soft and hard rlimits.
-- **Syscall least privilege:** classic seccomp-BPF validates the x86_64 audit architecture, permits only named syscalls, and returns `EPERM` for other x86_64 syscalls. The initial transition requires policy-authorized `execveat` plus `exit` or `exit_group`.
-- **Owned launch-error reporting:** setup errors publish a bounded phase plus errno through pre-fork shared anonymous memory. Reporting does not depend on target stdio or target `write(2)` permission.
-- **Fail-closed enforcement:** unsupported or failed mandatory enforcement never triggers an unrestricted retry.
-- **Observable termination:** absent a launch error, normal exit and signal death are surfaced distinctly.
+- **Pinned root/cwd/target:** configured sandbox paths are fail-closed; the initial executable is pinned and launched with `execveat(AT_EMPTY_PATH)`.
+- **Current-mount root revalidation:** after mount-namespace creation the selected root is reopened and must match the pre-fork `(st_dev, st_ino)` pin.
+- **User/mount namespace isolation:** namespace UID/GID 0 map only to the launching effective UID/GID; mount propagation is private.
+- **Filesystem mutability:** the revalidated root is recursively cloned/read-only; at most one declared bounded private `nosuid,nodev,noexec` scratch tmpfs is writable.
+- **Filesystem path boundary:** the target is chrooted into the constructed root and switches to a re-pinned cwd.
+- **Inherited-FD minimization:** arbitrary inherited descriptors >= 3 are marked `CLOEXEC` and do not survive successful target exec.
+- **Explicit stdio:** inherited descriptors must exist and not be directories; closed descriptors are explicitly closed. stdout additionally supports launcher-owned redirection and capture.
+- **Owned stdout redirection:** the launcher opens only a path strictly beneath private scratch after scratch exists, normalizes temporary low descriptors with `F_DUPFD_CLOEXEC`, maps only the source to fd 1 using `dup2`, then closes the source.
+- **Bounded owned stdout capture:** capture creates a new pre-fork `pipe2(O_CLOEXEC)` rather than exposing an arbitrary parent descriptor. Both pipe ends are normalized above fd 2 before fork. The child closes the read end, maps the write end only to fd 1, then closes the high source. The parent closes its own write end and drains the read end before waiting for the direct child.
+- **Bounded retained memory:** `stdio.stdout_capture_bytes` is limited to 1 byte–16 MiB. At most that many bytes are retained in `CapturedOutput`; additional bytes are drained and discarded and set `truncated = true`.
+- **Pipe-pressure liveness for the direct child:** because the parent drains before `waitpid`, a target that emits more than the kernel pipe capacity is not blocked merely because the retained capture buffer reached its policy ceiling.
+- **No target-policy widening:** launcher management operations for redirection/capture/remapping happen before target seccomp installation. The target receives only its named syscall allowlist.
+- **Capability/resource controls:** capability sets are reduced, `no_new_privs` is enabled, configured rlimits are applied, and seccomp remains default-deny.
+- **Owned launch-error reporting:** pre-exec phase+errno travels through shared anonymous memory and does not depend on target stdout/stderr or a target `write` grant.
+- **Fail-closed enforcement:** failed or unsupported mandatory enforcement never triggers an unrestricted retry.
 
-## Post-fork discipline
+## Parent/child orchestration
 
-Potentially allocating data is prepared before `fork`: pinned descriptors, path C strings, tmpfs options, redirect path, UID/GID map strings, argv/envp arrays, and the seccomp program. The child path uses direct libc/syscall operations and stack/local state. Launcher-owned stdout is opened before final stdio disposition, then normalized to a temporary fd >= 3 so a missing inherited standard descriptor cannot be silently satisfied by setup fd allocation. After stdio disposition, subsequent launcher stages do not open new descriptors; launch errors remain observable through shared memory.
+Potentially allocating policy data, argv/envp, seccomp instructions, pinned descriptors, and capture-pipe creation occur before `fork`. Capture endpoints are normalized above fd 2 before fork so a launcher-created endpoint cannot accidentally make a previously absent inherited standard descriptor appear valid. In the child, the capture read end is closed immediately and the write source remains `CLOEXEC` until explicit stdout remapping.
+
+In the parent, capture is drained to EOF **before `waitpid`**. Retention stops at the policy ceiling but draining continues. This ordering is a correctness requirement: waiting first could deadlock if the direct child fills the pipe and blocks in `write(2)` while the parent waits for it to exit.
 
 ## Explicit non-goals and limitations
 
 This sandbox is **not** a production multi-tenant container boundary. It does not provide:
 
-- confinement of an object deliberately exposed through `stdio.* = inherit`; an inherited pipe/socket/terminal/file may still refer outside the filesystem root;
-- stdin or stderr redirection in 2F-A;
-- launcher-owned pipe capture or a parent API that retrieves redirected stdout bytes;
-- deliberate selected non-stdio descriptor passing; arbitrary inherited descriptors >= 3 remain removed by the existing boundary;
-- persistence of the redirected file after the private mount namespace disappears;
-- an immutable or cryptographic snapshot of the selected root subtree;
-- a general persistent writable-volume policy beyond one ephemeral private tmpfs scratch;
+- confinement of objects explicitly exposed through `stdio.* = inherit`;
+- stdin/stderr redirect or capture;
+- a total-output byte ceiling for captured stdout. The configured ceiling limits retained parent memory only; excess output is discarded after being read;
+- direct-child-only capture lifetime when target-created descendants are possible. Pipe EOF occurs only after every process retaining the stdout writer closes it. Because PID/process-tree isolation is not yet implemented, a descendant can prolong `run_report()` completion if policy grants the process-creation syscalls needed to create that descendant;
+- deliberate selected non-stdio descriptor passing or a general arbitrary FD remapping language;
+- persistence of private-scratch redirect output after the mount namespace disappears;
 - PID, network, IPC, UTS, or cgroup namespaces;
 - cgroup-based aggregate memory/CPU/process accounting;
-- a separate device namespace or network endpoint policy;
-- syscall argument filtering;
+- a device namespace, network endpoint policy, syscall argument filtering, or persistent data-volume policy;
+- an immutable or cryptographic snapshot of the selected root subtree;
 - a guarantee that inherited supplementary groups are empty;
 - persistent executable allowlisting after the initial pinned transition;
-- multi-architecture seccomp;
-- protection from sufficiently privileged external ptrace/signal interference;
-- side-channel resistance;
-- physical-memory accounting equivalent to cgroups;
-- deterministic pipe/terminal output limits.
+- multi-architecture seccomp, side-channel resistance, or protection from sufficiently privileged external ptrace/signal interference.
 
 ## Trust assumptions
 
-- The Linux kernel and parent process are trusted.
-- The policy author is trusted to choose filesystem root/scratch, stdio exposure/redirection, target data, syscall grants, and realistic resource ceilings.
-- Choosing `stdio.* = inherit` is an intentional grant of the corresponding existing parent descriptor.
-- Choosing stdout `redirect` intentionally grants target writes to the declared private scratch file; the path must remain strictly under the scratch mount.
-- The selected root contains only content the operator intends the target to see; choosing `/` provides no path minimization even though the private clone is read-only.
-- `(st_dev, st_ino)` is used only as a root-directory identity revalidation signal, not as a subtree integrity proof.
-- The kernel correctly implements the required openat2/mount/namespace/capability/close_range/dup2/seccomp/execveat semantics.
+- The Linux kernel and trusted parent are trusted.
+- The policy author is trusted to choose the filesystem root/scratch, explicit stdio exposure, target data, syscall grants, and realistic resource/capture ceilings.
+- Choosing `inherit` intentionally grants the existing parent descriptor.
+- Choosing `redirect` intentionally grants writes to the declared private-scratch file.
+- Choosing `capture` intentionally creates a launcher-owned stdout channel and accepts that descendants retaining the writer affect EOF until process-tree isolation exists.
+- The selected root contains only content the operator intends to expose; root device/inode revalidation is not a subtree integrity proof.
 
 ## Test strategy and evidence
 
-The integration probe is statically linked with `-nostdlib` and uses raw Linux x86_64 syscalls, keeping target policies small and auditable. CI executes the entire suite on both stable Rust and Rust 1.74.
+The integration probe is statically linked with `-nostdlib` and uses raw Linux x86_64 syscalls. The full suite runs on stable Rust and Rust 1.74.
 
 Evidence includes:
 
-- allowed and denied syscall profiles, including omitted `getpid` returning `EPERM`;
-- fail-closed malformed/unknown policy behavior and invalid scratch/redirection declarations;
+- exact allowed/denied syscall behavior and fail-closed malformed policy handling;
 - inherited high-FD non-leakage;
-- all-closed stdio: raw `fcntl(F_GETFD)` observes `EBADF` for descriptors 0, 1, and 2;
-- selective stdio: stdin/stderr are `EBADF`, stdout remains valid, and a raw `write(1, ...)` succeeds;
-- owned stdout redirection: the raw target writes one byte through fd 1, reopens `/scratch/stdout.log`, reads the same byte back, and exits successfully; the parent verifies the corresponding host scratch path does not exist;
-- owned `execveat` error reporting without target `write` permission;
-- executable symlink escape rejection and host-path hiding;
-- namespace UID/GID 0 plus zero effective, permitted, inheritable, bounding, and ambient capability sets;
-- ordinary-root `O_CREAT` returning `EROFS`, scratch create/write succeeding, and parent verification that scratch is private;
-- environment/cwd controls, all four rlimit readbacks, active `RLIMIT_NOFILE`, target-observed `no_new_privs`, and exit-vs-signal reporting.
+- all-closed and selective-inherit stdio behavior;
+- owned stdout redirection with target readback from private scratch and parent verification of no host write-through;
+- exact small stdout capture returning the target bytes with `truncated = false`;
+- a stress target writing 4096 raw 64-byte chunks (**256 KiB**) with a **1 KiB** capture ceiling. The target exits successfully, the parent retains exactly 1 KiB of the expected byte, and `truncated = true`, proving excess output is drained rather than allowed to block on a full pipe;
+- owned launch-error reporting, filesystem hiding/read-only enforcement, private scratch, namespace UID/GID and capability reduction, environment/cwd, all four rlimits, `RLIMIT_NOFILE`, `no_new_privs`, and exit-vs-signal regressions.
 
-CI explicitly enables user-namespace settings on its disposable Ubuntu runner so namespace/mount enforcement is exercised rather than skipped. The runtime itself does not alter host policy; unavailable mandatory primitives produce explicit unsupported/setup failures.
+CI explicitly enables the user-namespace settings required by its disposable Ubuntu runner. The runtime itself never weakens host policy when mandatory primitives are unavailable.
 
 ## Failure semantics
 
-Invalid policy is rejected before launch. Stdout redirect is rejected unless its path is present, absolute, and strictly below the declared scratch path; redirect on stdin/stderr is rejected in this slice. Mandatory namespace/mount/descriptor/redirection/capability/seccomp failures are terminal and carry bounded launch phases where possible. No failure path re-executes the target without the requested boundary.
+Invalid capture policy is rejected before launch. Pipe creation, endpoint normalization, child-side remapping, capture reads, namespace/mount/capability/seccomp setup, and target exec failures are terminal. A capture read error is not converted into successful execution. No failure path retries the target without the requested restrictions.
 
-## Next hardening direction
+## Phase promotion
 
-After owned stdout redirection integrates, the next descriptor frontier is **deliberate selected handle passing and/or launcher-owned pipe capture** without weakening the invariant that arbitrary inherited descriptors >= 3 do not survive. A selected-handle design must normalize source descriptors safely, reserve deterministic target fd numbers below `RLIMIT_NOFILE`, avoid collisions with stdio/redirection, prove declared-handle usability, and independently prove undeclared inheritable descriptors remain absent. PID/process-tree isolation, network policy, and stronger aggregate resource accounting remain later frontiers.
+After 2F-B integrates, the descriptor phase has enough executable depth to stop farming stdout/FD variants: inherited high-FD authority is removed, stdio is explicit, and the launcher owns both a private-file output path and a bounded capture path. Deliberate selected non-stdio handle passing remains a possible future capability, but it is intentionally deferred rather than expanded into a generic FD-remapping language without a concrete integration need.
+
+The next architectural frontier is **Milestone 3A — PID/process-tree isolation**. The design must address Linux PID-namespace semantics correctly: `CLONE_NEWPID` affects subsequently created children, so the launcher needs an explicit namespace-child/init orchestration rather than merely adding another `unshare` flag. Acceptance must include executable PID identity/process-tree behavior, deterministic descendant cleanup/reaping semantics, preserved launch-error reporting, and integration with captured-output lifetime rather than a configuration-only namespace toggle.

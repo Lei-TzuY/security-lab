@@ -11,6 +11,8 @@ const MAX_ENV_VALUE_BYTES: usize = 8192;
 const MAX_SYSCALLS: usize = 128;
 const MIN_SCRATCH_BYTES: u64 = 4096;
 const MAX_SCRATCH_BYTES: u64 = 1024 * 1024 * 1024;
+const MIN_CAPTURE_BYTES: u64 = 1;
+const MAX_CAPTURE_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResourceLimits {
@@ -25,6 +27,7 @@ pub enum StdioMode {
     Inherit,
     Closed,
     Redirect,
+    Capture,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +65,9 @@ pub struct SandboxPolicy {
     /// Sandbox path used only when stdout disposition is `Redirect`. The path
     /// must be strictly beneath the declared private scratch directory.
     pub stdout_redirect: Option<PathBuf>,
+    /// Maximum number of stdout bytes retained by the parent when stdout is
+    /// `Capture`. Excess output is drained and discarded rather than retained.
+    pub stdout_capture_bytes: Option<u64>,
     pub limits: ResourceLimits,
     pub seccomp: SeccompPolicy,
 }
@@ -133,13 +139,24 @@ impl SandboxPolicy {
             }
         }
 
-        if self.stdio.stdin == StdioMode::Redirect || self.stdio.stderr == StdioMode::Redirect {
+        if matches!(self.stdio.stdin, StdioMode::Redirect | StdioMode::Capture)
+            || matches!(self.stdio.stderr, StdioMode::Redirect | StdioMode::Capture)
+        {
             return Err(PolicyError::new(
-                "redirect is currently supported only for stdio.stdout",
+                "redirect and capture are currently supported only for stdio.stdout",
             ));
         }
-        match (self.stdio.stdout, &self.stdout_redirect) {
-            (StdioMode::Redirect, Some(path)) => {
+
+        match self.stdio.stdout {
+            StdioMode::Redirect => {
+                if self.stdout_capture_bytes.is_some() {
+                    return Err(PolicyError::new(
+                        "stdio.stdout_capture_bytes is only valid when stdio.stdout = capture",
+                    ));
+                }
+                let path = self.stdout_redirect.as_ref().ok_or_else(|| {
+                    PolicyError::new("stdio.stdout = redirect requires stdio.stdout_path")
+                })?;
                 validate_absolute_path("stdio.stdout_path", path)?;
                 let scratch = self.scratch_dir.as_ref().ok_or_else(|| {
                     PolicyError::new(
@@ -152,17 +169,33 @@ impl SandboxPolicy {
                     ));
                 }
             }
-            (StdioMode::Redirect, None) => {
-                return Err(PolicyError::new(
-                    "stdio.stdout = redirect requires stdio.stdout_path",
-                ));
+            StdioMode::Capture => {
+                if self.stdout_redirect.is_some() {
+                    return Err(PolicyError::new(
+                        "stdio.stdout_path is only valid when stdio.stdout = redirect",
+                    ));
+                }
+                let bytes = self.stdout_capture_bytes.ok_or_else(|| {
+                    PolicyError::new("stdio.stdout = capture requires stdio.stdout_capture_bytes")
+                })?;
+                if !(MIN_CAPTURE_BYTES..=MAX_CAPTURE_BYTES).contains(&bytes) {
+                    return Err(PolicyError::new(format!(
+                        "stdio.stdout_capture_bytes must be between {MIN_CAPTURE_BYTES} and {MAX_CAPTURE_BYTES}"
+                    )));
+                }
             }
-            (_, Some(_)) => {
-                return Err(PolicyError::new(
-                    "stdio.stdout_path is only valid when stdio.stdout = redirect",
-                ));
+            StdioMode::Inherit | StdioMode::Closed => {
+                if self.stdout_redirect.is_some() {
+                    return Err(PolicyError::new(
+                        "stdio.stdout_path is only valid when stdio.stdout = redirect",
+                    ));
+                }
+                if self.stdout_capture_bytes.is_some() {
+                    return Err(PolicyError::new(
+                        "stdio.stdout_capture_bytes is only valid when stdio.stdout = capture",
+                    ));
+                }
             }
-            (_, None) => {}
         }
 
         if self.args.len() > MAX_ARGS {
@@ -256,6 +289,7 @@ impl FromStr for SandboxPolicy {
         let mut stdout = None;
         let mut stderr = None;
         let mut stdout_redirect = None;
+        let mut stdout_capture_bytes = None;
         let mut cpu_seconds = None;
         let mut address_space_bytes = None;
         let mut file_size_bytes = None;
@@ -308,6 +342,12 @@ impl FromStr for SandboxPolicy {
                 "stdio.stdout_path" => {
                     set_once(&mut stdout_redirect, value.to_owned(), line_no, key)?
                 }
+                "stdio.stdout_capture_bytes" => set_once(
+                    &mut stdout_capture_bytes,
+                    parse_u64(value, line_no, key)?,
+                    line_no,
+                    key,
+                )?,
                 "limit.cpu_seconds" => set_once(
                     &mut cpu_seconds,
                     parse_u64(value, line_no, key)?,
@@ -395,6 +435,7 @@ impl FromStr for SandboxPolicy {
                 stderr: required(stderr, "stdio.stderr")?,
             },
             stdout_redirect: stdout_redirect.map(PathBuf::from),
+            stdout_capture_bytes,
             limits: ResourceLimits {
                 cpu_seconds: required(cpu_seconds, "limit.cpu_seconds")?,
                 address_space_bytes: required(address_space_bytes, "limit.address_space_bytes")?,
@@ -436,9 +477,10 @@ fn parse_stdio_mode(value: &str, line: usize, key: &str) -> Result<StdioMode, Po
         "inherit" => Ok(StdioMode::Inherit),
         "closed" => Ok(StdioMode::Closed),
         "redirect" => Ok(StdioMode::Redirect),
+        "capture" => Ok(StdioMode::Capture),
         _ => Err(PolicyError::at(
             line,
-            format!("{key} must be inherit, closed, or redirect"),
+            format!("{key} must be inherit, closed, redirect, or capture"),
         )),
     }
 }
@@ -505,6 +547,7 @@ mod tests {
         assert_eq!(policy.stdio.stdout, StdioMode::Inherit);
         assert_eq!(policy.stdio.stderr, StdioMode::Inherit);
         assert_eq!(policy.stdout_redirect, None);
+        assert_eq!(policy.stdout_capture_bytes, None);
         assert_eq!(
             policy.environment.get("LANG").map(String::as_str),
             Some("C")
@@ -527,6 +570,17 @@ mod tests {
     }
 
     #[test]
+    fn parses_bounded_stdout_capture() {
+        let text = VALID.replace(
+            "stdio.stdout = inherit",
+            "stdio.stdout = capture\n        stdio.stdout_capture_bytes = 4096",
+        );
+        let policy: SandboxPolicy = text.parse().unwrap();
+        assert_eq!(policy.stdio.stdout, StdioMode::Capture);
+        assert_eq!(policy.stdout_capture_bytes, Some(4096));
+    }
+
+    #[test]
     fn rejects_redirect_path_outside_scratch() {
         let text = VALID.replace(
             "stdio.stdout = inherit",
@@ -542,9 +596,26 @@ mod tests {
     }
 
     #[test]
-    fn rejects_redirect_on_stdin() {
-        let text = VALID.replace("stdio.stdin = closed", "stdio.stdin = redirect");
+    fn rejects_capture_without_limit() {
+        let text = VALID.replace("stdio.stdout = inherit", "stdio.stdout = capture");
         assert!(text.parse::<SandboxPolicy>().is_err());
+    }
+
+    #[test]
+    fn rejects_zero_capture_limit() {
+        let text = VALID.replace(
+            "stdio.stdout = inherit",
+            "stdio.stdout = capture\n        stdio.stdout_capture_bytes = 0",
+        );
+        assert!(text.parse::<SandboxPolicy>().is_err());
+    }
+
+    #[test]
+    fn rejects_redirect_or_capture_on_stdin() {
+        let redirected = VALID.replace("stdio.stdin = closed", "stdio.stdin = redirect");
+        assert!(redirected.parse::<SandboxPolicy>().is_err());
+        let captured = VALID.replace("stdio.stdin = closed", "stdio.stdin = capture");
+        assert!(captured.parse::<SandboxPolicy>().is_err());
     }
 
     #[test]
@@ -570,7 +641,9 @@ mod tests {
     fn rejects_unknown_stdio_disposition() {
         let text = VALID.replace("stdio.stdin = closed", "stdio.stdin = magic");
         let err = text.parse::<SandboxPolicy>().unwrap_err();
-        assert!(err.to_string().contains("inherit, closed, or redirect"));
+        assert!(err
+            .to_string()
+            .contains("inherit, closed, redirect, or capture"));
     }
 
     #[test]

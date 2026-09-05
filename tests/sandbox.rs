@@ -1,8 +1,8 @@
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 
 use security_lab::{
-    run, ChildOutcome, ResourceLimits, SandboxError, SandboxPolicy, SeccompPolicy, StdioMode,
-    StdioPolicy,
+    run, run_report, ChildOutcome, ResourceLimits, SandboxError, SandboxPolicy, SeccompPolicy,
+    StdioMode, StdioPolicy,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::fs::{symlink, PermissionsExt};
@@ -55,6 +55,7 @@ fn policy(mode: &str, extra_args: &[&str], syscalls: &[&str]) -> SandboxPolicy {
             stderr: StdioMode::Inherit,
         },
         stdout_redirect: None,
+        stdout_capture_bytes: None,
         limits: ResourceLimits {
             cpu_seconds: 2,
             address_space_bytes: 128 * 1024 * 1024,
@@ -120,6 +121,33 @@ fn owned_stdout_redirect_is_usable_and_private() {
         !host_redirect.exists(),
         "owned stdout redirection leaked into the host scratch directory"
     );
+}
+
+#[test]
+fn owned_stdout_capture_returns_exact_bytes() {
+    let mut captured = policy("A", &[], &["execveat", "write", "exit"]);
+    captured.stdio.stdout = StdioMode::Capture;
+    captured.stdout_capture_bytes = Some(4096);
+
+    let report = run_report(&captured).unwrap();
+    assert_eq!(report.outcome, ChildOutcome::Exited(0));
+    let stdout = report.stdout.expect("capture result must be present");
+    assert_eq!(stdout.bytes, b"allowed operation succeeded\n");
+    assert!(!stdout.truncated);
+}
+
+#[test]
+fn bounded_stdout_capture_drains_excess_without_deadlock() {
+    let mut captured = policy("V", &[], &["execveat", "write", "exit"]);
+    captured.stdio.stdout = StdioMode::Capture;
+    captured.stdout_capture_bytes = Some(1024);
+
+    let report = run_report(&captured).unwrap();
+    assert_eq!(report.outcome, ChildOutcome::Exited(0));
+    let stdout = report.stdout.expect("capture result must be present");
+    assert_eq!(stdout.bytes.len(), 1024);
+    assert!(stdout.bytes.iter().all(|byte| *byte == b'C'));
+    assert!(stdout.truncated);
 }
 
 #[test]

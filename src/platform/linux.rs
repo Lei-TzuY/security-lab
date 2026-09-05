@@ -1,7 +1,7 @@
 #[cfg(not(target_arch = "x86_64"))]
-pub(crate) fn run(
+pub(crate) fn run_report(
     _policy: &crate::SandboxPolicy,
-) -> Result<crate::ChildOutcome, crate::SandboxError> {
+) -> Result<crate::RunReport, crate::SandboxError> {
     Err(crate::SandboxError::UnsupportedPlatform(
         "sandbox enforcement currently supports Linux x86_64 only".to_owned(),
     ))
@@ -10,7 +10,10 @@ pub(crate) fn run(
 #[cfg(target_arch = "x86_64")]
 mod x86_64 {
     use crate::policy::{StdioMode, StdioPolicy};
-    use crate::{ChildOutcome, PolicyError, ResourceLimits, SandboxError, SandboxPolicy};
+    use crate::{
+        CapturedOutput, ChildOutcome, PolicyError, ResourceLimits, RunReport, SandboxError,
+        SandboxPolicy,
+    };
     use std::ffi::CString;
     use std::io;
     use std::os::unix::ffi::OsStrExt;
@@ -76,6 +79,7 @@ mod x86_64 {
     const PHASE_EXECVEAT: u32 = 25;
     const PHASE_ROOT_REVALIDATE: u32 = 26;
     const PHASE_STDIO_REDIRECT: u32 = 27;
+    const PHASE_STDOUT_CAPTURE: u32 = 28;
 
     #[repr(C)]
     #[derive(Clone, Copy)]
@@ -127,6 +131,53 @@ mod x86_64 {
                 libc::close(self.0);
             }
         }
+    }
+
+    struct CapturePipe {
+        read_fd: OwnedFd,
+        write_fd: OwnedFd,
+        limit: usize,
+    }
+
+    impl CapturePipe {
+        fn new(limit: u64) -> Result<Self, SandboxError> {
+            let mut fds = [-1; 2];
+            if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } == -1 {
+                return Err(SandboxError::SetupFailed(format!(
+                    "cannot create stdout capture pipe: {}",
+                    io::Error::last_os_error()
+                )));
+            }
+
+            let read_fd = move_parent_fd_above_stdio(OwnedFd(fds[0]), "capture read end")?;
+            let write_fd = move_parent_fd_above_stdio(OwnedFd(fds[1]), "capture write end")?;
+            Ok(Self {
+                read_fd,
+                write_fd,
+                limit: limit as usize,
+            })
+        }
+    }
+
+    fn move_parent_fd_above_stdio(fd: OwnedFd, label: &str) -> Result<OwnedFd, SandboxError> {
+        if fd.raw() >= FIRST_NON_STDIO_FD as RawFd {
+            return Ok(fd);
+        }
+        let moved = unsafe {
+            libc::fcntl(
+                fd.raw(),
+                libc::F_DUPFD_CLOEXEC,
+                FIRST_NON_STDIO_FD as libc::c_int,
+            )
+        };
+        if moved == -1 {
+            return Err(SandboxError::SetupFailed(format!(
+                "cannot normalize {label} above standard descriptors: {}",
+                io::Error::last_os_error()
+            )));
+        }
+        drop(fd);
+        Ok(OwnedFd(moved))
     }
 
     struct SharedLaunchState {
@@ -295,11 +346,24 @@ mod x86_64 {
         error_exit_syscall: libc::c_long,
     }
 
-    pub(crate) fn run(policy: &SandboxPolicy) -> Result<ChildOutcome, SandboxError> {
+    pub(crate) fn run_report(policy: &SandboxPolicy) -> Result<RunReport, SandboxError> {
         ensure_fd_sanitization_supported()?;
         let prepared = PreparedLaunch::new(policy)?;
         let seccomp = compile_seccomp(policy)?;
         let launch_state = SharedLaunchState::new()?;
+        let capture = if policy.stdio.stdout == StdioMode::Capture {
+            Some(CapturePipe::new(policy.stdout_capture_bytes.ok_or_else(
+                || {
+                    SandboxError::InvalidPolicy(PolicyError::new(
+                        "stdio.stdout = capture requires stdio.stdout_capture_bytes",
+                    ))
+                },
+            )?)?)
+        } else {
+            None
+        };
+        let capture_read_fd = capture.as_ref().map_or(-1, |pipe| pipe.read_fd.raw());
+        let capture_write_fd = capture.as_ref().map_or(-1, |pipe| pipe.write_fd.raw());
 
         let pid = unsafe { libc::fork() };
         if pid == -1 {
@@ -317,17 +381,72 @@ mod x86_64 {
                     policy.limits,
                     &seccomp,
                     launch_state.record,
+                    capture_read_fd,
+                    capture_write_fd,
                 )
             }
         }
 
+        let capture_result = capture.map(|pipe| {
+            let CapturePipe {
+                read_fd,
+                write_fd,
+                limit,
+            } = pipe;
+            drop(write_fd);
+            let result = read_capture(read_fd.raw(), limit);
+            drop(read_fd);
+            result
+        });
+
         let status = wait_for_child(pid)?;
         let launch_error = launch_state.snapshot();
         if launch_error.phase != 0 {
-            return decode_launch_error(launch_error);
+            return decode_launch_error(launch_error).map(|outcome| RunReport {
+                outcome,
+                stdout: None,
+            });
         }
 
-        decode_wait_status(status)
+        let stdout = match capture_result {
+            Some(result) => Some(result?),
+            None => None,
+        };
+        let outcome = decode_wait_status(status)?;
+        Ok(RunReport { outcome, stdout })
+    }
+
+    fn read_capture(fd: RawFd, limit: usize) -> Result<CapturedOutput, SandboxError> {
+        let mut bytes = Vec::with_capacity(limit.min(8192));
+        let mut truncated = false;
+        let mut buffer = [0u8; 8192];
+
+        loop {
+            let read =
+                unsafe { libc::read(fd, buffer.as_mut_ptr().cast::<libc::c_void>(), buffer.len()) };
+            if read == 0 {
+                break;
+            }
+            if read == -1 {
+                let err = io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                return Err(SandboxError::SetupFailed(format!(
+                    "stdout capture read failed: {err}"
+                )));
+            }
+
+            let read = read as usize;
+            let remaining = limit.saturating_sub(bytes.len());
+            let retained = remaining.min(read);
+            bytes.extend_from_slice(&buffer[..retained]);
+            if retained < read {
+                truncated = true;
+            }
+        }
+
+        Ok(CapturedOutput { bytes, truncated })
     }
 
     fn cstring_bytes(label: &str, bytes: &[u8]) -> Result<CString, SandboxError> {
@@ -517,7 +636,17 @@ mod x86_64 {
         limits: ResourceLimits,
         seccomp: &CompiledSeccomp,
         launch_error: *mut LaunchErrorRecord,
+        capture_read_fd: RawFd,
+        capture_write_fd: RawFd,
     ) -> ! {
+        if capture_read_fd >= FIRST_NON_STDIO_FD as RawFd && libc::close(capture_read_fd) == -1 {
+            child_fail(
+                launch_error,
+                PHASE_STDOUT_CAPTURE,
+                seccomp.error_exit_syscall,
+            );
+        }
+
         if libc::syscall(libc::SYS_unshare, libc::CLONE_NEWUSER | libc::CLONE_NEWNS) == -1 {
             child_fail(launch_error, PHASE_NAMESPACE, seccomp.error_exit_syscall);
         }
@@ -707,6 +836,7 @@ mod x86_64 {
         apply_stdio_policy_or_fail(
             stdio,
             stdout_redirect_fd,
+            capture_write_fd,
             launch_error,
             seccomp.error_exit_syscall,
         );
@@ -891,6 +1021,7 @@ mod x86_64 {
     unsafe fn apply_stdio_policy_or_fail(
         stdio: StdioPolicy,
         stdout_redirect_fd: RawFd,
+        stdout_capture_fd: RawFd,
         launch_error: *mut LaunchErrorRecord,
         error_exit_syscall: libc::c_long,
     ) {
@@ -934,12 +1065,30 @@ mod x86_64 {
                         child_fail(launch_error, PHASE_STDIO_REDIRECT, error_exit_syscall);
                     }
                 }
+                StdioMode::Capture => {
+                    if fd != libc::STDOUT_FILENO || stdout_capture_fd < FIRST_NON_STDIO_FD as RawFd
+                    {
+                        child_fail_errno(
+                            launch_error,
+                            PHASE_STDOUT_CAPTURE,
+                            libc::EINVAL,
+                            error_exit_syscall,
+                        );
+                    }
+                    if libc::dup2(stdout_capture_fd, fd) == -1 {
+                        child_fail(launch_error, PHASE_STDOUT_CAPTURE, error_exit_syscall);
+                    }
+                }
             }
         }
         if stdout_redirect_fd >= FIRST_NON_STDIO_FD as RawFd
             && libc::close(stdout_redirect_fd) == -1
         {
             child_fail(launch_error, PHASE_STDIO_REDIRECT, error_exit_syscall);
+        }
+        if stdout_capture_fd >= FIRST_NON_STDIO_FD as RawFd && libc::close(stdout_capture_fd) == -1
+        {
+            child_fail(launch_error, PHASE_STDOUT_CAPTURE, error_exit_syscall);
         }
     }
 
@@ -1116,6 +1265,7 @@ mod x86_64 {
             PHASE_EXECVEAT => "execveat",
             PHASE_ROOT_REVALIDATE => "filesystem root revalidation in mount namespace",
             PHASE_STDIO_REDIRECT => "owned stdout redirection",
+            PHASE_STDOUT_CAPTURE => "bounded stdout capture",
             _ => "unknown launch phase",
         };
         format!(
@@ -1196,4 +1346,4 @@ mod x86_64 {
 }
 
 #[cfg(target_arch = "x86_64")]
-pub(crate) use x86_64::run;
+pub(crate) use x86_64::run_report;

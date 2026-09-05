@@ -23,6 +23,7 @@
 #   O assert stdin/stdout/stderr are all closed
 #   T assert stdin/stderr are closed while stdout is inherited and writable
 #   U assert stdout is redirected to a private scratch file and is readable there
+#   V emit 256 KiB through stdout to exercise bounded launcher-owned capture
 
 _start:
     mov 16(%rsp), %rdi
@@ -63,6 +64,8 @@ _start:
     je .stdio_stdout_only
     cmp $85, %al
     je .stdio_stdout_redirect
+    cmp $86, %al
+    je .stdio_stdout_capture_stress
     jmp .fail2
 
 .allowed:
@@ -469,6 +472,24 @@ _start:
     xor %edi, %edi
     jmp .exit
 
+.stdio_stdout_capture_stress:
+    xor %r12d, %r12d
+.capture_stress_loop:
+    cmp $4096, %r12d
+    je .capture_stress_done
+    mov $1, %eax
+    mov $1, %edi
+    lea capture_chunk(%rip), %rsi
+    mov $64, %edx
+    syscall
+    cmp $64, %rax
+    jne .fail22
+    inc %r12d
+    jmp .capture_stress_loop
+.capture_stress_done:
+    xor %edi, %edi
+    jmp .exit
+
 .str_eq:
 .str_eq_loop:
     movzbl (%rdi), %eax
@@ -540,6 +561,9 @@ _start:
     jmp .exit
 .fail21:
     mov $21, %edi
+    jmp .exit
+.fail22:
+    mov $22, %edi
 
 .exit:
     mov $60, %eax
@@ -567,6 +591,8 @@ redirect_path:
     .asciz "/scratch/stdout.log"
 redirect_byte:
     .ascii "R"
+capture_chunk:
+    .ascii "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
 
 .section .bss
 .balign 16

@@ -792,11 +792,7 @@ mod x86_64 {
             std::mem::size_of::<OpenHow>(),
         );
         if fd == -1 {
-            child_fail(
-                launch_error,
-                PHASE_STDIO_REDIRECT,
-                error_exit_syscall,
-            );
+            child_fail(launch_error, PHASE_STDIO_REDIRECT, error_exit_syscall);
         }
         move_fd_above_stdio_or_fail(
             fd as RawFd,
@@ -925,8 +921,7 @@ mod x86_64 {
                     }
                 }
                 StdioMode::Redirect => {
-                    if fd != libc::STDOUT_FILENO
-                        || stdout_redirect_fd < FIRST_NON_STDIO_FD as RawFd
+                    if fd != libc::STDOUT_FILENO || stdout_redirect_fd < FIRST_NON_STDIO_FD as RawFd
                     {
                         child_fail_errno(
                             launch_error,
@@ -936,11 +931,7 @@ mod x86_64 {
                         );
                     }
                     if libc::dup2(stdout_redirect_fd, fd) == -1 {
-                        child_fail(
-                            launch_error,
-                            PHASE_STDIO_REDIRECT,
-                            error_exit_syscall,
-                        );
+                        child_fail(launch_error, PHASE_STDIO_REDIRECT, error_exit_syscall);
                     }
                 }
             }
@@ -948,11 +939,7 @@ mod x86_64 {
         if stdout_redirect_fd >= FIRST_NON_STDIO_FD as RawFd
             && libc::close(stdout_redirect_fd) == -1
         {
-            child_fail(
-                launch_error,
-                PHASE_STDIO_REDIRECT,
-                error_exit_syscall,
-            );
+            child_fail(launch_error, PHASE_STDIO_REDIRECT, error_exit_syscall);
         }
     }
 

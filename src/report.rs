@@ -5,6 +5,9 @@ use std::fmt;
 pub enum ChildOutcome {
     Exited(i32),
     Signaled(i32),
+    /// Launcher-owned wall-clock deadline expired before the direct target
+    /// became waitable. This is distinct from an ordinary target signal.
+    TimedOut,
 }
 
 impl fmt::Display for ChildOutcome {
@@ -12,6 +15,7 @@ impl fmt::Display for ChildOutcome {
         match self {
             Self::Exited(code) => write!(f, "exited code={code}"),
             Self::Signaled(signal) => write!(f, "signaled signal={signal}"),
+            Self::TimedOut => f.write_str("timed out"),
         }
     }
 }

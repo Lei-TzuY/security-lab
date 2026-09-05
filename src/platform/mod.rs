@@ -2,13 +2,13 @@
 mod linux;
 
 #[cfg(target_os = "linux")]
-pub(crate) use linux::run;
+pub(crate) use linux::run_report;
 
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn run(
+pub(crate) fn run_report(
     _policy: &crate::SandboxPolicy,
-) -> Result<crate::ChildOutcome, crate::SandboxError> {
+) -> Result<crate::RunReport, crate::SandboxError> {
     Err(crate::SandboxError::UnsupportedPlatform(
-        "Milestone 1 enforcement is implemented only for Linux x86_64".to_owned(),
+        "sandbox enforcement currently supports Linux x86_64 only".to_owned(),
     ))
 }

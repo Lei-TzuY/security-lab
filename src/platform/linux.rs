@@ -1,8 +1,8 @@
-use crate::{ChildOutcome, SandboxError, SandboxPolicy};
-
 #[cfg(not(target_arch = "x86_64"))]
-pub(crate) fn run(_policy: &SandboxPolicy) -> Result<ChildOutcome, SandboxError> {
-    Err(SandboxError::UnsupportedPlatform(
+pub(crate) fn run(
+    _policy: &crate::SandboxPolicy,
+) -> Result<crate::ChildOutcome, crate::SandboxError> {
+    Err(crate::SandboxError::UnsupportedPlatform(
         "Milestone 1 seccomp enforcement currently supports Linux x86_64 only".to_owned(),
     ))
 }

@@ -352,11 +352,13 @@ mod x86_64 {
         let seccomp = compile_seccomp(policy)?;
         let launch_state = SharedLaunchState::new()?;
         let capture = if policy.stdio.stdout == StdioMode::Capture {
-            Some(CapturePipe::new(policy.stdout_capture_bytes.ok_or_else(|| {
-                SandboxError::InvalidPolicy(PolicyError::new(
-                    "stdio.stdout = capture requires stdio.stdout_capture_bytes",
-                ))
-            })?)?)
+            Some(CapturePipe::new(policy.stdout_capture_bytes.ok_or_else(
+                || {
+                    SandboxError::InvalidPolicy(PolicyError::new(
+                        "stdio.stdout = capture requires stdio.stdout_capture_bytes",
+                    ))
+                },
+            )?)?)
         } else {
             None
         };
@@ -420,13 +422,8 @@ mod x86_64 {
         let mut buffer = [0u8; 8192];
 
         loop {
-            let read = unsafe {
-                libc::read(
-                    fd,
-                    buffer.as_mut_ptr().cast::<libc::c_void>(),
-                    buffer.len(),
-                )
-            };
+            let read =
+                unsafe { libc::read(fd, buffer.as_mut_ptr().cast::<libc::c_void>(), buffer.len()) };
             if read == 0 {
                 break;
             }
@@ -643,7 +640,11 @@ mod x86_64 {
         capture_write_fd: RawFd,
     ) -> ! {
         if capture_read_fd >= FIRST_NON_STDIO_FD as RawFd && libc::close(capture_read_fd) == -1 {
-            child_fail(launch_error, PHASE_STDOUT_CAPTURE, seccomp.error_exit_syscall);
+            child_fail(
+                launch_error,
+                PHASE_STDOUT_CAPTURE,
+                seccomp.error_exit_syscall,
+            );
         }
 
         if libc::syscall(libc::SYS_unshare, libc::CLONE_NEWUSER | libc::CLONE_NEWNS) == -1 {
@@ -1065,7 +1066,8 @@ mod x86_64 {
                     }
                 }
                 StdioMode::Capture => {
-                    if fd != libc::STDOUT_FILENO || stdout_capture_fd < FIRST_NON_STDIO_FD as RawFd {
+                    if fd != libc::STDOUT_FILENO || stdout_capture_fd < FIRST_NON_STDIO_FD as RawFd
+                    {
                         child_fail_errno(
                             launch_error,
                             PHASE_STDOUT_CAPTURE,
@@ -1084,8 +1086,7 @@ mod x86_64 {
         {
             child_fail(launch_error, PHASE_STDIO_REDIRECT, error_exit_syscall);
         }
-        if stdout_capture_fd >= FIRST_NON_STDIO_FD as RawFd
-            && libc::close(stdout_capture_fd) == -1
+        if stdout_capture_fd >= FIRST_NON_STDIO_FD as RawFd && libc::close(stdout_capture_fd) == -1
         {
             child_fail(launch_error, PHASE_STDOUT_CAPTURE, error_exit_syscall);
         }

@@ -176,9 +176,7 @@ impl SandboxPolicy {
                     ));
                 }
                 let bytes = self.stdout_capture_bytes.ok_or_else(|| {
-                    PolicyError::new(
-                        "stdio.stdout = capture requires stdio.stdout_capture_bytes",
-                    )
+                    PolicyError::new("stdio.stdout = capture requires stdio.stdout_capture_bytes")
                 })?;
                 if !(MIN_CAPTURE_BYTES..=MAX_CAPTURE_BYTES).contains(&bytes) {
                     return Err(PolicyError::new(format!(
@@ -643,10 +641,9 @@ mod tests {
     fn rejects_unknown_stdio_disposition() {
         let text = VALID.replace("stdio.stdin = closed", "stdio.stdin = magic");
         let err = text.parse::<SandboxPolicy>().unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("inherit, closed, redirect, or capture")
-        );
+        assert!(err
+            .to_string()
+            .contains("inherit, closed, redirect, or capture"));
     }
 
     #[test]

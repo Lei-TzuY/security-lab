@@ -16,6 +16,7 @@
 #   P assert PR_GET_NO_NEW_PRIVS == 1
 #   R read back all configured resource limits
 #   W create argv[2] marker (used to prove failed setup never executes child)
+#   D assert descriptor number in argv[2] is closed after exec
 
 _start:
     mov 16(%rsp), %rdi
@@ -42,6 +43,8 @@ _start:
     je .resource_limits
     cmp $87, %al
     je .write_marker
+    cmp $68, %al
+    je .descriptor_closed
     jmp .fail2
 
 .allowed:
@@ -203,6 +206,33 @@ _start:
     xor %edi, %edi
     jmp .exit
 
+.descriptor_closed:
+    mov 24(%rsp), %rdi
+    test %rdi, %rdi
+    je .fail2
+    xor %r12d, %r12d
+.fd_parse_loop:
+    movzbl (%rdi), %eax
+    test %al, %al
+    je .fd_parsed
+    sub $48, %eax
+    cmp $9, %eax
+    ja .fail2
+    imul $10, %r12d, %r12d
+    add %eax, %r12d
+    inc %rdi
+    jmp .fd_parse_loop
+.fd_parsed:
+    mov $72, %eax                # fcntl
+    mov %r12d, %edi
+    mov $1, %esi                 # F_GETFD
+    xor %edx, %edx
+    syscall
+    cmp $-9, %rax                # -EBADF means fd did not survive exec
+    jne .fail15
+    xor %edi, %edi
+    jmp .exit
+
 # rdi=a, rsi=b; eax=1 if equal including terminating NUL, else 0.
 .str_eq:
 .str_eq_loop:
@@ -254,6 +284,9 @@ _start:
     jmp .exit
 .fail14:
     mov $14, %edi
+    jmp .exit
+.fail15:
+    mov $15, %edi
 
 .exit:
     mov $60, %eax

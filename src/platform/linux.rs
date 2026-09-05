@@ -3,7 +3,7 @@ pub(crate) fn run(
     _policy: &crate::SandboxPolicy,
 ) -> Result<crate::ChildOutcome, crate::SandboxError> {
     Err(crate::SandboxError::UnsupportedPlatform(
-        "Milestone 1 seccomp enforcement currently supports Linux x86_64 only".to_owned(),
+        "sandbox enforcement currently supports Linux x86_64 only".to_owned(),
     ))
 }
 
@@ -26,6 +26,12 @@ mod x86_64 {
     const BPF_JMP_JEQ_K: u16 = 0x15;
     const BPF_RET_K: u16 = 0x06;
 
+    // Linux UAPI CLOSE_RANGE_CLOEXEC. Defining the flag locally keeps the
+    // enforcement contract explicit instead of depending on libc exposing a
+    // particular header version.
+    const CLOSE_RANGE_CLOEXEC: libc::c_uint = 1 << 2;
+    const FIRST_NON_STDIO_FD: libc::c_uint = 3;
+
     pub(crate) fn run(policy: &SandboxPolicy) -> Result<ChildOutcome, SandboxError> {
         preflight(policy)?;
         let limits = policy.limits;
@@ -39,10 +45,14 @@ mod x86_64 {
             .current_dir(&policy.working_dir);
 
         // SAFETY: the closure performs only direct libc syscalls and accesses
-        // data prepared in the parent. No fallback path exists if any step
-        // fails: Command::spawn returns the pre-exec error to the parent.
+        // data prepared in the parent. Descriptor sanitization uses CLOEXEC
+        // rather than closing descriptors immediately so std::process::Command's
+        // private child-error pipe remains usable until a successful exec.
+        // No fallback path exists if any step fails: Command::spawn returns the
+        // pre-exec error to the parent.
         unsafe {
             command.pre_exec(move || {
+                sanitize_inherited_fds()?;
                 apply_resource_limits(limits)?;
                 apply_no_new_privs()?;
                 install_seccomp(&filter)?;
@@ -97,7 +107,37 @@ mod x86_64 {
                 policy.working_dir.display()
             )));
         }
+
+        ensure_fd_sanitization_supported()?;
         Ok(())
+    }
+
+    fn ensure_fd_sanitization_supported() -> Result<(), SandboxError> {
+        // Probe a range that cannot contain a normal userspace descriptor. A
+        // supporting kernel returns success without changing process state.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_close_range,
+                u32::MAX,
+                u32::MAX,
+                CLOSE_RANGE_CLOEXEC,
+            )
+        };
+        if result == 0 {
+            return Ok(());
+        }
+
+        let err = io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::ENOSYS) | Some(libc::EINVAL) => Err(SandboxError::UnsupportedPlatform(
+                format!(
+                    "inherited-FD sanitization requires close_range(CLOSE_RANGE_CLOEXEC) support: {err}"
+                ),
+            )),
+            _ => Err(SandboxError::SetupFailed(format!(
+                "cannot verify inherited-FD sanitization support: {err}"
+            ))),
+        }
     }
 
     fn compile_seccomp(policy: &SandboxPolicy) -> Result<Vec<libc::sock_filter>, SandboxError> {
@@ -131,6 +171,24 @@ mod x86_64 {
         }
         filter.push(stmt(BPF_RET_K, SECCOMP_RET_ERRNO | (libc::EPERM as u32)));
         Ok(filter)
+    }
+
+    unsafe fn sanitize_inherited_fds() -> io::Result<()> {
+        // Mark every non-stdio descriptor CLOEXEC atomically in the child. The
+        // descriptors remain open during pre-exec setup, which preserves the
+        // standard library's setup-error transport, but none survive a
+        // successful exec into the target image.
+        if libc::syscall(
+            libc::SYS_close_range,
+            FIRST_NON_STDIO_FD,
+            u32::MAX,
+            CLOSE_RANGE_CLOEXEC,
+        ) == -1
+        {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
     }
 
     unsafe fn apply_resource_limits(limits: ResourceLimits) -> io::Result<()> {

@@ -28,7 +28,7 @@ Acceptance evidence includes a raw target with a live descendant and a one-secon
 
 Milestone 3 exit condition is satisfied. Do not farm timer-unit aliases, different kill signals, or reap-count variants.
 
-## Milestone 4 — aggregate accounting and network isolation
+## Milestone 4 — aggregate accounting and namespace isolation
 
 ### Slice 4A — cgroup-v2 bounded process-tree accounting
 
@@ -54,7 +54,7 @@ Therefore 4A must not be implemented/claimed from mocks or sudo-only CI setup. T
 
 ### Slice 4B — isolated network namespace baseline
 
-**Current verified candidate.** Establish a real host-network-namespace boundary before designing controlled connectivity.
+**Status: complete on `main`.** Establishes a real host-network-namespace boundary before any controlled-connectivity policy is attempted.
 
 Implementation:
 
@@ -76,13 +76,25 @@ Acceptance evidence is executable:
 
 Boundary: 4B proves **host network namespace separation**, not a full network-policy system. Explicitly inherited socket objects remain intentionally exposed capabilities; the launcher does not yet create controlled network topology or positive allowlisted connectivity.
 
+### Slice 4C — isolated IPC namespace baseline
+
+**Current verified candidate.** Add `CLONE_NEWIPC` to the existing mandatory namespace transition and prove a real host SysV IPC object is invisible from the target namespace.
+
+Acceptance evidence is executable:
+
+- the trusted host creates a SysV message queue under a collision-checked explicit key and proves `msgget(key, 0)` returns that queue ID before sandbox launch;
+- the raw target receives the same key and is explicitly granted `execveat`, `msgget`, and `exit`;
+- inside the new IPC namespace, `msgget(key, 0)` must return `ENOENT`; seeing the host queue or receiving seccomp `EPERM` fails the fixture;
+- the host removes the queue with `IPC_RMID` after the sandbox run, independent of whether the sandbox result succeeds;
+- `CLONE_NEWIPC` is part of the same fail-closed unshare as user/mount/PID/network namespaces, so failure never retries in the host IPC namespace;
+- all Milestones 1–4B regressions, stable quality checks, and Rust 1.74 full tests remain green.
+
+Boundary: 4C establishes SysV IPC/POSIX message-queue namespace separation. It does not revoke pipes, sockets, or other descriptor-based IPC deliberately exposed through the existing stdio/descriptor policy.
+
 ### Milestone 4 promotion rule
 
-After 4B integrates, do not farm additional unreachable errno variants or duplicate loopback tests. Choose one of two higher-value frontiers:
-
-1. return to 4A when real unprivileged cgroup-v2 delegation becomes available; or
-2. design a coherent controlled-connectivity slice that introduces explicit topology/route/endpoint policy and proves both an allowed connection and a denied connection through real networking.
+After 4C integrates, do not farm additional SysV keys, queue variants, or duplicate namespace probes. Return to 4A when real unprivileged cgroup-v2 delegation becomes available; otherwise promote to the next independently executable isolation/control-plane frontier. A strong candidate is an owned UTS identity slice that sets a launcher-controlled hostname in `CLONE_NEWUTS` and proves the target observes that value while the host hostname remains unchanged.
 
 ## Later frontiers
 
-External asynchronous cancellation, selected-handle passing, syscall-argument filtering, IPC/UTS isolation, broader persistent-volume policy, and controlled networking remain separate evidence-backed frontiers. Do not add configuration-only names without executable kernel behavior and integration evidence.
+External asynchronous cancellation, selected-handle passing, syscall-argument filtering, UTS isolation, broader persistent-volume policy, and controlled networking remain separate evidence-backed frontiers. Do not add configuration-only names without executable kernel behavior and integration evidence.

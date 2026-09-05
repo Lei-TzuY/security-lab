@@ -20,6 +20,8 @@
 #   H assert absolute host path argv[2] is hidden by filesystem root
 #   I assert namespace uid/gid are 0 and all capability sets are empty
 #   M assert root is read-only while /scratch is writable
+#   O assert stdin/stdout/stderr are all closed
+#   T assert stdin/stderr are closed while stdout is inherited and writable
 
 _start:
     mov 16(%rsp), %rdi
@@ -54,6 +56,10 @@ _start:
     je .identity_reduced
     cmp $77, %al
     je .mutability
+    cmp $79, %al
+    je .stdio_all_closed
+    cmp $84, %al
+    je .stdio_stdout_only
     jmp .fail2
 
 .allowed:
@@ -324,17 +330,15 @@ _start:
     jmp .exit
 
 .mutability:
-    # Root path must be read-only at the VFS mount layer.
     mov $257, %eax
     mov $-100, %edi
     lea forbidden_create(%rip), %rsi
     mov $577, %edx
     mov $384, %r10d
     syscall
-    cmp $-30, %rax               # -EROFS
+    cmp $-30, %rax
     jne .fail18
 
-    # The explicitly mounted scratch tmpfs must remain writable.
     mov $257, %eax
     mov $-100, %edi
     lea scratch_create(%rip), %rsi
@@ -358,6 +362,70 @@ _start:
     syscall
     test %rax, %rax
     js .fail18
+    xor %edi, %edi
+    jmp .exit
+
+.stdio_all_closed:
+    mov $72, %eax
+    xor %edi, %edi
+    mov $1, %esi
+    xor %edx, %edx
+    syscall
+    cmp $-9, %rax
+    jne .fail19
+
+    mov $72, %eax
+    mov $1, %edi
+    mov $1, %esi
+    xor %edx, %edx
+    syscall
+    cmp $-9, %rax
+    jne .fail19
+
+    mov $72, %eax
+    mov $2, %edi
+    mov $1, %esi
+    xor %edx, %edx
+    syscall
+    cmp $-9, %rax
+    jne .fail19
+
+    xor %edi, %edi
+    jmp .exit
+
+.stdio_stdout_only:
+    mov $72, %eax
+    xor %edi, %edi
+    mov $1, %esi
+    xor %edx, %edx
+    syscall
+    cmp $-9, %rax
+    jne .fail20
+
+    mov $72, %eax
+    mov $1, %edi
+    mov $1, %esi
+    xor %edx, %edx
+    syscall
+    test %rax, %rax
+    js .fail20
+
+    mov $72, %eax
+    mov $2, %edi
+    mov $1, %esi
+    xor %edx, %edx
+    syscall
+    cmp $-9, %rax
+    jne .fail20
+
+    mov $1, %eax
+    mov $1, %edi
+    lea stdio_message(%rip), %rsi
+    mov $stdio_message_len, %edx
+    syscall
+    cmp $stdio_message_len, %rax
+    jne .fail20
+
     xor %edi, %edi
     jmp .exit
 
@@ -423,6 +491,12 @@ _start:
     jmp .exit
 .fail18:
     mov $18, %edi
+    jmp .exit
+.fail19:
+    mov $19, %edi
+    jmp .exit
+.fail20:
+    mov $20, %edi
 
 .exit:
     mov $60, %eax
@@ -443,6 +517,9 @@ scratch_create:
     .asciz "/scratch/allowed"
 scratch_byte:
     .ascii "x"
+stdio_message:
+    .ascii "explicit stdout inheritance succeeded\n"
+.set stdio_message_len, . - stdio_message
 
 .section .bss
 .balign 16

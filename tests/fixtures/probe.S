@@ -8,6 +8,7 @@
 # argv[1] mode:
 #   A allowed write
 #   B assert 64-bit masked seccomp argument filtering on lseek offset
+#   G assert one selected non-stdio handle is remapped without ambient FD leakage
 #   F forbidden getpid; exits 77 only when seccomp returns -EPERM
 #   E validate sanitized environment
 #   C validate working directory against argv[2]
@@ -41,6 +42,8 @@ _start:
     je .allowed
     cmp $66, %al
     je .seccomp_argument_filter
+    cmp $71, %al
+    je .selected_handle
     cmp $70, %al
     je .forbidden
     cmp $69, %al
@@ -142,6 +145,79 @@ _start:
     js .fail29
     xor %edi, %edi
     jmp .exit
+
+.selected_handle:
+    mov 24(%rsp), %rdi
+    test %rdi, %rdi
+    je .fail30
+    call .parse_handle_fd
+    mov %eax, %r12d
+    mov 32(%rsp), %rdi
+    test %rdi, %rdi
+    je .fail30
+    call .parse_handle_fd
+    mov %eax, %r13d
+
+    xor %eax, %eax
+    mov $9, %edi
+    lea selected_handle_buffer(%rip), %rsi
+    mov $selected_handle_message_len, %edx
+    syscall
+    cmp $selected_handle_message_len, %rax
+    jne .fail30
+
+    lea selected_handle_buffer(%rip), %rdi
+    lea selected_handle_message(%rip), %rsi
+    mov $selected_handle_message_len, %ecx
+.selected_handle_compare:
+    test %ecx, %ecx
+    je .selected_handle_check_closed
+    movzbl (%rdi), %eax
+    movzbl (%rsi), %edx
+    cmp %dl, %al
+    jne .fail30
+    inc %rdi
+    inc %rsi
+    dec %ecx
+    jmp .selected_handle_compare
+
+.selected_handle_check_closed:
+    mov $72, %eax
+    mov %r12d, %edi
+    mov $1, %esi
+    xor %edx, %edx
+    syscall
+    cmp $-9, %rax
+    jne .fail30
+
+    mov $72, %eax
+    mov %r13d, %edi
+    mov $1, %esi
+    xor %edx, %edx
+    syscall
+    cmp $-9, %rax
+    jne .fail30
+    xor %edi, %edi
+    jmp .exit
+
+.parse_handle_fd:
+    xor %eax, %eax
+    movzbl (%rdi), %edx
+    test %dl, %dl
+    je .fail30
+.parse_handle_fd_loop:
+    movzbl (%rdi), %edx
+    test %dl, %dl
+    je .parse_handle_fd_done
+    sub $48, %edx
+    cmp $9, %edx
+    ja .fail30
+    imul $10, %eax, %eax
+    add %edx, %eax
+    inc %rdi
+    jmp .parse_handle_fd_loop
+.parse_handle_fd_done:
+    ret
 
 .forbidden:
     mov $39, %eax
@@ -812,6 +888,9 @@ _start:
     jmp .exit
 .fail29:
     mov $29, %edi
+    jmp .exit
+.fail30:
+    mov $30, %edi
 
 .exit:
     mov $60, %eax
@@ -843,6 +922,9 @@ redirect_byte:
     .ascii "R"
 capture_chunk:
     .ascii "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+selected_handle_message:
+    .ascii "selected-handle-ok"
+.set selected_handle_message_len, . - selected_handle_message
 deadline_message:
     .ascii "deadline target started\n"
 .set deadline_message_len, . - deadline_message
@@ -863,6 +945,8 @@ cap_data:
     .skip 24
 redirect_buffer:
     .skip 1
+selected_handle_buffer:
+    .skip 64
 .balign 16
 uts_buffer:
     .skip 512

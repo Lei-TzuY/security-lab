@@ -56,6 +56,7 @@ fn policy(mode: &str, extra_args: &[&str], syscalls: &[&str]) -> SandboxPolicy {
         },
         stdout_redirect: None,
         stdout_capture_bytes: None,
+        wall_clock_milliseconds: None,
         limits: ResourceLimits {
             cpu_seconds: 2,
             address_space_bytes: 128 * 1024 * 1024,
@@ -175,6 +176,32 @@ fn namespace_init_kills_reaps_live_descendant_and_releases_capture() {
     let stdout = report.stdout.expect("capture result must be present");
     assert!(stdout.bytes.is_empty());
     assert!(!stdout.truncated);
+}
+
+#[test]
+fn wall_clock_deadline_terminates_process_tree_and_releases_capture() {
+    let mut deadline = policy(
+        "Q",
+        &[],
+        &["execveat", "write", "fork", "nanosleep", "pause", "exit"],
+    );
+    deadline.wall_clock_milliseconds = Some(1000);
+    deadline.stdio.stdout = StdioMode::Capture;
+    deadline.stdout_capture_bytes = Some(4096);
+
+    let report = run_report(&deadline).unwrap();
+    assert_eq!(report.outcome, ChildOutcome::TimedOut);
+    assert_eq!(report.reaped_descendants, 1);
+    let stdout = report.stdout.expect("capture result must be present");
+    assert_eq!(stdout.bytes, b"deadline target started\n");
+    assert!(!stdout.truncated);
+}
+
+#[test]
+fn natural_target_exit_wins_before_wall_clock_deadline() {
+    let mut natural = policy("X", &[], &["execveat", "exit"]);
+    natural.wall_clock_milliseconds = Some(5000);
+    assert_eq!(run(&natural).unwrap(), ChildOutcome::Exited(42));
 }
 
 #[test]

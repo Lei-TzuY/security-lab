@@ -8,82 +8,75 @@ Delivered strict policy validation, environment/cwd control, four rlimits, `PR_S
 
 ## Milestone 2 — ambient authority, launch integrity, filesystem and descriptor authority
 
-### Slice 2A — inherited descriptor sanitization
+**Status: sealed on `main`.**
 
-**Status: complete on `main`.** Arbitrary inherited descriptors >= 3 are marked `CLOEXEC` before target exec, with deterministic non-leakage evidence.
-
-### Slice 2B — owned launch/error protocol
-
-**Status: complete on `main`.** The Linux x86_64 launcher owns the fork/setup/seccomp/exec/wait lifecycle and reports phase-specific launch failures through shared memory without requiring target `write` permission.
-
-### Slice 2C — filesystem and identity boundary
-
-**Status: complete on `main`.** Root/cwd/initial-target selection is pinned with `openat2`; user/mount namespaces, UID/GID mapping, cap drop, private mount propagation, chroot, target `execveat(AT_EMPTY_PATH)`, directory-handle escape prevention, and capability reduction are enforced and integration-tested.
-
-### Slice 2D — explicit filesystem mutability
-
-**Status: complete on `main`.** The revalidated root is recursively cloned/read-only and policy may declare one bounded private `nosuid,nodev,noexec` tmpfs scratch area. Raw target evidence proves ordinary-root writes fail while scratch writes succeed without host write-through.
-
-### Slice 2E — explicit standard descriptor disposition
-
-**Status: complete on `main`.** stdin/stdout/stderr have no implicit default. Inherited descriptors must exist and not be directories; closed descriptors are actually closed. Raw evidence covers all-closed and selective inheritance while arbitrary descriptor >=3 non-leakage remains intact.
-
-### Slice 2F-A — launcher-owned stdout redirection
-
-**Status: complete on `main`.** `stdio.stdout = redirect` requires a destination strictly beneath private scratch. The launcher opens it only after scratch exists, keeps the temporary source `CLOEXEC`, maps only that source to fd 1, closes the source, and does not widen target seccomp. Raw target readback plus parent-side host-path absence proves usable private redirection.
-
-### Slice 2F-B — bounded launcher-owned stdout capture
-
-**Status: complete on `main`.** `stdio.stdout = capture` requires `stdio.stdout_capture_bytes` in the range 1 byte–16 MiB. The launcher creates `pipe2(O_CLOEXEC)` before fork, normalizes both endpoints above fd 2, closes the read side outside the host parent, preserves the write source through target setup, maps it only to fd 1, and closes temporary sources. The host parent drains stdout before waiting for launcher completion, retains no more than the declared ceiling, discards excess bytes, and reports truncation.
-
-Acceptance evidence is executable:
-
-- a small raw target returns exact stdout bytes with `truncated = false`;
-- a stress target emits 4096 × 64-byte raw writes (**256 KiB**) under a **1 KiB retention ceiling**; the direct target exits successfully, exactly 1 KiB is retained, all retained bytes are correct, and `truncated = true`;
-- all Milestones 1–2F-A regressions remain green, including arbitrary inherited high-FD absence;
-- stable rustfmt, Clippy `-D warnings`, the full locked stable suite, and the full Rust 1.74 suite pass on the integrated implementation.
-
-### Milestone 2 exit condition
-
-**Sealed on `main`.** Descriptor/stdio authority has sufficient executable depth; do not farm more stdout/FD variants. Generic arbitrary FD remapping and selected non-stdio handle passing remain deferred capabilities that require a concrete future integration need and their own evidence-backed design.
+Slices 2A–2F-B removed arbitrary inherited-FD authority, introduced owned launch/error reporting, filesystem/identity confinement, recursively read-only root + bounded private scratch, explicit stdio, launcher-owned stdout redirection, and bounded launcher-owned stdout capture. Exact integrated implementations passed locked stable quality and Rust 1.74 suites. Do not farm more stdout/FD variants without a concrete new integration need.
 
 ## Milestone 3 — process-tree isolation and lifecycle ownership
 
 ### Slice 3A — PID namespace and owned process-tree lifecycle
 
-**Current verified candidate.** Linux `CLONE_NEWPID` affects subsequently created children, so the launcher now uses explicit bootstrap/init/target orchestration rather than a configuration-only namespace flag:
+**Status: complete on `main`.**
 
-- the launcher constructs user/mount/PID namespaces and filesystem state before entering the PID namespace;
-- the first child in that namespace is launcher-owned PID 1;
-- PID 1 forks the direct target as PID 2, while remaining outside target stdio/rlimit/capability/seccomp setup;
+Linux `CLONE_NEWPID` is implemented through explicit bootstrap/init/target orchestration rather than a configuration-only flag:
+
+- launcher-owned namespace init runs as PID 1;
+- direct target runs as PID 2 and alone receives target stdio/rlimit/capability/seccomp setup;
 - PID 1 waits for the direct target, then repeatedly kills remaining namespace processes and reaps children until `ECHILD`;
-- shared lifecycle state publishes the direct target raw wait status, an additional-descendant reap count, and readiness only after teardown completes;
-- bootstrap/PID1 close descriptors >= 3, so they do not hold launcher capture writers open.
+- shared lifecycle state preserves direct-target raw wait status and descendant-reap count;
+- bootstrap/PID1 close descriptors >= 3, so descendant teardown resolves capture-writer lifetime correctly.
+
+Raw evidence proves PID2/PID1 identity and cleanup of a live descendant retaining stdout.
+
+### Slice 3B — policy-owned wall-clock deadline
+
+**Current verified candidate.** Add real bounded-runtime enforcement rather than a policy-only timeout name.
+
+Implementation:
+
+- optional `limit.wall_clock_milliseconds`, validated in the range **1–86,400,000 ms**;
+- requested deadline support is preflighted for `pidfd_open` and monotonic timerfd primitives; missing/denied mandatory support fails explicitly;
+- after PID 1 forks the direct target and closes inherited setup descriptors, it opens a pidfd for the target, arms a one-shot `CLOCK_MONOTONIC` timerfd, and polls both descriptors;
+- on every supervision wake, one `wait4(target, WNOHANG)` is the race arbiter: already-waitable target means natural termination wins;
+- if the timer is readable while the target is still not waitable, deadline ownership wins, PID 1 sends `SIGKILL`, waits for the direct target, then performs the existing deterministic descendant kill/reap loop;
+- shared lifecycle state records timeout ownership separately from the raw wait status, so callers receive `ChildOutcome::TimedOut` rather than an ordinary `Signaled(SIGKILL)`;
+- pidfd/timerfd/poll remain launcher-only and do not widen target seccomp;
+- timeout enforcement is independent of host-side blocking capture drain, so timeout teardown releases target-tree stdout writers and lets capture EOF converge;
+- CLI maps `TimedOut` to exit status 124.
 
 Acceptance evidence is executable:
 
-- a raw target proves `getpid() == 2` and `getppid() == 1`;
-- a raw target forks a descendant that blocks indefinitely in `pause()` while retaining stdout, then exits; PID 1 kills and reaps that descendant, `run_report()` reports one reaped descendant, and capture reaches EOF;
-- direct-target exit-vs-signal and shared-memory launch-error semantics remain attached to the target rather than bootstrap/init status;
-- all existing filesystem, capability, rlimit, seccomp, descriptor, redirection, capture, and MSRV regressions remain green;
-- the exact implementation candidate passes stable rustfmt, Clippy `-D warnings`, the full locked stable suite, and the full Rust 1.74 suite before PR integration.
+- parser/unit tests accept an exact valid millisecond deadline and reject zero, oversized, and duplicate declarations;
+- a raw target writes `deadline target started\n`, forks one descendant that blocks indefinitely in `pause()`, and keeps the direct target alive for five seconds. A **1,000 ms** deadline returns `TimedOut`, reaps exactly one additional descendant, preserves the exact captured marker, and converges capture EOF;
+- the five-second direct-target path is only a test watchdog so a broken deadline cannot hang CI indefinitely;
+- a raw target that exits 42 under a **5,000 ms** deadline still returns `Exited(42)`, proving natural completion is not rewritten as timeout;
+- all Milestones 1–3A regressions remain green;
+- exact implementation head passes stable rustfmt, Clippy `-D warnings`, the full locked stable suite, and the full Rust 1.74 suite.
 
-Boundary: 3A owns **post-target process-tree cleanup**, not target-runtime deadlines or aggregate process accounting. A direct target that never terminates can still keep the sandbox active indefinitely, subject only to already configured per-process rlimits and target behavior.
+Boundary: the deadline is armed by PID 1 after the direct-target fork and PID1 descriptor cleanup. It is not an end-to-end API-call latency guarantee. 3B also does **not** implement an externally-triggerable asynchronous cancellation handle.
 
-### Slice 3B — policy-owned wall-clock deadline/cancellation
+### Milestone 3 exit condition
 
-**Next architectural frontier after 3A integration.** Add a real launcher-owned termination path for a direct target that never exits; do not model this as another enum without runtime enforcement.
+After 3B passes PR merge-ref and post-merge main CI, seal the basic process-lifecycle phase instead of farming timeout aliases, different timer units, or reap-count variants. PID-tree identity, post-target cleanup, capture-lifetime integration, and bounded runtime ownership will then all have executable evidence.
+
+## Milestone 4 — aggregate resource and process accounting
+
+### Slice 4A — cgroup-v2 bounded process-tree accounting
+
+**Next architectural frontier after 3B integration, contingent on executable CI support for the real kernel controller.** Per-process rlimits are already useful, but they do not aggregate a process tree. The next high-value hypothesis is a launcher-owned cgroup-v2 boundary rather than another rlimit wrapper.
 
 Initial acceptance criteria:
 
-- policy validation for a bounded wall-clock deadline with explicit units/range and fail-closed malformed values;
-- launcher-side timing/control that does not require widening the target seccomp allowlist;
-- on deadline expiry, terminate the direct target/process tree through the owned PID-namespace lifecycle and reap all descendants deterministically;
-- report timeout/cancellation as an explicit launcher result distinct from ordinary target exit or target-delivered signal;
-- captured stdout remains bounded and reaches a defined terminal state when timeout teardown occurs;
-- timeout races with natural target exit have one deterministic ownership rule and no double-wait/double-report path;
-- all Milestones 1–3A regressions, stable quality checks, and Rust 1.74 tests remain green.
+- detect and fail explicitly when the required writable/delegated cgroup-v2 capability is unavailable; no fake fallback or skipped enforcement claim;
+- place the sandbox process tree into a launcher-owned cgroup before untrusted target execution can escape aggregate accounting;
+- enforce at least one real aggregate controller/property with deterministic evidence (prefer `pids.max` first because it directly complements 3A/3B process-tree ownership; memory/CPU controllers only when CI can exercise them reliably);
+- prove a target cannot exceed the declared aggregate process count while ordinary permitted process creation below the ceiling still works;
+- clean up the cgroup only after PID-tree teardown and verify no sandbox processes remain attached;
+- preserve deadline, capture, filesystem, seccomp, capability, descriptor, and launch-error semantics;
+- stable quality and Rust 1.74 full suites remain green.
+
+If the available CI runner does not expose a safely writable/delegated cgroup-v2 subtree, that is a real external-platform blocker for 4A; in that case promote to the next independently verifiable frontier (for example network namespace/policy) rather than claiming cgroup enforcement from mocks.
 
 ## Later frontiers
 
-After deadline/cancellation ownership, prioritize aggregate resource accounting/process quotas (for example cgroup-backed accounting where the supported CI platform can execute the real kernel mechanism), then network namespace/policy. Keep selected-handle passing, syscall-argument filtering, broader persistent volume policy, and other isolation surfaces as separate evidence-backed frontiers rather than configuration-only names.
+After aggregate accounting, prioritize network namespace/policy. Keep external asynchronous cancellation, selected-handle passing, syscall-argument filtering, broader persistent-volume policy, and other isolation surfaces as separate evidence-backed frontiers rather than configuration-only names.

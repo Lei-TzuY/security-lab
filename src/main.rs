@@ -39,6 +39,7 @@ fn main() {
             match outcome {
                 ChildOutcome::Exited(code) => process::exit(code),
                 ChildOutcome::Signaled(signal) => process::exit(128 + signal),
+                ChildOutcome::TimedOut => process::exit(124),
             }
         }
         Err(err) => {

@@ -26,6 +26,7 @@
 #   V emit 256 KiB through stdout to exercise bounded launcher-owned capture
 #   Y assert direct target is PID 2 with launcher-owned namespace init as PID 1
 #   Z fork a live descendant that must be killed/reaped by namespace init
+#   Q emit a marker, fork a descendant, then remain live past the policy deadline
 
 _start:
     mov 16(%rsp), %rdi
@@ -72,6 +73,8 @@ _start:
     je .pid_namespace_identity
     cmp $90, %al
     je .live_descendant
+    cmp $81, %al
+    je .deadline_tree
     jmp .fail2
 
 .allowed:
@@ -521,6 +524,35 @@ _start:
     syscall
     jmp .descendant_pause
 
+.deadline_tree:
+    mov $1, %eax
+    mov $1, %edi
+    lea deadline_message(%rip), %rsi
+    mov $deadline_message_len, %edx
+    syscall
+    cmp $deadline_message_len, %rax
+    jne .fail25
+
+    mov $57, %eax
+    syscall
+    test %rax, %rax
+    js .fail25
+    jz .deadline_descendant_pause
+
+    lea deadline_watchdog_sleep(%rip), %rdi
+    xor %esi, %esi
+    mov $35, %eax
+    syscall
+    test %rax, %rax
+    js .fail25
+    mov $99, %edi
+    jmp .exit
+
+.deadline_descendant_pause:
+    mov $34, %eax
+    syscall
+    jmp .deadline_descendant_pause
+
 .str_eq:
 .str_eq_loop:
     movzbl (%rdi), %eax
@@ -601,6 +633,9 @@ _start:
     jmp .exit
 .fail24:
     mov $24, %edi
+    jmp .exit
+.fail25:
+    mov $25, %edi
 
 .exit:
     mov $60, %eax
@@ -630,6 +665,13 @@ redirect_byte:
     .ascii "R"
 capture_chunk:
     .ascii "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+deadline_message:
+    .ascii "deadline target started\n"
+.set deadline_message_len, . - deadline_message
+.balign 8
+deadline_watchdog_sleep:
+    .quad 5
+    .quad 0
 
 .section .bss
 .balign 16

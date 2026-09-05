@@ -44,6 +44,7 @@ fn policy(mode: &str, extra_args: &[&str], syscalls: &[&str]) -> SandboxPolicy {
     args.extend(extra_args.iter().map(|arg| (*arg).to_owned()));
     SandboxPolicy {
         root_dir: fixture_root().to_path_buf(),
+        hostname: "security-lab".to_owned(),
         executable: PathBuf::from("/probe"),
         args,
         environment: BTreeMap::new(),
@@ -129,6 +130,28 @@ fn ipc_namespace_cannot_observe_host_sysv_message_queue() {
 
     let removed = unsafe { libc::msgctl(queue_id, libc::IPC_RMID, std::ptr::null_mut()) };
     assert_eq!(removed, 0, "remove host SysV message queue");
+    assert_eq!(result.unwrap(), ChildOutcome::Exited(0));
+}
+
+#[test]
+fn uts_namespace_uses_policy_hostname_without_changing_host() {
+    let host_before = std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .expect("read host hostname before sandbox");
+    let sandbox_hostname = format!("security-lab-{}", process::id());
+    let mut identity = policy(
+        "J",
+        &[sandbox_hostname.as_str()],
+        &["execveat", "uname", "exit"],
+    );
+    identity.hostname = sandbox_hostname;
+
+    let result = run(&identity);
+    let host_after = std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .expect("read host hostname after sandbox");
+    assert_eq!(
+        host_after, host_before,
+        "sandbox UTS hostname changed host hostname"
+    );
     assert_eq!(result.unwrap(), ChildOutcome::Exited(0));
 }
 
@@ -279,6 +302,7 @@ fn forbidden_syscall_is_denied_with_eperm() {
 fn malformed_policy_is_rejected() {
     let malformed = r#"
         filesystem.root = /
+        identity.hostname = malformed-policy
         executable = /bin/true
         working_dir = /tmp
         stdio.stdin = closed

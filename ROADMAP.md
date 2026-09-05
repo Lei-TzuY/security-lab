@@ -14,69 +14,75 @@ Slices 2A–2F-B removed arbitrary inherited-FD authority, introduced owned laun
 
 ## Milestone 3 — process-tree isolation and lifecycle ownership
 
+**Status: sealed on `main`.**
+
 ### Slice 3A — PID namespace and owned process-tree lifecycle
 
-**Status: complete on `main`.**
-
-Linux `CLONE_NEWPID` is implemented through explicit bootstrap/init/target orchestration rather than a configuration-only flag:
-
-- launcher-owned namespace init runs as PID 1;
-- direct target runs as PID 2 and alone receives target stdio/rlimit/capability/seccomp setup;
-- PID 1 waits for the direct target, then repeatedly kills remaining namespace processes and reaps children until `ECHILD`;
-- shared lifecycle state preserves direct-target raw wait status and descendant-reap count;
-- bootstrap/PID1 close descriptors >= 3, so descendant teardown resolves capture-writer lifetime correctly.
-
-Raw evidence proves PID2/PID1 identity and cleanup of a live descendant retaining stdout.
+**Complete on `main`.** Launcher-owned namespace PID 1 supervises the direct target as PID 2, preserves direct-target wait semantics, kills/reaps remaining descendants, and integrates process-tree completion with capture-writer lifetime.
 
 ### Slice 3B — policy-owned wall-clock deadline
 
-**Current verified candidate.** Add real bounded-runtime enforcement rather than a policy-only timeout name.
+**Complete on `main`.** Optional `limit.wall_clock_milliseconds` is validated from 1–86,400,000 ms. Namespace PID 1 owns pidfd + `CLOCK_MONOTONIC` timerfd supervision, deterministic natural-exit/timeout arbitration, `SIGKILL` termination after deadline ownership, descendant teardown, and explicit `ChildOutcome::TimedOut` reporting. Timeout enforcement remains active even while the host blocks draining captured stdout.
 
-Implementation:
+Acceptance evidence includes a raw target with a live descendant and a one-second deadline returning `TimedOut` with deterministic teardown/capture EOF, plus a fast `exit(42)` target retaining natural completion under a five-second deadline. Exact candidate, PR merge-ref, and post-merge `main` all passed stable rustfmt/Clippy/full tests and the full Rust 1.74 suite.
 
-- optional `limit.wall_clock_milliseconds`, validated in the range **1–86,400,000 ms**;
-- requested deadline support is preflighted for `pidfd_open` and monotonic timerfd primitives; missing/denied mandatory support fails explicitly;
-- after PID 1 forks the direct target and closes inherited setup descriptors, it opens a pidfd for the target, arms a one-shot `CLOCK_MONOTONIC` timerfd, and polls both descriptors;
-- on every supervision wake, one `wait4(target, WNOHANG)` is the race arbiter: already-waitable target means natural termination wins;
-- if the timer is readable while the target is still not waitable, deadline ownership wins, PID 1 sends `SIGKILL`, waits for the direct target, then performs the existing deterministic descendant kill/reap loop;
-- shared lifecycle state records timeout ownership separately from the raw wait status, so callers receive `ChildOutcome::TimedOut` rather than an ordinary `Signaled(SIGKILL)`;
-- pidfd/timerfd/poll remain launcher-only and do not widen target seccomp;
-- timeout enforcement is independent of host-side blocking capture drain, so timeout teardown releases target-tree stdout writers and lets capture EOF converge;
-- CLI maps `TimedOut` to exit status 124.
+Milestone 3 exit condition is satisfied. Do not farm timer-unit aliases, different kill signals, or reap-count variants.
 
-Acceptance evidence is executable:
-
-- parser/unit tests accept an exact valid millisecond deadline and reject zero, oversized, and duplicate declarations;
-- a raw target writes `deadline target started\n`, forks one descendant that blocks indefinitely in `pause()`, and keeps the direct target alive for five seconds. A **1,000 ms** deadline returns `TimedOut`, reaps exactly one additional descendant, preserves the exact captured marker, and converges capture EOF;
-- the five-second direct-target path is only a test watchdog so a broken deadline cannot hang CI indefinitely;
-- a raw target that exits 42 under a **5,000 ms** deadline still returns `Exited(42)`, proving natural completion is not rewritten as timeout;
-- all Milestones 1–3A regressions remain green;
-- exact implementation head passes stable rustfmt, Clippy `-D warnings`, the full locked stable suite, and the full Rust 1.74 suite.
-
-Boundary: the deadline is armed by PID 1 after the direct-target fork and PID1 descriptor cleanup. It is not an end-to-end API-call latency guarantee. 3B also does **not** implement an externally-triggerable asynchronous cancellation handle.
-
-### Milestone 3 exit condition
-
-After 3B passes PR merge-ref and post-merge main CI, seal the basic process-lifecycle phase instead of farming timeout aliases, different timer units, or reap-count variants. PID-tree identity, post-target cleanup, capture-lifetime integration, and bounded runtime ownership will then all have executable evidence.
-
-## Milestone 4 — aggregate resource and process accounting
+## Milestone 4 — aggregate accounting and network isolation
 
 ### Slice 4A — cgroup-v2 bounded process-tree accounting
 
-**Next architectural frontier after 3B integration, contingent on executable CI support for the real kernel controller.** Per-process rlimits are already useful, but they do not aggregate a process tree. The next high-value hypothesis is a launcher-owned cgroup-v2 boundary rather than another rlimit wrapper.
+**Status: blocked by current CI platform delegation, not implemented.**
 
-Initial acceptance criteria:
+The intended hypothesis remains a launcher-owned cgroup-v2 boundary with `pids.max` as the first aggregate controller/property. Acceptance still requires all of the following with the actual runtime user, without test-local sudo/root substitution:
 
-- detect and fail explicitly when the required writable/delegated cgroup-v2 capability is unavailable; no fake fallback or skipped enforcement claim;
-- place the sandbox process tree into a launcher-owned cgroup before untrusted target execution can escape aggregate accounting;
-- enforce at least one real aggregate controller/property with deterministic evidence (prefer `pids.max` first because it directly complements 3A/3B process-tree ownership; memory/CPU controllers only when CI can exercise them reliably);
-- prove a target cannot exceed the declared aggregate process count while ordinary permitted process creation below the ceiling still works;
-- clean up the cgroup only after PID-tree teardown and verify no sandbox processes remain attached;
-- preserve deadline, capture, filesystem, seccomp, capability, descriptor, and launch-error semantics;
-- stable quality and Rust 1.74 full suites remain green.
+- create a child cgroup inside a writable/delegated cgroup-v2 subtree;
+- set a real `pids.max` limit;
+- attach the sandbox process tree before untrusted target execution can escape aggregate accounting;
+- prove process creation below the ceiling works and exceeding the ceiling fails;
+- clean up only after PID-tree teardown and verify no sandbox processes remain attached;
+- preserve deadline, capture, filesystem, seccomp, capability, descriptor, and launch-error semantics.
 
-If the available CI runner does not expose a safely writable/delegated cgroup-v2 subtree, that is a real external-platform blocker for 4A; in that case promote to the next independently verifiable frontier (for example network namespace/policy) rather than claiming cgroup enforcement from mocks.
+Current GitHub-hosted Ubuntu runner probe evidence:
+
+- `/sys/fs/cgroup` is cgroup v2 and includes the `pids` controller;
+- workflow user is unprivileged UID 1001 (`runner`);
+- current cgroup is `/system.slice/hosted-compute-agent.service`, owned by root;
+- creating a child cgroup there as the workflow user fails with `Permission denied`.
+
+Therefore 4A must not be implemented/claimed from mocks or sudo-only CI setup. The blocker is removed only when the supported CI/test environment provides a real writable/delegated cgroup-v2 subtree to the runtime user with child creation, controller configuration, process attachment, and cleanup permissions.
+
+### Slice 4B — isolated network namespace baseline
+
+**Current verified candidate.** Establish a real host-network-namespace boundary before designing controlled connectivity.
+
+Implementation:
+
+- include `CLONE_NEWNET` in the existing fail-closed `unshare(CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWPID | ...)` transition;
+- do not configure a veth, host bridge, routes, DNS, or endpoint allowlist in this baseline;
+- keep network-namespace creation launcher-owned and outside target seccomp;
+- add `socket` and `connect` to the reviewable x86_64 syscall-name mapping so a policy may explicitly grant those target syscalls without implying host-network access;
+- preserve existing capability reduction, so the executed target does not receive network-administration capabilities.
+
+Acceptance evidence is executable:
+
+- Rust parent binds a real TCP listener on host `127.0.0.1` and first proves that listener is reachable from the host process;
+- the raw target receives the exact host listener port and is explicitly granted `execveat`, `socket`, `connect`, `close`, and `exit`;
+- target `connect(127.0.0.1:<host-port>)` runs inside the new network namespace;
+- the fixture accepts only network-stack separation outcomes (`ECONNREFUSED`, `ENETUNREACH`, or `EHOSTUNREACH`); seccomp `EPERM` is a test failure, so syscall denial cannot masquerade as network isolation;
+- a successful connection to the host listener is also a test failure;
+- a two-second launcher-owned wall-clock deadline prevents a broken connectivity path from hanging CI;
+- all Milestones 1–3B regressions, stable quality checks, and Rust 1.74 full tests remain green.
+
+Boundary: 4B proves **host network namespace separation**, not a full network-policy system. Explicitly inherited socket objects remain intentionally exposed capabilities; the launcher does not yet create controlled network topology or positive allowlisted connectivity.
+
+### Milestone 4 promotion rule
+
+After 4B integrates, do not farm additional unreachable errno variants or duplicate loopback tests. Choose one of two higher-value frontiers:
+
+1. return to 4A when real unprivileged cgroup-v2 delegation becomes available; or
+2. design a coherent controlled-connectivity slice that introduces explicit topology/route/endpoint policy and proves both an allowed connection and a denied connection through real networking.
 
 ## Later frontiers
 
-After aggregate accounting, prioritize network namespace/policy. Keep external asynchronous cancellation, selected-handle passing, syscall-argument filtering, broader persistent-volume policy, and other isolation surfaces as separate evidence-backed frontiers rather than configuration-only names.
+External asynchronous cancellation, selected-handle passing, syscall-argument filtering, IPC/UTS isolation, broader persistent-volume policy, and controlled networking remain separate evidence-backed frontiers. Do not add configuration-only names without executable kernel behavior and integration evidence.

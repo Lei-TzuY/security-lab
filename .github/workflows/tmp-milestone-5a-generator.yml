@@ -18,7 +18,9 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
       - name: Materialize seccomp argument-filter candidate
-        run: python3 .github/tmp-milestone-5a-seccomp.py
+        run: |
+          python3 .github/tmp-milestone-5a-seccomp.py
+          python3 .github/tmp-milestone-5a-clippy-fix.py
       - name: Format Rust sources
         run: cargo fmt --all
       - name: Enable user namespace capability tests
@@ -38,6 +40,7 @@ jobs:
         run: |
           set -euo pipefail
           rm .github/tmp-milestone-5a-seccomp.py
+          rm .github/tmp-milestone-5a-clippy-fix.py
           rm .github/workflows/tmp-milestone-5a-generator.yml
           git add -A
           git diff --cached --check

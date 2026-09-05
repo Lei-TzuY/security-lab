@@ -105,11 +105,7 @@ fn setup_failure_never_falls_back_to_execution() {
     let marker_host = fixture_root().join(&marker_name);
     let _ = std::fs::remove_file(&marker_host);
     let marker_sandbox = format!("/{marker_name}");
-    let mut failing = policy(
-        "W",
-        &[&marker_sandbox],
-        &["execveat", "openat", "exit"],
-    );
+    let mut failing = policy("W", &[&marker_sandbox], &["execveat", "openat", "exit"]);
     failing.working_dir = PathBuf::from("/definitely/missing");
 
     let error = run(&failing).unwrap_err();
@@ -144,11 +140,7 @@ fn inherited_non_stdio_descriptor_does_not_survive_exec() {
     );
 
     let descriptor = inherited.to_string();
-    let result = run(&policy(
-        "D",
-        &[&descriptor],
-        &["execveat", "fcntl", "exit"],
-    ));
+    let result = run(&policy("D", &[&descriptor], &["execveat", "fcntl", "exit"]));
     unsafe {
         libc::close(inherited);
     }
@@ -160,8 +152,11 @@ fn inherited_non_stdio_descriptor_does_not_survive_exec() {
 fn exec_failure_is_reported_without_target_write_permission() {
     let name = format!("missing-interpreter-{}-{}", process::id(), unique_suffix());
     let host_path = fixture_root().join(&name);
-    std::fs::write(&host_path, b"#!/definitely/missing/security-lab-interpreter\n")
-        .expect("write executable fixture");
+    std::fs::write(
+        &host_path,
+        b"#!/definitely/missing/security-lab-interpreter\n",
+    )
+    .expect("write executable fixture");
     let mut permissions = std::fs::metadata(&host_path).unwrap().permissions();
     permissions.set_mode(0o755);
     std::fs::set_permissions(&host_path, permissions).unwrap();

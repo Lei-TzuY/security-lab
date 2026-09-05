@@ -264,9 +264,7 @@ mod x86_64 {
 
     fn sandbox_relative(path: &Path) -> Result<CString, SandboxError> {
         let relative = path.strip_prefix(Path::new("/")).map_err(|_| {
-            SandboxError::InvalidPolicy(PolicyError::new(
-                "sandbox paths must be absolute",
-            ))
+            SandboxError::InvalidPolicy(PolicyError::new("sandbox paths must be absolute"))
         })?;
         let relative = if relative.as_os_str().is_empty() {
             PathBuf::from(".")
@@ -443,11 +441,7 @@ mod x86_64 {
         seccomp: &CompiledSeccomp,
         launch_error: *mut LaunchErrorRecord,
     ) -> ! {
-        if libc::syscall(
-            libc::SYS_unshare,
-            libc::CLONE_NEWUSER | libc::CLONE_NEWNS,
-        ) == -1
-        {
+        if libc::syscall(libc::SYS_unshare, libc::CLONE_NEWUSER | libc::CLONE_NEWNS) == -1 {
             child_fail(launch_error, PHASE_NAMESPACE, seccomp.error_exit_syscall);
         }
 
@@ -492,25 +486,13 @@ mod x86_64 {
         reject_directory_stdio_or_fail(launch_error, seccomp.error_exit_syscall);
 
         if libc::syscall(libc::SYS_fchdir, prepared.root_fd.raw()) == -1 {
-            child_fail(
-                launch_error,
-                PHASE_ROOT_FCHDIR,
-                seccomp.error_exit_syscall,
-            );
+            child_fail(launch_error, PHASE_ROOT_FCHDIR, seccomp.error_exit_syscall);
         }
-        if libc::syscall(
-            libc::SYS_chroot,
-            b".\0".as_ptr().cast::<libc::c_char>(),
-        ) == -1
-        {
+        if libc::syscall(libc::SYS_chroot, b".\0".as_ptr().cast::<libc::c_char>()) == -1 {
             child_fail(launch_error, PHASE_CHROOT, seccomp.error_exit_syscall);
         }
         if libc::syscall(libc::SYS_fchdir, prepared.cwd_fd.raw()) == -1 {
-            child_fail(
-                launch_error,
-                PHASE_CWD_FCHDIR,
-                seccomp.error_exit_syscall,
-            );
+            child_fail(launch_error, PHASE_CWD_FCHDIR, seccomp.error_exit_syscall);
         }
 
         if libc::syscall(
@@ -642,12 +624,7 @@ mod x86_64 {
                 child_fail_errno(launch_error, PHASE_STDIO, errno, error_exit_syscall);
             }
             if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
-                child_fail_errno(
-                    launch_error,
-                    PHASE_STDIO,
-                    libc::EISDIR,
-                    error_exit_syscall,
-                );
+                child_fail_errno(launch_error, PHASE_STDIO, libc::EISDIR, error_exit_syscall);
             }
         }
     }
@@ -673,25 +650,12 @@ mod x86_64 {
         error_exit_syscall: libc::c_long,
     ) {
         for capability in 0..=64u64 {
-            if libc::syscall(
-                libc::SYS_prctl,
-                PR_CAPBSET_DROP,
-                capability,
-                0,
-                0,
-                0,
-            ) == -1
-            {
+            if libc::syscall(libc::SYS_prctl, PR_CAPBSET_DROP, capability, 0, 0, 0) == -1 {
                 let errno = *libc::__errno_location();
                 if errno == libc::EINVAL {
                     break;
                 }
-                child_fail_errno(
-                    launch_error,
-                    PHASE_CAP_BOUNDING,
-                    errno,
-                    error_exit_syscall,
-                );
+                child_fail_errno(launch_error, PHASE_CAP_BOUNDING, errno, error_exit_syscall);
             }
         }
 
@@ -704,11 +668,7 @@ mod x86_64 {
             0,
         ) == -1
         {
-            child_fail(
-                launch_error,
-                PHASE_CAP_AMBIENT,
-                error_exit_syscall,
-            );
+            child_fail(launch_error, PHASE_CAP_AMBIENT, error_exit_syscall);
         }
 
         let mut header = CapabilityHeader {

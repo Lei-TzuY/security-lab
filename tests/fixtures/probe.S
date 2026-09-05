@@ -17,6 +17,8 @@
 #   R read back all configured resource limits
 #   W create argv[2] marker (used to prove failed setup never executes child)
 #   D assert descriptor number in argv[2] is closed after exec
+#   H assert absolute host path argv[2] is hidden by filesystem root
+#   I assert namespace uid/gid are 0 and all capability sets are empty
 
 _start:
     mov 16(%rsp), %rdi
@@ -45,6 +47,10 @@ _start:
     je .write_marker
     cmp $68, %al
     je .descriptor_closed
+    cmp $72, %al
+    je .host_path_hidden
+    cmp $73, %al
+    je .identity_reduced
     jmp .fail2
 
 .allowed:
@@ -137,7 +143,7 @@ _start:
 .nofile_loop:
     mov $257, %eax
     mov $-100, %edi
-    lea dev_null(%rip), %rsi
+    lea sandbox_root(%rip), %rsi
     xor %edx, %edx
     xor %r10d, %r10d
     syscall
@@ -233,6 +239,89 @@ _start:
     xor %edi, %edi
     jmp .exit
 
+.host_path_hidden:
+    mov 24(%rsp), %rsi
+    test %rsi, %rsi
+    je .fail2
+    mov $257, %eax               # openat
+    mov $-100, %edi              # AT_FDCWD
+    xor %edx, %edx               # O_RDONLY
+    xor %r10d, %r10d
+    syscall
+    cmp $-2, %rax                # -ENOENT proves host path is outside root
+    jne .fail16
+    xor %edi, %edi
+    jmp .exit
+
+.identity_reduced:
+    mov $102, %eax               # getuid
+    syscall
+    test %rax, %rax
+    jne .fail17
+    mov $104, %eax               # getgid
+    syscall
+    test %rax, %rax
+    jne .fail17
+
+    movl $0x20080522, cap_header(%rip)  # _LINUX_CAPABILITY_VERSION_3
+    movl $0, cap_header+4(%rip)
+    lea cap_header(%rip), %rdi
+    lea cap_data(%rip), %rsi
+    mov $125, %eax               # capget
+    syscall
+    test %rax, %rax
+    js .fail17
+
+    cmpl $0, cap_data(%rip)
+    jne .fail17
+    cmpl $0, cap_data+4(%rip)
+    jne .fail17
+    cmpl $0, cap_data+8(%rip)
+    jne .fail17
+    cmpl $0, cap_data+12(%rip)
+    jne .fail17
+    cmpl $0, cap_data+16(%rip)
+    jne .fail17
+    cmpl $0, cap_data+20(%rip)
+    jne .fail17
+
+    xor %r12d, %r12d
+.cap_bound_loop:
+    cmp $41, %r12d               # Linux capabilities 0..40 in v3 ABI
+    je .cap_ambient_start
+    mov $157, %eax               # prctl
+    mov $23, %edi                # PR_CAPBSET_READ
+    mov %r12d, %esi
+    xor %edx, %edx
+    xor %r10d, %r10d
+    xor %r8d, %r8d
+    syscall
+    test %rax, %rax              # every bounding bit must be clear
+    jne .fail17
+    inc %r12d
+    jmp .cap_bound_loop
+
+.cap_ambient_start:
+    xor %r12d, %r12d
+.cap_ambient_loop:
+    cmp $41, %r12d
+    je .identity_ok
+    mov $157, %eax               # prctl
+    mov $47, %edi                # PR_CAP_AMBIENT
+    mov $1, %esi                 # PR_CAP_AMBIENT_IS_SET
+    mov %r12d, %edx
+    xor %r10d, %r10d
+    xor %r8d, %r8d
+    syscall
+    test %rax, %rax              # no ambient capability may be set
+    jne .fail17
+    inc %r12d
+    jmp .cap_ambient_loop
+
+.identity_ok:
+    xor %edi, %edi
+    jmp .exit
+
 # rdi=a, rsi=b; eax=1 if equal including terminating NUL, else 0.
 .str_eq:
 .str_eq_loop:
@@ -287,6 +376,12 @@ _start:
     jmp .exit
 .fail15:
     mov $15, %edi
+    jmp .exit
+.fail16:
+    mov $16, %edi
+    jmp .exit
+.fail17:
+    mov $17, %edi
 
 .exit:
     mov $60, %eax
@@ -299,8 +394,8 @@ allowed_message:
 .set allowed_message_len, . - allowed_message
 allowed_env:
     .asciz "SANDBOX_ALLOWED=yes"
-dev_null:
-    .asciz "/dev/null"
+sandbox_root:
+    .asciz "/"
 
 .section .bss
 .balign 16
@@ -308,5 +403,9 @@ cwd_buffer:
     .skip 4096
 limit_buffer:
     .skip 16
+cap_header:
+    .skip 8
+cap_data:
+    .skip 24
 
 .section .note.GNU-stack,"",@progbits

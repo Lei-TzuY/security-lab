@@ -90,6 +90,10 @@ pub struct SandboxPolicy {
     /// and target descriptor must be specified together.
     pub host_loopback_tcp_port: Option<u16>,
     pub host_loopback_tcp_target_fd: Option<u32>,
+    /// Optional launcher-brokered TCP listener bound only to host 127.0.0.1.
+    /// The port and target descriptor must be specified together.
+    pub host_loopback_tcp_listen_port: Option<u16>,
+    pub host_loopback_tcp_listen_target_fd: Option<u32>,
     /// Optional trusted host directory exposed read-only at exactly one
     /// declared sandbox mountpoint. Source and target must be specified together.
     pub readonly_volume_source: Option<PathBuf>,
@@ -262,6 +266,46 @@ impl SandboxPolicy {
             _ => {
                 return Err(PolicyError::new(
                     "network.host_loopback_tcp_port and network.host_loopback_tcp_target_fd must be specified together",
+                ));
+            }
+        }
+
+        match (
+            self.host_loopback_tcp_listen_port,
+            self.host_loopback_tcp_listen_target_fd,
+        ) {
+            (None, None) => {}
+            (Some(port), Some(target_fd)) => {
+                if port == 0 {
+                    return Err(PolicyError::new(
+                        "network.host_loopback_tcp_listen_port must be between 1 and 65535",
+                    ));
+                }
+                if !(MIN_SELECTED_TARGET_FD..=MAX_SELECTED_TARGET_FD).contains(&target_fd) {
+                    return Err(PolicyError::new(format!(
+                        "network.host_loopback_tcp_listen_target_fd must be between {MIN_SELECTED_TARGET_FD} and {MAX_SELECTED_TARGET_FD}: {target_fd}"
+                    )));
+                }
+                if u64::from(target_fd) >= self.limits.open_files {
+                    return Err(PolicyError::new(format!(
+                        "network.host_loopback_tcp_listen_target_fd {target_fd} must be below limit.open_files {}",
+                        self.limits.open_files
+                    )));
+                }
+                if self.selected_handles.contains_key(&target_fd) {
+                    return Err(PolicyError::new(format!(
+                        "network host-loopback listener target fd {target_fd} collides with a selected handle target"
+                    )));
+                }
+                if self.host_loopback_tcp_target_fd == Some(target_fd) {
+                    return Err(PolicyError::new(format!(
+                        "network host-loopback listener target fd {target_fd} collides with the brokered connection target"
+                    )));
+                }
+            }
+            _ => {
+                return Err(PolicyError::new(
+                    "network.host_loopback_tcp_listen_port and network.host_loopback_tcp_listen_target_fd must be specified together",
                 ));
             }
         }
@@ -616,6 +660,8 @@ impl FromStr for SandboxPolicy {
         let mut loopback_enabled = None;
         let mut host_loopback_tcp_port = None;
         let mut host_loopback_tcp_target_fd = None;
+        let mut host_loopback_tcp_listen_port = None;
+        let mut host_loopback_tcp_listen_target_fd = None;
         let mut readonly_volume_source = None;
         let mut readonly_volume_target = None;
         let mut writable_volume_source = None;
@@ -667,6 +713,20 @@ impl FromStr for SandboxPolicy {
                 )?,
                 "network.host_loopback_tcp_target_fd" => set_once(
                     &mut host_loopback_tcp_target_fd,
+                    value.parse::<u32>().map_err(|_| {
+                        PolicyError::at(line_no, format!("{key} must be an unsigned integer"))
+                    })?,
+                    line_no,
+                    key,
+                )?,
+                "network.host_loopback_tcp_listen_port" => set_once(
+                    &mut host_loopback_tcp_listen_port,
+                    parse_tcp_port(value, line_no, key)?,
+                    line_no,
+                    key,
+                )?,
+                "network.host_loopback_tcp_listen_target_fd" => set_once(
+                    &mut host_loopback_tcp_listen_target_fd,
                     value.parse::<u32>().map_err(|_| {
                         PolicyError::at(line_no, format!("{key} must be an unsigned integer"))
                     })?,
@@ -873,6 +933,8 @@ impl FromStr for SandboxPolicy {
             loopback_enabled: loopback_enabled.unwrap_or(false),
             host_loopback_tcp_port,
             host_loopback_tcp_target_fd,
+            host_loopback_tcp_listen_port,
+            host_loopback_tcp_listen_target_fd,
             readonly_volume_source: readonly_volume_source.map(PathBuf::from),
             readonly_volume_target: readonly_volume_target.map(PathBuf::from),
             writable_volume_source: writable_volume_source.map(PathBuf::from),
@@ -1245,6 +1307,38 @@ mod tests {
         assert!(error
             .to_string()
             .contains("collides with a selected handle target"));
+    }
+
+    #[test]
+    fn parses_brokered_host_loopback_tcp_listener() {
+        let text = format!(
+            "{VALID}\nnetwork.host_loopback_tcp_listen_port = 9090\nnetwork.host_loopback_tcp_listen_target_fd = 11"
+        );
+        let policy: SandboxPolicy = text.parse().unwrap();
+        assert_eq!(policy.host_loopback_tcp_listen_port, Some(9090));
+        assert_eq!(policy.host_loopback_tcp_listen_target_fd, Some(11));
+    }
+
+    #[test]
+    fn rejects_incomplete_or_colliding_brokered_host_loopback_tcp_listener() {
+        let incomplete = format!("{VALID}\nnetwork.host_loopback_tcp_listen_port = 9090");
+        assert!(incomplete.parse::<SandboxPolicy>().is_err());
+
+        let collision = format!(
+            "{VALID}\nhandle.11 = 0\nnetwork.host_loopback_tcp_listen_port = 9090\nnetwork.host_loopback_tcp_listen_target_fd = 11"
+        );
+        let error = collision.parse::<SandboxPolicy>().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("collides with a selected handle target"));
+
+        let broker_collision = format!(
+            "{VALID}\nnetwork.host_loopback_tcp_port = 8080\nnetwork.host_loopback_tcp_target_fd = 11\nnetwork.host_loopback_tcp_listen_port = 9090\nnetwork.host_loopback_tcp_listen_target_fd = 11"
+        );
+        let error = broker_collision.parse::<SandboxPolicy>().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("collides with the brokered connection target"));
     }
 
     #[test]

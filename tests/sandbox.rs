@@ -72,6 +72,8 @@ fn fixture_root() -> &'static Path {
         std::fs::create_dir_all(root.join("work")).expect("create sandbox work directory");
         std::fs::create_dir_all(root.join("scratch")).expect("create sandbox scratch mountpoint");
         std::fs::create_dir_all(root.join("data")).expect("create sandbox volume mountpoint");
+        std::fs::create_dir_all(root.join("persist"))
+            .expect("create sandbox writable-volume mountpoint");
 
         let output = root.join("probe");
         let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/probe.S");
@@ -102,6 +104,19 @@ fn readonly_volume_source() -> &'static Path {
         .as_path()
 }
 
+fn writable_volume_source() -> &'static Path {
+    static SOURCE: OnceLock<PathBuf> = OnceLock::new();
+    SOURCE
+        .get_or_init(|| {
+            let source = std::env::temp_dir()
+                .join(format!("security-lab-writable-volume-{}", process::id()));
+            let _ = std::fs::remove_dir_all(&source);
+            std::fs::create_dir_all(&source).expect("create writable persistent volume source");
+            source
+        })
+        .as_path()
+}
+
 fn syscall_set(names: &[&str]) -> BTreeSet<String> {
     names.iter().map(|name| (*name).to_owned()).collect()
 }
@@ -118,6 +133,8 @@ fn policy(mode: &str, extra_args: &[&str], syscalls: &[&str]) -> SandboxPolicy {
         working_dir: PathBuf::from("/work"),
         readonly_volume_source: None,
         readonly_volume_target: None,
+        writable_volume_source: None,
+        writable_volume_target: None,
         scratch_dir: Some(PathBuf::from("/scratch")),
         scratch_bytes: Some(SCRATCH_BYTES),
         stdio: StdioPolicy {
@@ -167,6 +184,34 @@ fn readonly_persistent_volume_is_visible_only_at_declared_readonly_mount() {
     assert!(
         !forbidden_write.exists(),
         "sandbox write escaped the read-only persistent volume"
+    );
+}
+
+#[test]
+fn writable_persistent_volume_mutates_only_declared_host_tree() {
+    let source = writable_volume_source().to_path_buf();
+    let persisted = source.join("persisted");
+    let _ = std::fs::remove_file(&persisted);
+    let root_forbidden = fixture_root().join("root-write-must-fail");
+    let _ = std::fs::remove_file(&root_forbidden);
+    let source_argument = source.to_string_lossy().into_owned();
+
+    let mut mounted = policy(
+        "w",
+        &[source_argument.as_str()],
+        &["execveat", "openat", "write", "close", "exit"],
+    );
+    mounted.writable_volume_source = Some(source.clone());
+    mounted.writable_volume_target = Some(PathBuf::from("/persist"));
+
+    assert_eq!(run(&mounted).unwrap(), ChildOutcome::Exited(0));
+    assert_eq!(
+        std::fs::read(&persisted).expect("read persisted host volume output"),
+        b"persistent-write\n",
+    );
+    assert!(
+        !root_forbidden.exists(),
+        "writable volume reopened mutation outside its declared target"
     );
 }
 

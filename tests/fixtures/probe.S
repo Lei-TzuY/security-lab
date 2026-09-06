@@ -655,11 +655,18 @@ _start:
     test %rax, %rax
     js .fail38
 
-    # Existing file in the allowed persistent subtree must be writable+truncatable.
+    # Exercise TRUNCATE independently from WRITE_FILE on the allowed file.
+    mov $76, %eax
+    lea landlock_mutation_existing(%rip), %rdi
+    xor %esi, %esi
+    syscall
+    test %rax, %rax
+    js .fail38
+
     mov $257, %eax
     mov $-100, %edi
     lea landlock_mutation_existing(%rip), %rsi
-    mov $513, %edx
+    mov $1, %edx
     xor %r10d, %r10d
     syscall
     test %rax, %rax
@@ -699,6 +706,24 @@ _start:
 
     mov $87, %eax
     lea landlock_mutation_denied_remove(%rip), %rdi
+    syscall
+    cmp $-13, %rax
+    jne .fail38
+
+    # WRITE_FILE must be independently denied on an existing sibling file.
+    mov $257, %eax
+    mov $-100, %edi
+    lea landlock_mutation_denied_remove(%rip), %rsi
+    mov $1, %edx
+    xor %r10d, %r10d
+    syscall
+    cmp $-13, %rax
+    jne .fail38
+
+    # TRUNCATE must also be independently denied, proving the ABI-3 right is active.
+    mov $76, %eax
+    lea landlock_mutation_denied_remove(%rip), %rdi
+    xor %esi, %esi
     syscall
     cmp $-13, %rax
     jne .fail38

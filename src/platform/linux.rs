@@ -376,6 +376,70 @@ mod x86_64 {
         })
     }
 
+    fn listen_host_loopback_tcp(
+        port: u16,
+        target_fd: u32,
+        storage_floor: RawFd,
+    ) -> Result<PreparedSelectedHandle, SandboxError> {
+        let socket_fd =
+            unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+        if socket_fd == -1 {
+            return Err(SandboxError::SetupFailed(format!(
+                "cannot create brokered host-loopback TCP listener: {}",
+                io::Error::last_os_error()
+            )));
+        }
+        let socket_fd = OwnedFd(socket_fd);
+        let address = libc::sockaddr_in {
+            sin_family: libc::AF_INET as libc::sa_family_t,
+            sin_port: port.to_be(),
+            sin_addr: libc::in_addr {
+                s_addr: u32::from_ne_bytes([127, 0, 0, 1]),
+            },
+            sin_zero: [0; 8],
+        };
+        loop {
+            let bound = unsafe {
+                libc::bind(
+                    socket_fd.raw(),
+                    (&address as *const libc::sockaddr_in).cast::<libc::sockaddr>(),
+                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                )
+            };
+            if bound == 0 {
+                break;
+            }
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(SandboxError::SetupFailed(format!(
+                "cannot bind brokered host-loopback TCP listener 127.0.0.1:{port}: {error}"
+            )));
+        }
+        loop {
+            if unsafe { libc::listen(socket_fd.raw(), 1) } == 0 {
+                break;
+            }
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(SandboxError::SetupFailed(format!(
+                "cannot listen on brokered host-loopback TCP endpoint 127.0.0.1:{port}: {error}"
+            )));
+        }
+        let storage_fd = move_owned_fd_to_selected_storage(
+            socket_fd,
+            storage_floor,
+            "brokered host-loopback TCP listener",
+        )?;
+        Ok(PreparedSelectedHandle {
+            storage_fd,
+            target_fd: target_fd as RawFd,
+        })
+    }
+
     fn prepare_volume(
         root_fd: RawFd,
         source: &Path,
@@ -540,6 +604,7 @@ mod x86_64 {
                 .keys()
                 .copied()
                 .chain(policy.host_loopback_tcp_target_fd.iter().copied())
+                .chain(policy.host_loopback_tcp_listen_target_fd.iter().copied())
                 .max()
                 .map_or(FIRST_NON_STDIO_FD as RawFd, |target_fd| {
                     target_fd as RawFd + 1
@@ -553,6 +618,11 @@ mod x86_64 {
             let mut selected_handles = Vec::with_capacity(
                 policy.selected_handles.len()
                     + if policy.host_loopback_tcp_target_fd.is_some() {
+                        1
+                    } else {
+                        0
+                    }
+                    + if policy.host_loopback_tcp_listen_target_fd.is_some() {
                         1
                     } else {
                         0
@@ -578,6 +648,22 @@ mod x86_64 {
                 _ => {
                     return Err(SandboxError::InvalidPolicy(PolicyError::new(
                         "network.host_loopback_tcp_port and network.host_loopback_tcp_target_fd must be specified together",
+                    )));
+                }
+            }
+            match (
+                policy.host_loopback_tcp_listen_port,
+                policy.host_loopback_tcp_listen_target_fd,
+            ) {
+                (Some(port), Some(target_fd)) => selected_handles.push(listen_host_loopback_tcp(
+                    port,
+                    target_fd,
+                    selected_storage_floor,
+                )?),
+                (None, None) => {}
+                _ => {
+                    return Err(SandboxError::InvalidPolicy(PolicyError::new(
+                        "network.host_loopback_tcp_listen_port and network.host_loopback_tcp_listen_target_fd must be specified together",
                     )));
                 }
             }

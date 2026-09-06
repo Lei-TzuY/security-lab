@@ -15,6 +15,7 @@
 #   n prove policy-owned loopback supports positive intra-sandbox TCP
 #   o prove loopback remains down unless policy explicitly enables it
 #   p write through a brokered host-loopback TCP fd while direct host reachability stays isolated
+#   q accept one connection through a launcher-brokered host-loopback TCP listening fd
 #   r prove Landlock allows declared reads and returns EACCES for an undeclared visible file
 #   m prove Landlock narrows regular-file mutation inside scratch and a writable persistent volume
 #   F forbidden getpid; exits 77 only when seccomp returns -EPERM
@@ -64,6 +65,8 @@ _start:
     je .loopback_disabled
     cmp $112, %al
     je .brokered_host_loopback
+    cmp $113, %al
+    je .brokered_host_loopback_ingress
     cmp $114, %al
     je .landlock_read_envelope
     cmp $109, %al
@@ -583,6 +586,89 @@ _start:
     syscall
     test %rax, %rax
     js .fail36
+    xor %edi, %edi
+    jmp .exit
+
+.brokered_host_loopback_ingress:
+    mov $1, %eax
+    mov $9, %edi
+    lea brokered_ingress_ready(%rip), %rsi
+    mov $brokered_ingress_ready_len, %edx
+    syscall
+    cmp $brokered_ingress_ready_len, %rax
+    jne .fail39
+
+    mov $3, %eax
+    mov $9, %edi
+    syscall
+    test %rax, %rax
+    js .fail39
+
+    mov $43, %eax
+    mov $10, %edi
+    xor %esi, %esi
+    xor %edx, %edx
+    syscall
+    test %rax, %rax
+    js .fail39
+    mov %rax, %r12
+
+    xor %r13d, %r13d
+.ingress_read_loop:
+    mov $brokered_ingress_request_len, %edx
+    sub %r13d, %edx
+    jz .ingress_read_done
+    xor %eax, %eax
+    mov %r12, %rdi
+    lea network_buffer(%rip), %rsi
+    add %r13, %rsi
+    syscall
+    test %rax, %rax
+    jg .ingress_read_progress
+    je .fail39
+    cmp $-4, %rax
+    je .ingress_read_loop
+    jmp .fail39
+.ingress_read_progress:
+    add %rax, %r13
+    jmp .ingress_read_loop
+.ingress_read_done:
+    lea network_buffer(%rip), %rdi
+    lea brokered_ingress_request(%rip), %rsi
+    mov $brokered_ingress_request_len, %ecx
+    repe cmpsb
+    jne .fail39
+
+    xor %r13d, %r13d
+.ingress_write_loop:
+    mov $brokered_ingress_reply_len, %edx
+    sub %r13d, %edx
+    jz .ingress_write_done
+    mov $1, %eax
+    mov %r12, %rdi
+    lea brokered_ingress_reply(%rip), %rsi
+    add %r13, %rsi
+    syscall
+    test %rax, %rax
+    jg .ingress_write_progress
+    cmp $-4, %rax
+    je .ingress_write_loop
+    jmp .fail39
+.ingress_write_progress:
+    add %rax, %r13
+    jmp .ingress_write_loop
+.ingress_write_done:
+    mov $3, %eax
+    mov %r12, %rdi
+    syscall
+    test %rax, %rax
+    js .fail39
+
+    mov $3, %eax
+    mov $10, %edi
+    syscall
+    test %rax, %rax
+    js .fail39
     xor %edi, %edi
     jmp .exit
 
@@ -1427,6 +1513,9 @@ _start:
     jmp .exit
 .fail38:
     mov $38, %edi
+    jmp .exit
+.fail39:
+    mov $39, %edi
 
 .exit:
     mov $60, %eax
@@ -1482,6 +1571,15 @@ loopback_message:
 brokered_host_message:
     .ascii "brokered-host-loopback-ok"
 .set brokered_host_message_len, . - brokered_host_message
+brokered_ingress_ready:
+    .ascii "brokered-host-ingress-ready\n"
+.set brokered_ingress_ready_len, . - brokered_ingress_ready
+brokered_ingress_request:
+    .ascii "brokered-host-ingress-request"
+.set brokered_ingress_request_len, . - brokered_ingress_request
+brokered_ingress_reply:
+    .ascii "brokered-host-ingress-ok"
+.set brokered_ingress_reply_len, . - brokered_ingress_reply
 landlock_allowed_path:
     .asciz "/landlock-allowed/marker"
 landlock_denied_path:

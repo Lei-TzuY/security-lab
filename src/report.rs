@@ -11,6 +11,9 @@ pub enum ChildOutcome {
     /// A caller-controlled cancellation token became ready while the direct
     /// target was still running. PID 1 owns the resulting tree teardown.
     Cancelled,
+    /// The host capture path observed stdout beyond the declared total-output
+    /// budget and requested launcher-owned process-tree termination.
+    OutputLimitExceeded,
 }
 
 impl fmt::Display for ChildOutcome {
@@ -20,6 +23,7 @@ impl fmt::Display for ChildOutcome {
             Self::Signaled(signal) => write!(f, "signaled signal={signal}"),
             Self::TimedOut => f.write_str("timed out"),
             Self::Cancelled => f.write_str("cancelled"),
+            Self::OutputLimitExceeded => f.write_str("stdout output limit exceeded"),
         }
     }
 }

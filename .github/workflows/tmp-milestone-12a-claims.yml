@@ -16,6 +16,18 @@ jobs:
         with:
           toolchain: stable
           components: rustfmt, clippy
+      - name: Align current README evidence anchor
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('.github/tmp-milestone-12a-claims.py')
+          text = p.read_text()
+          old = '    "- a host `127.0.0.1` TCP listener is first proven reachable from the host process,",'
+          new = '    "- separately, a host `127.0.0.1` TCP listener is first proven reachable from the host process,",'
+          if text.count(old) != 1:
+              raise SystemExit(f'README evidence anchor patch expected one match, got {text.count(old)}')
+          p.write_text(text.replace(old, new, 1))
+          PY
       - name: Materialize claims
         run: python3 .github/tmp-milestone-12a-claims.py
       - name: Enable user namespace capability tests

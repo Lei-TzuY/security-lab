@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
+use std::net::Ipv4Addr;
 use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 
@@ -107,6 +108,11 @@ pub struct SandboxPolicy {
     /// and target descriptor must be specified together.
     pub host_loopback_tcp_port: Option<u16>,
     pub host_loopback_tcp_target_fd: Option<u32>,
+    /// Optional launcher-brokered TCP connection to one exact numeric host IPv4
+    /// endpoint. Address, port, and target descriptor are all-or-nothing.
+    pub host_ipv4_tcp_address: Option<Ipv4Addr>,
+    pub host_ipv4_tcp_port: Option<u16>,
+    pub host_ipv4_tcp_target_fd: Option<u32>,
     /// Optional launcher-brokered TCP listener bound only to host 127.0.0.1.
     /// The port and target descriptor must be specified together.
     pub host_loopback_tcp_listen_port: Option<u16>,
@@ -313,6 +319,58 @@ impl SandboxPolicy {
             _ => {
                 return Err(PolicyError::new(
                     "network.host_loopback_tcp_port and network.host_loopback_tcp_target_fd must be specified together",
+                ));
+            }
+        }
+
+        match (
+            self.host_ipv4_tcp_address,
+            self.host_ipv4_tcp_port,
+            self.host_ipv4_tcp_target_fd,
+        ) {
+            (None, None, None) => {}
+            (Some(address), Some(port), Some(target_fd)) => {
+                let octets = address.octets();
+                if octets == [0, 0, 0, 0] || octets[0] >= 224 {
+                    return Err(PolicyError::new(
+                        "network.host_ipv4_tcp_address must be a unicast IPv4 address",
+                    ));
+                }
+                if port == 0 {
+                    return Err(PolicyError::new(
+                        "network.host_ipv4_tcp_port must be between 1 and 65535",
+                    ));
+                }
+                if !(MIN_SELECTED_TARGET_FD..=MAX_SELECTED_TARGET_FD).contains(&target_fd) {
+                    return Err(PolicyError::new(format!(
+                        "network.host_ipv4_tcp_target_fd must be between {MIN_SELECTED_TARGET_FD} and {MAX_SELECTED_TARGET_FD}: {target_fd}"
+                    )));
+                }
+                if u64::from(target_fd) >= self.limits.open_files {
+                    return Err(PolicyError::new(format!(
+                        "network.host_ipv4_tcp_target_fd {target_fd} must be below limit.open_files {}",
+                        self.limits.open_files
+                    )));
+                }
+                if self.selected_handles.contains_key(&target_fd) {
+                    return Err(PolicyError::new(format!(
+                        "network host-IPv4 target fd {target_fd} collides with a selected handle target"
+                    )));
+                }
+                if self.host_loopback_tcp_target_fd == Some(target_fd) {
+                    return Err(PolicyError::new(format!(
+                        "network host-IPv4 target fd {target_fd} collides with the brokered host-loopback connection target"
+                    )));
+                }
+                if self.host_loopback_tcp_listen_target_fd == Some(target_fd) {
+                    return Err(PolicyError::new(format!(
+                        "network host-IPv4 target fd {target_fd} collides with the brokered host-loopback listener target"
+                    )));
+                }
+            }
+            _ => {
+                return Err(PolicyError::new(
+                    "network.host_ipv4_tcp_address, network.host_ipv4_tcp_port, and network.host_ipv4_tcp_target_fd must be specified together",
                 ));
             }
         }
@@ -712,6 +770,9 @@ impl FromStr for SandboxPolicy {
         let mut loopback_enabled = None;
         let mut host_loopback_tcp_port = None;
         let mut host_loopback_tcp_target_fd = None;
+        let mut host_ipv4_tcp_address = None;
+        let mut host_ipv4_tcp_port = None;
+        let mut host_ipv4_tcp_target_fd = None;
         let mut host_loopback_tcp_listen_port = None;
         let mut host_loopback_tcp_listen_target_fd = None;
         let mut readonly_volume_source = None;
@@ -783,6 +844,26 @@ impl FromStr for SandboxPolicy {
                 )?,
                 "network.host_loopback_tcp_target_fd" => set_once(
                     &mut host_loopback_tcp_target_fd,
+                    value.parse::<u32>().map_err(|_| {
+                        PolicyError::at(line_no, format!("{key} must be an unsigned integer"))
+                    })?,
+                    line_no,
+                    key,
+                )?,
+                "network.host_ipv4_tcp_address" => set_once(
+                    &mut host_ipv4_tcp_address,
+                    parse_ipv4_address(value, line_no, key)?,
+                    line_no,
+                    key,
+                )?,
+                "network.host_ipv4_tcp_port" => set_once(
+                    &mut host_ipv4_tcp_port,
+                    parse_tcp_port(value, line_no, key)?,
+                    line_no,
+                    key,
+                )?,
+                "network.host_ipv4_tcp_target_fd" => set_once(
+                    &mut host_ipv4_tcp_target_fd,
                     value.parse::<u32>().map_err(|_| {
                         PolicyError::at(line_no, format!("{key} must be an unsigned integer"))
                     })?,
@@ -1013,6 +1094,9 @@ impl FromStr for SandboxPolicy {
             loopback_enabled: loopback_enabled.unwrap_or(false),
             host_loopback_tcp_port,
             host_loopback_tcp_target_fd,
+            host_ipv4_tcp_address,
+            host_ipv4_tcp_port,
+            host_ipv4_tcp_target_fd,
             host_loopback_tcp_listen_port,
             host_loopback_tcp_listen_target_fd,
             readonly_volume_source: readonly_volume_source.map(PathBuf::from),
@@ -1109,6 +1193,20 @@ fn parse_enabled_disabled(value: &str, line: usize, key: &str) -> Result<bool, P
             format!("{key} must be enabled or disabled"),
         )),
     }
+}
+
+fn parse_ipv4_address(value: &str, line: usize, key: &str) -> Result<Ipv4Addr, PolicyError> {
+    let address = value
+        .parse::<Ipv4Addr>()
+        .map_err(|_| PolicyError::at(line, format!("{key} must be a numeric IPv4 address")))?;
+    let octets = address.octets();
+    if octets == [0, 0, 0, 0] || octets[0] >= 224 {
+        return Err(PolicyError::at(
+            line,
+            format!("{key} must be a unicast IPv4 address"),
+        ));
+    }
+    Ok(address)
 }
 
 fn parse_tcp_port(value: &str, line: usize, key: &str) -> Result<u16, PolicyError> {
@@ -1249,6 +1347,9 @@ mod tests {
         assert!(!policy.loopback_enabled);
         assert_eq!(policy.host_loopback_tcp_port, None);
         assert_eq!(policy.host_loopback_tcp_target_fd, None);
+        assert_eq!(policy.host_ipv4_tcp_address, None);
+        assert_eq!(policy.host_ipv4_tcp_port, None);
+        assert_eq!(policy.host_ipv4_tcp_target_fd, None);
         assert!(policy.landlock_read_execute.is_empty());
         assert!(policy.landlock_file_mutate.is_empty());
         assert!(policy.landlock_device_ioctl.is_empty());
@@ -1518,6 +1619,54 @@ mod tests {
         assert!(error
             .to_string()
             .contains("collides with a selected handle target"));
+    }
+
+    #[test]
+    fn parses_brokered_host_ipv4_tcp_endpoint() {
+        let text = format!(
+            "{VALID}\nnetwork.host_ipv4_tcp_address = 127.0.0.2\nnetwork.host_ipv4_tcp_port = 8080\nnetwork.host_ipv4_tcp_target_fd = 12"
+        );
+        let policy: SandboxPolicy = text.parse().unwrap();
+        assert_eq!(
+            policy.host_ipv4_tcp_address,
+            Some(Ipv4Addr::new(127, 0, 0, 2))
+        );
+        assert_eq!(policy.host_ipv4_tcp_port, Some(8080));
+        assert_eq!(policy.host_ipv4_tcp_target_fd, Some(12));
+    }
+
+    #[test]
+    fn rejects_incomplete_or_unsafe_brokered_host_ipv4_tcp_endpoint() {
+        let incomplete = format!(
+            "{VALID}\nnetwork.host_ipv4_tcp_address = 127.0.0.2\nnetwork.host_ipv4_tcp_port = 8080"
+        );
+        assert!(incomplete.parse::<SandboxPolicy>().is_err());
+
+        for address in ["example.com", "0.0.0.0", "224.0.0.1", "255.255.255.255"] {
+            let text = format!(
+                "{VALID}\nnetwork.host_ipv4_tcp_address = {address}\nnetwork.host_ipv4_tcp_port = 8080\nnetwork.host_ipv4_tcp_target_fd = 12"
+            );
+            assert!(
+                text.parse::<SandboxPolicy>().is_err(),
+                "accepted unsafe address {address}"
+            );
+        }
+
+        let collision = format!(
+            "{VALID}\nhandle.12 = 0\nnetwork.host_ipv4_tcp_address = 127.0.0.2\nnetwork.host_ipv4_tcp_port = 8080\nnetwork.host_ipv4_tcp_target_fd = 12"
+        );
+        let error = collision.parse::<SandboxPolicy>().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("collides with a selected handle target"));
+
+        let legacy_collision = format!(
+            "{VALID}\nnetwork.host_loopback_tcp_port = 8080\nnetwork.host_loopback_tcp_target_fd = 12\nnetwork.host_ipv4_tcp_address = 127.0.0.2\nnetwork.host_ipv4_tcp_port = 8080\nnetwork.host_ipv4_tcp_target_fd = 12"
+        );
+        let error = legacy_collision.parse::<SandboxPolicy>().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("collides with the brokered host-loopback connection target"));
     }
 
     #[test]

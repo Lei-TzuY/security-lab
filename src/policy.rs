@@ -88,6 +88,9 @@ pub struct SandboxPolicy {
     /// rules restrict bind/connect syscalls without granting those syscalls.
     pub landlock_tcp_bind_ports: Vec<u16>,
     pub landlock_tcp_connect_ports: Vec<u16>,
+    /// Whether the direct target enters a Landlock signal scope. This attenuates
+    /// signal authority toward processes outside the same or a nested domain.
+    pub landlock_scope_signal: bool,
     /// Whether the launcher activates `lo` inside the isolated network namespace.
     /// This does not attach the namespace to any host or external network.
     pub loopback_enabled: bool,
@@ -670,6 +673,7 @@ impl FromStr for SandboxPolicy {
         let mut landlock_file_mutate = Vec::new();
         let mut landlock_tcp_bind_ports = Vec::new();
         let mut landlock_tcp_connect_ports = Vec::new();
+        let mut landlock_scope_signal = None;
         let mut loopback_enabled = None;
         let mut host_loopback_tcp_port = None;
         let mut host_loopback_tcp_target_fd = None;
@@ -718,6 +722,12 @@ impl FromStr for SandboxPolicy {
                 "landlock.tcp_connect_port" => {
                     landlock_tcp_connect_ports.push(parse_tcp_port(value, line_no, key)?)
                 }
+                "landlock.scope_signal" => set_once(
+                    &mut landlock_scope_signal,
+                    parse_enabled_disabled(value, line_no, key)?,
+                    line_no,
+                    key,
+                )?,
                 "network.loopback" => set_once(
                     &mut loopback_enabled,
                     parse_enabled_disabled(value, line_no, key)?,
@@ -951,6 +961,7 @@ impl FromStr for SandboxPolicy {
                 .collect(),
             landlock_tcp_bind_ports,
             landlock_tcp_connect_ports,
+            landlock_scope_signal: landlock_scope_signal.unwrap_or(false),
             loopback_enabled: loopback_enabled.unwrap_or(false),
             host_loopback_tcp_port,
             host_loopback_tcp_target_fd,
@@ -1194,6 +1205,7 @@ mod tests {
         assert!(policy.landlock_file_mutate.is_empty());
         assert!(policy.landlock_tcp_bind_ports.is_empty());
         assert!(policy.landlock_tcp_connect_ports.is_empty());
+        assert!(!policy.landlock_scope_signal);
         assert_eq!(policy.readonly_volume_source, None);
         assert_eq!(policy.readonly_volume_target, None);
         assert_eq!(policy.writable_volume_source, None);
@@ -1306,6 +1318,26 @@ mod tests {
 
         let scratch_subdir = format!("{VALID}\nlandlock.file_mutate = /scratch/subdir");
         assert!(scratch_subdir.parse::<SandboxPolicy>().is_err());
+    }
+
+    #[test]
+    fn parses_landlock_signal_scope_mode() {
+        let enabled: SandboxPolicy = format!("{VALID}\nlandlock.scope_signal = enabled")
+            .parse()
+            .unwrap();
+        assert!(enabled.landlock_scope_signal);
+
+        let disabled: SandboxPolicy = format!("{VALID}\nlandlock.scope_signal = disabled")
+            .parse()
+            .unwrap();
+        assert!(!disabled.landlock_scope_signal);
+
+        let invalid = format!("{VALID}\nlandlock.scope_signal = yes");
+        assert!(invalid.parse::<SandboxPolicy>().is_err());
+
+        let duplicate =
+            format!("{VALID}\nlandlock.scope_signal = enabled\nlandlock.scope_signal = disabled");
+        assert!(duplicate.parse::<SandboxPolicy>().is_err());
     }
 
     #[test]

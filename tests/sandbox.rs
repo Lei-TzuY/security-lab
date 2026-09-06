@@ -42,6 +42,71 @@ fn duplicate_fd_at_least(fd: RawFd, minimum: RawFd, label: &str) -> TestFd {
     TestFd(duplicated)
 }
 
+fn abstract_unix_address(name: &[u8]) -> (libc::sockaddr_un, libc::socklen_t) {
+    assert!(
+        !name.is_empty(),
+        "abstract UNIX socket name must not be empty"
+    );
+    assert!(
+        name.len() < 108,
+        "abstract UNIX socket name exceeds sockaddr_un.sun_path"
+    );
+    let mut address = unsafe { std::mem::zeroed::<libc::sockaddr_un>() };
+    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (index, byte) in name.iter().enumerate() {
+        address.sun_path[index + 1] = *byte as libc::c_char;
+    }
+    let length = (std::mem::size_of::<libc::sa_family_t>() + 1 + name.len()) as libc::socklen_t;
+    (address, length)
+}
+
+fn abstract_unix_stream_listener(name: &[u8]) -> TestFd {
+    let listener = unsafe {
+        libc::socket(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+            0,
+        )
+    };
+    assert!(
+        listener >= 0,
+        "create abstract UNIX listener failed: {}",
+        std::io::Error::last_os_error()
+    );
+    let listener = TestFd(listener);
+    let (address, length) = abstract_unix_address(name);
+    let bound = unsafe {
+        libc::bind(
+            listener.raw(),
+            (&address as *const libc::sockaddr_un).cast::<libc::sockaddr>(),
+            length,
+        )
+    };
+    assert_eq!(
+        bound,
+        0,
+        "bind abstract UNIX listener failed: {}",
+        std::io::Error::last_os_error()
+    );
+    assert_eq!(
+        unsafe { libc::listen(listener.raw(), 4) },
+        0,
+        "listen on abstract UNIX socket failed: {}",
+        std::io::Error::last_os_error()
+    );
+    listener
+}
+
+fn unix_stream_client() -> TestFd {
+    let client = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    assert!(
+        client >= 0,
+        "create abstract UNIX client failed: {}",
+        std::io::Error::last_os_error()
+    );
+    TestFd(client)
+}
+
 fn write_all_fd(fd: RawFd, buffer: &[u8]) {
     let mut offset = 0usize;
     while offset < buffer.len() {
@@ -165,6 +230,7 @@ fn policy(mode: &str, extra_args: &[&str], syscalls: &[&str]) -> SandboxPolicy {
         landlock_file_mutate: Vec::new(),
         landlock_tcp_bind_ports: Vec::new(),
         landlock_tcp_connect_ports: Vec::new(),
+        landlock_scope_abstract_unix_socket: false,
         landlock_scope_signal: false,
         loopback_enabled: false,
         host_loopback_tcp_port: None,
@@ -197,6 +263,65 @@ fn policy(mode: &str, extra_args: &[&str], syscalls: &[&str]) -> SandboxPolicy {
             argument_rules: BTreeMap::new(),
         },
     }
+}
+
+#[test]
+fn landlock_abstract_unix_scope_attenuates_selected_socket_connect_authority() {
+    let name = format!("security-lab-landlock-abstract-{}", process::id());
+    let listener = abstract_unix_stream_listener(name.as_bytes());
+
+    let unscoped_client = unix_stream_client();
+    let mut unscoped = policy("a", &[name.as_str()], &["execveat", "connect", "exit"]);
+    unscoped
+        .selected_handles
+        .insert(9, unscoped_client.raw() as u32);
+    assert_eq!(run(&unscoped).unwrap(), ChildOutcome::Exited(0));
+
+    let accepted = unsafe {
+        libc::accept4(
+            listener.raw(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            libc::SOCK_CLOEXEC,
+        )
+    };
+    assert!(
+        accepted >= 0,
+        "unscoped target did not reach host-domain abstract listener: {}",
+        std::io::Error::last_os_error()
+    );
+    drop(TestFd(accepted));
+    drop(unscoped_client);
+
+    let scoped_client = unix_stream_client();
+    let mut scoped = policy("a", &[name.as_str()], &["execveat", "connect", "exit"]);
+    scoped
+        .selected_handles
+        .insert(9, scoped_client.raw() as u32);
+    scoped.landlock_scope_abstract_unix_socket = true;
+    assert_eq!(
+        run(&scoped).unwrap(),
+        ChildOutcome::Exited(libc::EPERM),
+        "Landlock abstract UNIX scope must deny connect with exact EPERM"
+    );
+
+    let unexpected = unsafe {
+        libc::accept4(
+            listener.raw(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            libc::SOCK_CLOEXEC,
+        )
+    };
+    assert_eq!(
+        unexpected, -1,
+        "scoped target unexpectedly queued a connection"
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::EAGAIN),
+        "scoped target changed listener state without an accepted connection"
+    );
 }
 
 #[test]

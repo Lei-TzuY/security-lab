@@ -6,13 +6,14 @@ use security_lab::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CString;
-use std::net::{Ipv4Addr, TcpListener, TcpStream};
+use std::net::{Ipv4Addr, TcpListener, TcpStream, UdpSocket};
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::process::{self, Command};
 use std::sync::OnceLock;
 use std::thread;
+use std::time::Duration;
 
 const SCRATCH_BYTES: u64 = 16 * 1024 * 1024;
 
@@ -266,6 +267,9 @@ fn policy(mode: &str, extra_args: &[&str], syscalls: &[&str]) -> SandboxPolicy {
         host_ipv4_tcp_address: None,
         host_ipv4_tcp_port: None,
         host_ipv4_tcp_target_fd: None,
+        host_ipv4_udp_address: None,
+        host_ipv4_udp_port: None,
+        host_ipv4_udp_target_fd: None,
         host_loopback_tcp_listen_port: None,
         host_loopback_tcp_listen_target_fd: None,
         readonly_volume_source: None,
@@ -306,6 +310,75 @@ fn assert_random_device_ioctl_available(path: &str) {
         "host random-device ioctl baseline failed for {path}: {}",
         std::io::Error::last_os_error()
     );
+}
+
+#[test]
+fn brokered_host_ipv4_udp_preserves_datagram_boundary_and_exact_address() {
+    const PORT_ACQUIRE_ATTEMPTS: usize = 32;
+    let mut endpoints = None;
+    for _ in 0..PORT_ACQUIRE_ATTEMPTS {
+        let other = UdpSocket::bind((Ipv4Addr::new(127, 0, 0, 1), 0))
+            .expect("bind first address-aware UDP broker endpoint");
+        let port = other
+            .local_addr()
+            .expect("read first UDP broker endpoint")
+            .port();
+        match UdpSocket::bind((Ipv4Addr::new(127, 0, 0, 2), port)) {
+            Ok(selected) => {
+                endpoints = Some((other, selected, port));
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => continue,
+            Err(error) => panic!("bind selected UDP broker endpoint failed: {error}"),
+        }
+    }
+    let (other, selected, port) = endpoints.expect("acquire shared UDP port across 127/8");
+    selected
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set selected UDP receive timeout");
+
+    let port_text = port.to_string();
+    let mut brokered = policy(
+        "e",
+        &[port_text.as_str()],
+        &["execveat", "write", "close", "socket", "connect", "exit"],
+    );
+    brokered.host_ipv4_udp_address = Some(Ipv4Addr::new(127, 0, 0, 2));
+    brokered.host_ipv4_udp_port = Some(port);
+    brokered.host_ipv4_udp_target_fd = Some(10);
+    brokered.wall_clock_milliseconds = Some(2000);
+
+    assert_eq!(run(&brokered).unwrap(), ChildOutcome::Exited(0));
+
+    let mut datagram = [0u8; 64];
+    let (received, _) = selected
+        .recv_from(&mut datagram)
+        .expect("selected UDP endpoint did not receive brokered datagram");
+    assert_eq!(&datagram[..received], b"brokered-host-udp-ok");
+
+    selected
+        .set_nonblocking(true)
+        .expect("make selected UDP endpoint nonblocking");
+    match selected.recv_from(&mut datagram) {
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+        Ok((received, peer)) => panic!(
+            "isolated target unexpectedly delivered a second UDP datagram from {peer}: {:?}",
+            &datagram[..received]
+        ),
+        Err(error) => panic!("unexpected selected UDP receive error: {error}"),
+    }
+
+    other
+        .set_nonblocking(true)
+        .expect("make non-selected UDP endpoint nonblocking");
+    match other.recv_from(&mut datagram) {
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+        Ok((received, peer)) => panic!(
+            "UDP broker selected the wrong same-port address; received from {peer}: {:?}",
+            &datagram[..received]
+        ),
+        Err(error) => panic!("unexpected non-selected UDP receive error: {error}"),
+    }
 }
 
 #[test]

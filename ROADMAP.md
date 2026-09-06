@@ -498,7 +498,7 @@ Boundary: `SO_PEERCRED` is Linux kernel credential metadata captured for the con
 
 ### Slice 20A — bounded directory/symlink/reparent mutation
 
-**Current verified candidate.** Extends the existing 10B regular-file mutation envelope with an explicit topology authority bitset rather than implicitly widening every writable directory.
+**Status: complete on `main`.** Extends the existing 10B regular-file mutation envelope with an explicit topology authority bitset rather than implicitly widening every writable directory.
 
 Acceptance evidence is executable:
 
@@ -514,6 +514,26 @@ Boundary: 20A is a narrow augmentation of an existing `landlock.file_mutate` dir
 ### Milestone 20 promotion rule
 
 After 20A integrates, seal this bounded pathname-topology slice. Do not farm additional topology syscall spellings that map to the same Landlock rights. Promote to a materially different capability such as a broader routed network model only with explicit topology/endpoint evidence, or revisit blocked cgroup/supplementary-group work only when its environment/namespace prerequisites become real.
+
+## Milestone 21 — richer numeric syscall semantics
+
+### Slice 21A — inclusive unsigned 64-bit seccomp argument ranges
+
+**Current verified candidate.** Adds a materially different numeric predicate model beyond 5A masked equality without widening the syscall allowlist.
+
+Acceptance evidence is executable:
+
+- policy accepts `seccomp.range.<syscall>.<0..5> = <minimum>:<maximum>` using decimal or `0x` literals; a range only applies to an already-allowed syscall, launcher-critical `execveat`/`exit`/`exit_group` remain unconstrainable, argument indexes stay 0–5, `minimum` may not exceed `maximum`, and the full unconstrained `0..=u64::MAX` interval is rejected;
+- masked-equality and range rules retain separate per-syscall/per-argument maps but share the existing aggregate 64-predicate ceiling; when both families constrain the same argument, they compose conjunctively rather than one overriding the other;
+- Linux x86_64 cBPF compares each bound as unsigned high/low 32-bit words and performs the low-word comparison only when the high word equals that bound, implementing full-64-bit inclusive comparison before the syscall's final `ALLOW`;
+- the raw `lseek` oracle uses range `0x00000000fffffff0..=0x0000000100000010` plus an even-value mask on the same argument: exact lower/interior-cross-boundary/upper values succeed, an in-range odd value receives `EPERM` from the mask, and even below/above plus a high-32-bit outlier receive `EPERM` from the range;
+- the existing 5A masked-value oracle, Milestone 17A resource-usage mode, all Milestones 1–20A regressions, stable format/Clippy/full tests, and the full Rust 1.74 suite remain green.
+
+Boundary: 21A compares one raw syscall argument against an unsigned inclusive interval. It does not provide signed ranges, relations between arguments, pointed-to/string/path inspection, arbitrary Boolean expressions, or pointer-target TOCTOU protection.
+
+### Milestone 21 promotion rule
+
+After 21A integrates, seal this bounded numeric-range slice. Do not farm `<`, `<=`, `>`, `>=`, endpoint aliases, or more fixture values around the same cBPF comparison mechanism. A later seccomp slice must introduce materially different executable semantics; otherwise promote to another subsystem frontier such as routed/broader networking only when explicit topology/endpoint evidence is available.
 
 ## Later frontiers
 

@@ -22,6 +22,8 @@ jobs:
           echo "newgidmap=$(command -v newgidmap || true)"
           echo "setpriv=$(command -v setpriv || true)"
           echo "unshare=$(unshare --version | head -n1)"
+          stat -c 'newuidmap mode=%A uid=%u gid=%g' /usr/bin/newuidmap 2>/dev/null || true
+          stat -c 'newgidmap mode=%A uid=%u gid=%g' /usr/bin/newgidmap 2>/dev/null || true
           echo "subuid entries:"
           grep -E "^($(id -un)|$(id -u)):" /etc/subuid 2>/dev/null || true
           echo "subgid entries:"
@@ -58,16 +60,16 @@ jobs:
           after = os.getgroups()
           print(f"after_groups={after}")
           PY
-      - name: Probe delegated multi-GID mapping path
+      - name: Probe util-linux delegated multi-GID mapping path
         shell: bash
         run: |
           set -u
           if ! command -v newgidmap >/dev/null 2>&1; then
-            echo "delegated_path=unavailable reason=newgidmap-missing"
+            echo "util_linux_delegated_path=unavailable reason=newgidmap-missing"
             exit 0
           fi
           if ! grep -Eq "^($(id -un)|$(id -u)):" /etc/subgid 2>/dev/null; then
-            echo "delegated_path=unavailable reason=subgid-delegation-missing"
+            echo "util_linux_delegated_path=unavailable reason=subgid-delegation-missing"
             exit 0
           fi
 
@@ -91,9 +93,109 @@ jobs:
           rc=$?
           set -e
           printf '%s\n' "$output"
-          echo "delegated_probe_rc=$rc"
+          echo "util_linux_delegated_probe_rc=$rc"
           if [ "$rc" -eq 0 ]; then
-            echo "delegated_path=viable"
+            echo "util_linux_delegated_path=viable"
           else
-            echo "delegated_path=unavailable reason=helper-or-mapping-failed"
+            echo "util_linux_delegated_path=unavailable reason=helper-or-mapping-failed"
           fi
+      - name: Probe direct newuidmap/newgidmap architecture
+        shell: bash
+        run: |
+          set -eu
+          python3 - <<'PY'
+          import ctypes
+          import errno
+          import os
+          import pwd
+          import signal
+          import subprocess
+          import sys
+
+          CLONE_NEWUSER = 0x10000000
+          libc = ctypes.CDLL(None, use_errno=True)
+          user = pwd.getpwuid(os.getuid()).pw_name
+
+          def delegated_start(path):
+              with open(path, encoding="utf-8") as f:
+                  for line in f:
+                      name, start, count = line.strip().split(":")
+                      if name in (user, str(os.getuid())) and int(count) > 0:
+                          return int(start)
+              raise RuntimeError(f"no delegation in {path}")
+
+          subuid = delegated_start("/etc/subuid")
+          subgid = delegated_start("/etc/subgid")
+          ready_r, ready_w = os.pipe()
+          go_r, go_w = os.pipe()
+          pid = os.fork()
+          if pid == 0:
+              try:
+                  os.close(ready_r)
+                  os.close(go_w)
+                  if libc.unshare(CLONE_NEWUSER) != 0:
+                      err = ctypes.get_errno()
+                      print(f"direct_child_unshare_errno={err} {errno.errorcode.get(err, 'UNKNOWN')}", flush=True)
+                      os._exit(31)
+                  os.write(ready_w, b"R")
+                  if os.read(go_r, 1) != b"G":
+                      os._exit(32)
+                  before = os.getgroups()
+                  rc = libc.setgroups(0, None)
+                  err = ctypes.get_errno()
+                  after = os.getgroups()
+                  print(
+                      f"direct_child_uid={os.getuid()} gid={os.getgid()} before_groups={before} "
+                      f"setgroups_clear_rc={rc} errno={err} errno_name={errno.errorcode.get(err, 'UNKNOWN')} "
+                      f"after_groups={after}",
+                      flush=True,
+                  )
+                  os._exit(0 if rc == 0 and not after else 23)
+              finally:
+                  os._exit(33)
+
+          os.close(ready_w)
+          os.close(go_r)
+          ready = os.read(ready_r, 1)
+          if ready != b"R":
+              _, status = os.waitpid(pid, 0)
+              print(f"direct_helper_path=unavailable reason=child-unshare status={status}")
+              raise SystemExit(0)
+
+          uid_cmd = [
+              "newuidmap", str(pid),
+              "0", str(os.getuid()), "1",
+              "1", str(subuid), "1",
+          ]
+          gid_cmd = [
+              "newgidmap", str(pid),
+              "0", str(os.getgid()), "1",
+              "1", str(subgid), "1",
+          ]
+          uid = subprocess.run(uid_cmd, text=True, capture_output=True)
+          print(f"newuidmap_rc={uid.returncode} stderr={uid.stderr.strip()!r}")
+          if uid.returncode != 0:
+              os.kill(pid, signal.SIGKILL)
+              os.waitpid(pid, 0)
+              print("direct_helper_path=unavailable reason=newuidmap-failed")
+              raise SystemExit(0)
+
+          gid = subprocess.run(gid_cmd, text=True, capture_output=True)
+          print(f"newgidmap_rc={gid.returncode} stderr={gid.stderr.strip()!r}")
+          if gid.returncode != 0:
+              os.kill(pid, signal.SIGKILL)
+              os.waitpid(pid, 0)
+              print("direct_helper_path=unavailable reason=newgidmap-failed")
+              raise SystemExit(0)
+
+          with open(f"/proc/{pid}/setgroups", encoding="utf-8") as f:
+              print(f"setgroups_state_after_helper_maps={f.read().strip()}")
+          os.write(go_w, b"G")
+          _, status = os.waitpid(pid, 0)
+          code = os.waitstatus_to_exitcode(status)
+          print(f"direct_child_exit={code}")
+          if code == 0:
+              print("direct_helper_path=viable")
+          else:
+              print("direct_helper_path=unavailable reason=setgroups-clear-failed")
+          PY

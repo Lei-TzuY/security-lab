@@ -336,7 +336,7 @@ Boundary: Landlock ABI 4 TCP network rules match **ports, not IP addresses**. 12
 
 ### Slice 13A — Landlock signal scope
 
-**Current verified candidate.** Adds a process-to-process authority boundary rather than another pathname, port, or brokered-socket variant.
+**Status: complete on `main`.** Adds a process-to-process authority boundary rather than another pathname, port, or brokered-socket variant.
 
 Acceptance evidence is executable:
 
@@ -349,9 +349,24 @@ Acceptance evidence is executable:
 
 Boundary: 13A is one Landlock signal scope with no per-process exception list. It does not grant signalling syscalls, replace PID-namespace lifecycle supervision, provide arbitrary signal forwarding/brokering, or claim Landlock scoping for abstract Unix sockets or another IPC class.
 
+### Slice 13B — Landlock abstract UNIX socket scope
+
+**Current verified candidate.** Adds a distinct cross-domain socket-object boundary and deliberately composes with existing selected-handle authority rather than inventing another broker path.
+
+Acceptance evidence is executable:
+
+- policy accepts optional `landlock.scope_abstract_unix_socket = enabled|disabled`, defaults to disabled, rejects invalid/duplicate declarations, and can coexist with the independent signal scope;
+- enabling abstract-UNIX scope requires Landlock ABI 6 or newer. Older or unavailable kernels fail explicitly rather than dropping the request;
+- the direct target ORs `LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET` into the ABI-6 ruleset `scoped` bitmask and may combine it with `LANDLOCK_SCOPE_SIGNAL`; historical shorter ruleset structure sizes remain unchanged when neither scope is requested;
+- the scope does not grant socket authority: target seccomp must explicitly include `connect`, and the oracle uses an already-open AF_UNIX client delivered through existing selected-handle fd 9 rather than adding `socket`;
+- the host binds/listens on a real abstract AF_UNIX stream endpoint. The unscoped raw target connects through selected fd 9 and the parent successfully accepts that connection; the otherwise-identical scoped target must exit with exact `EPERM`, and a nonblocking parent `accept4` must then return `EAGAIN`, proving no connection was queued;
+- all Milestones 1–13A regressions plus deterministic CLI tests remain active; stable format/Clippy/full tests and the full Rust 1.74 suite are green.
+
+Boundary: 13B is the kernel-defined cross-domain abstract-UNIX `connect` scope. It does not provide pathname UNIX-socket filtering, per-address/per-peer exceptions, a general AF_UNIX broker, implicit `socket`/`connect` grants, or revocation of already-connected stream traffic. Stream-vs-datagram variants are not separate roadmap milestones for this same scope bit.
+
 ### Milestone 13 promotion rule
 
-After 13A integrates, seal this signal-scope mechanism. Do not farm signal numbers, `kill`/`tgkill` aliases, or pidfd variants that repeat the same permission boundary. Promote only to a materially different IPC object boundary with executable positive/negative evidence or to another subsystem frontier; delegated cgroup accounting and supplementary-group isolation remain blocked until their external/kernel mapping prerequisites change.
+After 13B integrates, seal the ABI-6 Landlock scope surface at this bounded laboratory scope. Do not farm signal syscall aliases, signal numbers, or AF_UNIX socket-type variants that repeat the same scoped-field mechanism. Promote only to a materially different executable authority frontier; delegated cgroup accounting and supplementary-group isolation remain blocked until their external/kernel mapping prerequisites change.
 
 ## Later frontiers
 

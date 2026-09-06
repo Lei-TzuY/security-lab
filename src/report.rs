@@ -8,6 +8,9 @@ pub enum ChildOutcome {
     /// Launcher-owned wall-clock deadline expired before the direct target
     /// became waitable. This is distinct from an ordinary target signal.
     TimedOut,
+    /// A caller-controlled cancellation token became ready while the direct
+    /// target was still running. PID 1 owns the resulting tree teardown.
+    Cancelled,
 }
 
 impl fmt::Display for ChildOutcome {
@@ -16,6 +19,7 @@ impl fmt::Display for ChildOutcome {
             Self::Exited(code) => write!(f, "exited code={code}"),
             Self::Signaled(signal) => write!(f, "signaled signal={signal}"),
             Self::TimedOut => f.write_str("timed out"),
+            Self::Cancelled => f.write_str("cancelled"),
         }
     }
 }

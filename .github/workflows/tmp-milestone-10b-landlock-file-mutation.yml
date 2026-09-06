@@ -22,24 +22,24 @@ jobs:
         run: |
           python3 - <<'PY'
           from pathlib import Path
+          import re
           p = Path("src/policy.rs")
           text = p.read_text()
-          old = '''                let in_scratch = self
-                      .scratch_dir
-                      .as_ref()
-                      .map_or(false, |scratch| path == scratch);
-                  let in_writable_volume = self
-                      .writable_volume_target
-                      .as_ref()
-                      .map_or(false, |target| path.starts_with(target));'''
-          new = '''                let in_scratch = self.scratch_dir.as_ref() == Some(path);
-                  let in_writable_volume = self
-                      .writable_volume_target
-                      .as_ref()
-                      .is_some_and(|target| path.starts_with(target));'''
-          if text.count(old) != 1:
-              raise SystemExit(f"MSRV-safe normalization: expected one match, got {text.count(old)}")
-          p.write_text(text.replace(old, new, 1))
+          text, scratch_count = re.subn(
+              r"let in_scratch = self\s*\.scratch_dir\s*\.as_ref\(\)\s*\.map_or\(false, \|scratch\| path == scratch\);",
+              "let in_scratch = self.scratch_dir.as_ref() == Some(path);",
+              text,
+          )
+          text, volume_count = re.subn(
+              r"let in_writable_volume = self\s*\.writable_volume_target\s*\.as_ref\(\)\s*\.map_or\(false, \|target\| path\.starts_with\(target\)\);",
+              "let in_writable_volume = self.writable_volume_target.as_ref().is_some_and(|target| path.starts_with(target));",
+              text,
+          )
+          if scratch_count != 1 or volume_count != 1:
+              raise SystemExit(
+                  f"MSRV-safe normalization expected one match each, got scratch={scratch_count}, volume={volume_count}"
+              )
+          p.write_text(text)
           PY
       - name: Format
         run: cargo fmt --all

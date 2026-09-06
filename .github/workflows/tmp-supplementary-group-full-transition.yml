@@ -27,7 +27,6 @@ jobs:
           set -euo pipefail
           command -v newuidmap
           command -v newgidmap
-          command -v ip
           test "$(id -u)" -ne 0
           grep -Eq "^($(id -un)|$(id -u)):" /etc/subuid
           grep -Eq "^($(id -un)|$(id -u)):" /etc/subgid
@@ -35,9 +34,12 @@ jobs:
           python3 - <<'PY'
           import ctypes
           import errno
+          import fcntl
           import os
           import pwd
           import signal
+          import socket
+          import struct
           import subprocess
           import traceback
 
@@ -49,6 +51,9 @@ jobs:
           CLONE_NEWNET = 0x40000000
           MS_REC = 16384
           MS_PRIVATE = 1 << 18
+          SIOCGIFFLAGS = 0x8913
+          SIOCSIFFLAGS = 0x8914
+          IFF_UP = 0x1
           flags = CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWNET | CLONE_NEWIPC | CLONE_NEWUTS
 
           libc = ctypes.CDLL(None, use_errno=True)
@@ -70,6 +75,25 @@ jobs:
                   name: os.readlink(f"{prefix}/{name}")
                   for name in ("user", "mnt", "net", "ipc", "uts")
               }
+
+          def bring_loopback_up_without_fork():
+              control = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+              try:
+                  request = struct.pack("16sH22x", b"lo", 0)
+                  current = fcntl.ioctl(control.fileno(), SIOCGIFFLAGS, request)
+                  current_flags = struct.unpack("16sH22x", current)[1]
+                  updated = struct.pack("16sH22x", b"lo", current_flags | IFF_UP)
+                  fcntl.ioctl(control.fileno(), SIOCSIFFLAGS, updated)
+                  observed = fcntl.ioctl(control.fileno(), SIOCGIFFLAGS, request)
+                  observed_flags = struct.unpack("16sH22x", observed)[1]
+                  print(
+                      f"loopback_flags_before=0x{current_flags:x} after=0x{observed_flags:x}",
+                      flush=True,
+                  )
+                  if not (observed_flags & IFF_UP):
+                      raise RuntimeError("loopback did not become UP")
+              finally:
+                  control.close()
 
           subuid = delegated_start("/etc/subuid")
           subgid = delegated_start("/etc/subgid")
@@ -131,7 +155,7 @@ jobs:
                   with open("/proc/sys/kernel/hostname", "rb") as f:
                       observed_hostname = f.read().strip()
                   if observed_hostname != hostname:
-                      print(f"unexpected hostname={observed_hostname!r}", flush=True)
+                      print(f"unexpected_hostname={observed_hostname!r}", flush=True)
                       os._exit(43)
 
                   if libc.mount(None, b"/", None, MS_REC | MS_PRIVATE, None) != 0:
@@ -139,19 +163,14 @@ jobs:
                       print(f"mount_private_errno={err} {errno.errorcode.get(err, 'UNKNOWN')}", flush=True)
                       os._exit(44)
 
-                  net = subprocess.run(
-                      ["ip", "link", "set", "lo", "up"],
-                      text=True,
-                      capture_output=True,
-                  )
-                  print(f"loopback_setup_rc={net.returncode} stderr={net.stderr.strip()!r}", flush=True)
-                  if net.returncode != 0:
-                      os._exit(45)
+                  # Do not spawn an `ip` helper here: after CLONE_NEWPID the
+                  # first forked process becomes namespace PID 1. Production
+                  # performs loopback setup in-process before creating PID 1,
+                  # so the probe uses the same raw ioctl shape.
+                  bring_loopback_up_without_fork()
 
-                  # CLONE_NEWPID changes the PID namespace of subsequently
-                  # created children. The first child must therefore observe
-                  # itself as namespace PID 1; this is the executable PID
-                  # namespace oracle rather than a procfs symlink assumption.
+                  # The first and only fork since CLONE_NEWPID must create the
+                  # namespace init process, which observes itself as PID 1.
                   namespace_init = os.fork()
                   if namespace_init == 0:
                       actual_pid = os.getpid()

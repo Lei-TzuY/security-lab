@@ -16,6 +16,8 @@ jobs:
         with:
           toolchain: stable
           components: rustfmt, clippy
+      - name: Repair generator anchor
+        run: python3 .github/tmp-milestone-8a-generator-fix.py
       - name: Materialize candidate
         run: python3 .github/tmp-milestone-8a-readonly-volume.py
       - name: Format
@@ -34,6 +36,7 @@ jobs:
         run: cargo test --locked --all-targets --all-features
       - name: Remove construction files and commit candidate tree
         run: |
+          rm .github/tmp-milestone-8a-generator-fix.py
           rm .github/tmp-milestone-8a-readonly-volume.py
           rm .github/workflows/tmp-milestone-8a-readonly-volume.yml
           git config user.name LeiZ

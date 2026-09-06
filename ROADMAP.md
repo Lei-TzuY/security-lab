@@ -456,7 +456,7 @@ Boundary: 17A is post-mortem kernel observability only. It does not provide live
 
 ### Slice 18A — one exact host-path AF_UNIX stream broker
 
-**Current verified candidate.** Adds a host-local IPC authority surface that is distinct from the sealed IPv4 TCP/UDP broker family and from Landlock's abstract-UNIX cross-domain scope.
+**Status: complete on `main`.** Adds a host-local IPC authority surface that is distinct from the sealed IPv4 TCP/UDP broker family and from Landlock's abstract-UNIX cross-domain scope.
 
 Acceptance evidence is executable:
 
@@ -471,8 +471,29 @@ Boundary: 18A is exactly one preconnected filesystem-path AF_UNIX stream capabil
 
 ### Milestone 18 promotion rule
 
-After 18A integrates, seal this single exact-path stream object-capability slice. Do not farm socket paths, target-fd aliases, or AF_UNIX socket-type variants. Promote only to a materially different executable authority/enforcement frontier. Supplementary-group isolation and cgroup-backed aggregate accounting remain blocked on their documented kernel/environment prerequisites.
+18A is integrated; seal the exact-path stream object-capability slice. Do not farm socket paths, target-fd aliases, or AF_UNIX socket-type variants. The next AF_UNIX work must add a materially different enforcement property rather than another transport spelling. Supplementary-group isolation and cgroup-backed aggregate accounting remain blocked on their documented kernel/environment prerequisites.
+
+## Milestone 19 — host-local IPC peer identity enforcement
+
+### Slice 19A — exact peer UID/GID for the host AF_UNIX broker
+
+**Current verified candidate.** Narrows the already-bounded 18A object capability with kernel-provided peer identity evidence before target authority exists.
+
+Acceptance evidence is executable:
+
+- policy accepts optional all-or-nothing `ipc.host_unix_stream_peer_uid` / `ipc.host_unix_stream_peer_gid` unsigned integers and rejects incomplete pairs or credentials declared without the exact-path host-UNIX broker;
+- the trusted parent performs the existing exact host-path `connect(2)`, then calls `getsockopt(SOL_SOCKET, SO_PEERCRED)` before the connected socket is moved onto the selected-handle storage plane; query failure, unexpected credential size, or UID/GID mismatch is a terminal setup failure;
+- target seccomp authority is unchanged because peer inspection occurs entirely in trusted parent preparation and does not add target `getsockopt`, `socket`, or `connect`;
+- a real `UnixListener` run pins the launcher's actual UID/GID, completes the exact 18A request/reply oracle, and retains the fresh-target-socket `ENOENT` host-path confinement proof;
+- a separate real listener run deliberately declares the wrong UID with the real GID and requires public `run()` to return peer-credential `SetupFailed` before target execution;
+- all Milestones 1–18A regressions remain active; stable format/Clippy/full tests and the full Rust 1.74 suite are green.
+
+Boundary: `SO_PEERCRED` is Linux kernel credential metadata captured for the connected peer. 19A matches UID/GID only; it does not provide cryptographic authentication, service-unique identity among processes sharing credentials, peer-PID enforcement, pathname alias/canonical-inode proof, SCM_RIGHTS mediation, or dynamic post-launch brokering.
+
+### Milestone 19 promotion rule
+
+After 19A integrates, seal peer UID/GID matching at this bounded scope. Do not farm PID/credential field variants around the same `SO_PEERCRED` query. Promote only to a materially different executable authority/enforcement frontier. Supplementary-group isolation and delegated cgroup accounting remain blocked on their documented prerequisites.
 
 ## Later frontiers
 
-Supplementary-group isolation with a viable mapping architecture, broader/generalized persistent-volume policy, routed/broader network authority beyond the bounded IPv4 brokers, generalized AF_UNIX authority beyond the single exact-path 18A stream object, and delegated aggregate cgroup accounting remain separate evidence-backed frontiers. Do not add configuration-only names without executable kernel behavior and integration evidence.
+Supplementary-group isolation with a viable mapping architecture, broader/generalized persistent-volume policy, routed/broader network authority beyond the bounded IPv4 brokers, generalized host-local IPC authority beyond the exact-path/peer-credential broker, and delegated aggregate cgroup accounting remain separate evidence-backed frontiers. Do not add configuration-only names without executable kernel behavior and integration evidence.

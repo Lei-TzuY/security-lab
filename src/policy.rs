@@ -61,6 +61,14 @@ pub struct SeccompArgRule {
     pub value: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SeccompArgRangeRule {
+    /// Inclusive unsigned lower bound for the selected raw 64-bit argument.
+    pub minimum: u64,
+    /// Inclusive unsigned upper bound for the selected raw 64-bit argument.
+    pub maximum: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SeccompPolicy {
     /// Syscall names allowed by the policy. Every other syscall is denied with
@@ -69,6 +77,9 @@ pub struct SeccompPolicy {
     /// Optional masked-equality constraints keyed by syscall name and argument
     /// index (0 through 5). Rules only narrow syscalls already in the allowlist.
     pub argument_rules: BTreeMap<String, BTreeMap<u8, SeccompArgRule>>,
+    /// Optional inclusive unsigned 64-bit ranges keyed by syscall and argument
+    /// index. Range rules compose conjunctively with masked-equality rules.
+    pub argument_range_rules: BTreeMap<String, BTreeMap<u8, SeccompArgRangeRule>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -880,12 +891,19 @@ impl SandboxPolicy {
             }
         }
 
-        let argument_rule_count = self
+        let masked_rule_count = self
             .seccomp
             .argument_rules
             .values()
             .map(BTreeMap::len)
             .sum::<usize>();
+        let range_rule_count = self
+            .seccomp
+            .argument_range_rules
+            .values()
+            .map(BTreeMap::len)
+            .sum::<usize>();
+        let argument_rule_count = masked_rule_count + range_rule_count;
         if argument_rule_count > MAX_SECCOMP_ARG_RULES {
             return Err(PolicyError::new(format!(
                 "too many seccomp argument rules: {argument_rule_count} > {MAX_SECCOMP_ARG_RULES}"
@@ -921,6 +939,40 @@ impl SandboxPolicy {
                 if rule.value & !rule.mask != 0 {
                     return Err(PolicyError::new(format!(
                         "seccomp argument value for {syscall}.{argument_index} sets bits outside its mask"
+                    )));
+                }
+            }
+        }
+        for (syscall, rules) in &self.seccomp.argument_range_rules {
+            if !valid_syscall_name(syscall) {
+                return Err(PolicyError::new(format!(
+                    "invalid seccomp range-rule syscall name: {syscall:?}"
+                )));
+            }
+            if !self.seccomp.allowed_syscalls.contains(syscall) {
+                return Err(PolicyError::new(format!(
+                    "seccomp range rule for {syscall} requires that syscall in seccomp.allow"
+                )));
+            }
+            if matches!(syscall.as_str(), "execveat" | "exit" | "exit_group") {
+                return Err(PolicyError::new(format!(
+                    "seccomp range rules may not constrain launcher-critical syscall {syscall}"
+                )));
+            }
+            for (argument_index, rule) in rules {
+                if *argument_index > 5 {
+                    return Err(PolicyError::new(format!(
+                        "seccomp range argument index for {syscall} must be between 0 and 5"
+                    )));
+                }
+                if rule.minimum > rule.maximum {
+                    return Err(PolicyError::new(format!(
+                        "seccomp range minimum for {syscall}.{argument_index} must not exceed its maximum"
+                    )));
+                }
+                if rule.minimum == 0 && rule.maximum == u64::MAX {
+                    return Err(PolicyError::new(format!(
+                        "seccomp range for {syscall}.{argument_index} must narrow at least one value"
                     )));
                 }
             }
@@ -982,6 +1034,8 @@ impl FromStr for SandboxPolicy {
         let mut open_files = None;
         let mut seccomp_allow = None;
         let mut seccomp_argument_rules: BTreeMap<String, BTreeMap<u8, SeccompArgRule>> =
+            BTreeMap::new();
+        let mut seccomp_argument_range_rules: BTreeMap<String, BTreeMap<u8, SeccompArgRangeRule>> =
             BTreeMap::new();
 
         for (index, raw_line) in input.lines().enumerate() {
@@ -1243,6 +1297,45 @@ impl FromStr for SandboxPolicy {
                     }
                     seccomp_allow = Some(names);
                 }
+                _ if key.starts_with("seccomp.range.") => {
+                    let spec = key
+                        .strip_prefix("seccomp.range.")
+                        .expect("prefix checked above");
+                    let (syscall, index_text) = spec.rsplit_once('.').ok_or_else(|| {
+                        PolicyError::at(
+                            line_no,
+                            "seccomp range key must be seccomp.range.<syscall>.<0..5>",
+                        )
+                    })?;
+                    if !valid_syscall_name(syscall) {
+                        return Err(PolicyError::at(
+                            line_no,
+                            format!("invalid seccomp range-rule syscall name: {syscall:?}"),
+                        ));
+                    }
+                    let argument_index = index_text.parse::<u8>().map_err(|_| {
+                        PolicyError::at(
+                            line_no,
+                            "seccomp range argument index must be between 0 and 5",
+                        )
+                    })?;
+                    if argument_index > 5 {
+                        return Err(PolicyError::at(
+                            line_no,
+                            "seccomp range argument index must be between 0 and 5",
+                        ));
+                    }
+                    let rule = parse_seccomp_arg_range_rule(value, line_no, key)?;
+                    let syscall_rules = seccomp_argument_range_rules
+                        .entry(syscall.to_owned())
+                        .or_default();
+                    if syscall_rules.insert(argument_index, rule).is_some() {
+                        return Err(PolicyError::at(
+                            line_no,
+                            format!("duplicate seccomp range rule: {syscall}.{argument_index}"),
+                        ));
+                    }
+                }
                 _ if key.starts_with("seccomp.arg.") => {
                     let spec = key
                         .strip_prefix("seccomp.arg.")
@@ -1372,6 +1465,7 @@ impl FromStr for SandboxPolicy {
             seccomp: SeccompPolicy {
                 allowed_syscalls: required(seccomp_allow, "seccomp.allow")?,
                 argument_rules: seccomp_argument_rules,
+                argument_range_rules: seccomp_argument_range_rules,
             },
         };
         policy.validate()?;
@@ -1413,6 +1507,20 @@ fn parse_seccomp_arg_rule(
     Ok(SeccompArgRule {
         mask: parse_u64_literal(mask.trim(), line, key)?,
         value: parse_u64_literal(expected.trim(), line, key)?,
+    })
+}
+
+fn parse_seccomp_arg_range_rule(
+    value: &str,
+    line: usize,
+    key: &str,
+) -> Result<SeccompArgRangeRule, PolicyError> {
+    let (minimum, maximum) = value
+        .split_once(':')
+        .ok_or_else(|| PolicyError::at(line, format!("{key} must be formatted as <min>:<max>")))?;
+    Ok(SeccompArgRangeRule {
+        minimum: parse_u64_literal(minimum.trim(), line, key)?,
+        maximum: parse_u64_literal(maximum.trim(), line, key)?,
     })
 }
 
@@ -2432,6 +2540,52 @@ mod tests {
     fn rejects_scratch_overlapping_working_directory() {
         let text = VALID.replace("filesystem.scratch = /scratch", "filesystem.scratch = /tmp");
         assert!(text.parse::<SandboxPolicy>().is_err());
+    }
+
+    #[test]
+    fn parses_seccomp_argument_range_rule_syntax() {
+        let text = VALID.replace(
+            "seccomp.allow = execveat,read,write,exit_group",
+            "seccomp.allow = execveat,lseek,exit_group\n        seccomp.range.lseek.1 = 0x00000000fffffff0:0x0000000100000010",
+        );
+        let policy: SandboxPolicy = text.parse().unwrap();
+        let rule = policy
+            .seccomp
+            .argument_range_rules
+            .get("lseek")
+            .and_then(|rules| rules.get(&1))
+            .copied()
+            .expect("lseek argument range rule");
+        assert_eq!(rule.minimum, 0x0000_0000_ffff_fff0);
+        assert_eq!(rule.maximum, 0x0000_0001_0000_0010);
+    }
+
+    #[test]
+    fn rejects_invalid_or_duplicate_seccomp_argument_range_rule() {
+        for rule in [
+            "seccomp.range.lseek.6 = 1:2",
+            "seccomp.range.lseek.1 = 2:1",
+            "seccomp.range.lseek.1 = 0:18446744073709551615",
+            "seccomp.range.lseek.1 = not-a-range",
+        ] {
+            let text = VALID.replace(
+                "seccomp.allow = execveat,read,write,exit_group",
+                &format!("seccomp.allow = execveat,lseek,exit_group\n        {rule}"),
+            );
+            assert!(text.parse::<SandboxPolicy>().is_err(), "accepted {rule}");
+        }
+
+        let duplicate = VALID.replace(
+            "seccomp.allow = execveat,read,write,exit_group",
+            "seccomp.allow = execveat,lseek,exit_group\n        seccomp.range.lseek.1 = 1:2\n        seccomp.range.lseek.1 = 1:2",
+        );
+        assert!(duplicate.parse::<SandboxPolicy>().is_err());
+
+        let unallowed = format!("{VALID}\nseccomp.range.lseek.1 = 1:2");
+        assert!(unallowed.parse::<SandboxPolicy>().is_err());
+
+        let critical = format!("{VALID}\nseccomp.range.execveat.0 = 1:2");
+        assert!(critical.parse::<SandboxPolicy>().is_err());
     }
 
     #[test]

@@ -40,6 +40,8 @@ mod x86_64 {
     const BPF_LD_W_ABS: u16 = 0x20;
     const BPF_ALU_AND_K: u16 = 0x54;
     const BPF_JMP_JEQ_K: u16 = 0x15;
+    const BPF_JMP_JGT_K: u16 = 0x25;
+    const BPF_JMP_JGE_K: u16 = 0x35;
     const BPF_RET_K: u16 = 0x06;
     const SECCOMP_DATA_ARGS_OFFSET: u32 = 16;
 
@@ -1554,6 +1556,16 @@ mod x86_64 {
                     );
                 }
             }
+            if let Some(rules) = policy.seccomp.argument_range_rules.get(name) {
+                for (argument_index, rule) in rules {
+                    append_seccomp_argument_range_checks(
+                        &mut checks,
+                        *argument_index,
+                        rule.minimum,
+                        rule.maximum,
+                    );
+                }
+            }
             checks.push(stmt(BPF_RET_K, SECCOMP_RET_ALLOW));
             if checks.len() > u8::MAX as usize {
                 return Err(SandboxError::InvalidPolicy(PolicyError::new(format!(
@@ -1607,6 +1619,39 @@ mod x86_64 {
             filter.push(stmt(BPF_ALU_AND_K, mask));
         }
         filter.push(jump(BPF_JMP_JEQ_K, value, 1, 0));
+        filter.push(stmt(BPF_RET_K, SECCOMP_RET_ERRNO | (libc::EPERM as u32)));
+    }
+
+    fn append_seccomp_argument_range_checks(
+        filter: &mut Vec<libc::sock_filter>,
+        argument_index: u8,
+        minimum: u64,
+        maximum: u64,
+    ) {
+        let argument_offset = SECCOMP_DATA_ARGS_OFFSET + u32::from(argument_index) * 8;
+        let minimum_low = minimum as u32;
+        let minimum_high = (minimum >> 32) as u32;
+        let maximum_low = maximum as u32;
+        let maximum_high = (maximum >> 32) as u32;
+
+        // Unsigned lower bound. A high word above minimum skips the low-word
+        // comparison; equality requires low >= minimum_low.
+        filter.push(stmt(BPF_LD_W_ABS, argument_offset + 4));
+        filter.push(jump(BPF_JMP_JGE_K, minimum_high, 1, 0));
+        filter.push(stmt(BPF_RET_K, SECCOMP_RET_ERRNO | (libc::EPERM as u32)));
+        filter.push(jump(BPF_JMP_JEQ_K, minimum_high, 0, 3));
+        filter.push(stmt(BPF_LD_W_ABS, argument_offset));
+        filter.push(jump(BPF_JMP_JGE_K, minimum_low, 1, 0));
+        filter.push(stmt(BPF_RET_K, SECCOMP_RET_ERRNO | (libc::EPERM as u32)));
+
+        // Unsigned upper bound. A high word below maximum skips the low-word
+        // comparison; equality requires low <= maximum_low.
+        filter.push(stmt(BPF_LD_W_ABS, argument_offset + 4));
+        filter.push(jump(BPF_JMP_JGT_K, maximum_high, 0, 1));
+        filter.push(stmt(BPF_RET_K, SECCOMP_RET_ERRNO | (libc::EPERM as u32)));
+        filter.push(jump(BPF_JMP_JEQ_K, maximum_high, 0, 3));
+        filter.push(stmt(BPF_LD_W_ABS, argument_offset));
+        filter.push(jump(BPF_JMP_JGT_K, maximum_low, 0, 1));
         filter.push(stmt(BPF_RET_K, SECCOMP_RET_ERRNO | (libc::EPERM as u32)));
     }
 

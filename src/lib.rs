@@ -13,8 +13,8 @@ use std::fmt;
 
 pub use cancellation::CancellationToken;
 pub use policy::{
-    PolicyError, ResourceLimits, SandboxPolicy, SeccompArgRule, SeccompPolicy, StdioMode,
-    StdioPolicy,
+    PolicyError, ResourceLimits, SandboxPolicy, SeccompArgRangeRule, SeccompArgRule, SeccompPolicy,
+    StdioMode, StdioPolicy,
 };
 pub use report::{CapturedOutput, ChildOutcome, ProcessTreeUsage, RunReport};
 

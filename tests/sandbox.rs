@@ -2,7 +2,8 @@
 
 use security_lab::{
     run, run_report, run_report_with_cancel, CancellationToken, ChildOutcome, ResourceLimits,
-    SandboxError, SandboxPolicy, SeccompArgRule, SeccompPolicy, StdioMode, StdioPolicy,
+    SandboxError, SandboxPolicy, SeccompArgRangeRule, SeccompArgRule, SeccompPolicy, StdioMode,
+    StdioPolicy,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CString;
@@ -325,6 +326,7 @@ fn policy(mode: &str, extra_args: &[&str], syscalls: &[&str]) -> SandboxPolicy {
         seccomp: SeccompPolicy {
             allowed_syscalls: syscall_set(syscalls),
             argument_rules: BTreeMap::new(),
+            argument_range_rules: BTreeMap::new(),
         },
     }
 }
@@ -1194,6 +1196,35 @@ fn seccomp_argument_filter_checks_full_64_bit_masked_value() {
         .seccomp
         .argument_rules
         .insert("lseek".to_owned(), lseek_rules);
+
+    assert_eq!(run(&filtered).unwrap(), ChildOutcome::Exited(0));
+}
+
+#[test]
+fn seccomp_argument_range_checks_unsigned_64_bit_boundaries_and_composes() {
+    let mut filtered = policy("y", &[], &["execveat", "openat", "lseek", "close", "exit"]);
+
+    let mut lseek_ranges = BTreeMap::new();
+    lseek_ranges.insert(
+        1,
+        SeccompArgRangeRule {
+            minimum: 0x0000_0000_ffff_fff0,
+            maximum: 0x0000_0001_0000_0010,
+        },
+    );
+    filtered
+        .seccomp
+        .argument_range_rules
+        .insert("lseek".to_owned(), lseek_ranges);
+
+    // Compose a masked-equality rule on the same argument: in-range odd values
+    // must still fail, proving both predicate families are conjunctive.
+    let mut lseek_masks = BTreeMap::new();
+    lseek_masks.insert(1, SeccompArgRule { mask: 1, value: 0 });
+    filtered
+        .seccomp
+        .argument_rules
+        .insert("lseek".to_owned(), lseek_masks);
 
     assert_eq!(run(&filtered).unwrap(), ChildOutcome::Exited(0));
 }

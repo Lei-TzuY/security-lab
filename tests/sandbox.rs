@@ -241,6 +241,29 @@ fn writable_volume_source() -> &'static Path {
         .as_path()
 }
 
+fn landlock_topology_source() -> &'static Path {
+    static SOURCE: OnceLock<PathBuf> = OnceLock::new();
+    SOURCE
+        .get_or_init(|| {
+            let source = std::env::temp_dir()
+                .join(format!("security-lab-landlock-topology-{}", process::id()));
+            let _ = std::fs::remove_dir_all(&source);
+            std::fs::create_dir_all(source.join("allowed/from"))
+                .expect("create Landlock topology source directory");
+            std::fs::create_dir_all(source.join("allowed/to"))
+                .expect("create Landlock topology destination directory");
+            std::fs::create_dir_all(source.join("denied"))
+                .expect("create Landlock topology denied directory");
+            std::fs::write(
+                source.join("allowed/from/item"),
+                b"landlock-topology-item\n",
+            )
+            .expect("seed Landlock topology rename fixture");
+            source
+        })
+        .as_path()
+}
+
 fn syscall_set(names: &[&str]) -> BTreeSet<String> {
     names.iter().map(|name| (*name).to_owned()).collect()
 }
@@ -257,6 +280,7 @@ fn policy(mode: &str, extra_args: &[&str], syscalls: &[&str]) -> SandboxPolicy {
         working_dir: PathBuf::from("/work"),
         landlock_read_execute: Vec::new(),
         landlock_file_mutate: Vec::new(),
+        landlock_path_topology_mutate: Vec::new(),
         landlock_device_ioctl: Vec::new(),
         landlock_tcp_bind_ports: Vec::new(),
         landlock_tcp_connect_ports: Vec::new(),
@@ -597,6 +621,42 @@ fn landlock_file_mutation_envelope_narrows_existing_writable_surfaces() {
         !denied_created.exists(),
         "Landlock mutation escaped its declared persistent subtree"
     );
+}
+
+#[test]
+fn landlock_path_topology_mutation_is_scoped_to_declared_directory() {
+    let source = landlock_topology_source().to_path_buf();
+    let allowed = source.join("allowed");
+    let denied = source.join("denied");
+
+    let mut confined = policy(
+        "h",
+        &[],
+        &["execveat", "mkdir", "rmdir", "symlink", "rename", "exit"],
+    );
+    confined.landlock_read_execute = vec![PathBuf::from("/probe")];
+    confined.landlock_file_mutate = vec![PathBuf::from("/persist/allowed")];
+    confined.landlock_path_topology_mutate = vec![PathBuf::from("/persist/allowed")];
+    confined.writable_volume_source = Some(source.clone());
+    confined.writable_volume_target = Some(PathBuf::from("/persist"));
+
+    assert_eq!(run(&confined).unwrap(), ChildOutcome::Exited(0));
+    assert_eq!(
+        std::fs::read(allowed.join("to/item")).expect("read renamed topology fixture"),
+        b"landlock-topology-item\n",
+    );
+    assert!(!allowed.join("from/item").exists());
+    assert_eq!(
+        std::fs::read_link(allowed.join("newlink")).expect("read allowed topology symlink"),
+        PathBuf::from("topology-target"),
+    );
+    assert!(!allowed.join("newdir").exists());
+    for denied_path in ["newdir", "newlink", "item"] {
+        assert!(
+            !denied.join(denied_path).exists(),
+            "Landlock topology mutation escaped to denied path {denied_path}"
+        );
+    }
 }
 
 #[test]

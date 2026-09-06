@@ -132,8 +132,12 @@ mod x86_64 {
     const LANDLOCK_ACCESS_FS_WRITE_FILE: u64 = 1 << 1;
     const LANDLOCK_ACCESS_FS_READ_FILE: u64 = 1 << 2;
     const LANDLOCK_ACCESS_FS_READ_DIR: u64 = 1 << 3;
+    const LANDLOCK_ACCESS_FS_REMOVE_DIR: u64 = 1 << 4;
     const LANDLOCK_ACCESS_FS_REMOVE_FILE: u64 = 1 << 5;
+    const LANDLOCK_ACCESS_FS_MAKE_DIR: u64 = 1 << 7;
     const LANDLOCK_ACCESS_FS_MAKE_REG: u64 = 1 << 8;
+    const LANDLOCK_ACCESS_FS_MAKE_SYM: u64 = 1 << 12;
+    const LANDLOCK_ACCESS_FS_REFER: u64 = 1 << 13;
     const LANDLOCK_ACCESS_FS_TRUNCATE: u64 = 1 << 14;
     const LANDLOCK_ACCESS_FS_IOCTL_DEV: u64 = 1 << 15;
     const LANDLOCK_READ_EXECUTE_RIGHTS: u64 =
@@ -142,6 +146,10 @@ mod x86_64 {
         | LANDLOCK_ACCESS_FS_REMOVE_FILE
         | LANDLOCK_ACCESS_FS_MAKE_REG
         | LANDLOCK_ACCESS_FS_TRUNCATE;
+    const LANDLOCK_PATH_TOPOLOGY_MUTATE_RIGHTS: u64 = LANDLOCK_ACCESS_FS_REMOVE_DIR
+        | LANDLOCK_ACCESS_FS_MAKE_DIR
+        | LANDLOCK_ACCESS_FS_MAKE_SYM
+        | LANDLOCK_ACCESS_FS_REFER;
 
     const SIOCGIFFLAGS: libc::c_ulong = 0x8913;
     const SIOCSIFFLAGS: libc::c_ulong = 0x8914;
@@ -695,6 +703,7 @@ mod x86_64 {
     struct PreparedLandlock {
         read_execute: Vec<CString>,
         file_mutate: Vec<CString>,
+        path_topology_mutate: Vec<CString>,
         device_ioctl: Vec<CString>,
         tcp_bind_ports: Vec<u16>,
         tcp_connect_ports: Vec<u16>,
@@ -783,6 +792,11 @@ mod x86_64 {
             let mut landlock_file_mutate = Vec::with_capacity(policy.landlock_file_mutate.len());
             for path in &policy.landlock_file_mutate {
                 landlock_file_mutate.push(sandbox_relative(path)?);
+            }
+            let mut landlock_path_topology_mutate =
+                Vec::with_capacity(policy.landlock_path_topology_mutate.len());
+            for path in &policy.landlock_path_topology_mutate {
+                landlock_path_topology_mutate.push(sandbox_relative(path)?);
             }
             // Device paths may be supplied by a persistent volume, so the final
             // mounted object is pinned and type-checked by the direct target.
@@ -1079,6 +1093,7 @@ mod x86_64 {
                 landlock: PreparedLandlock {
                     read_execute: landlock_read_execute,
                     file_mutate: landlock_file_mutate,
+                    path_topology_mutate: landlock_path_topology_mutate,
                     device_ioctl: landlock_device_ioctl,
                     tcp_bind_ports: policy.landlock_tcp_bind_ports.clone(),
                     tcp_connect_ports: policy.landlock_tcp_connect_ports.clone(),
@@ -1598,6 +1613,7 @@ mod x86_64 {
     fn ensure_landlock_supported(policy: &SandboxPolicy) -> Result<(), SandboxError> {
         if policy.landlock_read_execute.is_empty()
             && policy.landlock_file_mutate.is_empty()
+            && policy.landlock_path_topology_mutate.is_empty()
             && policy.landlock_device_ioctl.is_empty()
             && policy.landlock_tcp_bind_ports.is_empty()
             && policy.landlock_tcp_connect_ports.is_empty()
@@ -1670,6 +1686,7 @@ mod x86_64 {
     ) -> RawFd {
         if landlock.read_execute.is_empty()
             && landlock.file_mutate.is_empty()
+            && landlock.path_topology_mutate.is_empty()
             && landlock.device_ioctl.is_empty()
             && landlock.tcp_bind_ports.is_empty()
             && landlock.tcp_connect_ports.is_empty()
@@ -1685,6 +1702,9 @@ mod x86_64 {
         }
         if !landlock.file_mutate.is_empty() {
             handled_access_fs |= LANDLOCK_FILE_MUTATE_RIGHTS;
+        }
+        if !landlock.path_topology_mutate.is_empty() {
+            handled_access_fs |= LANDLOCK_PATH_TOPOLOGY_MUTATE_RIGHTS;
         }
         if !landlock.device_ioctl.is_empty() {
             handled_access_fs |= LANDLOCK_ACCESS_FS_IOCTL_DEV;
@@ -1781,6 +1801,13 @@ mod x86_64 {
                     );
                 }
                 allowed_access |= LANDLOCK_FILE_MUTATE_RIGHTS;
+                if landlock
+                    .path_topology_mutate
+                    .iter()
+                    .any(|candidate| candidate.as_bytes() == path.as_bytes())
+                {
+                    allowed_access |= LANDLOCK_PATH_TOPOLOGY_MUTATE_RIGHTS;
+                }
             }
             let rule = LandlockPathBeneathAttr {
                 allowed_access,
@@ -1826,8 +1853,16 @@ mod x86_64 {
                 child_fail(launch_error, PHASE_LANDLOCK_PATH, error_exit_syscall);
             }
             let path_fd = path_fd as RawFd;
+            let mut allowed_access = LANDLOCK_FILE_MUTATE_RIGHTS;
+            if landlock
+                .path_topology_mutate
+                .iter()
+                .any(|candidate| candidate.as_bytes() == path.as_bytes())
+            {
+                allowed_access |= LANDLOCK_PATH_TOPOLOGY_MUTATE_RIGHTS;
+            }
             let rule = LandlockPathBeneathAttr {
-                allowed_access: LANDLOCK_FILE_MUTATE_RIGHTS,
+                allowed_access,
                 parent_fd: path_fd,
                 reserved: 0,
             };
@@ -2977,7 +3012,11 @@ mod x86_64 {
             "exit" => libc::SYS_exit,
             "tgkill" => libc::SYS_tgkill,
             "openat" => libc::SYS_openat,
+            "rename" => libc::SYS_rename,
+            "mkdir" => libc::SYS_mkdir,
+            "rmdir" => libc::SYS_rmdir,
             "unlink" => libc::SYS_unlink,
+            "symlink" => libc::SYS_symlink,
             "truncate" => libc::SYS_truncate,
             "newfstatat" => libc::SYS_newfstatat,
             "set_robust_list" => libc::SYS_set_robust_list,

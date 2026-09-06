@@ -1,0 +1,232 @@
+name: probe supplementary groups across full namespace transition
+
+on:
+  push:
+    branches: [tmp-supplementary-group-feasibility]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Enable user namespace capability probes
+        run: |
+          set -eu
+          if [ -e /proc/sys/kernel/unprivileged_userns_clone ]; then
+            sudo sysctl -w kernel.unprivileged_userns_clone=1
+          fi
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+
+      - name: Prove delegated mapping survives the full sandbox namespace transition
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v newuidmap
+          command -v newgidmap
+          command -v ip
+          test "$(id -u)" -ne 0
+          grep -Eq "^($(id -un)|$(id -u)):" /etc/subuid
+          grep -Eq "^($(id -un)|$(id -u)):" /etc/subgid
+
+          python3 - <<'PY'
+          import ctypes
+          import errno
+          import os
+          import pwd
+          import signal
+          import subprocess
+
+          CLONE_NEWNS = 0x00020000
+          CLONE_NEWUTS = 0x04000000
+          CLONE_NEWIPC = 0x08000000
+          CLONE_NEWUSER = 0x10000000
+          CLONE_NEWPID = 0x20000000
+          CLONE_NEWNET = 0x40000000
+          MS_REC = 16384
+          MS_PRIVATE = 1 << 18
+          flags = (
+              CLONE_NEWUSER
+              | CLONE_NEWNS
+              | CLONE_NEWPID
+              | CLONE_NEWNET
+              | CLONE_NEWIPC
+              | CLONE_NEWUTS
+          )
+
+          libc = ctypes.CDLL(None, use_errno=True)
+          host_uid = os.getuid()
+          host_gid = os.getgid()
+          host_groups = os.getgroups()
+          user = pwd.getpwuid(host_uid).pw_name
+
+          def delegated_start(path):
+              with open(path, encoding="utf-8") as f:
+                  for line in f:
+                      name, start, count = line.strip().split(":")
+                      if name in (user, str(host_uid)) and int(count) > 0:
+                          return int(start)
+              raise RuntimeError(f"no delegation in {path}")
+
+          subuid = delegated_start("/etc/subuid")
+          subgid = delegated_start("/etc/subgid")
+          host_ns = {
+              name: os.readlink(f"/proc/self/ns/{name}")
+              for name in ("user", "mnt", "net", "ipc", "uts")
+          }
+          host_pid_for_children = os.readlink("/proc/self/ns/pid_for_children")
+          print(
+              f"host uid={host_uid} gid={host_gid} groups={host_groups} "
+              f"subuid={subuid} subgid={subgid} namespaces={host_ns} "
+              f"pid_for_children={host_pid_for_children}",
+              flush=True,
+          )
+
+          ready_r, ready_w = os.pipe()
+          go_r, go_w = os.pipe()
+          pid = os.fork()
+          if pid == 0:
+              try:
+                  os.close(ready_r)
+                  os.close(go_w)
+                  if libc.unshare(flags) != 0:
+                      err = ctypes.get_errno()
+                      print(
+                          f"full_transition_unshare_errno={err} {errno.errorcode.get(err, 'UNKNOWN')}",
+                          flush=True,
+                      )
+                      os._exit(31)
+
+                  child_ns = {
+                      name: os.readlink(f"/proc/self/ns/{name}")
+                      for name in ("user", "mnt", "net", "ipc", "uts")
+                  }
+                  child_pid_for_children = os.readlink("/proc/self/ns/pid_for_children")
+                  if any(child_ns[name] == host_ns[name] for name in child_ns):
+                      print(f"namespace transition incomplete: {child_ns}", flush=True)
+                      os._exit(32)
+                  if child_pid_for_children == host_pid_for_children:
+                      print("PID-for-children namespace did not change", flush=True)
+                      os._exit(33)
+
+                  os.write(ready_w, b"R")
+                  if os.read(go_r, 1) != b"G":
+                      os._exit(34)
+
+                  with open("/proc/self/setgroups", encoding="utf-8") as f:
+                      setgroups_state = f.read().strip()
+                  before_groups = os.getgroups()
+                  ctypes.set_errno(0)
+                  rc = libc.setgroups(0, None)
+                  err = ctypes.get_errno()
+                  after_groups = os.getgroups()
+                  print(
+                      f"mapped uid={os.getuid()} gid={os.getgid()} "
+                      f"setgroups_state={setgroups_state} before_groups={before_groups} "
+                      f"clear_rc={rc} errno={err} after_groups={after_groups}",
+                      flush=True,
+                  )
+                  if os.getuid() != 0 or os.getgid() != 0:
+                      os._exit(40)
+                  if setgroups_state != "allow" or rc != 0 or after_groups:
+                      os._exit(41)
+
+                  hostname = b"security-lab-groups"
+                  if libc.sethostname(hostname, len(hostname)) != 0:
+                      err = ctypes.get_errno()
+                      print(f"sethostname_errno={err} {errno.errorcode.get(err, 'UNKNOWN')}", flush=True)
+                      os._exit(42)
+                  with open("/proc/sys/kernel/hostname", "rb") as f:
+                      observed_hostname = f.read().strip()
+                  if observed_hostname != hostname:
+                      print(f"unexpected hostname={observed_hostname!r}", flush=True)
+                      os._exit(43)
+
+                  if libc.mount(None, b"/", None, MS_REC | MS_PRIVATE, None) != 0:
+                      err = ctypes.get_errno()
+                      print(f"mount_private_errno={err} {errno.errorcode.get(err, 'UNKNOWN')}", flush=True)
+                      os._exit(44)
+
+                  net = subprocess.run(
+                      ["ip", "link", "set", "lo", "up"],
+                      text=True,
+                      capture_output=True,
+                  )
+                  print(
+                      f"loopback_setup_rc={net.returncode} stderr={net.stderr.strip()!r}",
+                      flush=True,
+                  )
+                  if net.returncode != 0:
+                      os._exit(45)
+
+                  namespace_init = os.fork()
+                  if namespace_init == 0:
+                      actual_pid = os.getpid()
+                      actual_groups = os.getgroups()
+                      print(
+                          f"namespace_init_pid={actual_pid} groups={actual_groups}",
+                          flush=True,
+                      )
+                      os._exit(0 if actual_pid == 1 and not actual_groups else 46)
+                  _, status = os.waitpid(namespace_init, 0)
+                  if os.waitstatus_to_exitcode(status) != 0:
+                      os._exit(47)
+
+                  print(
+                      "RESULT: delegated UID/GID helpers preserve setgroups=allow across the full "
+                      "user/mount/PID/net/IPC/UTS transition; supplementary groups can be cleared "
+                      "before launcher capability reduction.",
+                      flush=True,
+                  )
+                  os._exit(0)
+              finally:
+                  os._exit(60)
+
+          os.close(ready_w)
+          os.close(go_r)
+          if os.read(ready_r, 1) != b"R":
+              _, status = os.waitpid(pid, 0)
+              raise SystemExit(f"child failed before mapping: {os.waitstatus_to_exitcode(status)}")
+
+          uid_cmd = [
+              "newuidmap", str(pid),
+              "0", str(host_uid), "1",
+              "1", str(subuid), "1",
+          ]
+          gid_cmd = [
+              "newgidmap", str(pid),
+              "0", str(host_gid), "1",
+              "1", str(subgid), "1",
+          ]
+          uid = subprocess.run(uid_cmd, text=True, capture_output=True)
+          print(f"newuidmap_rc={uid.returncode} stderr={uid.stderr.strip()!r}", flush=True)
+          if uid.returncode != 0:
+              os.kill(pid, signal.SIGKILL)
+              os.waitpid(pid, 0)
+              raise SystemExit("newuidmap failed")
+
+          gid = subprocess.run(gid_cmd, text=True, capture_output=True)
+          print(f"newgidmap_rc={gid.returncode} stderr={gid.stderr.strip()!r}", flush=True)
+          if gid.returncode != 0:
+              os.kill(pid, signal.SIGKILL)
+              os.waitpid(pid, 0)
+              raise SystemExit("newgidmap failed")
+
+          with open(f"/proc/{pid}/setgroups", encoding="utf-8") as f:
+              state = f.read().strip()
+          print(f"parent_observed_setgroups_state={state}", flush=True)
+          if state != "allow":
+              os.kill(pid, signal.SIGKILL)
+              os.waitpid(pid, 0)
+              raise SystemExit("delegated mapping unexpectedly disabled setgroups")
+
+          os.write(go_w, b"G")
+          _, status = os.waitpid(pid, 0)
+          code = os.waitstatus_to_exitcode(status)
+          print(f"full_transition_child_exit={code}", flush=True)
+          if code != 0:
+              raise SystemExit(code)
+          PY

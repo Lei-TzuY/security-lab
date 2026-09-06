@@ -15,6 +15,7 @@
 #   n prove policy-owned loopback supports positive intra-sandbox TCP
 #   o prove loopback remains down unless policy explicitly enables it
 #   p write through a brokered host-loopback TCP fd while direct host reachability stays isolated
+#   r prove Landlock allows declared reads and returns EACCES for an undeclared visible file
 #   F forbidden getpid; exits 77 only when seccomp returns -EPERM
 #   E validate sanitized environment
 #   C validate working directory against argv[2]
@@ -62,6 +63,8 @@ _start:
     je .loopback_disabled
     cmp $112, %al
     je .brokered_host_loopback
+    cmp $114, %al
+    je .landlock_read_envelope
     cmp $70, %al
     je .forbidden
     cmp $69, %al
@@ -577,6 +580,49 @@ _start:
     syscall
     test %rax, %rax
     js .fail36
+    xor %edi, %edi
+    jmp .exit
+
+.landlock_read_envelope:
+    mov $257, %eax
+    mov $-100, %edi
+    lea landlock_allowed_path(%rip), %rsi
+    xor %edx, %edx
+    xor %r10d, %r10d
+    syscall
+    test %rax, %rax
+    js .fail37
+    mov %rax, %r12
+
+    xor %eax, %eax
+    mov %r12, %rdi
+    lea landlock_buffer(%rip), %rsi
+    mov $landlock_allowed_message_len, %edx
+    syscall
+    cmp $landlock_allowed_message_len, %rax
+    jne .fail37
+
+    lea landlock_buffer(%rip), %rdi
+    lea landlock_allowed_message(%rip), %rsi
+    mov $landlock_allowed_message_len, %ecx
+    repe cmpsb
+    jne .fail37
+
+    mov $3, %eax
+    mov %r12, %rdi
+    syscall
+    test %rax, %rax
+    js .fail37
+
+    mov $257, %eax
+    mov $-100, %edi
+    lea landlock_denied_path(%rip), %rsi
+    xor %edx, %edx
+    xor %r10d, %r10d
+    syscall
+    cmp $-13, %rax
+    jne .fail37
+
     xor %edi, %edi
     jmp .exit
 
@@ -1270,6 +1316,9 @@ _start:
     jmp .exit
 .fail36:
     mov $36, %edi
+    jmp .exit
+.fail37:
+    mov $37, %edi
 
 .exit:
     mov $60, %eax
@@ -1325,6 +1374,13 @@ loopback_message:
 brokered_host_message:
     .ascii "brokered-host-loopback-ok"
 .set brokered_host_message_len, . - brokered_host_message
+landlock_allowed_path:
+    .asciz "/landlock-allowed/marker"
+landlock_denied_path:
+    .asciz "/landlock-denied/secret"
+landlock_allowed_message:
+    .ascii "landlock-allowed\n"
+.set landlock_allowed_message_len, . - landlock_allowed_message
 deadline_message:
     .ascii "deadline target started\n"
 .set deadline_message_len, . - deadline_message
@@ -1359,6 +1415,8 @@ network_addr:
 network_ifreq:
     .skip 40
 network_buffer:
+    .skip 32
+landlock_buffer:
     .skip 32
 
 .section .note.GNU-stack,"",@progbits

@@ -74,6 +74,14 @@ fn fixture_root() -> &'static Path {
         std::fs::create_dir_all(root.join("data")).expect("create sandbox volume mountpoint");
         std::fs::create_dir_all(root.join("persist"))
             .expect("create sandbox writable-volume mountpoint");
+        std::fs::create_dir_all(root.join("landlock-allowed"))
+            .expect("create Landlock allowed directory");
+        std::fs::create_dir_all(root.join("landlock-denied"))
+            .expect("create Landlock denied directory");
+        std::fs::write(root.join("landlock-allowed/marker"), b"landlock-allowed\n")
+            .expect("write Landlock allowed marker");
+        std::fs::write(root.join("landlock-denied/secret"), b"landlock-secret\n")
+            .expect("write Landlock denied secret");
 
         let output = root.join("probe");
         let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/probe.S");
@@ -131,6 +139,7 @@ fn policy(mode: &str, extra_args: &[&str], syscalls: &[&str]) -> SandboxPolicy {
         args,
         environment: BTreeMap::new(),
         working_dir: PathBuf::from("/work"),
+        landlock_read_execute: Vec::new(),
         loopback_enabled: false,
         host_loopback_tcp_port: None,
         host_loopback_tcp_target_fd: None,
@@ -160,6 +169,15 @@ fn policy(mode: &str, extra_args: &[&str], syscalls: &[&str]) -> SandboxPolicy {
             argument_rules: BTreeMap::new(),
         },
     }
+}
+
+#[test]
+fn landlock_read_execute_envelope_denies_visible_undeclared_path() {
+    let mut confined = policy("r", &[], &["execveat", "openat", "read", "close", "exit"]);
+    confined.landlock_read_execute =
+        vec![PathBuf::from("/probe"), PathBuf::from("/landlock-allowed")];
+
+    assert_eq!(run(&confined).unwrap(), ChildOutcome::Exited(0));
 }
 
 #[test]

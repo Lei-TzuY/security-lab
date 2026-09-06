@@ -18,44 +18,112 @@ jobs:
           components: rustfmt, clippy
       - name: Materialize candidate
         run: python3 .github/tmp-milestone-13a-landlock-signal.py
-      - name: Instrument unscoped errno
+      - name: Reframe oracle inside sandbox PID namespace
         shell: bash
         run: |
           python3 - <<'PY'
           from pathlib import Path
-          p = Path('tests/fixtures/probe.S')
-          text = p.read_text()
-          old = '''.pidfd_signal_allowed:
-              mov $424, %eax
-              mov $9, %edi
-              mov $10, %esi
-              xor %edx, %edx
-              xor %r10d, %r10d
-              syscall
-              test %rax, %rax
-              js .fail41
-              xor %edi, %edi
-              jmp .exit
+          import re
+
+          linux = Path('src/platform/linux.rs')
+          text = linux.read_text()
+          old = '            "pidfd_send_signal" => libc::SYS_pidfd_send_signal,\n'
+          new = (
+              '            "pidfd_open" => libc::SYS_pidfd_open,\n'
+              '            "pidfd_send_signal" => libc::SYS_pidfd_send_signal,\n'
+          )
+          if text.count(old) != 1:
+              raise SystemExit(f'pidfd syscall mapping matches={text.count(old)}')
+          linux.write_text(text.replace(old, new, 1))
+
+          tests = Path('tests/sandbox.rs')
+          text = tests.read_text()
+          replacement = '''#[test]
+          fn landlock_signal_scope_attenuates_namespace_init_signal_permission() {
+              let unscoped = policy(
+                  "t",
+                  &[],
+                  &["execveat", "pidfd_open", "pidfd_send_signal", "exit"],
+              );
+              assert_eq!(run(&unscoped).unwrap(), ChildOutcome::Exited(0));
+
+              let mut scoped = policy(
+                  "u",
+                  &[],
+                  &["execveat", "pidfd_open", "pidfd_send_signal", "exit"],
+              );
+              scoped.landlock_scope_signal = true;
+              assert_eq!(run(&scoped).unwrap(), ChildOutcome::Exited(0));
+          }
+
           '''
-          new = '''.pidfd_signal_allowed:
+          pattern = re.compile(
+              r'struct PausedExternalHelper \{.*?(?=#\[test\]\nfn landlock_read_execute_envelope_denies_visible_undeclared_path)',
+              re.S,
+          )
+          text, count = pattern.subn(replacement, text, count=1)
+          if count != 1:
+              raise SystemExit(f'external-helper test block matches={count}')
+          tests.write_text(text)
+
+          probe = Path('tests/fixtures/probe.S')
+          text = probe.read_text()
+          replacement = '''.pidfd_signal_allowed:
+              mov $434, %eax
+              mov $1, %edi
+              xor %esi, %esi
+              syscall
+              test %rax, %rax
+              js .pidfd_open_errno
+              mov %eax, %edi
               mov $424, %eax
-              mov $9, %edi
-              mov $10, %esi
+              xor %esi, %esi
               xor %edx, %edx
               xor %r10d, %r10d
               syscall
               test %rax, %rax
-              jns .pidfd_signal_allowed_ok
+              jns .pidfd_signal_ok
               neg %eax
               mov %eax, %edi
               jmp .exit
-          .pidfd_signal_allowed_ok:
+          .pidfd_signal_ok:
               xor %edi, %edi
               jmp .exit
+
+          .pidfd_signal_denied:
+              mov $434, %eax
+              mov $1, %edi
+              xor %esi, %esi
+              syscall
+              test %rax, %rax
+              js .pidfd_open_errno
+              mov %eax, %edi
+              mov $424, %eax
+              xor %esi, %esi
+              xor %edx, %edx
+              xor %r10d, %r10d
+              syscall
+              cmp $-1, %rax
+              je .pidfd_signal_ok
+              test %rax, %rax
+              jns .fail42
+              neg %eax
+              mov %eax, %edi
+              jmp .exit
+
+          .pidfd_open_errno:
+              neg %eax
+              add $100, %eax
+              mov %eax, %edi
+              jmp .exit
+
+          .forbidden:
           '''
-          if text.count(old) != 1:
-              raise SystemExit(f'unscoped oracle block matches={text.count(old)}')
-          p.write_text(text.replace(old, new, 1))
+          pattern = re.compile(r'\.pidfd_signal_allowed:\n.*?\.forbidden:\n', re.S)
+          text, count = pattern.subn(replacement, text, count=1)
+          if count != 1:
+              raise SystemExit(f'pidfd fixture block matches={count}')
+          probe.write_text(text)
           PY
       - name: Format generated Rust
         run: cargo fmt --all
@@ -70,4 +138,4 @@ jobs:
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
       - name: Focused oracle
-        run: cargo test --locked --test sandbox selected_pidfd_signal_authority_is_attenuated_by_landlock_scope -- --exact --nocapture
+        run: cargo test --locked --test sandbox landlock_signal_scope_attenuates_namespace_init_signal_permission -- --exact --nocapture

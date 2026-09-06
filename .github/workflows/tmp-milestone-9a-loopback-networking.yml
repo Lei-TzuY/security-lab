@@ -16,6 +16,8 @@ jobs:
         with:
           toolchain: stable
           components: rustfmt, clippy
+      - name: Repair construction anchor
+        run: python3 .github/tmp-milestone-9a-generator-repair.py
       - name: Materialize candidate
         run: python3 .github/tmp-milestone-9a-loopback-networking.py
       - name: Format
@@ -35,6 +37,7 @@ jobs:
       - name: Remove construction files and commit candidate tree
         run: |
           rm .github/tmp-milestone-9a-loopback-networking.py
+          rm .github/tmp-milestone-9a-generator-repair.py
           rm .github/workflows/tmp-milestone-9a-loopback-networking.yml
           git config user.name LeiZ
           git config user.email 52287354+Lei-TzuY@users.noreply.github.com

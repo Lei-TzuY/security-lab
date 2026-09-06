@@ -133,6 +133,7 @@ mod x86_64 {
     const LANDLOCK_ACCESS_FS_REMOVE_FILE: u64 = 1 << 5;
     const LANDLOCK_ACCESS_FS_MAKE_REG: u64 = 1 << 8;
     const LANDLOCK_ACCESS_FS_TRUNCATE: u64 = 1 << 14;
+    const LANDLOCK_ACCESS_FS_IOCTL_DEV: u64 = 1 << 15;
     const LANDLOCK_READ_EXECUTE_RIGHTS: u64 =
         LANDLOCK_ACCESS_FS_EXECUTE | LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR;
     const LANDLOCK_FILE_MUTATE_RIGHTS: u64 = LANDLOCK_ACCESS_FS_WRITE_FILE
@@ -529,6 +530,7 @@ mod x86_64 {
     struct PreparedLandlock {
         read_execute: Vec<CString>,
         file_mutate: Vec<CString>,
+        device_ioctl: Vec<CString>,
         tcp_bind_ports: Vec<u16>,
         tcp_connect_ports: Vec<u16>,
         scope_abstract_unix_socket: bool,
@@ -616,6 +618,12 @@ mod x86_64 {
             let mut landlock_file_mutate = Vec::with_capacity(policy.landlock_file_mutate.len());
             for path in &policy.landlock_file_mutate {
                 landlock_file_mutate.push(sandbox_relative(path)?);
+            }
+            // Device paths may be supplied by a persistent volume, so the final
+            // mounted object is pinned and type-checked by the direct target.
+            let mut landlock_device_ioctl = Vec::with_capacity(policy.landlock_device_ioctl.len());
+            for path in &policy.landlock_device_ioctl {
+                landlock_device_ioctl.push(sandbox_relative(path)?);
             }
 
             // Keep every launcher-owned source above all target-visible handle
@@ -818,6 +826,7 @@ mod x86_64 {
                 landlock: PreparedLandlock {
                     read_execute: landlock_read_execute,
                     file_mutate: landlock_file_mutate,
+                    device_ioctl: landlock_device_ioctl,
                     tcp_bind_ports: policy.landlock_tcp_bind_ports.clone(),
                     tcp_connect_ports: policy.landlock_tcp_connect_ports.clone(),
                     scope_abstract_unix_socket: policy.landlock_scope_abstract_unix_socket,
@@ -1330,6 +1339,7 @@ mod x86_64 {
     fn ensure_landlock_supported(policy: &SandboxPolicy) -> Result<(), SandboxError> {
         if policy.landlock_read_execute.is_empty()
             && policy.landlock_file_mutate.is_empty()
+            && policy.landlock_device_ioctl.is_empty()
             && policy.landlock_tcp_bind_ports.is_empty()
             && policy.landlock_tcp_connect_ports.is_empty()
             && !policy.landlock_scope_abstract_unix_socket
@@ -1349,6 +1359,11 @@ mod x86_64 {
             if !policy.landlock_file_mutate.is_empty() && abi < 3 {
                 return Err(SandboxError::UnsupportedPlatform(format!(
                     "Landlock file-mutation enforcement requires ABI 3 for TRUNCATE control; kernel reports ABI {abi}"
+                )));
+            }
+            if !policy.landlock_device_ioctl.is_empty() && abi < 5 {
+                return Err(SandboxError::UnsupportedPlatform(format!(
+                    "Landlock device ioctl enforcement requires ABI 5; kernel reports ABI {abi}"
                 )));
             }
             if (!policy.landlock_tcp_bind_ports.is_empty()
@@ -1396,6 +1411,7 @@ mod x86_64 {
     ) -> RawFd {
         if landlock.read_execute.is_empty()
             && landlock.file_mutate.is_empty()
+            && landlock.device_ioctl.is_empty()
             && landlock.tcp_bind_ports.is_empty()
             && landlock.tcp_connect_ports.is_empty()
             && !landlock.scope_abstract_unix_socket
@@ -1410,6 +1426,9 @@ mod x86_64 {
         }
         if !landlock.file_mutate.is_empty() {
             handled_access_fs |= LANDLOCK_FILE_MUTATE_RIGHTS;
+        }
+        if !landlock.device_ioctl.is_empty() {
+            handled_access_fs |= LANDLOCK_ACCESS_FS_IOCTL_DEV;
         }
         let mut handled_access_net = 0;
         if !landlock.tcp_bind_ports.is_empty() {
@@ -1550,6 +1569,55 @@ mod x86_64 {
             let path_fd = path_fd as RawFd;
             let rule = LandlockPathBeneathAttr {
                 allowed_access: LANDLOCK_FILE_MUTATE_RIGHTS,
+                parent_fd: path_fd,
+                reserved: 0,
+            };
+            if libc::syscall(
+                SYS_LANDLOCK_ADD_RULE,
+                ruleset_fd,
+                LANDLOCK_RULE_PATH_BENEATH,
+                &rule as *const LandlockPathBeneathAttr,
+                0u32,
+            ) == -1
+            {
+                child_fail(launch_error, PHASE_LANDLOCK_RULE, error_exit_syscall);
+            }
+            if libc::close(path_fd) == -1 {
+                child_fail(launch_error, PHASE_LANDLOCK_PATH, error_exit_syscall);
+            }
+        }
+        let device_path_how = OpenHow {
+            flags: (libc::O_PATH | libc::O_CLOEXEC) as u64,
+            mode: 0,
+            resolve: RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS,
+        };
+        for path in &landlock.device_ioctl {
+            let path_fd = libc::syscall(
+                libc::SYS_openat2,
+                root_tree_fd,
+                path.as_ptr(),
+                &device_path_how as *const OpenHow,
+                std::mem::size_of::<OpenHow>(),
+            );
+            if path_fd == -1 {
+                child_fail(launch_error, PHASE_LANDLOCK_PATH, error_exit_syscall);
+            }
+            let path_fd = path_fd as RawFd;
+            let mut stat = std::mem::zeroed::<libc::stat>();
+            if libc::fstat(path_fd, &mut stat) == -1 {
+                child_fail(launch_error, PHASE_LANDLOCK_PATH, error_exit_syscall);
+            }
+            let kind = stat.st_mode & libc::S_IFMT;
+            if kind != libc::S_IFCHR && kind != libc::S_IFBLK {
+                child_fail_errno(
+                    launch_error,
+                    PHASE_LANDLOCK_PATH,
+                    libc::ENODEV,
+                    error_exit_syscall,
+                );
+            }
+            let rule = LandlockPathBeneathAttr {
+                allowed_access: LANDLOCK_ACCESS_FS_IOCTL_DEV,
                 parent_fd: path_fd,
                 reserved: 0,
             };

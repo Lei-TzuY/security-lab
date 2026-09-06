@@ -85,8 +85,7 @@ fn push_json_string(output: &mut String, value: &str) {
             '\r' => output.push_str("\\r"),
             '\t' => output.push_str("\\t"),
             character if character <= '\u{1f}' => {
-                write!(output, "\\u{:04x}", character as u32)
-                    .expect("write to String cannot fail");
+                write!(output, "\\u{:04x}", character as u32).expect("write to String cannot fail");
             }
             character => output.push(character),
         }

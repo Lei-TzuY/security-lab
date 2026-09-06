@@ -372,7 +372,7 @@ Boundary: 13B is the kernel-defined cross-domain abstract-UNIX `connect` scope. 
 
 ### Slice 14A — Landlock device-ioctl envelope
 
-**Current verified candidate.** Adds a distinct device-driver operation boundary rather than another pathname, network-port, or IPC-scope variant.
+**Status: complete on `main`.** Adds a distinct device-driver operation boundary rather than another pathname, network-port, or IPC-scope variant.
 
 Acceptance evidence is executable:
 
@@ -387,8 +387,29 @@ Boundary: Landlock ABI-5 `IOCTL_DEV` is a coarse right bound when a character/bl
 
 ### Milestone 14 promotion rule
 
-After 14A integrates, seal this coarse device-ioctl layer. Do not farm extra device names or ioctl request codes through the same rule. Promote only to a materially different executable frontier with kernel/runtime evidence.
+14A is integrated; seal this coarse device-ioctl layer. Do not farm extra device names or ioctl request codes through the same rule.
+
+## Milestone 15 — address-aware network object authority
+
+### Slice 15A — exact numeric host-IPv4 TCP broker
+
+**Current verified candidate.** Adds address discrimination to launcher-brokered outbound object authority without joining the target network namespace to host routing.
+
+Acceptance evidence is executable:
+
+- policy accepts the all-or-nothing triple `network.host_ipv4_tcp_address` / `network.host_ipv4_tcp_port` / `network.host_ipv4_tcp_target_fd`; the address must be numeric unicast IPv4, the port is 1–65535, and the fd is 3–63 below `limit.open_files` without collisions against selected handles or existing broker destinations;
+- the trusted parent reuses one generic host-IPv4 TCP connector: legacy 9B still fixes the address to `127.0.0.1`, while 15A passes the declared address. Connection failure remains a setup error and never falls back to target-side networking;
+- the connected socket is stored above every target-visible destination and installed only in the direct target as an already-open object capability. No target `socket` or `connect` grant is added implicitly;
+- the integration oracle binds the same TCP port on host `127.0.0.1` and `127.0.0.2`, declares `127.0.0.2`, requires the exact broker marker only on the selected listener, and requires no connection queued on `127.0.0.1`;
+- the raw target then independently attempts a fresh connection through its own isolated network namespace and still requires an ordinary unreachable/refused result, preserving the no-host-route invariant;
+- all Milestones 1–14A regressions remain active; stable format/Clippy/full tests and the full Rust 1.74 suite are green.
+
+Boundary: 15A is one preconnected IPv4 TCP socket to an exact numeric endpoint. It does not provide DNS/hostname resolution, IPv6, UDP/raw sockets, CIDR/range allowlists, dynamic post-launch brokering, veth/bridge/NAT/routing, TLS/application authentication, or an external-network reachability guarantee. The deterministic address oracle uses host-local `127/8`; it proves endpoint selection, not Internet egress.
+
+### Milestone 15 promotion rule
+
+After 15A integrates, seal this single exact-address preconnected TCP broker. Do not farm more IPv4 literals, ports, or target-fd aliases around the same connector. Promote only to a materially different protocol/topology authority, resource boundary, or observability surface with executable evidence.
 
 ## Later frontiers
 
-Supplementary-group isolation with a viable mapping architecture, broader/generalized persistent-volume policy, address-aware or broader protocol network authority beyond the existing brokered sockets and Landlock TCP port envelope, and delegated aggregate cgroup accounting remain separate evidence-backed frontiers. Do not add configuration-only names without executable kernel behavior and integration evidence.
+Supplementary-group isolation with a viable mapping architecture, broader/generalized persistent-volume policy, broader-protocol or routed network authority beyond the bounded preconnected TCP brokers and Landlock TCP port envelope, and delegated aggregate cgroup accounting remain separate evidence-backed frontiers. Do not add configuration-only names without executable kernel behavior and integration evidence.

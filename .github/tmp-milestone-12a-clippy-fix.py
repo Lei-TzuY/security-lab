@@ -49,6 +49,14 @@ for old, new in [
 ]:
     segment = segment.replace(old, new)
 segment = segment.replace(
+    "for path in landlock.read_execute {",
+    "for path in &landlock.read_execute {",
+)
+segment = segment.replace(
+    "for path in landlock.file_mutate {",
+    "for path in &landlock.file_mutate {",
+)
+segment = segment.replace(
     "for port in landlock.tcp_bind_ports {",
     "for &port in &landlock.tcp_bind_ports {",
 )

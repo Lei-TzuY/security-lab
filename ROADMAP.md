@@ -435,7 +435,7 @@ Boundary: 16A is one preconnected IPv4 UDP socket to an exact numeric endpoint. 
 
 ### Slice 17A — process-tree resource usage report
 
-**Current verified candidate.** Converts resource data already owned by namespace PID 1 into an explicit post-mortem report without pretending to provide cgroup enforcement or benchmarking.
+**Status: complete on `main`.** Converts resource data already owned by namespace PID 1 into an explicit post-mortem report without pretending to provide cgroup enforcement or benchmarking.
 
 Acceptance evidence is executable:
 
@@ -450,8 +450,29 @@ Boundary: 17A is post-mortem kernel observability only. It does not provide live
 
 ### Milestone 17 promotion rule
 
-After 17A integrates, do not farm more `rusage` counters or output aliases. Promote only to a materially different enforceable resource boundary when prerequisites exist, or another independent authority/observability subsystem with executable evidence. Milestone 4A remains blocked until a real writable/delegated cgroup-v2 subtree is available to the unprivileged runtime user.
+17A is integrated; do not farm more `rusage` counters or output aliases. Promote only to a materially different enforceable resource boundary when prerequisites exist, or another independent authority/observability subsystem with executable evidence. Milestone 4A remains blocked until a real writable/delegated cgroup-v2 subtree is available to the unprivileged runtime user.
+
+## Milestone 18 — exact host-local IPC object authority
+
+### Slice 18A — one exact host-path AF_UNIX stream broker
+
+**Current verified candidate.** Adds a host-local IPC authority surface that is distinct from the sealed IPv4 TCP/UDP broker family and from Landlock's abstract-UNIX cross-domain scope.
+
+Acceptance evidence is executable:
+
+- policy accepts the all-or-nothing pair `ipc.host_unix_stream_path` / `ipc.host_unix_stream_target_fd`; the pathname must be absolute, contain no NUL or `..`, fit Linux `sockaddr_un.sun_path` at no more than 107 pathname bytes, and be lexically disjoint from `filesystem.root`;
+- the target fd remains bounded to 3–63, below `limit.open_files`, and cannot collide with a selected handle or any existing TCP/UDP/listener broker destination;
+- before fork and before entering the target namespaces/chroot, the trusted parent creates `AF_UNIX` `SOCK_STREAM|SOCK_CLOEXEC`, connects to exactly the configured host pathname, and moves the connected stream onto the existing collision-safe selected-handle storage/remap plane; setup/connect failure is terminal rather than a fallback;
+- a real host `UnixListener` accepts that connection. The raw target writes exact `brokered-host-unix-ok` bytes through fd 10 and reads exact `host-unix-reply` bytes back;
+- the same raw target then creates a fresh AF_UNIX stream socket with explicit `socket` and `connect` seccomp grants and attempts the original absolute host pathname. Exact `ENOENT` is required, proving the host pathname was not made directly reachable through the sandbox chroot and that seccomp `EPERM` is not masquerading as path confinement;
+- all Milestones 1–17A regressions remain active; stable format/Clippy/full tests and the full Rust 1.74 suite are green.
+
+Boundary: 18A is exactly one preconnected filesystem-path AF_UNIX stream capability. It does not support abstract addresses, datagram/seqpacket variants, SCM_RIGHTS descriptor brokering, pathname alias/canonical-inode proof, per-peer credential policy, a general AF_UNIX graph, or dynamic post-launch connection brokering.
+
+### Milestone 18 promotion rule
+
+After 18A integrates, seal this single exact-path stream object-capability slice. Do not farm socket paths, target-fd aliases, or AF_UNIX socket-type variants. Promote only to a materially different executable authority/enforcement frontier. Supplementary-group isolation and cgroup-backed aggregate accounting remain blocked on their documented kernel/environment prerequisites.
 
 ## Later frontiers
 
-Supplementary-group isolation with a viable mapping architecture, broader/generalized persistent-volume policy, broader-protocol or routed network authority beyond the bounded preconnected IPv4 TCP/UDP brokers and Landlock TCP port envelope, and delegated aggregate cgroup accounting remain separate evidence-backed frontiers. Do not add configuration-only names without executable kernel behavior and integration evidence.
+Supplementary-group isolation with a viable mapping architecture, broader/generalized persistent-volume policy, routed/broader network authority beyond the bounded IPv4 brokers, generalized AF_UNIX authority beyond the single exact-path 18A stream object, and delegated aggregate cgroup accounting remain separate evidence-backed frontiers. Do not add configuration-only names without executable kernel behavior and integration evidence.

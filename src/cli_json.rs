@@ -17,7 +17,24 @@ pub(crate) fn report_json(report: &RunReport) -> String {
     }
     output.push_str(",\"reaped_descendants\":");
     write!(&mut output, "{}", report.reaped_descendants).expect("write to String cannot fail");
-    output.push('}');
+    output.push_str(",\"process_tree_usage\":{\"user_cpu_micros\":");
+    write!(&mut output, "{}", report.process_tree_usage.user_cpu_micros)
+        .expect("write to String cannot fail");
+    output.push_str(",\"system_cpu_micros\":");
+    write!(
+        &mut output,
+        "{}",
+        report.process_tree_usage.system_cpu_micros
+    )
+    .expect("write to String cannot fail");
+    output.push_str(",\"max_child_rss_kib\":");
+    write!(
+        &mut output,
+        "{}",
+        report.process_tree_usage.max_child_rss_kib
+    )
+    .expect("write to String cannot fail");
+    output.push_str("}}");
     output
 }
 
@@ -100,7 +117,7 @@ fn push_json_string(output: &mut String, value: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use security_lab::{CapturedOutput, RunReport};
+    use security_lab::{CapturedOutput, ProcessTreeUsage, RunReport};
 
     #[test]
     fn serializes_binary_capture_without_loss() {
@@ -111,11 +128,16 @@ mod tests {
                 truncated: true,
             }),
             reaped_descendants: 3,
+            process_tree_usage: ProcessTreeUsage {
+                user_cpu_micros: 11,
+                system_cpu_micros: 22,
+                max_child_rss_kib: 33,
+            },
         };
 
         assert_eq!(
             report_json(&report),
-            "{\"ok\":true,\"outcome\":{\"kind\":\"exited\",\"code\":7},\"stdout\":{\"encoding\":\"hex\",\"data\":\"0022ff\",\"truncated\":true},\"reaped_descendants\":3}"
+            "{\"ok\":true,\"outcome\":{\"kind\":\"exited\",\"code\":7},\"stdout\":{\"encoding\":\"hex\",\"data\":\"0022ff\",\"truncated\":true},\"reaped_descendants\":3,\"process_tree_usage\":{\"user_cpu_micros\":11,\"system_cpu_micros\":22,\"max_child_rss_kib\":33}}"
         );
     }
 

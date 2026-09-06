@@ -30,7 +30,9 @@ jobs:
             exit 1
           fi
       - name: Materialize production implementation and integration oracle
-        run: python3 .github/tmp-milestone-12a.py production
+        run: |
+          python3 .github/tmp-milestone-12a.py production
+          python3 .github/tmp-milestone-12a-clippy-fix.py
       - name: Format
         run: cargo fmt --all
       - name: Enable user namespace capability tests
@@ -50,6 +52,7 @@ jobs:
       - name: Remove construction files and commit candidate tree
         run: |
           rm .github/tmp-milestone-12a.py
+          rm .github/tmp-milestone-12a-clippy-fix.py
           rm .github/workflows/tmp-milestone-12a.yml
           git config user.name LeiZ
           git config user.email 52287354+Lei-TzuY@users.noreply.github.com

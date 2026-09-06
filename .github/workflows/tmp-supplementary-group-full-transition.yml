@@ -74,11 +74,9 @@ jobs:
           subuid = delegated_start("/etc/subuid")
           subgid = delegated_start("/etc/subgid")
           host_ns = ns_snapshot("/proc/self/ns")
-          host_pid_for_children = os.readlink("/proc/self/ns/pid_for_children")
           print(
               f"host uid={host_uid} gid={host_gid} groups={host_groups} "
-              f"subuid={subuid} subgid={subgid} namespaces={host_ns} "
-              f"pid_for_children={host_pid_for_children}",
+              f"subuid={subuid} subgid={subgid} namespaces={host_ns}",
               flush=True,
           )
 
@@ -111,12 +109,11 @@ jobs:
                   err = ctypes.get_errno()
                   after_groups = os.getgroups()
                   child_ns = ns_snapshot("/proc/self/ns")
-                  child_pid_for_children = os.readlink("/proc/self/ns/pid_for_children")
                   print(
                       f"mapped uid={os.getuid()} gid={os.getgid()} "
                       f"setgroups_state={setgroups_state} before_groups={before_groups} "
                       f"clear_rc={rc} errno={err} after_groups={after_groups} "
-                      f"namespaces={child_ns} pid_for_children={child_pid_for_children}",
+                      f"namespaces={child_ns}",
                       flush=True,
                   )
                   if os.getuid() != 0 or os.getgid() != 0:
@@ -125,8 +122,6 @@ jobs:
                       os._exit(41)
                   if any(child_ns[name] == host_ns[name] for name in child_ns):
                       os._exit(48)
-                  if child_pid_for_children == host_pid_for_children:
-                      os._exit(49)
 
                   hostname = b"security-lab-groups"
                   if libc.sethostname(hostname, len(hostname)) != 0:
@@ -153,6 +148,10 @@ jobs:
                   if net.returncode != 0:
                       os._exit(45)
 
+                  # CLONE_NEWPID changes the PID namespace of subsequently
+                  # created children. The first child must therefore observe
+                  # itself as namespace PID 1; this is the executable PID
+                  # namespace oracle rather than a procfs symlink assumption.
                   namespace_init = os.fork()
                   if namespace_init == 0:
                       actual_pid = os.getpid()
@@ -181,9 +180,6 @@ jobs:
               _, status = os.waitpid(pid, 0)
               raise SystemExit(f"child failed before mapping: {os.waitstatus_to_exitcode(status)}")
 
-          # Cross-process pid_for_children is intentionally not read here:
-          # before maps exist that procfs lookup may be hidden as ENOENT. The
-          # child proves the PID namespace transition itself after mapping.
           child_ns = ns_snapshot(f"/proc/{pid}/ns")
           print(f"parent observed child namespaces={child_ns}", flush=True)
           if any(child_ns[name] == host_ns[name] for name in child_ns):

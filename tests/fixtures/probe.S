@@ -11,6 +11,7 @@
 #   G assert one selected non-stdio handle is remapped without ambient FD leakage
 #   c fork a descendant, publish cancellation readiness on fd 9, then pause
 #   v read a declared persistent volume, prove it is read-only, and hide its host source path
+#   w write through a declared persistent volume while root and host source paths stay confined
 #   F forbidden getpid; exits 77 only when seccomp returns -EPERM
 #   E validate sanitized environment
 #   C validate working directory against argv[2]
@@ -50,6 +51,8 @@ _start:
     je .cancellation_tree
     cmp $118, %al
     je .readonly_volume
+    cmp $119, %al
+    je .writable_volume
     cmp $70, %al
     je .forbidden
     cmp $69, %al
@@ -299,6 +302,54 @@ _start:
     syscall
     cmp $-2, %rax
     jne .fail32
+
+    xor %edi, %edi
+    jmp .exit
+
+.writable_volume:
+    mov $257, %eax
+    mov $-100, %edi
+    lea writable_volume_output(%rip), %rsi
+    mov $577, %edx
+    mov $384, %r10d
+    syscall
+    test %rax, %rax
+    js .fail33
+    mov %rax, %r12
+
+    mov $1, %eax
+    mov %r12, %rdi
+    lea writable_volume_message(%rip), %rsi
+    mov $writable_volume_message_len, %edx
+    syscall
+    cmp $writable_volume_message_len, %rax
+    jne .fail33
+
+    mov $3, %eax
+    mov %r12, %rdi
+    syscall
+    test %rax, %rax
+    js .fail33
+
+    mov $257, %eax
+    mov $-100, %edi
+    lea forbidden_create(%rip), %rsi
+    mov $577, %edx
+    mov $384, %r10d
+    syscall
+    cmp $-30, %rax
+    jne .fail33
+
+    mov 24(%rsp), %rsi
+    test %rsi, %rsi
+    je .fail33
+    mov $257, %eax
+    mov $-100, %edi
+    xor %edx, %edx
+    xor %r10d, %r10d
+    syscall
+    cmp $-2, %rax
+    jne .fail33
 
     xor %edi, %edi
     jmp .exit
@@ -981,6 +1032,9 @@ _start:
     jmp .exit
 .fail32:
     mov $32, %edi
+    jmp .exit
+.fail33:
+    mov $33, %edi
 
 .exit:
     mov $60, %eax
@@ -1025,6 +1079,11 @@ volume_forbidden_write:
 volume_marker_expected:
     .ascii "volume-marker\n"
 .set volume_marker_len, . - volume_marker_expected
+writable_volume_output:
+    .asciz "/persist/persisted"
+writable_volume_message:
+    .ascii "persistent-write\n"
+.set writable_volume_message_len, . - writable_volume_message
 deadline_message:
     .ascii "deadline target started\n"
 .set deadline_message_len, . - deadline_message

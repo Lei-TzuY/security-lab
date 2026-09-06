@@ -1,0 +1,101 @@
+name: probe supplementary group clearing
+
+on:
+  push:
+    branches: [tmp-10a-supplementary-groups-probe]
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Enable user namespace capability tests
+        run: |
+          if [ -e /proc/sys/kernel/unprivileged_userns_clone ]; then
+            sudo sysctl -w kernel.unprivileged_userns_clone=1
+          fi
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - name: Probe clear-before-deny user namespace flow
+        run: |
+          cat > /tmp/probe-groups.c <<'EOF'
+          #define _GNU_SOURCE
+          #include <errno.h>
+          #include <fcntl.h>
+          #include <grp.h>
+          #include <sched.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <sys/types.h>
+          #include <unistd.h>
+
+          static void write_file(const char *path, const char *text) {
+              int fd = open(path, O_WRONLY | O_CLOEXEC);
+              if (fd < 0) { perror(path); exit(20); }
+              size_t len = strlen(text);
+              if (write(fd, text, len) != (ssize_t)len) { perror("write proc map"); exit(21); }
+              if (close(fd) < 0) { perror("close proc map"); exit(22); }
+          }
+
+          int main(void) {
+              uid_t host_uid = geteuid();
+              gid_t host_gid = getegid();
+              int before = getgroups(0, NULL);
+              if (before < 0) { perror("getgroups before"); return 1; }
+              printf("host supplementary groups before unshare: %d\n", before);
+
+              if (unshare(CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWNET | CLONE_NEWIPC | CLONE_NEWUTS) < 0) {
+                  perror("unshare"); return 2;
+              }
+
+              if (setgroups(0, NULL) < 0) {
+                  perror("setgroups clear before deny"); return 3;
+              }
+              if (getgroups(0, NULL) != 0) {
+                  fprintf(stderr, "supplementary groups not empty immediately after clear\n"); return 4;
+              }
+
+              write_file("/proc/self/setgroups", "deny\n");
+
+              char map[64];
+              snprintf(map, sizeof(map), "0 %u 1\n", (unsigned)host_uid);
+              write_file("/proc/self/uid_map", map);
+              snprintf(map, sizeof(map), "0 %u 1\n", (unsigned)host_gid);
+              write_file("/proc/self/gid_map", map);
+
+              if (geteuid() != 0 || getegid() != 0) {
+                  fprintf(stderr, "mapped namespace identity is not uid/gid 0: %u/%u\n", (unsigned)geteuid(), (unsigned)getegid());
+                  return 5;
+              }
+              if (getgroups(0, NULL) != 0) {
+                  fprintf(stderr, "supplementary groups reappeared after mapping\n"); return 6;
+              }
+
+              gid_t zero = 0;
+              errno = 0;
+              if (setgroups(1, &zero) == 0) {
+                  fprintf(stderr, "setgroups unexpectedly succeeded after deny\n"); return 7;
+              }
+              if (errno != EPERM) {
+                  fprintf(stderr, "setgroups after deny failed with errno %d, expected EPERM\n", errno); return 8;
+              }
+
+              puts("clear-before-deny supplementary-group flow is supported");
+              return 0;
+          }
+          EOF
+          cc -Wall -Wextra -Werror -O2 /tmp/probe-groups.c -o /tmp/probe-groups
+          /tmp/probe-groups
+      - name: Remove probe workflow and record clean tree
+        run: |
+          rm .github/workflows/tmp-milestone-10a-supplementary-groups-probe.yml
+          git config user.name LeiZ
+          git config user.email 52287354+Lei-TzuY@users.noreply.github.com
+          git add -A
+          git commit -m "chore: record supplementary group probe"
+          git push origin HEAD:tmp-10a-supplementary-groups-probe

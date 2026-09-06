@@ -5,10 +5,10 @@ on:
     branches: [tmp-13a-landlock-signal-generator]
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  construct:
+  diagnose:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -18,10 +18,47 @@ jobs:
           components: rustfmt, clippy
       - name: Materialize candidate
         run: python3 .github/tmp-milestone-13a-landlock-signal.py
+      - name: Instrument unscoped errno
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('tests/fixtures/probe.S')
+          text = p.read_text()
+          old = '''.pidfd_signal_allowed:
+              mov $424, %eax
+              mov $9, %edi
+              mov $10, %esi
+              xor %edx, %edx
+              xor %r10d, %r10d
+              syscall
+              test %rax, %rax
+              js .fail41
+              xor %edi, %edi
+              jmp .exit
+          '''
+          new = '''.pidfd_signal_allowed:
+              mov $424, %eax
+              mov $9, %edi
+              mov $10, %esi
+              xor %edx, %edx
+              xor %r10d, %r10d
+              syscall
+              test %rax, %rax
+              jns .pidfd_signal_allowed_ok
+              neg %eax
+              mov %eax, %edi
+              jmp .exit
+          .pidfd_signal_allowed_ok:
+              xor %edi, %edi
+              jmp .exit
+          '''
+          if text.count(old) != 1:
+              raise SystemExit(f'unscoped oracle block matches={text.count(old)}')
+          p.write_text(text.replace(old, new, 1))
+          PY
       - name: Format
-        run: cargo fmt --all
-      - name: Show focused oracle lines
-        run: nl -ba tests/sandbox.rs | sed -n '300,330p'
+        run: cargo fmt --all -- --check
       - name: Enable user namespace capability tests
         run: |
           if [ -e /proc/sys/kernel/unprivileged_userns_clone ]; then
@@ -30,16 +67,5 @@ jobs:
           if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
-      - name: Clippy
-        run: cargo clippy --locked --all-targets --all-features -- -D warnings
-      - name: Test
-        run: cargo test --locked --all-targets --all-features
-      - name: Remove construction files and commit candidate tree
-        run: |
-          rm .github/tmp-milestone-13a-landlock-signal.py
-          rm .github/workflows/tmp-milestone-13a-landlock-signal.yml
-          git config user.name LeiZ
-          git config user.email 52287354+Lei-TzuY@users.noreply.github.com
-          git add -A
-          git commit -m "feat: scope external signal authority with Landlock"
-          git push origin HEAD:tmp-13a-landlock-signal-generator
+      - name: Focused oracle
+        run: cargo test --locked --test sandbox selected_pidfd_signal_authority_is_attenuated_by_landlock_scope -- --exact --nocapture

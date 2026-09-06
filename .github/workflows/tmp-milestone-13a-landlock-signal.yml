@@ -106,9 +106,12 @@ jobs:
               cmp $-1, %rax
               je .pidfd_signal_ok
               test %rax, %rax
-              jns .fail42
+              jns .pidfd_signal_unexpected_success
               neg %eax
               mov %eax, %edi
+              jmp .exit
+          .pidfd_signal_unexpected_success:
+              mov $42, %edi
               jmp .exit
 
           .pidfd_open_errno:

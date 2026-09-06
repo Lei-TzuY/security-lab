@@ -75,6 +75,10 @@ pub struct SandboxPolicy {
     pub environment: BTreeMap<String, String>,
     /// Absolute path interpreted inside `root_dir`.
     pub working_dir: PathBuf,
+    /// Optional trusted host directory exposed read-only at exactly one
+    /// declared sandbox mountpoint. Source and target must be specified together.
+    pub readonly_volume_source: Option<PathBuf>,
+    pub readonly_volume_target: Option<PathBuf>,
     /// Optional absolute path inside `root_dir` replaced by a private writable
     /// tmpfs after the root mount tree has been made recursively read-only.
     pub scratch_dir: Option<PathBuf>,
@@ -140,6 +144,36 @@ impl SandboxPolicy {
         validate_hostname(&self.hostname)?;
         validate_absolute_path("executable", &self.executable)?;
         validate_absolute_path("working_dir", &self.working_dir)?;
+
+        match (&self.readonly_volume_source, &self.readonly_volume_target) {
+            (None, None) => {}
+            (Some(source), Some(target)) => {
+                validate_absolute_path("volume.readonly_source", source)?;
+                validate_absolute_path("volume.readonly_target", target)?;
+                if target == Path::new("/") {
+                    return Err(PolicyError::new(
+                        "volume.readonly_target must not replace the sandbox root",
+                    ));
+                }
+                if self.executable.starts_with(target) || self.working_dir.starts_with(target) {
+                    return Err(PolicyError::new(
+                        "volume.readonly_target must not contain the executable or working_dir",
+                    ));
+                }
+                if let Some(scratch) = &self.scratch_dir {
+                    if target.starts_with(scratch) || scratch.starts_with(target) {
+                        return Err(PolicyError::new(
+                            "volume.readonly_target must not overlap filesystem.scratch",
+                        ));
+                    }
+                }
+            }
+            _ => {
+                return Err(PolicyError::new(
+                    "volume.readonly_source and volume.readonly_target must be specified together",
+                ));
+            }
+        }
 
         match (&self.scratch_dir, self.scratch_bytes) {
             (None, None) => {}
@@ -389,6 +423,8 @@ impl FromStr for SandboxPolicy {
         let mut args = Vec::new();
         let mut environment = BTreeMap::new();
         let mut working_dir = None;
+        let mut readonly_volume_source = None;
+        let mut readonly_volume_target = None;
         let mut scratch_dir = None;
         let mut scratch_bytes = None;
         let mut stdin = None;
@@ -422,6 +458,12 @@ impl FromStr for SandboxPolicy {
             match key {
                 "filesystem.root" => set_once(&mut root_dir, value.to_owned(), line_no, key)?,
                 "identity.hostname" => set_once(&mut hostname, value.to_owned(), line_no, key)?,
+                "volume.readonly_source" => {
+                    set_once(&mut readonly_volume_source, value.to_owned(), line_no, key)?
+                }
+                "volume.readonly_target" => {
+                    set_once(&mut readonly_volume_target, value.to_owned(), line_no, key)?
+                }
                 "filesystem.scratch" => set_once(&mut scratch_dir, value.to_owned(), line_no, key)?,
                 "filesystem.scratch_bytes" => set_once(
                     &mut scratch_bytes,
@@ -597,6 +639,8 @@ impl FromStr for SandboxPolicy {
             args,
             environment,
             working_dir: PathBuf::from(required(working_dir, "working_dir")?),
+            readonly_volume_source: readonly_volume_source.map(PathBuf::from),
+            readonly_volume_target: readonly_volume_target.map(PathBuf::from),
             scratch_dir: scratch_dir.map(PathBuf::from),
             scratch_bytes,
             stdio: StdioPolicy {
@@ -777,6 +821,8 @@ mod tests {
         let policy: SandboxPolicy = VALID.parse().unwrap();
         assert_eq!(policy.root_dir, PathBuf::from("/"));
         assert_eq!(policy.hostname, "security-lab");
+        assert_eq!(policy.readonly_volume_source, None);
+        assert_eq!(policy.readonly_volume_target, None);
         assert_eq!(policy.scratch_dir, Some(PathBuf::from("/scratch")));
         assert_eq!(policy.scratch_bytes, Some(16 * 1024 * 1024));
         assert_eq!(policy.executable, PathBuf::from("/bin/echo"));
@@ -794,6 +840,41 @@ mod tests {
         );
         assert!(policy.seccomp.allowed_syscalls.contains("execveat"));
         assert!(policy.seccomp.argument_rules.is_empty());
+    }
+
+    #[test]
+    fn parses_readonly_volume_pair() {
+        let text =
+            format!("{VALID}\nvolume.readonly_source = /srv/data\nvolume.readonly_target = /data");
+        let policy: SandboxPolicy = text.parse().unwrap();
+        assert_eq!(
+            policy.readonly_volume_source,
+            Some(PathBuf::from("/srv/data"))
+        );
+        assert_eq!(policy.readonly_volume_target, Some(PathBuf::from("/data")));
+    }
+
+    #[test]
+    fn rejects_incomplete_or_unsafe_readonly_volume() {
+        let incomplete = format!("{VALID}\nvolume.readonly_source = /srv/data");
+        assert!(incomplete.parse::<SandboxPolicy>().is_err());
+
+        let root_target =
+            format!("{VALID}\nvolume.readonly_source = /srv/data\nvolume.readonly_target = /");
+        assert!(root_target.parse::<SandboxPolicy>().is_err());
+
+        let relative_source =
+            format!("{VALID}\nvolume.readonly_source = relative\nvolume.readonly_target = /data");
+        assert!(relative_source.parse::<SandboxPolicy>().is_err());
+
+        let hides_cwd =
+            format!("{VALID}\nvolume.readonly_source = /srv/data\nvolume.readonly_target = /tmp");
+        assert!(hides_cwd.parse::<SandboxPolicy>().is_err());
+
+        let overlaps_scratch = format!(
+            "{VALID}\nvolume.readonly_source = /srv/data\nvolume.readonly_target = /scratch/data"
+        );
+        assert!(overlaps_scratch.parse::<SandboxPolicy>().is_err());
     }
 
     #[test]

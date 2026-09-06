@@ -71,6 +71,7 @@ fn fixture_root() -> &'static Path {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("work")).expect("create sandbox work directory");
         std::fs::create_dir_all(root.join("scratch")).expect("create sandbox scratch mountpoint");
+        std::fs::create_dir_all(root.join("data")).expect("create sandbox volume mountpoint");
 
         let output = root.join("probe");
         let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/probe.S");
@@ -84,6 +85,21 @@ fn fixture_root() -> &'static Path {
         root
     })
     .as_path()
+}
+
+fn readonly_volume_source() -> &'static Path {
+    static SOURCE: OnceLock<PathBuf> = OnceLock::new();
+    SOURCE
+        .get_or_init(|| {
+            let source =
+                std::env::temp_dir().join(format!("security-lab-volume-{}", process::id()));
+            let _ = std::fs::remove_dir_all(&source);
+            std::fs::create_dir_all(&source).expect("create persistent volume source");
+            std::fs::write(source.join("marker"), b"volume-marker\n")
+                .expect("write persistent volume marker");
+            source
+        })
+        .as_path()
 }
 
 fn syscall_set(names: &[&str]) -> BTreeSet<String> {
@@ -100,6 +116,8 @@ fn policy(mode: &str, extra_args: &[&str], syscalls: &[&str]) -> SandboxPolicy {
         args,
         environment: BTreeMap::new(),
         working_dir: PathBuf::from("/work"),
+        readonly_volume_source: None,
+        readonly_volume_target: None,
         scratch_dir: Some(PathBuf::from("/scratch")),
         scratch_bytes: Some(SCRATCH_BYTES),
         stdio: StdioPolicy {
@@ -122,6 +140,34 @@ fn policy(mode: &str, extra_args: &[&str], syscalls: &[&str]) -> SandboxPolicy {
             argument_rules: BTreeMap::new(),
         },
     }
+}
+
+#[test]
+fn readonly_persistent_volume_is_visible_only_at_declared_readonly_mount() {
+    let source = readonly_volume_source().to_path_buf();
+    let forbidden_write = source.join("write-must-fail");
+    let _ = std::fs::remove_file(&forbidden_write);
+    let marker_before = std::fs::read(source.join("marker")).expect("read host volume marker");
+    let source_argument = source.to_string_lossy().into_owned();
+
+    let mut mounted = policy(
+        "v",
+        &[source_argument.as_str()],
+        &["execveat", "openat", "read", "close", "exit"],
+    );
+    mounted.readonly_volume_source = Some(source.clone());
+    mounted.readonly_volume_target = Some(PathBuf::from("/data"));
+
+    assert_eq!(run(&mounted).unwrap(), ChildOutcome::Exited(0));
+    assert_eq!(
+        std::fs::read(source.join("marker")).expect("read host volume marker after run"),
+        marker_before,
+        "sandbox changed persistent volume marker"
+    );
+    assert!(
+        !forbidden_write.exists(),
+        "sandbox write escaped the read-only persistent volume"
+    );
 }
 
 #[test]

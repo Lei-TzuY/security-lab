@@ -104,6 +104,11 @@ mod x86_64 {
     const PHASE_SELECTED_HANDLES: u32 = 39;
     const PHASE_CANCELLATION_PIDFD: u32 = 40;
     const PHASE_CANCELLATION_POLL: u32 = 41;
+    const PHASE_VOLUME_SOURCE_REVALIDATE: u32 = 42;
+    const PHASE_VOLUME_CLONE: u32 = 43;
+    const PHASE_VOLUME_READONLY: u32 = 44;
+    const PHASE_VOLUME_TARGET_PIN: u32 = 45;
+    const PHASE_VOLUME_ATTACH: u32 = 46;
 
     #[repr(C)]
     struct OpenHow {
@@ -311,6 +316,9 @@ mod x86_64 {
         executable_fd: OwnedFd,
         selected_handles: Vec<PreparedSelectedHandle>,
         cancellation_fd: Option<OwnedFd>,
+        readonly_volume_source_fd: Option<OwnedFd>,
+        readonly_volume_source_path: Option<CString>,
+        readonly_volume_target_relative: Option<CString>,
         cwd_relative: CString,
         scratch_relative: Option<CString>,
         scratch_options: Option<CString>,
@@ -392,6 +400,36 @@ mod x86_64 {
                 })
                 .transpose()?;
 
+            let (
+                readonly_volume_source_fd,
+                readonly_volume_source_path,
+                readonly_volume_target_relative,
+            ) = match (
+                &policy.readonly_volume_source,
+                &policy.readonly_volume_target,
+            ) {
+                (Some(source), Some(target)) => {
+                    let source_fd = open_host_directory(source, "read-only volume source")?;
+                    let target_check = open_beneath_root(
+                        root_fd.raw(),
+                        target,
+                        (libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
+                        "read-only volume target",
+                    )?;
+                    drop(target_check);
+                    let source_path =
+                        cstring_bytes("volume.readonly_source", source.as_os_str().as_bytes())?;
+                    let target_relative = sandbox_relative(target)?;
+                    (Some(source_fd), Some(source_path), Some(target_relative))
+                }
+                (None, None) => (None, None, None),
+                _ => {
+                    return Err(SandboxError::InvalidPolicy(PolicyError::new(
+                        "volume.readonly_source and volume.readonly_target must be specified together",
+                    )));
+                }
+            };
+
             let cwd_relative = sandbox_relative(&policy.working_dir)?;
             let (scratch_relative, scratch_options) = match (
                 &policy.scratch_dir,
@@ -456,6 +494,9 @@ mod x86_64 {
                 executable_fd,
                 selected_handles,
                 cancellation_fd,
+                readonly_volume_source_fd,
+                readonly_volume_source_path,
+                readonly_volume_target_relative,
                 cwd_relative,
                 scratch_relative,
                 scratch_options,
@@ -664,6 +705,26 @@ mod x86_64 {
             }
             Err(err) => Err(SandboxError::SetupFailed(format!(
                 "cannot pin filesystem.root without symlink traversal: {err}"
+            ))),
+        }
+    }
+
+    fn open_host_directory(path: &Path, label: &str) -> Result<OwnedFd, SandboxError> {
+        let path = cstring_bytes(label, path.as_os_str().as_bytes())?;
+        let how = OpenHow {
+            flags: (libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
+            mode: 0,
+            resolve: RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS,
+        };
+        match openat2(libc::AT_FDCWD, &path, &how) {
+            Ok(fd) => Ok(OwnedFd(fd)),
+            Err(err) if matches!(err.raw_os_error(), Some(libc::ENOSYS | libc::EINVAL)) => {
+                Err(SandboxError::UnsupportedPlatform(format!(
+                    "{label} requires Linux openat2 support: {err}"
+                )))
+            }
+            Err(err) => Err(SandboxError::SetupFailed(format!(
+                "cannot pin {label} without symlink traversal: {err}"
             ))),
         }
     }
@@ -1094,6 +1155,13 @@ mod x86_64 {
             child_fail(launch_error, PHASE_ROOT_FCHDIR, seccomp.error_exit_syscall);
         }
 
+        install_readonly_volume_or_fail(
+            prepared,
+            root_tree_fd,
+            launch_error,
+            seccomp.error_exit_syscall,
+        );
+
         if let (Some(scratch), Some(options)) =
             (&prepared.scratch_relative, &prepared.scratch_options)
         {
@@ -1262,6 +1330,116 @@ mod x86_64 {
         child_fail(launch_error, PHASE_EXECVEAT, seccomp.error_exit_syscall)
     }
 
+    unsafe fn install_readonly_volume_or_fail(
+        prepared: &PreparedLaunch,
+        root_tree_fd: RawFd,
+        launch_error: *mut LaunchErrorRecord,
+        error_exit_syscall: libc::c_long,
+    ) {
+        let (Some(pinned_source), Some(source_path), Some(target_relative)) = (
+            &prepared.readonly_volume_source_fd,
+            &prepared.readonly_volume_source_path,
+            &prepared.readonly_volume_target_relative,
+        ) else {
+            return;
+        };
+
+        let source_how = OpenHow {
+            flags: (libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
+            mode: 0,
+            resolve: RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS,
+        };
+        let current_source_fd = libc::syscall(
+            libc::SYS_openat2,
+            libc::AT_FDCWD,
+            source_path.as_ptr(),
+            &source_how as *const OpenHow,
+            std::mem::size_of::<OpenHow>(),
+        );
+        if current_source_fd == -1 {
+            child_fail(
+                launch_error,
+                PHASE_VOLUME_SOURCE_REVALIDATE,
+                error_exit_syscall,
+            );
+        }
+        let current_source_fd = current_source_fd as RawFd;
+        revalidate_fd_identity_or_fail(
+            pinned_source.raw(),
+            current_source_fd,
+            PHASE_VOLUME_SOURCE_REVALIDATE,
+            launch_error,
+            error_exit_syscall,
+        );
+
+        let volume_tree_fd = libc::syscall(
+            libc::SYS_open_tree,
+            current_source_fd,
+            b".\0".as_ptr().cast::<libc::c_char>(),
+            OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC | AT_RECURSIVE,
+        );
+        if volume_tree_fd == -1 {
+            child_fail(launch_error, PHASE_VOLUME_CLONE, error_exit_syscall);
+        }
+        let volume_tree_fd = volume_tree_fd as RawFd;
+
+        let volume_attr = MountAttr {
+            attr_set: MOUNT_ATTR_RDONLY,
+            attr_clr: 0,
+            propagation: 0,
+            userns_fd: 0,
+        };
+        if libc::syscall(
+            libc::SYS_mount_setattr,
+            volume_tree_fd,
+            b"\0".as_ptr().cast::<libc::c_char>(),
+            AT_EMPTY_PATH | AT_RECURSIVE,
+            &volume_attr as *const MountAttr,
+            std::mem::size_of::<MountAttr>(),
+        ) == -1
+        {
+            child_fail(launch_error, PHASE_VOLUME_READONLY, error_exit_syscall);
+        }
+
+        let target_how = OpenHow {
+            flags: (libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
+            mode: 0,
+            resolve: RESOLVE_BENEATH
+                | RESOLVE_NO_XDEV
+                | RESOLVE_NO_MAGICLINKS
+                | RESOLVE_NO_SYMLINKS,
+        };
+        let target_fd = libc::syscall(
+            libc::SYS_openat2,
+            root_tree_fd,
+            target_relative.as_ptr(),
+            &target_how as *const OpenHow,
+            std::mem::size_of::<OpenHow>(),
+        );
+        if target_fd == -1 {
+            child_fail(launch_error, PHASE_VOLUME_TARGET_PIN, error_exit_syscall);
+        }
+        let target_fd = target_fd as RawFd;
+
+        if libc::syscall(
+            libc::SYS_move_mount,
+            volume_tree_fd,
+            b"\0".as_ptr().cast::<libc::c_char>(),
+            target_fd,
+            b"\0".as_ptr().cast::<libc::c_char>(),
+            MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_EMPTY_PATH,
+        ) == -1
+        {
+            child_fail(launch_error, PHASE_VOLUME_ATTACH, error_exit_syscall);
+        }
+
+        for fd in [target_fd, volume_tree_fd, current_source_fd] {
+            if libc::close(fd) == -1 {
+                child_fail(launch_error, PHASE_VOLUME_ATTACH, error_exit_syscall);
+            }
+        }
+    }
+
     unsafe fn open_stdout_redirect_or_fail(
         root_tree_fd: RawFd,
         path: &CString,
@@ -1316,21 +1494,32 @@ mod x86_64 {
         launch_error: *mut LaunchErrorRecord,
         error_exit_syscall: libc::c_long,
     ) {
+        revalidate_fd_identity_or_fail(
+            pinned_root_fd,
+            current_root_fd,
+            PHASE_ROOT_REVALIDATE,
+            launch_error,
+            error_exit_syscall,
+        );
+    }
+
+    unsafe fn revalidate_fd_identity_or_fail(
+        pinned_fd: RawFd,
+        current_fd: RawFd,
+        phase: u32,
+        launch_error: *mut LaunchErrorRecord,
+        error_exit_syscall: libc::c_long,
+    ) {
         let mut pinned = std::mem::zeroed::<libc::stat>();
-        if libc::fstat(pinned_root_fd, &mut pinned) == -1 {
-            child_fail(launch_error, PHASE_ROOT_REVALIDATE, error_exit_syscall);
+        if libc::fstat(pinned_fd, &mut pinned) == -1 {
+            child_fail(launch_error, phase, error_exit_syscall);
         }
         let mut current = std::mem::zeroed::<libc::stat>();
-        if libc::fstat(current_root_fd, &mut current) == -1 {
-            child_fail(launch_error, PHASE_ROOT_REVALIDATE, error_exit_syscall);
+        if libc::fstat(current_fd, &mut current) == -1 {
+            child_fail(launch_error, phase, error_exit_syscall);
         }
         if pinned.st_dev != current.st_dev || pinned.st_ino != current.st_ino {
-            child_fail_errno(
-                launch_error,
-                PHASE_ROOT_REVALIDATE,
-                libc::ESTALE,
-                error_exit_syscall,
-            );
+            child_fail_errno(launch_error, phase, libc::ESTALE, error_exit_syscall);
         }
     }
 
@@ -1592,7 +1781,13 @@ mod x86_64 {
             && matches!(record.errno, libc::EPERM | libc::EACCES | libc::ENOSYS);
         let mount_boundary_unavailable = matches!(
             record.phase,
-            PHASE_ROOT_CLONE | PHASE_ROOT_READONLY | PHASE_ROOT_ATTACH | PHASE_SCRATCH_MOUNT
+            PHASE_ROOT_CLONE
+                | PHASE_ROOT_READONLY
+                | PHASE_ROOT_ATTACH
+                | PHASE_SCRATCH_MOUNT
+                | PHASE_VOLUME_CLONE
+                | PHASE_VOLUME_READONLY
+                | PHASE_VOLUME_ATTACH
         ) && matches!(
             record.errno,
             libc::EPERM | libc::EACCES | libc::ENOSYS | libc::ENODEV
@@ -1661,6 +1856,11 @@ mod x86_64 {
             PHASE_SELECTED_HANDLES => "selected non-stdio handle installation",
             PHASE_CANCELLATION_PIDFD => "external cancellation pidfd supervision",
             PHASE_CANCELLATION_POLL => "external cancellation supervision poll",
+            PHASE_VOLUME_SOURCE_REVALIDATE => "read-only volume source revalidation",
+            PHASE_VOLUME_CLONE => "detached read-only volume mount clone",
+            PHASE_VOLUME_READONLY => "recursive read-only volume attributes",
+            PHASE_VOLUME_TARGET_PIN => "read-only volume target pin",
+            PHASE_VOLUME_ATTACH => "read-only volume mount attachment",
             _ => "unknown launch phase",
         };
         format!(

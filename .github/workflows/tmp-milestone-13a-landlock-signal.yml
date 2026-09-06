@@ -20,6 +20,8 @@ jobs:
         run: python3 .github/tmp-milestone-13a-landlock-signal.py
       - name: Format
         run: cargo fmt --all
+      - name: Show focused oracle lines
+        run: nl -ba tests/sandbox.rs | sed -n '300,330p'
       - name: Enable user namespace capability tests
         run: |
           if [ -e /proc/sys/kernel/unprivileged_userns_clone ]; then

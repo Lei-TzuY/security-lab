@@ -393,7 +393,7 @@ Boundary: Landlock ABI-5 `IOCTL_DEV` is a coarse right bound when a character/bl
 
 ### Slice 15A — exact numeric host-IPv4 TCP broker
 
-**Current verified candidate.** Adds address discrimination to launcher-brokered outbound object authority without joining the target network namespace to host routing.
+**Status: complete on `main`.** Adds address discrimination to launcher-brokered outbound object authority without joining the target network namespace to host routing.
 
 Acceptance evidence is executable:
 
@@ -410,6 +410,27 @@ Boundary: 15A is one preconnected IPv4 TCP socket to an exact numeric endpoint. 
 
 After 15A integrates, seal this single exact-address preconnected TCP broker. Do not farm more IPv4 literals, ports, or target-fd aliases around the same connector. Promote only to a materially different protocol/topology authority, resource boundary, or observability surface with executable evidence.
 
+## Milestone 16 — datagram network object authority
+
+### Slice 16A — exact numeric host-IPv4 UDP datagram broker
+
+**Current verified candidate.** Adds a connectionless/message-boundary-preserving transport capability rather than another TCP endpoint alias.
+
+Acceptance evidence is executable:
+
+- policy accepts the all-or-nothing triple `network.host_ipv4_udp_address` / `network.host_ipv4_udp_port` / `network.host_ipv4_udp_target_fd`; the address must be numeric unicast IPv4, the port is 1–65535, and the fd is 3–63 below `limit.open_files` without collisions against selected handles or any existing broker destination;
+- the trusted parent creates `SOCK_DGRAM|SOCK_CLOEXEC` in the host network namespace and calls `connect(2)` to fix the socket's default peer to exactly the declared numeric IPv4 address and port, then stores that socket above every target-visible destination and remaps it only into the direct target;
+- UDP `connect()` is treated only as peer selection: it is not a handshake and does not claim service availability or delivery;
+- the deterministic oracle binds the same UDP port on host `127.0.0.1` and `127.0.0.2`, selects `127.0.0.2`, and observes one exact `brokered-host-udp-ok` datagram only at the selected address, preserving one-datagram message boundaries;
+- the raw target independently creates a fresh UDP socket inside its isolated network namespace and attempts the same host address/port; host-side observation proves no second datagram crosses into either host endpoint, preserving the no-host-route invariant even when target `socket`, `connect`, and `write` are explicitly granted;
+- all Milestones 1–15A regressions remain active; stable format/Clippy/full tests and the full Rust 1.74 suite are green.
+
+Boundary: 16A is one preconnected IPv4 UDP socket to an exact numeric endpoint. It does not provide DNS/hostname resolution, IPv6, raw sockets, UDP listeners/bind brokering, multicast/broadcast policy, CIDR/range allowlists, dynamic post-launch brokering, veth/bridge/NAT/routing, application authentication, or an external-network reachability/delivery guarantee. The deterministic oracle uses host-local `127/8`; it proves endpoint selection and datagram semantics, not Internet egress.
+
+### Milestone 16 promotion rule
+
+After 16A integrates, seal the bounded exact-address preconnected IPv4 TCP/UDP broker family. Do not farm more address literals, ports, target-fd aliases, or trivial socket-type variants. Promote only to a materially different topology/resource/observability boundary with executable evidence.
+
 ## Later frontiers
 
-Supplementary-group isolation with a viable mapping architecture, broader/generalized persistent-volume policy, broader-protocol or routed network authority beyond the bounded preconnected TCP brokers and Landlock TCP port envelope, and delegated aggregate cgroup accounting remain separate evidence-backed frontiers. Do not add configuration-only names without executable kernel behavior and integration evidence.
+Supplementary-group isolation with a viable mapping architecture, broader/generalized persistent-volume policy, broader-protocol or routed network authority beyond the bounded preconnected IPv4 TCP/UDP brokers and Landlock TCP port envelope, and delegated aggregate cgroup accounting remain separate evidence-backed frontiers. Do not add configuration-only names without executable kernel behavior and integration evidence.

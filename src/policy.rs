@@ -14,6 +14,7 @@ const MAX_SECCOMP_ARG_RULES: usize = 64;
 const MAX_SELECTED_HANDLES: usize = 16;
 const MAX_LANDLOCK_READ_EXECUTE_PATHS: usize = 32;
 const MAX_LANDLOCK_FILE_MUTATE_PATHS: usize = 32;
+const MAX_LANDLOCK_TCP_PORTS: usize = 32;
 const MIN_SELECTED_TARGET_FD: u32 = 3;
 const MAX_SELECTED_TARGET_FD: u32 = 63;
 const MIN_SCRATCH_BYTES: u64 = 4096;
@@ -83,6 +84,10 @@ pub struct SandboxPolicy {
     /// Optional Landlock regular-file mutation allowlist. Each path names a
     /// directory within an already-writable scratch or persistent-volume surface.
     pub landlock_file_mutate: Vec<PathBuf>,
+    /// Optional Landlock TCP port envelopes for target-created sockets. These
+    /// rules restrict bind/connect syscalls without granting those syscalls.
+    pub landlock_tcp_bind_ports: Vec<u16>,
+    pub landlock_tcp_connect_ports: Vec<u16>,
     /// Whether the launcher activates `lo` inside the isolated network namespace.
     /// This does not attach the namespace to any host or external network.
     pub loopback_enabled: bool,
@@ -234,6 +239,12 @@ impl SandboxPolicy {
                 }
             }
         }
+
+        validate_landlock_tcp_ports("landlock.tcp_bind_port", &self.landlock_tcp_bind_ports)?;
+        validate_landlock_tcp_ports(
+            "landlock.tcp_connect_port",
+            &self.landlock_tcp_connect_ports,
+        )?;
 
         match (
             self.host_loopback_tcp_port,
@@ -657,6 +668,8 @@ impl FromStr for SandboxPolicy {
         let mut working_dir = None;
         let mut landlock_read_execute = Vec::new();
         let mut landlock_file_mutate = Vec::new();
+        let mut landlock_tcp_bind_ports = Vec::new();
+        let mut landlock_tcp_connect_ports = Vec::new();
         let mut loopback_enabled = None;
         let mut host_loopback_tcp_port = None;
         let mut host_loopback_tcp_target_fd = None;
@@ -699,6 +712,12 @@ impl FromStr for SandboxPolicy {
             match key {
                 "filesystem.root" => set_once(&mut root_dir, value.to_owned(), line_no, key)?,
                 "identity.hostname" => set_once(&mut hostname, value.to_owned(), line_no, key)?,
+                "landlock.tcp_bind_port" => {
+                    landlock_tcp_bind_ports.push(parse_tcp_port(value, line_no, key)?)
+                }
+                "landlock.tcp_connect_port" => {
+                    landlock_tcp_connect_ports.push(parse_tcp_port(value, line_no, key)?)
+                }
                 "network.loopback" => set_once(
                     &mut loopback_enabled,
                     parse_enabled_disabled(value, line_no, key)?,
@@ -930,6 +949,8 @@ impl FromStr for SandboxPolicy {
                 .into_iter()
                 .map(PathBuf::from)
                 .collect(),
+            landlock_tcp_bind_ports,
+            landlock_tcp_connect_ports,
             loopback_enabled: loopback_enabled.unwrap_or(false),
             host_loopback_tcp_port,
             host_loopback_tcp_target_fd,
@@ -1042,6 +1063,27 @@ fn parse_tcp_port(value: &str, line: usize, key: &str) -> Result<u16, PolicyErro
     Ok(port as u16)
 }
 
+fn validate_landlock_tcp_ports(label: &str, ports: &[u16]) -> Result<(), PolicyError> {
+    if ports.len() > MAX_LANDLOCK_TCP_PORTS {
+        return Err(PolicyError::new(format!(
+            "too many {label} entries: {} > {MAX_LANDLOCK_TCP_PORTS}",
+            ports.len()
+        )));
+    }
+    let mut seen = BTreeSet::new();
+    for port in ports {
+        if *port == 0 {
+            return Err(PolicyError::new(format!(
+                "{label} must be between 1 and 65535"
+            )));
+        }
+        if !seen.insert(*port) {
+            return Err(PolicyError::new(format!("duplicate {label}: {port}")));
+        }
+    }
+    Ok(())
+}
+
 fn parse_stdio_mode(value: &str, line: usize, key: &str) -> Result<StdioMode, PolicyError> {
     match value {
         "inherit" => Ok(StdioMode::Inherit),
@@ -1150,6 +1192,8 @@ mod tests {
         assert_eq!(policy.host_loopback_tcp_target_fd, None);
         assert!(policy.landlock_read_execute.is_empty());
         assert!(policy.landlock_file_mutate.is_empty());
+        assert!(policy.landlock_tcp_bind_ports.is_empty());
+        assert!(policy.landlock_tcp_connect_ports.is_empty());
         assert_eq!(policy.readonly_volume_source, None);
         assert_eq!(policy.readonly_volume_target, None);
         assert_eq!(policy.writable_volume_source, None);
@@ -1199,6 +1243,28 @@ mod tests {
         let misses_executable = format!("{VALID}\nlandlock.read_execute = /tmp");
         let error = misses_executable.parse::<SandboxPolicy>().unwrap_err();
         assert!(error.to_string().contains("cover the initial executable"));
+    }
+
+    #[test]
+    fn parses_landlock_tcp_port_rules() {
+        let allowed = format!("{VALID}\nlandlock.tcp_bind_port = 42421\nlandlock.tcp_bind_port = 42423\nlandlock.tcp_connect_port = 42421");
+        let policy: SandboxPolicy = allowed.parse().unwrap();
+        assert_eq!(policy.landlock_tcp_bind_ports, [42421, 42423]);
+        assert_eq!(policy.landlock_tcp_connect_ports, [42421]);
+
+        for key in ["landlock.tcp_bind_port", "landlock.tcp_connect_port"] {
+            let zero = format!("{VALID}\n{key} = 0");
+            assert!(zero.parse::<SandboxPolicy>().is_err());
+
+            let duplicate = format!("{VALID}\n{key} = 42421\n{key} = 42421");
+            assert!(duplicate.parse::<SandboxPolicy>().is_err());
+
+            let mut oversized = VALID.to_owned();
+            for port in 1..=33 {
+                oversized.push_str(&format!("\n{key} = {}", 43000 + port));
+            }
+            assert!(oversized.parse::<SandboxPolicy>().is_err());
+        }
     }
 
     #[test]

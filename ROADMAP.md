@@ -293,7 +293,7 @@ Milestone 10B is integrated; seal this bounded pathname-envelope phase. Do not f
 
 ### Slice 11A — one brokered host-loopback TCP listener
 
-**Current verified candidate.** Adds a materially different inbound object capability without attaching the target network namespace to host or external routing.
+**Status: complete on `main`.** Adds a materially different inbound object capability without attaching the target network namespace to host or external routing.
 
 Acceptance evidence is executable:
 
@@ -311,6 +311,27 @@ Boundary: 11A grants one host-loopback TCP listening object. It does not promise
 
 After 11A integrates, seal the single-listener object-capability slice. Do not farm additional port numbers, backlog values, or equivalent listener aliases. Promote only to a materially different network topology/endpoint authority or another evidence-backed resource frontier.
 
+## Milestone 12 — target-created TCP port mediation
+
+### Slice 12A — Landlock TCP bind/connect port envelope
+
+**Current verified candidate.** Adds an independent kernel access-control layer for target-created TCP bind/connect operations rather than another launcher-brokered socket alias.
+
+Acceptance evidence is executable:
+
+- repeatable `landlock.tcp_bind_port = <1..65535>` and `landlock.tcp_connect_port = <1..65535>` entries are independently bounded to 32 unique ports; duplicate values, port 0, and malformed values are rejected fail-closed;
+- each non-empty list activates only its matching Landlock access class (`LANDLOCK_ACCESS_NET_BIND_TCP` or `LANDLOCK_ACCESS_NET_CONNECT_TCP`); an empty list leaves that class unhandled, so policy intent is explicit instead of silently denying unrelated networking;
+- requested TCP-port enforcement requires Landlock ABI 4 or newer. The parent preflights the ABI and older/unavailable kernels fail explicitly rather than dropping the restriction;
+- the direct target builds `handled_access_net` alongside any existing pathname rights, adds `LANDLOCK_RULE_NET_PORT` rules for declared ports, applies `no_new_privs`, and restricts itself before target seccomp and pinned exec. Landlock rules do not add `socket`, `bind`, `connect`, or any other syscall to the target seccomp allowlist;
+- with isolated loopback explicitly enabled and the raw target granted the necessary TCP syscalls, local bind/listen/connect/accept on declared port 42421 succeeds and transfers the expected bytes, while otherwise-identical bind and connect attempts to undeclared port 42422 must each return exact `EACCES`;
+- the oracle therefore distinguishes Landlock denial from seccomp `EPERM` and from an unreachable/refused network endpoint; all earlier sandbox regressions plus the deterministic `run-json` CLI tests remain active, and stable format/Clippy/full tests plus the full Rust 1.74 suite are green.
+
+Boundary: Landlock ABI 4 TCP network rules match **ports, not IP addresses**. 12A therefore does not claim an IP/hostname destination firewall, UDP mediation, external routing, veth/bridge/NAT/DNS, TLS/application authentication, or attenuation of already-connected/listening sockets passed as explicit object capabilities. Port 0/ephemeral-bind authorization is deliberately outside this initial slice.
+
+### Milestone 12 promotion rule
+
+After 12A integrates, seal this bounded port-envelope mechanism. Do not farm more test ports, IPv4/IPv6 aliases, or port-count variants. A later networking slice must add a materially different, verifiable address/topology or protocol authority boundary; otherwise promote to another subsystem frontier.
+
 ## Later frontiers
 
-Supplementary-group isolation with a viable mapping architecture, broader/generalized persistent-volume policy, network authority beyond one preconnected host-loopback stream plus one host-loopback listener, and delegated aggregate cgroup accounting remain separate evidence-backed frontiers. Do not add configuration-only names without executable kernel behavior and integration evidence.
+Supplementary-group isolation with a viable mapping architecture, broader/generalized persistent-volume policy, address-aware or broader protocol network authority beyond the existing brokered sockets and Landlock TCP port envelope, and delegated aggregate cgroup accounting remain separate evidence-backed frontiers. Do not add configuration-only names without executable kernel behavior and integration evidence.

@@ -384,6 +384,12 @@ fn network_namespace_cannot_reach_host_loopback_listener() {
 }
 
 #[test]
+fn loopback_is_down_unless_policy_enables_it() {
+    let disabled = policy("o", &[], &["execveat", "socket", "ioctl", "close", "exit"]);
+    assert_eq!(run(&disabled).unwrap(), ChildOutcome::Exited(0));
+}
+
+#[test]
 fn enabled_loopback_supports_intra_sandbox_tcp() {
     let mut local = policy(
         "n",

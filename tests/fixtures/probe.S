@@ -13,6 +13,7 @@
 #   v read a declared persistent volume, prove it is read-only, and hide its host source path
 #   w write through a declared persistent volume while root and host source paths stay confined
 #   n prove policy-owned loopback supports positive intra-sandbox TCP
+#   o prove loopback remains down unless policy explicitly enables it
 #   F forbidden getpid; exits 77 only when seccomp returns -EPERM
 #   E validate sanitized environment
 #   C validate working directory against argv[2]
@@ -56,6 +57,8 @@ _start:
     je .writable_volume
     cmp $110, %al
     je .loopback_networking
+    cmp $111, %al
+    je .loopback_disabled
     cmp $70, %al
     je .forbidden
     cmp $69, %al
@@ -459,6 +462,39 @@ _start:
     syscall
     test %rax, %rax
     js .fail34
+    xor %edi, %edi
+    jmp .exit
+
+.loopback_disabled:
+    mov $41, %eax
+    mov $2, %edi
+    mov $2, %esi
+    xor %edx, %edx
+    syscall
+    test %rax, %rax
+    js .fail35
+    mov %rax, %r12
+
+    movb $108, network_ifreq(%rip)
+    movb $111, network_ifreq+1(%rip)
+    movb $0, network_ifreq+2(%rip)
+    mov $16, %eax
+    mov %r12, %rdi
+    mov $0x8913, %esi
+    lea network_ifreq(%rip), %rdx
+    syscall
+    test %rax, %rax
+    js .fail35
+
+    movzwl network_ifreq+16(%rip), %eax
+    test $1, %eax
+    jnz .fail35
+
+    mov $3, %eax
+    mov %r12, %rdi
+    syscall
+    test %rax, %rax
+    js .fail35
     xor %edi, %edi
     jmp .exit
 
@@ -1146,6 +1182,9 @@ _start:
     jmp .exit
 .fail34:
     mov $34, %edi
+    jmp .exit
+.fail35:
+    mov $35, %edi
 
 .exit:
     mov $60, %eax
@@ -1228,6 +1267,9 @@ uts_buffer:
 .balign 16
 network_addr:
     .skip 16
+.balign 8
+network_ifreq:
+    .skip 40
 network_buffer:
     .skip 32
 

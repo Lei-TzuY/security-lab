@@ -1,0 +1,89 @@
+name: probe supplementary group isolation feasibility
+
+on:
+  push:
+    branches: [tmp-supplementary-group-feasibility]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Inspect unprivileged mapping prerequisites
+        shell: bash
+        run: |
+          set -eu
+          echo "uid=$(id -u) gid=$(id -g) groups=$(id -G)"
+          echo "user=$(id -un) group=$(id -gn)"
+          echo "newuidmap=$(command -v newuidmap || true)"
+          echo "newgidmap=$(command -v newgidmap || true)"
+          echo "setpriv=$(command -v setpriv || true)"
+          echo "unshare=$(unshare --version | head -n1)"
+          echo "subuid entries:"
+          grep -E "^($(id -un)|$(id -u)):" /etc/subuid 2>/dev/null || true
+          echo "subgid entries:"
+          grep -E "^($(id -un)|$(id -u)):" /etc/subgid 2>/dev/null || true
+          echo "effective capabilities:"
+          grep '^CapEff:' /proc/self/status
+      - name: Prove one-entry root mapping cannot clear supplementary groups
+        shell: bash
+        run: |
+          set -eu
+          unshare --user --map-root-user python3 - <<'PY'
+          import ctypes
+          import errno
+          import os
+
+          libc = ctypes.CDLL(None, use_errno=True)
+          before = os.getgroups()
+          rc = libc.setgroups(0, None)
+          err = ctypes.get_errno()
+          print(f"mapped_uid={os.getuid()} mapped_gid={os.getgid()} before_groups={before}")
+          print(f"setgroups_clear_rc={rc} errno={err} errno_name={errno.errorcode.get(err, 'UNKNOWN')}")
+          if rc != -1 or err != errno.EPERM:
+              raise SystemExit("expected permanent setgroups denial under --map-root-user")
+          after = os.getgroups()
+          print(f"after_groups={after}")
+          PY
+      - name: Probe delegated multi-GID mapping path
+        shell: bash
+        run: |
+          set -u
+          if ! command -v newgidmap >/dev/null 2>&1; then
+            echo "delegated_path=unavailable reason=newgidmap-missing"
+            exit 0
+          fi
+          if ! grep -Eq "^($(id -un)|$(id -u)):" /etc/subgid 2>/dev/null; then
+            echo "delegated_path=unavailable reason=subgid-delegation-missing"
+            exit 0
+          fi
+
+          set +e
+          output=$(unshare --user --map-users=auto --map-groups=auto --setgroups=allow python3 - <<'PY' 2>&1
+          import ctypes
+          import errno
+          import os
+
+          libc = ctypes.CDLL(None, use_errno=True)
+          before = os.getgroups()
+          rc = libc.setgroups(0, None)
+          err = ctypes.get_errno()
+          after = os.getgroups()
+          print(f"mapped_uid={os.getuid()} mapped_gid={os.getgid()} before_groups={before}")
+          print(f"setgroups_clear_rc={rc} errno={err} errno_name={errno.errorcode.get(err, 'UNKNOWN')} after_groups={after}")
+          if rc != 0 or after:
+              raise SystemExit(23)
+          PY
+          )
+          rc=$?
+          set -e
+          printf '%s\n' "$output"
+          echo "delegated_probe_rc=$rc"
+          if [ "$rc" -eq 0 ]; then
+            echo "delegated_path=viable"
+          else
+            echo "delegated_path=unavailable reason=helper-or-mapping-failed"
+          fi

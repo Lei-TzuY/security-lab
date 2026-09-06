@@ -140,6 +140,7 @@ fn policy(mode: &str, extra_args: &[&str], syscalls: &[&str]) -> SandboxPolicy {
         environment: BTreeMap::new(),
         working_dir: PathBuf::from("/work"),
         landlock_read_execute: Vec::new(),
+        landlock_file_mutate: Vec::new(),
         loopback_enabled: false,
         host_loopback_tcp_port: None,
         host_loopback_tcp_target_fd: None,
@@ -178,6 +179,66 @@ fn landlock_read_execute_envelope_denies_visible_undeclared_path() {
         vec![PathBuf::from("/probe"), PathBuf::from("/landlock-allowed")];
 
     assert_eq!(run(&confined).unwrap(), ChildOutcome::Exited(0));
+}
+
+#[test]
+fn landlock_file_mutation_envelope_narrows_existing_writable_surfaces() {
+    let source = writable_volume_source().to_path_buf();
+    let allowed = source.join("allowed");
+    let denied = source.join("denied");
+    std::fs::create_dir_all(&allowed).expect("create Landlock mutation allowed directory");
+    std::fs::create_dir_all(&denied).expect("create Landlock mutation denied directory");
+    std::fs::write(allowed.join("existing"), b"stale\n")
+        .expect("seed Landlock mutation truncate fixture");
+    std::fs::write(allowed.join("remove-me"), b"remove-me\n")
+        .expect("seed Landlock mutation remove fixture");
+    std::fs::write(denied.join("blocked"), b"blocked\n")
+        .expect("seed Landlock mutation denied remove fixture");
+    let denied_created = denied.join("created");
+    let _ = std::fs::remove_file(&denied_created);
+
+    let mut confined = policy(
+        "m",
+        &[],
+        &["execveat", "openat", "write", "close", "unlink", "exit"],
+    );
+    confined.landlock_read_execute = vec![PathBuf::from("/probe")];
+    confined.landlock_file_mutate =
+        vec![PathBuf::from("/scratch"), PathBuf::from("/persist/allowed")];
+    confined.writable_volume_source = Some(source.clone());
+    confined.writable_volume_target = Some(PathBuf::from("/persist"));
+
+    assert_eq!(run(&confined).unwrap(), ChildOutcome::Exited(0));
+    assert_eq!(
+        std::fs::read(allowed.join("existing")).expect("read Landlock-mutated host file"),
+        b"landlock-persistent-write\n",
+    );
+    assert!(
+        !allowed.join("remove-me").exists(),
+        "declared mutation envelope did not allow REMOVE_FILE"
+    );
+    assert_eq!(
+        std::fs::read(denied.join("blocked")).expect("read denied mutation sentinel"),
+        b"blocked\n",
+    );
+    assert!(
+        !denied_created.exists(),
+        "Landlock mutation escaped its declared persistent subtree"
+    );
+}
+
+#[test]
+fn landlock_file_mutation_requires_existing_writable_surface() {
+    let mut confined = policy("X", &[], &["execveat", "exit"]);
+    confined.landlock_file_mutate = vec![PathBuf::from("/work")];
+    match run(&confined).unwrap_err() {
+        SandboxError::InvalidPolicy(error) => {
+            assert!(error.to_string().contains(
+                "landlock.file_mutate must be within filesystem.scratch or volume.writable_target"
+            ));
+        }
+        other => panic!("unexpected Landlock mutation policy result: {other}"),
+    }
 }
 
 #[test]

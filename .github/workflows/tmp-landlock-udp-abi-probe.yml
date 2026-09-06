@@ -1,0 +1,31 @@
+name: probe Landlock UDP ABI support
+
+on:
+  push:
+    branches: [tmp-13a-landlock-udp-probe]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Query Landlock ABI
+        run: |
+          python3 - <<'PY'
+          import ctypes
+          import os
+
+          SYS_landlock_create_ruleset = 444
+          LANDLOCK_CREATE_RULESET_VERSION = 1
+          libc = ctypes.CDLL(None, use_errno=True)
+          abi = libc.syscall(SYS_landlock_create_ruleset, 0, 0, LANDLOCK_CREATE_RULESET_VERSION)
+          if abi < 0:
+              err = ctypes.get_errno()
+              raise SystemExit(f"landlock ABI query failed: errno={err} ({os.strerror(err)})")
+          print(f"landlock_abi={abi}")
+          if abi < 10:
+              raise SystemExit(f"Landlock UDP requires ABI >= 10; runner provides {abi}")
+          PY

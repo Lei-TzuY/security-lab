@@ -5,10 +5,10 @@ on:
     branches: [tmp-13a-landlock-signal-generator]
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  diagnose:
+  construct:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -16,9 +16,15 @@ jobs:
         with:
           toolchain: stable
           components: rustfmt, clippy
+      - name: Switch construction to latest main
+        run: |
+          cp .github/tmp-milestone-13a-landlock-signal.py /tmp/milestone-13a-landlock-signal.py
+          git fetch --depth=1 origin main
+          git checkout --detach origin/main
+          test "$(git rev-parse HEAD)" = "7682d2a2babef0d059fd28ba05da0f7d67765fba"
       - name: Materialize candidate
-        run: python3 .github/tmp-milestone-13a-landlock-signal.py
-      - name: Reframe oracle inside sandbox PID namespace
+        run: python3 /tmp/milestone-13a-landlock-signal.py
+      - name: Use same-namespace PID1 signal oracle
         shell: bash
         run: |
           python3 - <<'PY'
@@ -68,6 +74,17 @@ jobs:
 
           probe = Path('tests/fixtures/probe.S')
           text = probe.read_text()
+          old_comments = (
+              '#   t send SIGUSR1 through selected pidfd 9; succeeds only without signal scope\n'
+              '#   u send SIGUSR1 through selected pidfd 9; requires Landlock signal-scope EPERM\n'
+          )
+          new_comments = (
+              '#   t permission-check namespace PID1 through a target-opened pidfd; unscoped succeeds\n'
+              '#   u repeat the PID1 signal permission check; Landlock scope requires exact EPERM\n'
+          )
+          if text.count(old_comments) != 1:
+              raise SystemExit(f'pidfd fixture comments matches={text.count(old_comments)}')
+          text = text.replace(old_comments, new_comments, 1)
           replacement = '''.pidfd_signal_allowed:
               mov $434, %eax
               mov $1, %edi
@@ -128,10 +145,14 @@ jobs:
               raise SystemExit(f'pidfd fixture block matches={count}')
           probe.write_text(text)
           PY
-      - name: Format generated Rust
-        run: cargo fmt --all
-      - name: Verify format
-        run: cargo fmt --all -- --check
+      - name: Format and verify scope
+        run: |
+          cargo fmt --all
+          cargo fmt --all -- --check
+          git diff --check
+          actual="$(git diff --name-only | sort)"
+          expected="$(printf '%s\n' src/platform/linux.rs src/policy.rs tests/fixtures/probe.S tests/sandbox.rs | sort)"
+          test "$actual" = "$expected"
       - name: Enable user namespace capability tests
         run: |
           if [ -e /proc/sys/kernel/unprivileged_userns_clone ]; then
@@ -140,5 +161,16 @@ jobs:
           if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
-      - name: Focused oracle
+      - name: Focused signal-scope oracle
         run: cargo test --locked --test sandbox landlock_signal_scope_attenuates_namespace_init_signal_permission -- --exact --nocapture
+      - name: Clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Full stable test suite
+        run: cargo test --locked --all-targets --all-features
+      - name: Commit clean candidate
+        run: |
+          git config user.name LeiZ
+          git config user.email 52287354+Lei-TzuY@users.noreply.github.com
+          git add src/platform/linux.rs src/policy.rs tests/fixtures/probe.S tests/sandbox.rs
+          git commit -m "feat: scope target signal authority with Landlock"
+          git push origin HEAD:milestone-13a-landlock-signal-scope

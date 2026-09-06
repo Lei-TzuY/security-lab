@@ -351,7 +351,7 @@ Boundary: 13A is one Landlock signal scope with no per-process exception list. I
 
 ### Slice 13B — Landlock abstract UNIX socket scope
 
-**Current verified candidate.** Adds a distinct cross-domain socket-object boundary and deliberately composes with existing selected-handle authority rather than inventing another broker path.
+**Status: complete on `main`.** Adds a distinct cross-domain socket-object boundary and deliberately composes with existing selected-handle authority rather than inventing another broker path.
 
 Acceptance evidence is executable:
 
@@ -366,7 +366,28 @@ Boundary: 13B is the kernel-defined cross-domain abstract-UNIX `connect` scope. 
 
 ### Milestone 13 promotion rule
 
-After 13B integrates, seal the ABI-6 Landlock scope surface at this bounded laboratory scope. Do not farm signal syscall aliases, signal numbers, or AF_UNIX socket-type variants that repeat the same scoped-field mechanism. Promote only to a materially different executable authority frontier; delegated cgroup accounting and supplementary-group isolation remain blocked until their external/kernel mapping prerequisites change.
+13B is integrated; seal the ABI-6 Landlock scope surface at this bounded laboratory scope. Do not farm signal syscall aliases, signal numbers, or AF_UNIX socket-type variants that repeat the same scoped-field mechanism. Promote only to a materially different executable authority frontier; delegated cgroup accounting and supplementary-group isolation remain blocked until their external/kernel mapping prerequisites change.
+
+## Milestone 14 — device operation authority
+
+### Slice 14A — Landlock device-ioctl envelope
+
+**Current verified candidate.** Adds a distinct device-driver operation boundary rather than another pathname, network-port, or IPC-scope variant.
+
+Acceptance evidence is executable:
+
+- policy accepts repeatable `landlock.device_ioctl = <absolute-sandbox-device>` entries, bounded to 32 unique paths; `/`, relative paths, duplicates, and oversized lists are rejected fail-closed;
+- requested enforcement requires Landlock ABI 5 or newer. Older or unavailable kernels fail explicitly rather than silently dropping `LANDLOCK_ACCESS_FS_IOCTL_DEV`;
+- after final namespace/mount construction, the direct target resolves each declared path with `openat2` beneath the sandbox root while rejecting symlink/magic-link traversal, verifies with `fstat` that it is a character or block device, and adds a `LANDLOCK_RULE_PATH_BENEATH` rule carrying only `IOCTL_DEV`;
+- host-side baselines first prove `RNDGETENTCNT` succeeds on both `/dev/urandom` and `/dev/random`; the sandbox then exposes host `/dev` read-only at `/devices`, so both device nodes are real and visible without creating a device namespace;
+- the raw target opens `/devices/urandom` after Landlock restriction and the same ioctl succeeds, proving positive declared authority; it separately opens undeclared `/devices/random` after restriction and requires exact `EACCES` for the same ioctl, proving Landlock denial rather than pathname invisibility;
+- target seccomp explicitly grants `openat`, `ioctl`, `close`, and `exit`, so seccomp `EPERM` cannot masquerade as device-ioctl evidence; all earlier sandbox/CLI regressions remain active, and the exact synced candidate passes stable format/Clippy/full tests plus the full Rust 1.74 suite.
+
+Boundary: Landlock ABI-5 `IOCTL_DEV` is a coarse right bound when a character/block device is opened after restriction. 14A does not provide a per-ioctl-command allowlist, revoke ioctl authority already attached to a pre-restriction fd, create/filter device nodes, provide a device namespace, or widen target seccomp.
+
+### Milestone 14 promotion rule
+
+After 14A integrates, seal this coarse device-ioctl layer. Do not farm extra device names or ioctl request codes through the same rule. Promote only to a materially different executable frontier with kernel/runtime evidence.
 
 ## Later frontiers
 

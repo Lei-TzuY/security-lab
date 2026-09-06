@@ -20,6 +20,7 @@
 #   m prove Landlock narrows regular-file mutation inside scratch and a writable persistent volume
 #   s prove Landlock allows declared TCP bind/connect ports and denies undeclared ports
 #   a connect selected fd 9 to argv[2] in the abstract UNIX socket namespace
+#   d prove Landlock device ioctl allows /devices/urandom and denies /devices/random
 #   t permission-check namespace PID1 through a target-opened pidfd; unscoped succeeds
 #   u repeat the PID1 signal permission check; Landlock scope requires exact EPERM
 #   F forbidden getpid; exits 77 only when seccomp returns -EPERM
@@ -79,6 +80,8 @@ _start:
     je .landlock_tcp_ports
     cmp $97, %al
     je .abstract_unix_connect
+    cmp $100, %al
+    je .landlock_device_ioctl
     cmp $116, %al
     je .pidfd_signal_allowed
     cmp $117, %al
@@ -1022,6 +1025,61 @@ _start:
     xor %edi, %edi
     jmp .exit
 
+.landlock_device_ioctl:
+    # The allowed device must be opened after Landlock restriction and its
+    # RNDGETENTCNT ioctl must really succeed.
+    mov $257, %eax
+    mov $-100, %edi
+    lea landlock_ioctl_allowed(%rip), %rsi
+    mov $524288, %edx
+    xor %r10d, %r10d
+    syscall
+    test %rax, %rax
+    js .fail44
+    mov %rax, %r12
+
+    mov $16, %eax
+    mov %r12, %rdi
+    mov $0x80045200, %esi
+    lea landlock_ioctl_entropy(%rip), %rdx
+    syscall
+    test %rax, %rax
+    js .fail44
+
+    mov $3, %eax
+    mov %r12, %rdi
+    syscall
+    test %rax, %rax
+    js .fail44
+
+    # The sibling random device is equally visible/openable but has no
+    # IOCTL_DEV rule, so the same ioctl must be denied by Landlock with EACCES.
+    mov $257, %eax
+    mov $-100, %edi
+    lea landlock_ioctl_denied(%rip), %rsi
+    mov $524288, %edx
+    xor %r10d, %r10d
+    syscall
+    test %rax, %rax
+    js .fail44
+    mov %rax, %r12
+
+    mov $16, %eax
+    mov %r12, %rdi
+    mov $0x80045200, %esi
+    lea landlock_ioctl_entropy(%rip), %rdx
+    syscall
+    cmp $-13, %rax
+    jne .fail44
+
+    mov $3, %eax
+    mov %r12, %rdi
+    syscall
+    test %rax, %rax
+    js .fail44
+    xor %edi, %edi
+    jmp .exit
+
 .pidfd_signal_allowed:
     mov $434, %eax
     mov $1, %edi
@@ -1782,6 +1840,9 @@ _start:
     jmp .exit
 .fail42:
     mov $42, %edi
+    jmp .exit
+.fail44:
+    mov $44, %edi
 
 .exit:
     mov $60, %eax
@@ -1846,6 +1907,10 @@ brokered_ingress_request:
 brokered_ingress_reply:
     .ascii "brokered-host-ingress-ok"
 .set brokered_ingress_reply_len, . - brokered_ingress_reply
+landlock_ioctl_allowed:
+    .asciz "/devices/urandom"
+landlock_ioctl_denied:
+    .asciz "/devices/random"
 landlock_allowed_path:
     .asciz "/landlock-allowed/marker"
 landlock_denied_path:
@@ -1877,6 +1942,8 @@ deadline_watchdog_sleep:
     .quad 0
 
 .section .bss
+landlock_ioctl_entropy:
+    .zero 4
 .balign 16
 cwd_buffer:
     .skip 4096

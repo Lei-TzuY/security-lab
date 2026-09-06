@@ -14,6 +14,7 @@ const MAX_SECCOMP_ARG_RULES: usize = 64;
 const MAX_SELECTED_HANDLES: usize = 16;
 const MAX_LANDLOCK_READ_EXECUTE_PATHS: usize = 32;
 const MAX_LANDLOCK_FILE_MUTATE_PATHS: usize = 32;
+const MAX_LANDLOCK_DEVICE_IOCTL_PATHS: usize = 32;
 const MAX_LANDLOCK_TCP_PORTS: usize = 32;
 const MIN_SELECTED_TARGET_FD: u32 = 3;
 const MAX_SELECTED_TARGET_FD: u32 = 63;
@@ -84,6 +85,10 @@ pub struct SandboxPolicy {
     /// Optional Landlock regular-file mutation allowlist. Each path names a
     /// directory within an already-writable scratch or persistent-volume surface.
     pub landlock_file_mutate: Vec<PathBuf>,
+    /// Optional Landlock device-ioctl allowlist. Each entry names a character
+    /// or block device in the final mounted sandbox tree. When non-empty,
+    /// ioctl on newly opened devices is denied unless covered by one entry.
+    pub landlock_device_ioctl: Vec<PathBuf>,
     /// Optional Landlock TCP port envelopes for target-created sockets. These
     /// rules restrict bind/connect syscalls without granting those syscalls.
     pub landlock_tcp_bind_ports: Vec<u16>,
@@ -243,6 +248,30 @@ impl SandboxPolicy {
                     return Err(PolicyError::new(
                         "landlock.file_mutate must be within filesystem.scratch or volume.writable_target",
                     ));
+                }
+            }
+        }
+
+        if self.landlock_device_ioctl.len() > MAX_LANDLOCK_DEVICE_IOCTL_PATHS {
+            return Err(PolicyError::new(format!(
+                "too many landlock.device_ioctl paths: {} > {MAX_LANDLOCK_DEVICE_IOCTL_PATHS}",
+                self.landlock_device_ioctl.len()
+            )));
+        }
+        if !self.landlock_device_ioctl.is_empty() {
+            let mut seen = BTreeSet::new();
+            for path in &self.landlock_device_ioctl {
+                validate_absolute_path("landlock.device_ioctl", path)?;
+                if path == Path::new("/") {
+                    return Err(PolicyError::new(
+                        "landlock.device_ioctl must not grant the entire sandbox root",
+                    ));
+                }
+                if !seen.insert(path.clone()) {
+                    return Err(PolicyError::new(format!(
+                        "duplicate landlock.device_ioctl path: {}",
+                        path.display()
+                    )));
                 }
             }
         }
@@ -675,6 +704,7 @@ impl FromStr for SandboxPolicy {
         let mut working_dir = None;
         let mut landlock_read_execute = Vec::new();
         let mut landlock_file_mutate = Vec::new();
+        let mut landlock_device_ioctl = Vec::new();
         let mut landlock_tcp_bind_ports = Vec::new();
         let mut landlock_tcp_connect_ports = Vec::new();
         let mut landlock_scope_abstract_unix_socket = None;
@@ -797,6 +827,7 @@ impl FromStr for SandboxPolicy {
                 "working_dir" => set_once(&mut working_dir, value.to_owned(), line_no, key)?,
                 "landlock.read_execute" => landlock_read_execute.push(value.to_owned()),
                 "landlock.file_mutate" => landlock_file_mutate.push(value.to_owned()),
+                "landlock.device_ioctl" => landlock_device_ioctl.push(value.to_owned()),
                 "stdio.stdin" => set_once(
                     &mut stdin,
                     parse_stdio_mode(value, line_no, key)?,
@@ -967,6 +998,10 @@ impl FromStr for SandboxPolicy {
                 .map(PathBuf::from)
                 .collect(),
             landlock_file_mutate: landlock_file_mutate
+                .into_iter()
+                .map(PathBuf::from)
+                .collect(),
+            landlock_device_ioctl: landlock_device_ioctl
                 .into_iter()
                 .map(PathBuf::from)
                 .collect(),
@@ -1216,6 +1251,7 @@ mod tests {
         assert_eq!(policy.host_loopback_tcp_target_fd, None);
         assert!(policy.landlock_read_execute.is_empty());
         assert!(policy.landlock_file_mutate.is_empty());
+        assert!(policy.landlock_device_ioctl.is_empty());
         assert!(policy.landlock_tcp_bind_ports.is_empty());
         assert!(policy.landlock_tcp_connect_ports.is_empty());
         assert!(!policy.landlock_scope_abstract_unix_socket);
@@ -1332,6 +1368,38 @@ mod tests {
 
         let scratch_subdir = format!("{VALID}\nlandlock.file_mutate = /scratch/subdir");
         assert!(scratch_subdir.parse::<SandboxPolicy>().is_err());
+    }
+
+    #[test]
+    fn parses_and_rejects_landlock_device_ioctl_paths() {
+        let allowed: SandboxPolicy = format!(
+            "{VALID}\nlandlock.device_ioctl = /devices/urandom\nlandlock.device_ioctl = /devices/random"
+        )
+        .parse()
+        .unwrap();
+        assert_eq!(
+            allowed.landlock_device_ioctl,
+            [
+                PathBuf::from("/devices/urandom"),
+                PathBuf::from("/devices/random")
+            ]
+        );
+
+        for invalid in [
+            format!("{VALID}\nlandlock.device_ioctl = /"),
+            format!("{VALID}\nlandlock.device_ioctl = devices/urandom"),
+            format!("{VALID}\nlandlock.device_ioctl = /devices/urandom\nlandlock.device_ioctl = /devices/urandom"),
+        ] {
+            assert!(invalid.parse::<SandboxPolicy>().is_err());
+        }
+
+        let mut oversized = VALID.to_owned();
+        for index in 0..=MAX_LANDLOCK_DEVICE_IOCTL_PATHS {
+            oversized.push_str(&format!(
+                "\nlandlock.device_ioctl = /devices/device-{index}"
+            ));
+        }
+        assert!(oversized.parse::<SandboxPolicy>().is_err());
     }
 
     #[test]

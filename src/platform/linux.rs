@@ -124,6 +124,7 @@ mod x86_64 {
     const LANDLOCK_RULE_NET_PORT: libc::c_int = 2;
     const LANDLOCK_ACCESS_NET_BIND_TCP: u64 = 1 << 0;
     const LANDLOCK_ACCESS_NET_CONNECT_TCP: u64 = 1 << 1;
+    const LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET: u64 = 1 << 0;
     const LANDLOCK_SCOPE_SIGNAL: u64 = 1 << 1;
     const LANDLOCK_ACCESS_FS_EXECUTE: u64 = 1 << 0;
     const LANDLOCK_ACCESS_FS_WRITE_FILE: u64 = 1 << 1;
@@ -530,6 +531,7 @@ mod x86_64 {
         file_mutate: Vec<CString>,
         tcp_bind_ports: Vec<u16>,
         tcp_connect_ports: Vec<u16>,
+        scope_abstract_unix_socket: bool,
         scope_signal: bool,
     }
 
@@ -818,6 +820,7 @@ mod x86_64 {
                     file_mutate: landlock_file_mutate,
                     tcp_bind_ports: policy.landlock_tcp_bind_ports.clone(),
                     tcp_connect_ports: policy.landlock_tcp_connect_ports.clone(),
+                    scope_abstract_unix_socket: policy.landlock_scope_abstract_unix_socket,
                     scope_signal: policy.landlock_scope_signal,
                 },
                 cancellation_fd,
@@ -1329,6 +1332,7 @@ mod x86_64 {
             && policy.landlock_file_mutate.is_empty()
             && policy.landlock_tcp_bind_ports.is_empty()
             && policy.landlock_tcp_connect_ports.is_empty()
+            && !policy.landlock_scope_abstract_unix_socket
             && !policy.landlock_scope_signal
         {
             return Ok(());
@@ -1353,6 +1357,11 @@ mod x86_64 {
             {
                 return Err(SandboxError::UnsupportedPlatform(format!(
                     "Landlock TCP port enforcement requires ABI 4; kernel reports ABI {abi}"
+                )));
+            }
+            if policy.landlock_scope_abstract_unix_socket && abi < 6 {
+                return Err(SandboxError::UnsupportedPlatform(format!(
+                    "Landlock abstract UNIX socket scoping requires ABI 6; kernel reports ABI {abi}"
                 )));
             }
             if policy.landlock_scope_signal && abi < 6 {
@@ -1389,6 +1398,7 @@ mod x86_64 {
             && landlock.file_mutate.is_empty()
             && landlock.tcp_bind_ports.is_empty()
             && landlock.tcp_connect_ports.is_empty()
+            && !landlock.scope_abstract_unix_socket
             && !landlock.scope_signal
         {
             return -1;
@@ -1408,11 +1418,13 @@ mod x86_64 {
         if !landlock.tcp_connect_ports.is_empty() {
             handled_access_net |= LANDLOCK_ACCESS_NET_CONNECT_TCP;
         }
-        let scoped = if landlock.scope_signal {
-            LANDLOCK_SCOPE_SIGNAL
-        } else {
-            0
-        };
+        let mut scoped = 0;
+        if landlock.scope_abstract_unix_socket {
+            scoped |= LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET;
+        }
+        if landlock.scope_signal {
+            scoped |= LANDLOCK_SCOPE_SIGNAL;
+        }
         let ruleset = LandlockRulesetAttr {
             handled_access_fs,
             handled_access_net,

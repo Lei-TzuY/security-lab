@@ -19,6 +19,7 @@
 #   r prove Landlock allows declared reads and returns EACCES for an undeclared visible file
 #   m prove Landlock narrows regular-file mutation inside scratch and a writable persistent volume
 #   s prove Landlock allows declared TCP bind/connect ports and denies undeclared ports
+#   a connect selected fd 9 to argv[2] in the abstract UNIX socket namespace
 #   t permission-check namespace PID1 through a target-opened pidfd; unscoped succeeds
 #   u repeat the PID1 signal permission check; Landlock scope requires exact EPERM
 #   F forbidden getpid; exits 77 only when seccomp returns -EPERM
@@ -76,6 +77,8 @@ _start:
     je .landlock_file_mutation
     cmp $115, %al
     je .landlock_tcp_ports
+    cmp $97, %al
+    je .abstract_unix_connect
     cmp $116, %al
     je .pidfd_signal_allowed
     cmp $117, %al
@@ -987,6 +990,38 @@ _start:
     xor %edi, %edi
     jmp .exit
 
+.abstract_unix_connect:
+    mov 24(%rsp), %rsi
+    test %rsi, %rsi
+    je .fail2
+    lea abstract_unix_addr(%rip), %rdi
+    movw $1, (%rdi)
+    movb $0, 2(%rdi)
+    xor %ecx, %ecx
+.abstract_unix_name_copy:
+    movzbl (%rsi,%rcx), %eax
+    test %al, %al
+    je .abstract_unix_name_done
+    cmp $107, %ecx
+    jae .fail42
+    movb %al, 3(%rdi,%rcx)
+    inc %ecx
+    jmp .abstract_unix_name_copy
+.abstract_unix_name_done:
+    lea 3(%rcx), %edx
+    mov $42, %eax
+    mov $9, %edi
+    lea abstract_unix_addr(%rip), %rsi
+    syscall
+    test %rax, %rax
+    jns .abstract_unix_connected
+    neg %eax
+    mov %eax, %edi
+    jmp .exit
+.abstract_unix_connected:
+    xor %edi, %edi
+    jmp .exit
+
 .pidfd_signal_allowed:
     mov $434, %eax
     mov $1, %edi
@@ -1744,6 +1779,9 @@ _start:
     jmp .exit
 .fail41:
     mov $41, %edi
+    jmp .exit
+.fail42:
+    mov $42, %edi
 
 .exit:
     mov $60, %eax
@@ -1862,6 +1900,8 @@ network_addr:
     .skip 16
 network_addr_denied:
     .skip 16
+abstract_unix_addr:
+    .skip 110
 .balign 8
 network_ifreq:
     .skip 40

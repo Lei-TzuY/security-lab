@@ -28,6 +28,16 @@ jobs:
           grep -E "^($(id -un)|$(id -u)):" /etc/subgid 2>/dev/null || true
           echo "effective capabilities:"
           grep '^CapEff:' /proc/self/status
+      - name: Enable user namespace capability probes
+        shell: bash
+        run: |
+          set -eu
+          if [ -e /proc/sys/kernel/unprivileged_userns_clone ]; then
+            sudo sysctl -w kernel.unprivileged_userns_clone=1
+          fi
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
       - name: Prove one-entry root mapping cannot clear supplementary groups
         shell: bash
         run: |

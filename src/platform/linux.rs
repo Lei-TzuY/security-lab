@@ -464,6 +464,7 @@ mod x86_64 {
         path: &Path,
         target_fd: u32,
         storage_floor: RawFd,
+        expected_peer: Option<(u32, u32)>,
     ) -> Result<PreparedSelectedHandle, SandboxError> {
         let path_bytes = path.as_os_str().as_bytes();
         if path_bytes.is_empty() || path_bytes.len() >= 108 || path_bytes.contains(&0) {
@@ -507,6 +508,43 @@ mod x86_64 {
                 path.display()
             )));
         }
+        if let Some((expected_uid, expected_gid)) = expected_peer {
+            let mut credentials = unsafe { std::mem::zeroed::<libc::ucred>() };
+            let mut credentials_len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+            if unsafe {
+                libc::getsockopt(
+                    socket_fd.raw(),
+                    libc::SOL_SOCKET,
+                    libc::SO_PEERCRED,
+                    (&mut credentials as *mut libc::ucred).cast::<libc::c_void>(),
+                    &mut credentials_len,
+                )
+            } == -1
+            {
+                return Err(SandboxError::SetupFailed(format!(
+                    "cannot inspect brokered host-UNIX peer credentials for {}: {}",
+                    path.display(),
+                    io::Error::last_os_error()
+                )));
+            }
+            if credentials_len as usize != std::mem::size_of::<libc::ucred>() {
+                return Err(SandboxError::SetupFailed(format!(
+                    "brokered host-UNIX peer credential query for {} returned {} bytes, expected {}",
+                    path.display(),
+                    credentials_len,
+                    std::mem::size_of::<libc::ucred>()
+                )));
+            }
+            if credentials.uid != expected_uid || credentials.gid != expected_gid {
+                return Err(SandboxError::SetupFailed(format!(
+                    "brokered host-UNIX peer credentials mismatch for {}: expected uid {expected_uid} gid {expected_gid}, got uid {} gid {}",
+                    path.display(),
+                    credentials.uid,
+                    credentials.gid
+                )));
+            }
+        }
+
         let storage_fd = move_owned_fd_to_selected_storage(
             socket_fd,
             storage_floor,
@@ -862,6 +900,18 @@ mod x86_64 {
                     )));
                 }
             }
+            let host_unix_expected_peer = match (
+                policy.host_unix_stream_peer_uid,
+                policy.host_unix_stream_peer_gid,
+            ) {
+                (Some(uid), Some(gid)) => Some((uid, gid)),
+                (None, None) => None,
+                _ => {
+                    return Err(SandboxError::InvalidPolicy(PolicyError::new(
+                        "ipc.host_unix_stream_peer_uid and ipc.host_unix_stream_peer_gid must be specified together",
+                    )));
+                }
+            };
             match (
                 &policy.host_unix_stream_path,
                 policy.host_unix_stream_target_fd,
@@ -870,8 +920,14 @@ mod x86_64 {
                     path,
                     target_fd,
                     selected_storage_floor,
+                    host_unix_expected_peer,
                 )?),
-                (None, None) => {}
+                (None, None) if host_unix_expected_peer.is_none() => {}
+                (None, None) => {
+                    return Err(SandboxError::InvalidPolicy(PolicyError::new(
+                        "host-UNIX peer credentials require a brokered endpoint",
+                    )));
+                }
                 _ => {
                     return Err(SandboxError::InvalidPolicy(PolicyError::new(
                         "ipc.host_unix_stream_path and ipc.host_unix_stream_target_fd must be specified together",

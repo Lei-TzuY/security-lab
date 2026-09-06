@@ -273,6 +273,8 @@ fn policy(mode: &str, extra_args: &[&str], syscalls: &[&str]) -> SandboxPolicy {
         host_ipv4_udp_target_fd: None,
         host_unix_stream_path: None,
         host_unix_stream_target_fd: None,
+        host_unix_stream_peer_uid: None,
+        host_unix_stream_peer_gid: None,
         host_loopback_tcp_listen_port: None,
         host_loopback_tcp_listen_target_fd: None,
         readonly_volume_source: None,
@@ -340,12 +342,45 @@ fn brokered_host_unix_stream_is_usable_while_host_path_stays_hidden() {
     );
     brokered.host_unix_stream_path = Some(socket_path.clone());
     brokered.host_unix_stream_target_fd = Some(10);
+    brokered.host_unix_stream_peer_uid = Some(unsafe { libc::geteuid() });
+    brokered.host_unix_stream_peer_gid = Some(unsafe { libc::getegid() });
     brokered.wall_clock_milliseconds = Some(2000);
 
     let result = run(&brokered);
     server.join().expect("host UNIX server thread failed");
     let _ = std::fs::remove_file(&socket_path);
     assert_eq!(result.unwrap(), ChildOutcome::Exited(0));
+}
+
+#[test]
+fn brokered_host_unix_stream_rejects_wrong_peer_credentials_before_target_exec() {
+    let socket_path = std::env::temp_dir().join(format!(
+        "security-lab-host-unix-peer-mismatch-{}.sock",
+        process::id()
+    ));
+    let _ = std::fs::remove_file(&socket_path);
+    let listener = UnixListener::bind(&socket_path).expect("bind peer-credential test endpoint");
+
+    let actual_uid = unsafe { libc::geteuid() };
+    let actual_gid = unsafe { libc::getegid() };
+    let wrong_uid = actual_uid.wrapping_add(1);
+    assert_ne!(wrong_uid, actual_uid);
+
+    let mut brokered = policy("A", &[], &["execveat", "write", "exit"]);
+    brokered.host_unix_stream_path = Some(socket_path.clone());
+    brokered.host_unix_stream_target_fd = Some(10);
+    brokered.host_unix_stream_peer_uid = Some(wrong_uid);
+    brokered.host_unix_stream_peer_gid = Some(actual_gid);
+
+    let result = run(&brokered);
+    drop(listener);
+    let _ = std::fs::remove_file(&socket_path);
+    match result.unwrap_err() {
+        SandboxError::SetupFailed(message) => {
+            assert!(message.contains("peer credentials mismatch"));
+        }
+        other => panic!("unexpected peer-credential mismatch result: {other}"),
+    }
 }
 
 #[test]

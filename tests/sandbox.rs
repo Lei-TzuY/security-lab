@@ -163,6 +163,8 @@ fn policy(mode: &str, extra_args: &[&str], syscalls: &[&str]) -> SandboxPolicy {
         working_dir: PathBuf::from("/work"),
         landlock_read_execute: Vec::new(),
         landlock_file_mutate: Vec::new(),
+        landlock_tcp_bind_ports: Vec::new(),
+        landlock_tcp_connect_ports: Vec::new(),
         loopback_enabled: false,
         host_loopback_tcp_port: None,
         host_loopback_tcp_target_fd: None,
@@ -606,6 +608,24 @@ fn enabled_loopback_supports_intra_sandbox_tcp() {
     local.loopback_enabled = true;
     local.wall_clock_milliseconds = Some(2000);
     assert_eq!(run(&local).unwrap(), ChildOutcome::Exited(0));
+}
+
+#[test]
+fn landlock_tcp_port_envelope_allows_declared_loopback_endpoint_and_denies_other_ports() {
+    let mut confined = policy(
+        "s",
+        &[],
+        &[
+            "execveat", "socket", "bind", "listen", "fork", "connect", "accept", "read", "write",
+            "close", "exit",
+        ],
+    );
+    confined.loopback_enabled = true;
+    confined.landlock_tcp_bind_ports = vec![42421];
+    confined.landlock_tcp_connect_ports = vec![42421];
+    confined.wall_clock_milliseconds = Some(2000);
+
+    assert_eq!(run(&confined).unwrap(), ChildOutcome::Exited(0));
 }
 
 #[test]

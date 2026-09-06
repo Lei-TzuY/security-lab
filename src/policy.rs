@@ -124,6 +124,10 @@ pub struct SandboxPolicy {
     /// Host pathname and target descriptor are all-or-nothing.
     pub host_unix_stream_path: Option<PathBuf>,
     pub host_unix_stream_target_fd: Option<u32>,
+    /// Optional exact peer UID/GID required on the connected host AF_UNIX stream.
+    /// The pair only narrows an already-declared host-UNIX broker.
+    pub host_unix_stream_peer_uid: Option<u32>,
+    pub host_unix_stream_peer_gid: Option<u32>,
     /// Optional launcher-brokered TCP listener bound only to host 127.0.0.1.
     /// The port and target descriptor must be specified together.
     pub host_loopback_tcp_listen_port: Option<u16>,
@@ -490,6 +494,26 @@ impl SandboxPolicy {
             _ => {
                 return Err(PolicyError::new(
                     "ipc.host_unix_stream_path and ipc.host_unix_stream_target_fd must be specified together",
+                ));
+            }
+        }
+
+        match (
+            self.host_unix_stream_peer_uid,
+            self.host_unix_stream_peer_gid,
+        ) {
+            (None, None) => {}
+            (Some(_), Some(_)) => {
+                if self.host_unix_stream_path.is_none() || self.host_unix_stream_target_fd.is_none()
+                {
+                    return Err(PolicyError::new(
+                        "ipc.host_unix_stream_peer_uid and ipc.host_unix_stream_peer_gid require a brokered host-UNIX stream endpoint",
+                    ));
+                }
+            }
+            _ => {
+                return Err(PolicyError::new(
+                    "ipc.host_unix_stream_peer_uid and ipc.host_unix_stream_peer_gid must be specified together",
                 ));
             }
         }
@@ -897,6 +921,8 @@ impl FromStr for SandboxPolicy {
         let mut host_ipv4_udp_target_fd = None;
         let mut host_unix_stream_path = None;
         let mut host_unix_stream_target_fd = None;
+        let mut host_unix_stream_peer_uid = None;
+        let mut host_unix_stream_peer_gid = None;
         let mut host_loopback_tcp_listen_port = None;
         let mut host_loopback_tcp_listen_target_fd = None;
         let mut readonly_volume_source = None;
@@ -1019,6 +1045,22 @@ impl FromStr for SandboxPolicy {
                 }
                 "ipc.host_unix_stream_target_fd" => set_once(
                     &mut host_unix_stream_target_fd,
+                    value.parse::<u32>().map_err(|_| {
+                        PolicyError::at(line_no, format!("{key} must be an unsigned integer"))
+                    })?,
+                    line_no,
+                    key,
+                )?,
+                "ipc.host_unix_stream_peer_uid" => set_once(
+                    &mut host_unix_stream_peer_uid,
+                    value.parse::<u32>().map_err(|_| {
+                        PolicyError::at(line_no, format!("{key} must be an unsigned integer"))
+                    })?,
+                    line_no,
+                    key,
+                )?,
+                "ipc.host_unix_stream_peer_gid" => set_once(
+                    &mut host_unix_stream_peer_gid,
                     value.parse::<u32>().map_err(|_| {
                         PolicyError::at(line_no, format!("{key} must be an unsigned integer"))
                     })?,
@@ -1257,6 +1299,8 @@ impl FromStr for SandboxPolicy {
             host_ipv4_udp_target_fd,
             host_unix_stream_path: host_unix_stream_path.map(PathBuf::from),
             host_unix_stream_target_fd,
+            host_unix_stream_peer_uid,
+            host_unix_stream_peer_gid,
             host_loopback_tcp_listen_port,
             host_loopback_tcp_listen_target_fd,
             readonly_volume_source: readonly_volume_source.map(PathBuf::from),
@@ -1529,6 +1573,8 @@ mod tests {
         assert_eq!(policy.host_ipv4_udp_target_fd, None);
         assert_eq!(policy.host_unix_stream_path, None);
         assert_eq!(policy.host_unix_stream_target_fd, None);
+        assert_eq!(policy.host_unix_stream_peer_uid, None);
+        assert_eq!(policy.host_unix_stream_peer_gid, None);
         assert!(policy.landlock_read_execute.is_empty());
         assert!(policy.landlock_file_mutate.is_empty());
         assert!(policy.landlock_device_ioctl.is_empty());
@@ -1943,6 +1989,35 @@ mod tests {
             Some(PathBuf::from("/run/security-lab.sock"))
         );
         assert_eq!(policy.host_unix_stream_target_fd, Some(14));
+    }
+
+    #[test]
+    fn parses_brokered_host_unix_peer_credentials() {
+        let base = volume_valid();
+        let text = format!(
+            "{base}\nipc.host_unix_stream_path = /run/security-lab.sock\nipc.host_unix_stream_target_fd = 14\nipc.host_unix_stream_peer_uid = 1000\nipc.host_unix_stream_peer_gid = 1001"
+        );
+        let policy: SandboxPolicy = text.parse().unwrap();
+        assert_eq!(policy.host_unix_stream_peer_uid, Some(1000));
+        assert_eq!(policy.host_unix_stream_peer_gid, Some(1001));
+    }
+
+    #[test]
+    fn rejects_incomplete_or_detached_host_unix_peer_credentials() {
+        let base = volume_valid();
+        let incomplete = format!(
+            "{base}\nipc.host_unix_stream_path = /run/security-lab.sock\nipc.host_unix_stream_target_fd = 14\nipc.host_unix_stream_peer_uid = 1000"
+        );
+        let error = incomplete.parse::<SandboxPolicy>().unwrap_err();
+        assert!(error.to_string().contains("must be specified together"));
+
+        let detached = format!(
+            "{base}\nipc.host_unix_stream_peer_uid = 1000\nipc.host_unix_stream_peer_gid = 1001"
+        );
+        let error = detached.parse::<SandboxPolicy>().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("require a brokered host-UNIX stream endpoint"));
     }
 
     #[test]

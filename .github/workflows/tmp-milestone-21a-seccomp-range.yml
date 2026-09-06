@@ -25,6 +25,34 @@ jobs:
           fi
       - name: Materialize production and deterministic evidence
         run: python3 .github/tmp-milestone-21a-seccomp-range.py production
+      - name: Allocate a distinct raw-fixture mode
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          sandbox = Path("tests/sandbox.rs")
+          text = sandbox.read_text()
+          anchor = "fn seccomp_argument_range_checks_unsigned_64_bit_boundaries_and_composes()"
+          start = text.index(anchor)
+          tail = text[start:]
+          old = 'policy("x", &[], &["execveat", "openat", "lseek", "close", "exit"])'
+          if tail.count(old) != 1:
+              raise SystemExit(f"range integration mode replacement expected once, got {tail.count(old)}")
+          tail = tail.replace(old, 'policy("y", &[], &["execveat", "openat", "lseek", "close", "exit"])', 1)
+          sandbox.write_text(text[:start] + tail)
+
+          probe = Path("tests/fixtures/probe.S")
+          text = probe.read_text()
+          old_comment = "#   x assert unsigned 64-bit inclusive seccomp range filtering on lseek offset"
+          if text.count(old_comment) != 1:
+              raise SystemExit("range fixture comment replacement mismatch")
+          text = text.replace(old_comment, "#   y assert unsigned 64-bit inclusive seccomp range filtering on lseek offset", 1)
+          old_dispatch = "    cmp $120, %al\n    je .seccomp_argument_range\n"
+          if text.count(old_dispatch) != 1:
+              raise SystemExit("range fixture dispatch replacement mismatch")
+          text = text.replace(old_dispatch, "    cmp $121, %al\n    je .seccomp_argument_range\n", 1)
+          probe.write_text(text)
+          PY
       - name: Format
         run: cargo fmt --all
       - name: Enable user namespace capability tests

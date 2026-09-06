@@ -219,7 +219,7 @@ Milestone 8 is sealed at this bounded laboratory scope. Do not farm extra mountp
 
 ### Slice 9A — policy-owned isolated loopback
 
-**Current verified candidate.** Adds real positive connectivity inside the private network namespace without attaching it to the host or an external network.
+**Status: complete on `main`.** Adds real positive connectivity inside the private network namespace without attaching it to the host or an external network.
 
 Acceptance evidence is executable:
 
@@ -233,10 +233,25 @@ Acceptance evidence is executable:
 
 Boundary: 9A controls only `lo` inside the already-isolated network namespace. It does not configure a veth, host bridge, host/external routes, DNS, NAT, endpoint allowlist, ingress, or egress.
 
+### Slice 9B — launcher-brokered host-loopback TCP endpoint
+
+**Current verified candidate.** Adds one explicit host endpoint object capability without attaching the target network namespace to the host.
+
+Acceptance evidence is executable:
+
+- policy accepts the all-or-nothing pair `network.host_loopback_tcp_port` / `network.host_loopback_tcp_target_fd`; the port is 1–65535, the fd is 3–63 and below `limit.open_files`, and collision with a `handle.*` target is rejected fail-closed;
+- before fork and before entering the sandbox network namespace, the trusted parent creates a `SOCK_CLOEXEC` IPv4 TCP socket and connects only to `127.0.0.1:<declared-port>`; connection failure is an explicit setup failure rather than a fallback;
+- the brokered socket participates in the existing collision-safe selected-object storage floor and is installed only into the direct target at the declared fd; host parent, bootstrap, and namespace PID 1 do not retain a launcher-owned copy while the target runs;
+- a host listener receives exact `brokered-host-loopback-ok` bytes written by the raw target through brokered fd 10;
+- in the same run, a fresh socket created by that target attempts the same host loopback port and must still fail with `ECONNREFUSED`, `ENETUNREACH`, or `EHOSTUNREACH`; seccomp `EPERM` or successful direct host reachability fails the oracle;
+- 9A default-down/intra-sandbox-loopback/host-separation evidence and all Milestones 1–8B regressions remain active; stable format/Clippy/full tests and the full Rust 1.74 suite are green.
+
+Boundary: 9B is one launcher-created, already-connected IPv4 TCP stream to host `127.0.0.1`. It does not provide arbitrary IP/hostname endpoints, DNS, UDP, ingress/listening exposure, veth/bridge/routes/NAT, TLS/application authentication, a general network ACL, or a separate parent-preparation connection deadline. The host service may observe the broker connection before later sandbox setup completes.
+
 ### Milestone 9 promotion rule
 
-After 9A integrates, do not farm loopback ports, protocol variants, or aliases. The next networking slice must add a materially different topology or host/external endpoint capability with explicit positive and negative executable evidence. Milestone 4A aggregate cgroup accounting remains blocked until real unprivileged cgroup-v2 delegation is available; supplementary-group isolation remains a separate user-namespace mapping problem.
+After 9B integrates, do not farm extra ports, target-fd aliases, or protocol-name variants around the same preconnected-socket mechanism. Further networking work must add a materially different endpoint/topology authority boundary with new executable evidence; otherwise promote to a different architectural frontier. Milestone 4A aggregate cgroup accounting remains blocked until real unprivileged cgroup-v2 delegation is available; supplementary-group isolation remains a separate user-namespace mapping problem.
 
 ## Later frontiers
 
-Supplementary-group isolation with a viable mapping architecture, broader/generalized persistent-volume policy, externally attached controlled networking, and delegated aggregate cgroup accounting remain separate evidence-backed frontiers. Do not add configuration-only names without executable kernel behavior and integration evidence.
+Supplementary-group isolation with a viable mapping architecture, broader/generalized persistent-volume policy, network authority beyond one preconnected host-loopback stream, and delegated aggregate cgroup accounting remain separate evidence-backed frontiers. Do not add configuration-only names without executable kernel behavior and integration evidence.

@@ -109,6 +109,12 @@ mod x86_64 {
     const PHASE_VOLUME_READONLY: u32 = 44;
     const PHASE_VOLUME_TARGET_PIN: u32 = 45;
     const PHASE_VOLUME_ATTACH: u32 = 46;
+    const PHASE_NETWORK_LOOPBACK: u32 = 47;
+
+    const SIOCGIFFLAGS: libc::c_ulong = 0x8913;
+    const SIOCSIFFLAGS: libc::c_ulong = 0x8914;
+    const IFF_UP: libc::c_short = 0x1;
+    const IFNAMSIZ: usize = 16;
 
     #[repr(C)]
     struct OpenHow {
@@ -123,6 +129,13 @@ mod x86_64 {
         attr_clr: u64,
         propagation: u64,
         userns_fd: u64,
+    }
+
+    #[repr(C, align(8))]
+    struct IfreqFlags {
+        name: [libc::c_char; IFNAMSIZ],
+        flags: libc::c_short,
+        _padding: [u8; 22],
     }
 
     #[repr(C)]
@@ -367,6 +380,7 @@ mod x86_64 {
         uid_map: Vec<u8>,
         gid_map: Vec<u8>,
         hostname: Vec<u8>,
+        loopback_enabled: bool,
     }
 
     impl PreparedLaunch {
@@ -555,6 +569,7 @@ mod x86_64 {
                 uid_map,
                 gid_map,
                 hostname,
+                loopback_enabled: policy.loopback_enabled,
             })
         }
     }
@@ -1109,6 +1124,10 @@ mod x86_64 {
             child_fail(launch_error, PHASE_HOSTNAME, seccomp.error_exit_syscall);
         }
 
+        if prepared.loopback_enabled {
+            enable_loopback_or_fail(launch_error, seccomp.error_exit_syscall);
+        }
+
         if libc::syscall(
             libc::SYS_mount,
             ptr::null::<libc::c_char>(),
@@ -1565,6 +1584,67 @@ mod x86_64 {
         }
     }
 
+    unsafe fn enable_loopback_or_fail(
+        launch_error: *mut LaunchErrorRecord,
+        error_exit_syscall: libc::c_long,
+    ) {
+        let socket_fd = libc::syscall(
+            libc::SYS_socket,
+            libc::AF_INET,
+            libc::SOCK_DGRAM | libc::SOCK_CLOEXEC,
+            0,
+        );
+        if socket_fd == -1 {
+            child_fail(launch_error, PHASE_NETWORK_LOOPBACK, error_exit_syscall);
+        }
+        let socket_fd = socket_fd as RawFd;
+
+        let mut request = IfreqFlags {
+            name: [0; IFNAMSIZ],
+            flags: 0,
+            _padding: [0; 22],
+        };
+        request.name[0] = b'l' as libc::c_char;
+        request.name[1] = b'o' as libc::c_char;
+
+        if libc::syscall(
+            libc::SYS_ioctl,
+            socket_fd,
+            SIOCGIFFLAGS,
+            &mut request as *mut IfreqFlags,
+        ) == -1
+        {
+            let errno = *libc::__errno_location();
+            libc::syscall(libc::SYS_close, socket_fd);
+            child_fail_errno(
+                launch_error,
+                PHASE_NETWORK_LOOPBACK,
+                errno,
+                error_exit_syscall,
+            );
+        }
+        request.flags |= IFF_UP;
+        if libc::syscall(
+            libc::SYS_ioctl,
+            socket_fd,
+            SIOCSIFFLAGS,
+            &request as *const IfreqFlags,
+        ) == -1
+        {
+            let errno = *libc::__errno_location();
+            libc::syscall(libc::SYS_close, socket_fd);
+            child_fail_errno(
+                launch_error,
+                PHASE_NETWORK_LOOPBACK,
+                errno,
+                error_exit_syscall,
+            );
+        }
+        if libc::syscall(libc::SYS_close, socket_fd) == -1 {
+            child_fail(launch_error, PHASE_NETWORK_LOOPBACK, error_exit_syscall);
+        }
+    }
+
     unsafe fn write_proc_file_or_fail(
         path: &'static [u8],
         data: &[u8],
@@ -1834,9 +1914,18 @@ mod x86_64 {
             record.errno,
             libc::EPERM | libc::EACCES | libc::ENOSYS | libc::ENODEV
         );
+        let loopback_unavailable = record.phase == PHASE_NETWORK_LOOPBACK
+            && matches!(
+                record.errno,
+                libc::EPERM | libc::EACCES | libc::ENOSYS | libc::ENODEV | libc::EOPNOTSUPP
+            );
         if namespace_unavailable || mount_boundary_unavailable {
             Err(SandboxError::UnsupportedPlatform(format!(
                 "required namespace/mount isolation is unavailable: {message}"
+            )))
+        } else if loopback_unavailable {
+            Err(SandboxError::UnsupportedPlatform(format!(
+                "policy-owned loopback networking is unavailable: {message}"
             )))
         } else {
             Err(SandboxError::SetupFailed(message))
@@ -1903,6 +1992,7 @@ mod x86_64 {
             PHASE_VOLUME_READONLY => "recursive read-only volume attributes",
             PHASE_VOLUME_TARGET_PIN => "persistent volume target pin",
             PHASE_VOLUME_ATTACH => "persistent volume mount attachment",
+            PHASE_NETWORK_LOOPBACK => "policy-owned loopback activation",
             _ => "unknown launch phase",
         };
         format!(
@@ -1941,6 +2031,9 @@ mod x86_64 {
             "ioctl" => libc::SYS_ioctl,
             "socket" => libc::SYS_socket,
             "connect" => libc::SYS_connect,
+            "accept" => libc::SYS_accept,
+            "bind" => libc::SYS_bind,
+            "listen" => libc::SYS_listen,
             "msgget" => libc::SYS_msgget,
             "pread64" => libc::SYS_pread64,
             "access" => libc::SYS_access,

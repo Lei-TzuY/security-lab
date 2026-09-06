@@ -12,6 +12,7 @@
 #   c fork a descendant, publish cancellation readiness on fd 9, then pause
 #   v read a declared persistent volume, prove it is read-only, and hide its host source path
 #   w write through a declared persistent volume while root and host source paths stay confined
+#   n prove policy-owned loopback supports positive intra-sandbox TCP
 #   F forbidden getpid; exits 77 only when seccomp returns -EPERM
 #   E validate sanitized environment
 #   C validate working directory against argv[2]
@@ -53,6 +54,8 @@ _start:
     je .readonly_volume
     cmp $119, %al
     je .writable_volume
+    cmp $110, %al
+    je .loopback_networking
     cmp $70, %al
     je .forbidden
     cmp $69, %al
@@ -351,6 +354,111 @@ _start:
     cmp $-2, %rax
     jne .fail33
 
+    xor %edi, %edi
+    jmp .exit
+
+.loopback_networking:
+    movw $2, network_addr(%rip)
+    movw $0xb8a5, network_addr+2(%rip)
+    movl $0x0100007f, network_addr+4(%rip)
+
+    mov $41, %eax
+    mov $2, %edi
+    mov $1, %esi
+    xor %edx, %edx
+    syscall
+    test %rax, %rax
+    js .fail34
+    mov %rax, %r12
+
+    mov $49, %eax
+    mov %r12, %rdi
+    lea network_addr(%rip), %rsi
+    mov $16, %edx
+    syscall
+    test %rax, %rax
+    js .fail34
+
+    mov $50, %eax
+    mov %r12, %rdi
+    mov $1, %esi
+    syscall
+    test %rax, %rax
+    js .fail34
+
+    mov $57, %eax
+    syscall
+    test %rax, %rax
+    js .fail34
+    jz .loopback_client
+
+    mov $43, %eax
+    mov %r12, %rdi
+    xor %esi, %esi
+    xor %edx, %edx
+    syscall
+    test %rax, %rax
+    js .fail34
+    mov %rax, %r13
+
+    xor %eax, %eax
+    mov %r13, %rdi
+    lea network_buffer(%rip), %rsi
+    mov $loopback_message_len, %edx
+    syscall
+    cmp $loopback_message_len, %rax
+    jne .fail34
+
+    lea network_buffer(%rip), %rdi
+    lea loopback_message(%rip), %rsi
+    mov $loopback_message_len, %ecx
+    repe cmpsb
+    jne .fail34
+
+    mov $3, %eax
+    mov %r13, %rdi
+    syscall
+    test %rax, %rax
+    js .fail34
+    mov $3, %eax
+    mov %r12, %rdi
+    syscall
+    test %rax, %rax
+    js .fail34
+    xor %edi, %edi
+    jmp .exit
+
+.loopback_client:
+    mov $41, %eax
+    mov $2, %edi
+    mov $1, %esi
+    xor %edx, %edx
+    syscall
+    test %rax, %rax
+    js .fail34
+    mov %rax, %r13
+
+    mov $42, %eax
+    mov %r13, %rdi
+    lea network_addr(%rip), %rsi
+    mov $16, %edx
+    syscall
+    test %rax, %rax
+    js .fail34
+
+    mov $1, %eax
+    mov %r13, %rdi
+    lea loopback_message(%rip), %rsi
+    mov $loopback_message_len, %edx
+    syscall
+    cmp $loopback_message_len, %rax
+    jne .fail34
+
+    mov $3, %eax
+    mov %r13, %rdi
+    syscall
+    test %rax, %rax
+    js .fail34
     xor %edi, %edi
     jmp .exit
 
@@ -1035,6 +1143,9 @@ _start:
     jmp .exit
 .fail33:
     mov $33, %edi
+    jmp .exit
+.fail34:
+    mov $34, %edi
 
 .exit:
     mov $60, %eax
@@ -1084,6 +1195,9 @@ writable_volume_output:
 writable_volume_message:
     .ascii "persistent-write\n"
 .set writable_volume_message_len, . - writable_volume_message
+loopback_message:
+    .ascii "loopback-ok"
+.set loopback_message_len, . - loopback_message
 deadline_message:
     .ascii "deadline target started\n"
 .set deadline_message_len, . - deadline_message
@@ -1114,5 +1228,7 @@ uts_buffer:
 .balign 16
 network_addr:
     .skip 16
+network_buffer:
+    .skip 32
 
 .section .note.GNU-stack,"",@progbits

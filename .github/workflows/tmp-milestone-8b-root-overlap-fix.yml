@@ -1,0 +1,43 @@
+name: materialize milestone 8B root overlap fix
+
+on:
+  push:
+    branches: [tmp-8b-root-overlap-fix]
+
+permissions:
+  contents: write
+
+jobs:
+  construct:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - name: Materialize candidate
+        run: python3 .github/tmp-milestone-8b-root-overlap-fix.py
+      - name: Format
+        run: cargo fmt --all
+      - name: Enable user namespace capability tests
+        run: |
+          if [ -e /proc/sys/kernel/unprivileged_userns_clone ]; then
+            sudo sysctl -w kernel.unprivileged_userns_clone=1
+          fi
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - name: Clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Test
+        run: cargo test --locked --all-targets --all-features
+      - name: Remove construction files and commit candidate tree
+        run: |
+          rm .github/tmp-milestone-8b-root-overlap-fix.py
+          rm .github/workflows/tmp-milestone-8b-root-overlap-fix.yml
+          git config user.name LeiZ
+          git config user.email 52287354+Lei-TzuY@users.noreply.github.com
+          git add -A
+          git commit -m "fix: reject persistent volume root overlap"
+          git push origin HEAD:tmp-8b-root-overlap-fix

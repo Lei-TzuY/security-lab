@@ -97,9 +97,8 @@ jobs:
                       )
                       os._exit(31)
 
-                  # Before UID/GID maps exist, do not perform procfs introspection
-                  # in the child. The trusted parent owns that observation and
-                  # helper-mapping phase, matching the proposed launcher design.
+                  # The child performs no procfs introspection until the trusted
+                  # parent has installed delegated UID/GID maps.
                   os.write(ready_w, b"R")
                   if os.read(go_r, 1) != b"G":
                       os._exit(34)
@@ -124,6 +123,10 @@ jobs:
                       os._exit(40)
                   if setgroups_state != "allow" or rc != 0 or after_groups:
                       os._exit(41)
+                  if any(child_ns[name] == host_ns[name] for name in child_ns):
+                      os._exit(48)
+                  if child_pid_for_children == host_pid_for_children:
+                      os._exit(49)
 
                   hostname = b"security-lab-groups"
                   if libc.sethostname(hostname, len(hostname)) != 0:
@@ -178,21 +181,15 @@ jobs:
               _, status = os.waitpid(pid, 0)
               raise SystemExit(f"child failed before mapping: {os.waitstatus_to_exitcode(status)}")
 
+          # Cross-process pid_for_children is intentionally not read here:
+          # before maps exist that procfs lookup may be hidden as ENOENT. The
+          # child proves the PID namespace transition itself after mapping.
           child_ns = ns_snapshot(f"/proc/{pid}/ns")
-          child_pid_for_children = os.readlink(f"/proc/{pid}/ns/pid_for_children")
-          print(
-              f"parent observed child namespaces={child_ns} "
-              f"pid_for_children={child_pid_for_children}",
-              flush=True,
-          )
+          print(f"parent observed child namespaces={child_ns}", flush=True)
           if any(child_ns[name] == host_ns[name] for name in child_ns):
               os.kill(pid, signal.SIGKILL)
               os.waitpid(pid, 0)
               raise SystemExit("combined namespace transition was incomplete")
-          if child_pid_for_children == host_pid_for_children:
-              os.kill(pid, signal.SIGKILL)
-              os.waitpid(pid, 0)
-              raise SystemExit("PID-for-children namespace did not change")
 
           uid_cmd = ["newuidmap", str(pid), "0", str(host_uid), "1", "1", str(subuid), "1"]
           gid_cmd = ["newgidmap", str(pid), "0", str(host_gid), "1", "1", str(subgid), "1"]

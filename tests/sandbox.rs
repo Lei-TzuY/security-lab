@@ -132,6 +132,8 @@ fn policy(mode: &str, extra_args: &[&str], syscalls: &[&str]) -> SandboxPolicy {
         environment: BTreeMap::new(),
         working_dir: PathBuf::from("/work"),
         loopback_enabled: false,
+        host_loopback_tcp_port: None,
+        host_loopback_tcp_target_fd: None,
         readonly_volume_source: None,
         readonly_volume_target: None,
         writable_volume_source: None,
@@ -381,6 +383,32 @@ fn network_namespace_cannot_reach_host_loopback_listener() {
     isolated.wall_clock_milliseconds = Some(2000);
 
     assert_eq!(run(&isolated).unwrap(), ChildOutcome::Exited(0));
+}
+
+#[test]
+fn brokered_host_loopback_tcp_exposes_one_endpoint_without_rejoining_host_network() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind brokered host listener");
+    let address = listener
+        .local_addr()
+        .expect("read brokered host listener address");
+    let port = address.port().to_string();
+
+    let mut brokered = policy(
+        "p",
+        &[port.as_str()],
+        &["execveat", "write", "close", "socket", "connect", "exit"],
+    );
+    brokered.host_loopback_tcp_port = Some(address.port());
+    brokered.host_loopback_tcp_target_fd = Some(10);
+    brokered.wall_clock_milliseconds = Some(2000);
+
+    assert_eq!(run(&brokered).unwrap(), ChildOutcome::Exited(0));
+    let (peer, _) = listener
+        .accept()
+        .expect("accept brokered target connection");
+    let mut marker = [0u8; 25];
+    read_exact_fd(peer.as_raw_fd(), &mut marker);
+    assert_eq!(&marker, b"brokered-host-loopback-ok");
 }
 
 #[test]

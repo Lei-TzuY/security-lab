@@ -14,6 +14,7 @@
 #   w write through a declared persistent volume while root and host source paths stay confined
 #   n prove policy-owned loopback supports positive intra-sandbox TCP
 #   o prove loopback remains down unless policy explicitly enables it
+#   p write through a brokered host-loopback TCP fd while direct host reachability stays isolated
 #   F forbidden getpid; exits 77 only when seccomp returns -EPERM
 #   E validate sanitized environment
 #   C validate working directory against argv[2]
@@ -59,6 +60,8 @@ _start:
     je .loopback_networking
     cmp $111, %al
     je .loopback_disabled
+    cmp $112, %al
+    je .brokered_host_loopback
     cmp $70, %al
     je .forbidden
     cmp $69, %al
@@ -495,6 +498,85 @@ _start:
     syscall
     test %rax, %rax
     js .fail35
+    xor %edi, %edi
+    jmp .exit
+
+.brokered_host_loopback:
+    mov $1, %eax
+    mov $10, %edi
+    lea brokered_host_message(%rip), %rsi
+    mov $brokered_host_message_len, %edx
+    syscall
+    cmp $brokered_host_message_len, %rax
+    jne .fail36
+
+    mov $3, %eax
+    mov $10, %edi
+    syscall
+    test %rax, %rax
+    js .fail36
+
+    mov 24(%rsp), %rdi
+    test %rdi, %rdi
+    je .fail36
+    xor %r12d, %r12d
+.brokered_port_parse_loop:
+    movzbl (%rdi), %eax
+    test %al, %al
+    je .brokered_port_parsed
+    sub $48, %eax
+    cmp $9, %eax
+    ja .fail36
+    imul $10, %r12d, %r12d
+    add %eax, %r12d
+    cmp $65535, %r12d
+    ja .fail36
+    inc %rdi
+    jmp .brokered_port_parse_loop
+.brokered_port_parsed:
+    test %r12d, %r12d
+    je .fail36
+    movw $2, network_addr(%rip)
+    rolw $8, %r12w
+    movw %r12w, network_addr+2(%rip)
+    movl $0x0100007f, network_addr+4(%rip)
+
+    mov $41, %eax
+    mov $2, %edi
+    mov $1, %esi
+    xor %edx, %edx
+    syscall
+    test %rax, %rax
+    js .fail36
+    mov %rax, %r13
+
+    mov $42, %eax
+    mov %r13, %rdi
+    lea network_addr(%rip), %rsi
+    mov $16, %edx
+    syscall
+    test %rax, %rax
+    jns .brokered_unexpected_reachability
+    cmp $-111, %rax
+    je .brokered_direct_isolated
+    cmp $-101, %rax
+    je .brokered_direct_isolated
+    cmp $-113, %rax
+    je .brokered_direct_isolated
+    jmp .fail36
+
+.brokered_unexpected_reachability:
+    mov $3, %eax
+    mov %r13, %rdi
+    syscall
+    jmp .fail36
+
+.brokered_direct_isolated:
+    mov $3, %eax
+    mov %r13, %rdi
+    syscall
+    test %rax, %rax
+    js .fail36
     xor %edi, %edi
     jmp .exit
 
@@ -1185,6 +1267,9 @@ _start:
     jmp .exit
 .fail35:
     mov $35, %edi
+    jmp .exit
+.fail36:
+    mov $36, %edi
 
 .exit:
     mov $60, %eax
@@ -1237,6 +1322,9 @@ writable_volume_message:
 loopback_message:
     .ascii "loopback-ok"
 .set loopback_message_len, . - loopback_message
+brokered_host_message:
+    .ascii "brokered-host-loopback-ok"
+.set brokered_host_message_len, . - brokered_host_message
 deadline_message:
     .ascii "deadline target started\n"
 .set deadline_message_len, . - deadline_message

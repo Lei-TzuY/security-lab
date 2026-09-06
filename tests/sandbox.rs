@@ -216,6 +216,38 @@ fn writable_persistent_volume_mutates_only_declared_host_tree() {
 }
 
 #[test]
+fn persistent_volume_source_cannot_overlap_sandbox_root() {
+    let mut writable = policy("X", &[], &["execveat", "exit"]);
+    writable.writable_volume_source = Some(fixture_root().join("persist"));
+    writable.writable_volume_target = Some(PathBuf::from("/persist"));
+    match run(&writable).unwrap_err() {
+        SandboxError::InvalidPolicy(error) => {
+            assert!(error
+                .to_string()
+                .contains("must not overlap filesystem.root"));
+        }
+        other => panic!("unexpected writable root-overlap result: {other}"),
+    }
+
+    let mut readonly = policy("X", &[], &["execveat", "exit"]);
+    readonly.readonly_volume_source = Some(
+        fixture_root()
+            .parent()
+            .expect("fixture root has a parent")
+            .to_path_buf(),
+    );
+    readonly.readonly_volume_target = Some(PathBuf::from("/data"));
+    match run(&readonly).unwrap_err() {
+        SandboxError::InvalidPolicy(error) => {
+            assert!(error
+                .to_string()
+                .contains("must not overlap filesystem.root"));
+        }
+        other => panic!("unexpected read-only root-overlap result: {other}"),
+    }
+}
+
+#[test]
 fn selected_nonstdio_handle_is_exposed_only_at_declared_destination() {
     let mut pipe = [-1; 2];
     assert_eq!(

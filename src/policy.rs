@@ -154,6 +154,11 @@ impl SandboxPolicy {
             (Some(source), Some(target)) => {
                 validate_absolute_path("volume.readonly_source", source)?;
                 validate_absolute_path("volume.readonly_target", target)?;
+                if source.starts_with(&self.root_dir) || self.root_dir.starts_with(source) {
+                    return Err(PolicyError::new(
+                        "volume.readonly_source must not overlap filesystem.root",
+                    ));
+                }
                 if target == Path::new("/") {
                     return Err(PolicyError::new(
                         "volume.readonly_target must not replace the sandbox root",
@@ -184,9 +189,9 @@ impl SandboxPolicy {
             (Some(source), Some(target)) => {
                 validate_absolute_path("volume.writable_source", source)?;
                 validate_absolute_path("volume.writable_target", target)?;
-                if source == Path::new("/") {
+                if source.starts_with(&self.root_dir) || self.root_dir.starts_with(source) {
                     return Err(PolicyError::new(
-                        "volume.writable_source must not grant the host root",
+                        "volume.writable_source must not overlap filesystem.root",
                     ));
                 }
                 if target == Path::new("/") {
@@ -892,6 +897,10 @@ mod tests {
         seccomp.allow = execveat,read,write,exit_group
     "#;
 
+    fn volume_valid() -> String {
+        VALID.replace("filesystem.root = /", "filesystem.root = /sandbox/root")
+    }
+
     #[test]
     fn parses_complete_policy() {
         let policy: SandboxPolicy = VALID.parse().unwrap();
@@ -922,8 +931,9 @@ mod tests {
 
     #[test]
     fn parses_readonly_volume_pair() {
+        let base = volume_valid();
         let text =
-            format!("{VALID}\nvolume.readonly_source = /srv/data\nvolume.readonly_target = /data");
+            format!("{base}\nvolume.readonly_source = /srv/data\nvolume.readonly_target = /data");
         let policy: SandboxPolicy = text.parse().unwrap();
         assert_eq!(
             policy.readonly_volume_source,
@@ -934,31 +944,44 @@ mod tests {
 
     #[test]
     fn rejects_incomplete_or_unsafe_readonly_volume() {
-        let incomplete = format!("{VALID}\nvolume.readonly_source = /srv/data");
+        let base = volume_valid();
+        let incomplete = format!("{base}\nvolume.readonly_source = /srv/data");
         assert!(incomplete.parse::<SandboxPolicy>().is_err());
 
         let root_target =
-            format!("{VALID}\nvolume.readonly_source = /srv/data\nvolume.readonly_target = /");
+            format!("{base}\nvolume.readonly_source = /srv/data\nvolume.readonly_target = /");
         assert!(root_target.parse::<SandboxPolicy>().is_err());
 
         let relative_source =
-            format!("{VALID}\nvolume.readonly_source = relative\nvolume.readonly_target = /data");
+            format!("{base}\nvolume.readonly_source = relative\nvolume.readonly_target = /data");
         assert!(relative_source.parse::<SandboxPolicy>().is_err());
 
         let hides_cwd =
-            format!("{VALID}\nvolume.readonly_source = /srv/data\nvolume.readonly_target = /tmp");
+            format!("{base}\nvolume.readonly_source = /srv/data\nvolume.readonly_target = /tmp");
         assert!(hides_cwd.parse::<SandboxPolicy>().is_err());
 
         let overlaps_scratch = format!(
-            "{VALID}\nvolume.readonly_source = /srv/data\nvolume.readonly_target = /scratch/data"
+            "{base}\nvolume.readonly_source = /srv/data\nvolume.readonly_target = /scratch/data"
         );
         assert!(overlaps_scratch.parse::<SandboxPolicy>().is_err());
+
+        let source_inside_root = format!(
+            "{base}\nvolume.readonly_source = /sandbox/root/source\nvolume.readonly_target = /data"
+        );
+        let err = source_inside_root.parse::<SandboxPolicy>().unwrap_err();
+        assert!(err.to_string().contains("must not overlap filesystem.root"));
+
+        let source_contains_root =
+            format!("{base}\nvolume.readonly_source = /sandbox\nvolume.readonly_target = /data");
+        let err = source_contains_root.parse::<SandboxPolicy>().unwrap_err();
+        assert!(err.to_string().contains("must not overlap filesystem.root"));
     }
 
     #[test]
     fn parses_writable_volume_pair() {
+        let base = volume_valid();
         let text = format!(
-            "{VALID}\nvolume.writable_source = /srv/state\nvolume.writable_target = /persist"
+            "{base}\nvolume.writable_source = /srv/state\nvolume.writable_target = /persist"
         );
         let policy: SandboxPolicy = text.parse().unwrap();
         assert_eq!(
@@ -973,35 +996,47 @@ mod tests {
 
     #[test]
     fn rejects_incomplete_or_unsafe_writable_volume() {
-        let incomplete = format!("{VALID}\nvolume.writable_source = /srv/state");
+        let base = volume_valid();
+        let incomplete = format!("{base}\nvolume.writable_source = /srv/state");
         assert!(incomplete.parse::<SandboxPolicy>().is_err());
 
         let host_root =
-            format!("{VALID}\nvolume.writable_source = /\nvolume.writable_target = /persist");
+            format!("{base}\nvolume.writable_source = /\nvolume.writable_target = /persist");
         assert!(host_root.parse::<SandboxPolicy>().is_err());
 
         let root_target =
-            format!("{VALID}\nvolume.writable_source = /srv/state\nvolume.writable_target = /");
+            format!("{base}\nvolume.writable_source = /srv/state\nvolume.writable_target = /");
         assert!(root_target.parse::<SandboxPolicy>().is_err());
 
         let hides_cwd =
-            format!("{VALID}\nvolume.writable_source = /srv/state\nvolume.writable_target = /tmp");
+            format!("{base}\nvolume.writable_source = /srv/state\nvolume.writable_target = /tmp");
         assert!(hides_cwd.parse::<SandboxPolicy>().is_err());
 
         let overlaps_scratch = format!(
-            "{VALID}\nvolume.writable_source = /srv/state\nvolume.writable_target = /scratch/state"
+            "{base}\nvolume.writable_source = /srv/state\nvolume.writable_target = /scratch/state"
         );
         assert!(overlaps_scratch.parse::<SandboxPolicy>().is_err());
 
         let overlaps_readonly_target = format!(
-            "{VALID}\nvolume.readonly_source = /srv/data\nvolume.readonly_target = /data\nvolume.writable_source = /srv/state\nvolume.writable_target = /data/state"
+            "{base}\nvolume.readonly_source = /srv/data\nvolume.readonly_target = /data\nvolume.writable_source = /srv/state\nvolume.writable_target = /data/state"
         );
         assert!(overlaps_readonly_target.parse::<SandboxPolicy>().is_err());
 
         let overlaps_readonly_source = format!(
-            "{VALID}\nvolume.readonly_source = /srv/data\nvolume.readonly_target = /data\nvolume.writable_source = /srv/data/state\nvolume.writable_target = /persist"
+            "{base}\nvolume.readonly_source = /srv/data\nvolume.readonly_target = /data\nvolume.writable_source = /srv/data/state\nvolume.writable_target = /persist"
         );
         assert!(overlaps_readonly_source.parse::<SandboxPolicy>().is_err());
+
+        let source_inside_root = format!(
+            "{base}\nvolume.writable_source = /sandbox/root/state\nvolume.writable_target = /persist"
+        );
+        let err = source_inside_root.parse::<SandboxPolicy>().unwrap_err();
+        assert!(err.to_string().contains("must not overlap filesystem.root"));
+
+        let source_contains_root =
+            format!("{base}\nvolume.writable_source = /sandbox\nvolume.writable_target = /persist");
+        let err = source_contains_root.parse::<SandboxPolicy>().unwrap_err();
+        assert!(err.to_string().contains("must not overlap filesystem.root"));
     }
 
     #[test]

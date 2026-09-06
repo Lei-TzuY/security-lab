@@ -477,7 +477,7 @@ Boundary: 18A is exactly one preconnected filesystem-path AF_UNIX stream capabil
 
 ### Slice 19A — exact peer UID/GID for the host AF_UNIX broker
 
-**Current verified candidate.** Narrows the already-bounded 18A object capability with kernel-provided peer identity evidence before target authority exists.
+**Status: complete on `main`.** Narrows the already-bounded 18A object capability with kernel-provided peer identity evidence before target authority exists.
 
 Acceptance evidence is executable:
 
@@ -492,7 +492,28 @@ Boundary: `SO_PEERCRED` is Linux kernel credential metadata captured for the con
 
 ### Milestone 19 promotion rule
 
-After 19A integrates, seal peer UID/GID matching at this bounded scope. Do not farm PID/credential field variants around the same `SO_PEERCRED` query. Promote only to a materially different executable authority/enforcement frontier. Supplementary-group isolation and delegated cgroup accounting remain blocked on their documented prerequisites.
+19A is integrated; peer UID/GID matching is sealed at this bounded scope. Do not farm PID/credential field variants around the same `SO_PEERCRED` query. Promotion moves to a materially different executable authority/enforcement frontier. Supplementary-group isolation and delegated cgroup accounting remain blocked on their documented prerequisites.
+
+## Milestone 20 — Landlock pathname topology authority
+
+### Slice 20A — bounded directory/symlink/reparent mutation
+
+**Current verified candidate.** Extends the existing 10B regular-file mutation envelope with an explicit topology authority bitset rather than implicitly widening every writable directory.
+
+Acceptance evidence is executable:
+
+- repeatable `landlock.path_topology_mutate = <absolute-sandbox-directory>` entries are bounded to 32 unique non-root paths and each must exactly match a declared `landlock.file_mutate` directory; topology policy therefore cannot introduce a writable path that did not already pass the regular-file mutation surface checks;
+- the direct target reuses the same post-mount pinned Landlock path rule and adds only `LANDLOCK_ACCESS_FS_MAKE_DIR`, `REMOVE_DIR`, `MAKE_SYM`, and `REFER`; regular-file rights remain the 10B set and socket/FIFO/device creation rights are not granted;
+- target syscall authority remains independently explicit: `mkdir`, `rmdir`, `symlink`, and `rename` are recognized by the x86_64 seccomp compiler but are not auto-added to any allowlist;
+- a raw target creates and removes `/persist/allowed/newdir`, creates `/persist/allowed/newlink`, and renames `/persist/allowed/from/item` to `/persist/allowed/to/item`; host-side assertions prove exact renamed bytes and symlink target;
+- equivalent mkdir/symlink operations beneath `/persist/denied` and a rename from the allowed subtree into that denied sibling must return exact Landlock `EACCES`, while the trusted parent proves no denied-side objects were created;
+- the existing 10B file-mutation oracle and all Milestones 1–19A regressions remain active; stable format/Clippy/full tests and the full Rust 1.74 suite are green.
+
+Boundary: 20A is a narrow augmentation of an existing `landlock.file_mutate` directory. It does not grant socket/FIFO/device creation, general metadata mutation, filesystem alias/canonicalization proof, rights revocation for pre-opened descriptors, or a general mount/filesystem transaction model.
+
+### Milestone 20 promotion rule
+
+After 20A integrates, seal this bounded pathname-topology slice. Do not farm additional topology syscall spellings that map to the same Landlock rights. Promote to a materially different capability such as a broader routed network model only with explicit topology/endpoint evidence, or revisit blocked cgroup/supplementary-group work only when its environment/namespace prerequisites become real.
 
 ## Later frontiers
 

@@ -414,7 +414,7 @@ After 15A integrates, seal this single exact-address preconnected TCP broker. Do
 
 ### Slice 16A — exact numeric host-IPv4 UDP datagram broker
 
-**Current verified candidate.** Adds a connectionless/message-boundary-preserving transport capability rather than another TCP endpoint alias.
+**Status: complete on `main`.** Adds a connectionless/message-boundary-preserving transport capability rather than another TCP endpoint alias.
 
 Acceptance evidence is executable:
 
@@ -429,7 +429,28 @@ Boundary: 16A is one preconnected IPv4 UDP socket to an exact numeric endpoint. 
 
 ### Milestone 16 promotion rule
 
-After 16A integrates, seal the bounded exact-address preconnected IPv4 TCP/UDP broker family. Do not farm more address literals, ports, target-fd aliases, or trivial socket-type variants. Promote only to a materially different topology/resource/observability boundary with executable evidence.
+16A is integrated; seal the bounded exact-address preconnected IPv4 TCP/UDP broker family. Do not farm more address literals, ports, target-fd aliases, or trivial socket-type variants. Promotion is now a materially different resource/observability boundary.
+
+## Milestone 17 — launcher-owned resource observability
+
+### Slice 17A — process-tree resource usage report
+
+**Current verified candidate.** Converts resource data already owned by namespace PID 1 into an explicit post-mortem report without pretending to provide cgroup enforcement or benchmarking.
+
+Acceptance evidence is executable:
+
+- `RunReport` adds `ProcessTreeUsage { user_cpu_micros, system_cpu_micros, max_child_rss_kib }`, and the public re-export makes the telemetry part of the library report contract;
+- namespace PID 1 performs its existing direct-target wait and remaining-descendant kill/reap convergence first, then calls `getrusage(RUSAGE_CHILDREN)` and publishes all usage fields before lifecycle `ready`;
+- user/system CPU fields are cumulative waited-child CPU microseconds. On Linux, `max_child_rss_kib` deliberately names `RUSAGE_CHILDREN.ru_maxrss` as the largest child's peak RSS rather than a concurrent whole-tree memory high-water mark;
+- a statically linked raw target maps 8 MiB anonymous memory and faults every 4 KiB page using only explicit `mmap`/`exit` target grants; the completed report must expose at least 4096 KiB of `max_child_rss_kib`;
+- `run-json` carries all three resource fields as unsigned decimal integers while preserving the exact deterministic outcome/captured-output prefix instead of hard-coding nondeterministic CPU/RSS values;
+- stable format/Clippy/full tests and the full Rust 1.74 suite are green, with all Milestones 1–16A regressions retained.
+
+Boundary: 17A is post-mortem kernel observability only. It does not provide live sampling, per-process attribution, a deterministic performance benchmark, a concurrent process-tree RSS peak, cgroup-backed aggregate CPU/memory/I/O/process accounting, or any new resource limit/enforcement mechanism.
+
+### Milestone 17 promotion rule
+
+After 17A integrates, do not farm more `rusage` counters or output aliases. Promote only to a materially different enforceable resource boundary when prerequisites exist, or another independent authority/observability subsystem with executable evidence. Milestone 4A remains blocked until a real writable/delegated cgroup-v2 subtree is available to the unprivileged runtime user.
 
 ## Later frontiers
 

@@ -18,6 +18,29 @@ jobs:
           components: rustfmt, clippy
       - name: Materialize candidate
         run: python3 .github/tmp-milestone-10b-landlock-file-mutation.py
+      - name: Normalize MSRV-safe expressions
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("src/policy.rs")
+          text = p.read_text()
+          old = '''                let in_scratch = self
+                      .scratch_dir
+                      .as_ref()
+                      .map_or(false, |scratch| path == scratch);
+                  let in_writable_volume = self
+                      .writable_volume_target
+                      .as_ref()
+                      .map_or(false, |target| path.starts_with(target));'''
+          new = '''                let in_scratch = self.scratch_dir.as_ref() == Some(path);
+                  let in_writable_volume = self
+                      .writable_volume_target
+                      .as_ref()
+                      .is_some_and(|target| path.starts_with(target));'''
+          if text.count(old) != 1:
+              raise SystemExit(f"MSRV-safe normalization: expected one match, got {text.count(old)}")
+          p.write_text(text.replace(old, new, 1))
+          PY
       - name: Format
         run: cargo fmt --all
       - name: Enable user namespace capability tests

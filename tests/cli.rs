@@ -44,7 +44,11 @@ fn run_json_emits_deterministic_machine_report() {
     let _ = fs::remove_file(path);
 
     assert_eq!(output.status.code(), Some(0));
-    assert!(output.stderr.is_empty(), "unexpected stderr bytes: {:?}", output.stderr);
+    assert!(
+        output.stderr.is_empty(),
+        "unexpected stderr bytes: {:?}",
+        output.stderr
+    );
     assert_eq!(
         String::from_utf8(output.stdout).expect("JSON CLI stdout is UTF-8"),
         "{\"ok\":true,\"outcome\":{\"kind\":\"exited\",\"code\":0},\"stdout\":{\"encoding\":\"hex\",\"data\":\"68656c6c6f2066726f6d2073656375726974792d6c61620a\",\"truncated\":false},\"reaped_descendants\":0}\n"
@@ -61,7 +65,11 @@ fn run_command_keeps_human_readable_status_contract() {
     let _ = fs::remove_file(path);
 
     assert_eq!(output.status.code(), Some(0));
-    assert!(output.stderr.is_empty(), "unexpected stderr bytes: {:?}", output.stderr);
+    assert!(
+        output.stderr.is_empty(),
+        "unexpected stderr bytes: {:?}",
+        output.stderr
+    );
     assert_eq!(output.stdout, b"sandbox-result: exited code=0\n");
 }
 
@@ -75,11 +83,18 @@ fn run_json_reports_policy_errors_as_json() {
     let _ = fs::remove_file(path);
 
     assert_eq!(output.status.code(), Some(2));
-    assert!(output.stderr.is_empty(), "unexpected stderr bytes: {:?}", output.stderr);
+    assert!(
+        output.stderr.is_empty(),
+        "unexpected stderr bytes: {:?}",
+        output.stderr
+    );
     let stdout = String::from_utf8(output.stdout).expect("JSON CLI stdout is UTF-8");
     assert!(
         stdout.starts_with("{\"ok\":false,\"error\":{\"kind\":\"policy_rejected\",\"message\":"),
         "unexpected JSON error prefix: {stdout}"
     );
-    assert!(stdout.ends_with("}}\n"), "unexpected JSON error suffix: {stdout}");
+    assert!(
+        stdout.ends_with("}}\n"),
+        "unexpected JSON error suffix: {stdout}"
+    );
 }

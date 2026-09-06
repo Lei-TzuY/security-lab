@@ -119,6 +119,8 @@ mod x86_64 {
     const PHASE_LANDLOCK_RESTRICT: u32 = 51;
     const PHASE_LANDLOCK_NET_RULE: u32 = 52;
     const PHASE_PROCESS_TREE_USAGE: u32 = 53;
+    const PHASE_OUTPUT_LIMIT_PIDFD: u32 = 54;
+    const PHASE_OUTPUT_LIMIT_POLL: u32 = 55;
 
     const SYS_LANDLOCK_CREATE_RULESET: libc::c_long = 444;
     const SYS_LANDLOCK_ADD_RULE: libc::c_long = 445;
@@ -1132,7 +1134,61 @@ mod x86_64 {
         target_lifecycle: *mut TargetLifecycleRecord,
         capture_read_fd: RawFd,
         capture_write_fd: RawFd,
+        output_limit_fd: RawFd,
         wall_clock_milliseconds: u64,
+    }
+
+    fn create_output_limit_eventfd() -> Result<OwnedFd, SandboxError> {
+        let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
+        if fd == -1 {
+            let error = io::Error::last_os_error();
+            return if matches!(
+                error.raw_os_error(),
+                Some(libc::ENOSYS | libc::EINVAL | libc::EPERM | libc::EACCES)
+            ) {
+                Err(SandboxError::UnsupportedPlatform(format!(
+                    "stdout output-limit supervision requires eventfd support: {error}"
+                )))
+            } else {
+                Err(SandboxError::SetupFailed(format!(
+                    "cannot create stdout output-limit eventfd: {error}"
+                )))
+            };
+        }
+        move_parent_fd_above_stdio(OwnedFd(fd), "stdout output-limit eventfd")
+    }
+
+    fn signal_output_limit(fd: RawFd) -> Result<(), SandboxError> {
+        if fd < FIRST_NON_STDIO_FD as RawFd {
+            return Err(SandboxError::SetupFailed(
+                "stdout output-limit eventfd is unavailable".to_owned(),
+            ));
+        }
+        let value = 1u64;
+        loop {
+            let written = unsafe {
+                libc::write(
+                    fd,
+                    (&value as *const u64).cast::<libc::c_void>(),
+                    std::mem::size_of::<u64>(),
+                )
+            };
+            if written == std::mem::size_of::<u64>() as isize {
+                return Ok(());
+            }
+            if written == -1 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                return Err(SandboxError::SetupFailed(format!(
+                    "cannot signal stdout output-limit eventfd: {error}"
+                )));
+            }
+            return Err(SandboxError::SetupFailed(
+                "stdout output-limit eventfd accepted a short write".to_owned(),
+            ));
+        }
     }
 
     pub(crate) fn run_report(
@@ -1140,7 +1196,11 @@ mod x86_64 {
         cancellation: Option<&CancellationToken>,
     ) -> Result<RunReport, SandboxError> {
         ensure_fd_sanitization_supported()?;
-        ensure_supervision_support(policy.wall_clock_milliseconds, cancellation.is_some())?;
+        ensure_supervision_support(
+            policy.wall_clock_milliseconds,
+            cancellation.is_some(),
+            policy.stdout_total_bytes.is_some(),
+        )?;
         ensure_landlock_supported(policy)?;
         let prepared = PreparedLaunch::new(policy, cancellation)?;
         let seccomp = compile_seccomp(policy)?;
@@ -1150,6 +1210,11 @@ mod x86_64 {
                 "cannot allocate shared target lifecycle state: {err}"
             ))
         })?;
+        let output_limit_event = policy
+            .stdout_total_bytes
+            .map(|_| create_output_limit_eventfd())
+            .transpose()?;
+        let output_limit_fd = output_limit_event.as_ref().map_or(-1, |fd| fd.raw());
         let capture = if policy.stdio.stdout == StdioMode::Capture {
             Some(CapturePipe::new(policy.stdout_capture_bytes.ok_or_else(
                 || {
@@ -1168,6 +1233,7 @@ mod x86_64 {
             target_lifecycle: lifecycle.raw(),
             capture_read_fd,
             capture_write_fd,
+            output_limit_fd,
             wall_clock_milliseconds: policy.wall_clock_milliseconds.unwrap_or(0),
         };
 
@@ -1202,7 +1268,12 @@ mod x86_64 {
                 limit,
             } = pipe;
             drop(write_fd);
-            let result = read_capture(read_fd.raw(), limit);
+            let result = read_capture(
+                read_fd.raw(),
+                limit,
+                policy.stdout_total_bytes,
+                output_limit_fd,
+            );
             drop(read_fd);
             result
         });
@@ -1225,18 +1296,36 @@ mod x86_64 {
             )));
         }
 
-        let stdout = match capture_result {
-            Some(result) => Some(result?),
-            None => None,
+        let (stdout, output_limit_observed) = match capture_result {
+            Some(result) => {
+                let (captured, exceeded) = result?;
+                (Some(captured), exceeded)
+            }
+            None => (None, false),
         };
-        let outcome = match (lifecycle_record.timed_out, lifecycle_record.cancelled) {
-            (0, 0) => decode_wait_status(lifecycle_record.status)?,
-            (1, 0) => ChildOutcome::TimedOut,
-            (0, 1) => ChildOutcome::Cancelled,
-            (timed_out, cancelled) => {
-                return Err(SandboxError::SetupFailed(format!(
-                    "PID namespace lifecycle published invalid termination flags timed_out={timed_out} cancelled={cancelled}"
-                )));
+        let control_flags = lifecycle_record.timed_out
+            + lifecycle_record.cancelled
+            + lifecycle_record.output_limit_exceeded;
+        if control_flags > 1 {
+            return Err(SandboxError::SetupFailed(format!(
+                "PID namespace lifecycle published conflicting termination flags timed_out={} cancelled={} output_limit_exceeded={}",
+                lifecycle_record.timed_out,
+                lifecycle_record.cancelled,
+                lifecycle_record.output_limit_exceeded
+            )));
+        }
+        let outcome = if output_limit_observed || lifecycle_record.output_limit_exceeded == 1 {
+            ChildOutcome::OutputLimitExceeded
+        } else {
+            match (lifecycle_record.timed_out, lifecycle_record.cancelled) {
+                (0, 0) => decode_wait_status(lifecycle_record.status)?,
+                (1, 0) => ChildOutcome::TimedOut,
+                (0, 1) => ChildOutcome::Cancelled,
+                (timed_out, cancelled) => {
+                    return Err(SandboxError::SetupFailed(format!(
+                        "PID namespace lifecycle published invalid termination flags timed_out={timed_out} cancelled={cancelled}"
+                    )));
+                }
             }
         };
         Ok(RunReport {
@@ -1251,9 +1340,15 @@ mod x86_64 {
         })
     }
 
-    fn read_capture(fd: RawFd, limit: usize) -> Result<CapturedOutput, SandboxError> {
-        let mut bytes = Vec::with_capacity(limit.min(8192));
+    fn read_capture(
+        fd: RawFd,
+        retain_limit: usize,
+        total_limit: Option<u64>,
+        output_limit_fd: RawFd,
+    ) -> Result<(CapturedOutput, bool), SandboxError> {
+        let mut bytes = Vec::with_capacity(retain_limit.min(8192));
         let mut truncated = false;
+        let mut observed = 0u64;
         let mut buffer = [0u8; 8192];
 
         loop {
@@ -1273,15 +1368,21 @@ mod x86_64 {
             }
 
             let read = read as usize;
-            let remaining = limit.saturating_sub(bytes.len());
+            observed = observed.saturating_add(read as u64);
+            let remaining = retain_limit.saturating_sub(bytes.len());
             let retained = remaining.min(read);
             bytes.extend_from_slice(&buffer[..retained]);
             if retained < read {
                 truncated = true;
             }
+
+            if total_limit.is_some_and(|limit| observed > limit) {
+                signal_output_limit(output_limit_fd)?;
+                return Ok((CapturedOutput { bytes, truncated }, true));
+            }
         }
 
-        Ok(CapturedOutput { bytes, truncated })
+        Ok((CapturedOutput { bytes, truncated }, false))
     }
 
     fn cstring_bytes(label: &str, bytes: &[u8]) -> Result<CString, SandboxError> {
@@ -1436,16 +1537,21 @@ mod x86_64 {
     fn ensure_supervision_support(
         deadline: Option<u64>,
         cancellable: bool,
+        output_limited: bool,
     ) -> Result<(), SandboxError> {
-        if deadline.is_none() && !cancellable {
+        if deadline.is_none() && !cancellable && !output_limited {
             return Ok(());
         }
 
-        let purpose = match (deadline.is_some(), cancellable) {
-            (true, true) => "deadline/cancellation supervision",
-            (true, false) => "wall-clock deadline",
-            (false, true) => "external cancellation",
-            (false, false) => unreachable!(),
+        let purpose = if output_limited {
+            "stdout output-limit supervision"
+        } else {
+            match (deadline.is_some(), cancellable) {
+                (true, true) => "deadline/cancellation supervision",
+                (true, false) => "wall-clock deadline",
+                (false, true) => "external cancellation",
+                (false, false) => unreachable!(),
+            }
         };
         let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, libc::getpid(), 0u32) };
         if pidfd == -1 {
@@ -2044,6 +2150,7 @@ mod x86_64 {
             target_lifecycle,
             capture_read_fd,
             capture_write_fd,
+            output_limit_fd,
             wall_clock_milliseconds,
         } = control;
         if capture_read_fd >= FIRST_NON_STDIO_FD as RawFd && libc::close(capture_read_fd) == -1 {
@@ -2282,6 +2389,7 @@ mod x86_64 {
             launch_error,
             wall_clock_milliseconds,
             prepared.cancellation_fd.as_ref().map_or(-1, |fd| fd.raw()),
+            output_limit_fd,
             TargetSupervisionPhases {
                 fork: PHASE_TARGET_FORK,
                 kill: PHASE_PROCESS_TREE_KILL,
@@ -2293,6 +2401,8 @@ mod x86_64 {
                 poll: PHASE_DEADLINE_POLL,
                 cancellation_pidfd: PHASE_CANCELLATION_PIDFD,
                 cancellation_poll: PHASE_CANCELLATION_POLL,
+                output_limit_pidfd: PHASE_OUTPUT_LIMIT_PIDFD,
+                output_limit_poll: PHASE_OUTPUT_LIMIT_POLL,
                 usage: PHASE_PROCESS_TREE_USAGE,
             },
         );
@@ -2987,6 +3097,8 @@ mod x86_64 {
             PHASE_LANDLOCK_RESTRICT => "Landlock self restriction",
             PHASE_LANDLOCK_NET_RULE => "Landlock TCP port rule installation",
             PHASE_PROCESS_TREE_USAGE => "process-tree resource usage collection",
+            PHASE_OUTPUT_LIMIT_PIDFD => "stdout output-limit pidfd supervision",
+            PHASE_OUTPUT_LIMIT_POLL => "stdout output-limit supervision poll",
             _ => "unknown launch phase",
         };
         format!(

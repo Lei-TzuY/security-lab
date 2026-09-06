@@ -11,6 +11,7 @@
 #   y assert unsigned 64-bit inclusive seccomp range filtering on lseek offset
 #   G assert one selected non-stdio handle is remapped without ambient FD leakage
 #   c fork a descendant, publish cancellation readiness on fd 9, then pause
+#   g fork a paused descendant and continuously emit stdout until launcher output budget terminates the tree
 #   v read a declared persistent volume, prove it is read-only, and hide its host source path
 #   w write through a declared persistent volume while root and host source paths stay confined
 #   n prove policy-owned loopback supports positive intra-sandbox TCP
@@ -65,6 +66,8 @@ _start:
     je .selected_handle
     cmp $99, %al
     je .cancellation_tree
+    cmp $103, %al
+    je .stdout_output_budget_tree
     cmp $118, %al
     je .readonly_volume
     cmp $119, %al
@@ -357,6 +360,31 @@ _start:
     jmp .parse_handle_fd_loop
 .parse_handle_fd_done:
     ret
+
+.stdout_output_budget_tree:
+    mov $57, %eax
+    syscall
+    test %rax, %rax
+    js .fail22
+    jz .stdout_output_budget_descendant
+
+.stdout_output_budget_write:
+    mov $1, %eax
+    mov $1, %edi
+    lea capture_chunk(%rip), %rsi
+    mov $64, %edx
+    syscall
+    cmp $64, %rax
+    je .stdout_output_budget_write
+.stdout_output_budget_parent_pause:
+    mov $34, %eax
+    syscall
+    jmp .stdout_output_budget_parent_pause
+
+.stdout_output_budget_descendant:
+    mov $34, %eax
+    syscall
+    jmp .stdout_output_budget_descendant
 
 .cancellation_tree:
     mov $57, %eax

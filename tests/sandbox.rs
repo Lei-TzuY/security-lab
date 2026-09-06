@@ -316,6 +316,7 @@ fn policy(mode: &str, extra_args: &[&str], syscalls: &[&str]) -> SandboxPolicy {
         selected_handles: BTreeMap::new(),
         stdout_redirect: None,
         stdout_capture_bytes: None,
+        stdout_total_bytes: None,
         wall_clock_milliseconds: None,
         limits: ResourceLimits {
             cpu_seconds: 2,
@@ -874,6 +875,24 @@ fn uncancelled_token_preserves_natural_completion() {
 }
 
 #[test]
+fn stdout_total_budget_owns_process_tree_teardown() {
+    let mut limited = policy("g", &[], &["execveat", "write", "fork", "pause", "exit"]);
+    limited.stdio.stdout = StdioMode::Capture;
+    limited.stdout_capture_bytes = Some(1024);
+    limited.stdout_total_bytes = Some(4096);
+    // Watchdog only bounds a broken regression; output-limit ownership should
+    // win long before this timer becomes ready.
+    limited.wall_clock_milliseconds = Some(5000);
+
+    let report = run_report(&limited).expect("stdout-budget sandbox run failed");
+    assert_eq!(report.outcome, ChildOutcome::OutputLimitExceeded);
+    assert_eq!(report.reaped_descendants, 1);
+    let captured = report.stdout.expect("capture result missing");
+    assert_eq!(captured.bytes.len(), 1024);
+    assert!(captured.truncated);
+}
+
+#[test]
 fn network_namespace_cannot_reach_host_loopback_listener() {
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind host loopback listener");
     let address = listener.local_addr().expect("read host listener address");
@@ -1302,6 +1321,7 @@ fn bounded_stdout_capture_drains_excess_without_deadlock() {
     let mut captured = policy("V", &[], &["execveat", "write", "exit"]);
     captured.stdio.stdout = StdioMode::Capture;
     captured.stdout_capture_bytes = Some(1024);
+    assert_eq!(captured.stdout_total_bytes, None);
 
     let report = run_report(&captured).unwrap();
     assert_eq!(report.outcome, ChildOutcome::Exited(0));

@@ -6,7 +6,7 @@ use security_lab::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CString;
-use std::net::{TcpListener, TcpStream};
+use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
@@ -263,6 +263,9 @@ fn policy(mode: &str, extra_args: &[&str], syscalls: &[&str]) -> SandboxPolicy {
         loopback_enabled: false,
         host_loopback_tcp_port: None,
         host_loopback_tcp_target_fd: None,
+        host_ipv4_tcp_address: None,
+        host_ipv4_tcp_port: None,
+        host_ipv4_tcp_target_fd: None,
         host_loopback_tcp_listen_port: None,
         host_loopback_tcp_listen_target_fd: None,
         readonly_volume_source: None,
@@ -713,6 +716,62 @@ fn brokered_host_loopback_tcp_exposes_one_endpoint_without_rejoining_host_networ
     let mut marker = [0u8; 25];
     read_exact_fd(peer.as_raw_fd(), &mut marker);
     assert_eq!(&marker, b"brokered-host-loopback-ok");
+}
+
+#[test]
+fn brokered_host_ipv4_tcp_selects_exact_address_on_shared_port() {
+    const PORT_ACQUIRE_ATTEMPTS: usize = 32;
+    let mut listeners = None;
+    for _ in 0..PORT_ACQUIRE_ATTEMPTS {
+        let other =
+            TcpListener::bind(("127.0.0.1", 0)).expect("bind first address-aware broker listener");
+        let port = other
+            .local_addr()
+            .expect("read address-aware broker port")
+            .port();
+        match TcpListener::bind(("127.0.0.2", port)) {
+            Ok(selected) => {
+                listeners = Some((other, selected, port));
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => continue,
+            Err(error) => panic!("bind selected address-aware broker listener: {error}"),
+        }
+    }
+    let (other, selected, port) =
+        listeners.expect("acquire one port on two host loopback addresses");
+    other
+        .set_nonblocking(true)
+        .expect("set other address listener nonblocking");
+    selected
+        .set_nonblocking(true)
+        .expect("set selected address listener nonblocking");
+
+    let port_text = port.to_string();
+    let mut brokered = policy(
+        "p",
+        &[port_text.as_str()],
+        &["execveat", "write", "close", "socket", "connect", "exit"],
+    );
+    brokered.host_ipv4_tcp_address = Some(Ipv4Addr::new(127, 0, 0, 2));
+    brokered.host_ipv4_tcp_port = Some(port);
+    brokered.host_ipv4_tcp_target_fd = Some(10);
+    brokered.wall_clock_milliseconds = Some(2000);
+
+    assert_eq!(run(&brokered).unwrap(), ChildOutcome::Exited(0));
+
+    let (peer, _) = selected
+        .accept()
+        .expect("selected host IPv4 listener must receive brokered connection");
+    let mut marker = [0u8; 25];
+    read_exact_fd(peer.as_raw_fd(), &mut marker);
+    assert_eq!(&marker, b"brokered-host-loopback-ok");
+
+    match other.accept() {
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+        Err(error) => panic!("unexpected other-address accept error: {error}"),
+        Ok(_) => panic!("brokered connection reached the wrong host IPv4 address"),
+    }
 }
 
 #[test]

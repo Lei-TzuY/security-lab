@@ -25,6 +25,7 @@ mod x86_64 {
     };
     use std::ffi::CString;
     use std::io;
+    use std::net::Ipv4Addr;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::io::RawFd;
     use std::path::{Path, PathBuf};
@@ -339,25 +340,27 @@ mod x86_64 {
         })
     }
 
-    fn connect_host_loopback_tcp(
+    fn connect_host_tcp_ipv4(
+        address: Ipv4Addr,
         port: u16,
         target_fd: u32,
         storage_floor: RawFd,
+        broker_label: &str,
     ) -> Result<PreparedSelectedHandle, SandboxError> {
         let socket_fd =
             unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
         if socket_fd == -1 {
             return Err(SandboxError::SetupFailed(format!(
-                "cannot create brokered host-loopback TCP socket: {}",
+                "cannot create brokered {broker_label} TCP socket: {}",
                 io::Error::last_os_error()
             )));
         }
         let socket_fd = OwnedFd(socket_fd);
-        let address = libc::sockaddr_in {
+        let address_struct = libc::sockaddr_in {
             sin_family: libc::AF_INET as libc::sa_family_t,
             sin_port: port.to_be(),
             sin_addr: libc::in_addr {
-                s_addr: u32::from_ne_bytes([127, 0, 0, 1]),
+                s_addr: u32::from_ne_bytes(address.octets()),
             },
             sin_zero: [0; 8],
         };
@@ -365,7 +368,7 @@ mod x86_64 {
             let connected = unsafe {
                 libc::connect(
                     socket_fd.raw(),
-                    (&address as *const libc::sockaddr_in).cast::<libc::sockaddr>(),
+                    (&address_struct as *const libc::sockaddr_in).cast::<libc::sockaddr>(),
                     std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
                 )
             };
@@ -377,18 +380,30 @@ mod x86_64 {
                 continue;
             }
             return Err(SandboxError::SetupFailed(format!(
-                "cannot connect brokered host-loopback TCP endpoint 127.0.0.1:{port}: {error}"
+                "cannot connect brokered {broker_label} TCP endpoint {address}:{port}: {error}"
             )));
         }
-        let storage_fd = move_owned_fd_to_selected_storage(
-            socket_fd,
-            storage_floor,
-            "brokered host-loopback TCP socket",
-        )?;
+        let storage_label = format!("brokered {broker_label} TCP socket");
+        let storage_fd =
+            move_owned_fd_to_selected_storage(socket_fd, storage_floor, &storage_label)?;
         Ok(PreparedSelectedHandle {
             storage_fd,
             target_fd: target_fd as RawFd,
         })
+    }
+
+    fn connect_host_loopback_tcp(
+        port: u16,
+        target_fd: u32,
+        storage_floor: RawFd,
+    ) -> Result<PreparedSelectedHandle, SandboxError> {
+        connect_host_tcp_ipv4(
+            Ipv4Addr::new(127, 0, 0, 1),
+            port,
+            target_fd,
+            storage_floor,
+            "host-loopback",
+        )
     }
 
     fn listen_host_loopback_tcp(
@@ -634,6 +649,7 @@ mod x86_64 {
                 .keys()
                 .copied()
                 .chain(policy.host_loopback_tcp_target_fd.iter().copied())
+                .chain(policy.host_ipv4_tcp_target_fd.iter().copied())
                 .chain(policy.host_loopback_tcp_listen_target_fd.iter().copied())
                 .max()
                 .map_or(FIRST_NON_STDIO_FD as RawFd, |target_fd| {
@@ -648,6 +664,11 @@ mod x86_64 {
             let mut selected_handles = Vec::with_capacity(
                 policy.selected_handles.len()
                     + if policy.host_loopback_tcp_target_fd.is_some() {
+                        1
+                    } else {
+                        0
+                    }
+                    + if policy.host_ipv4_tcp_target_fd.is_some() {
                         1
                     } else {
                         0
@@ -678,6 +699,27 @@ mod x86_64 {
                 _ => {
                     return Err(SandboxError::InvalidPolicy(PolicyError::new(
                         "network.host_loopback_tcp_port and network.host_loopback_tcp_target_fd must be specified together",
+                    )));
+                }
+            }
+            match (
+                policy.host_ipv4_tcp_address,
+                policy.host_ipv4_tcp_port,
+                policy.host_ipv4_tcp_target_fd,
+            ) {
+                (Some(address), Some(port), Some(target_fd)) => {
+                    selected_handles.push(connect_host_tcp_ipv4(
+                        address,
+                        port,
+                        target_fd,
+                        selected_storage_floor,
+                        "host-IPv4",
+                    )?)
+                }
+                (None, None, None) => {}
+                _ => {
+                    return Err(SandboxError::InvalidPolicy(PolicyError::new(
+                        "network.host_ipv4_tcp_address, network.host_ipv4_tcp_port, and network.host_ipv4_tcp_target_fd must be specified together",
                     )));
                 }
             }

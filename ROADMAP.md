@@ -235,7 +235,7 @@ Boundary: 9A controls only `lo` inside the already-isolated network namespace. I
 
 ### Slice 9B — launcher-brokered host-loopback TCP endpoint
 
-**Current verified candidate.** Adds one explicit host endpoint object capability without attaching the target network namespace to the host.
+**Status: complete on `main`.** Adds one explicit host endpoint object capability without attaching the target network namespace to the host.
 
 Acceptance evidence is executable:
 
@@ -251,6 +251,27 @@ Boundary: 9B is one launcher-created, already-connected IPv4 TCP stream to host 
 ### Milestone 9 promotion rule
 
 After 9B integrates, do not farm extra ports, target-fd aliases, or protocol-name variants around the same preconnected-socket mechanism. Further networking work must add a materially different endpoint/topology authority boundary with new executable evidence; otherwise promote to a different architectural frontier. Milestone 4A aggregate cgroup accounting remains blocked until real unprivileged cgroup-v2 delegation is available; supplementary-group isolation remains a separate user-namespace mapping problem.
+
+## Milestone 10 — pathname access narrowing
+
+### Slice 10A — Landlock read/execute envelope
+
+**Current verified candidate.** Adds a kernel-enforced pathname access layer inside the already-constructed sandbox filesystem rather than another mount or networking variant.
+
+Acceptance evidence is executable:
+
+- repeatable `landlock.read_execute = <absolute-sandbox-path>` entries are bounded to 32, reject `/`, duplicates, relative paths, and policies that do not cover the initial executable; an empty list preserves the pre-10A behavior;
+- parent preparation fail-closed verifies each declared path beneath the pinned root as a regular file or directory and preallocates sandbox-relative path data before fork;
+- when requested, the runtime queries Landlock support rather than silently dropping the restriction; known unavailable-kernel results are reported as unsupported and other setup errors fail closed;
+- the direct target creates a ruleset handling only `EXECUTE`, `READ_FILE`, and `READ_DIR`, reopens declared paths against the final mounted root, stores the ruleset descriptor above all target-visible descriptor destinations, applies `PR_SET_NO_NEW_PRIVS`, then calls `landlock_restrict_self` before target seccomp and pinned `execveat`;
+- the raw target reads exact `landlock-allowed\n` bytes from a declared `/landlock-allowed/marker`, while a real `/landlock-denied/secret` that remains present in the same chroot returns exact `EACCES`; seccomp grants `openat` and therefore cannot masquerade as the pathname denial;
+- all Milestones 1–9B regressions remain active; stable format/Clippy/full tests and the full Rust 1.74 suite are green.
+
+Boundary: 10A is a read/execute pathname envelope only. It does not attenuate already-open stdio/selected/brokered object capabilities, does not add write/create/remove Landlock policy, does not prove filesystem aliases/canonicalization or subtree immutability, and is not a production multi-tenant container boundary.
+
+### Milestone 10 promotion rule
+
+After 10A integrates, do not farm extra path-count limits or equivalent read/execute aliases. Further Landlock work must add a materially different executable authority dimension, such as an intentionally designed mutation envelope with interactions against scratch/persistent volumes, or the project should promote to another independent frontier.
 
 ## Later frontiers
 

@@ -15,6 +15,9 @@ pub(super) struct TargetLifecycleRecord {
     pub(super) reaped_descendants: u32,
     pub(super) timed_out: u32,
     pub(super) cancelled: u32,
+    pub(super) user_cpu_micros: u64,
+    pub(super) system_cpu_micros: u64,
+    pub(super) max_child_rss_kib: u64,
     pub(super) ready: u32,
 }
 
@@ -48,6 +51,9 @@ impl SharedTargetLifecycle {
                     reaped_descendants: 0,
                     timed_out: 0,
                     cancelled: 0,
+                    user_cpu_micros: 0,
+                    system_cpu_micros: 0,
+                    max_child_rss_kib: 0,
                     ready: 0,
                 },
             );
@@ -122,6 +128,7 @@ pub(super) struct TargetSupervisionPhases {
     pub(super) poll: u32,
     pub(super) cancellation_pidfd: u32,
     pub(super) cancellation_poll: u32,
+    pub(super) usage: u32,
 }
 
 /// Called by the launcher-owned namespace init (PID 1). Fork the direct target.
@@ -164,6 +171,11 @@ pub(super) unsafe fn become_direct_target_or_reap(
         phases,
     );
     let reaped_descendants = kill_and_reap_remaining(launch_error, phases.kill, phases.reap);
+    let (user_cpu_micros, system_cpu_micros, max_child_rss_kib) = match collect_process_tree_usage()
+    {
+        Ok(usage) => usage,
+        Err(errno) => fail_errno(launch_error, phases.usage, errno),
+    };
 
     ptr::write_volatile(ptr::addr_of_mut!((*lifecycle).status), direct_status);
     ptr::write_volatile(
@@ -177,6 +189,18 @@ pub(super) unsafe fn become_direct_target_or_reap(
     ptr::write_volatile(
         ptr::addr_of_mut!((*lifecycle).cancelled),
         u32::from(cancelled),
+    );
+    ptr::write_volatile(
+        ptr::addr_of_mut!((*lifecycle).user_cpu_micros),
+        user_cpu_micros,
+    );
+    ptr::write_volatile(
+        ptr::addr_of_mut!((*lifecycle).system_cpu_micros),
+        system_cpu_micros,
+    );
+    ptr::write_volatile(
+        ptr::addr_of_mut!((*lifecycle).max_child_rss_kib),
+        max_child_rss_kib,
     );
     // Publish readiness last: the host treats ready != 1 as an incomplete
     // process-tree lifecycle and fails closed.
@@ -333,6 +357,44 @@ unsafe fn terminate_direct_target(
         Ok(status) => status,
         Err(errno) => fail_errno(launch_error, phases.reap, errno),
     }
+}
+
+unsafe fn collect_process_tree_usage() -> Result<(u64, u64, u64), i32> {
+    let mut usage = std::mem::zeroed::<libc::rusage>();
+    let result = libc::syscall(
+        libc::SYS_getrusage,
+        libc::RUSAGE_CHILDREN,
+        &mut usage as *mut libc::rusage,
+    );
+    if result == -1 {
+        return Err(*libc::__errno_location());
+    }
+    let max_child_rss_kib = if usage.ru_maxrss > 0 {
+        usage.ru_maxrss as u64
+    } else {
+        0
+    };
+    Ok((
+        timeval_to_micros(usage.ru_utime),
+        timeval_to_micros(usage.ru_stime),
+        max_child_rss_kib,
+    ))
+}
+
+fn timeval_to_micros(value: libc::timeval) -> u64 {
+    let seconds = if value.tv_sec > 0 {
+        value.tv_sec as u64
+    } else {
+        0
+    };
+    let micros = if value.tv_usec > 0 {
+        value.tv_usec as u64
+    } else {
+        0
+    };
+    seconds
+        .saturating_mul(1_000_000)
+        .saturating_add(micros.min(999_999))
 }
 
 unsafe fn close_nonstdio_except(keep_fd: libc::c_int) -> Result<(), i32> {

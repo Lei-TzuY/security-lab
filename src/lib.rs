@@ -16,7 +16,7 @@ pub use policy::{
     PolicyError, ResourceLimits, SandboxPolicy, SeccompArgRule, SeccompPolicy, StdioMode,
     StdioPolicy,
 };
-pub use report::{CapturedOutput, ChildOutcome, RunReport};
+pub use report::{CapturedOutput, ChildOutcome, ProcessTreeUsage, RunReport};
 
 #[derive(Debug)]
 pub enum SandboxError {

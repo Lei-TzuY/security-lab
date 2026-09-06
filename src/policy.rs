@@ -331,7 +331,7 @@ impl SandboxPolicy {
             (None, None, None) => {}
             (Some(address), Some(port), Some(target_fd)) => {
                 let octets = address.octets();
-                if octets == [0, 0, 0, 0] || octets[0] >= 224 {
+                if octets[0] == 0 || octets[0] >= 224 {
                     return Err(PolicyError::new(
                         "network.host_ipv4_tcp_address must be a unicast IPv4 address",
                     ));
@@ -1200,7 +1200,7 @@ fn parse_ipv4_address(value: &str, line: usize, key: &str) -> Result<Ipv4Addr, P
         .parse::<Ipv4Addr>()
         .map_err(|_| PolicyError::at(line, format!("{key} must be a numeric IPv4 address")))?;
     let octets = address.octets();
-    if octets == [0, 0, 0, 0] || octets[0] >= 224 {
+    if octets[0] == 0 || octets[0] >= 224 {
         return Err(PolicyError::at(
             line,
             format!("{key} must be a unicast IPv4 address"),
@@ -1642,7 +1642,13 @@ mod tests {
         );
         assert!(incomplete.parse::<SandboxPolicy>().is_err());
 
-        for address in ["example.com", "0.0.0.0", "224.0.0.1", "255.255.255.255"] {
+        for address in [
+            "example.com",
+            "0.0.0.0",
+            "0.1.2.3",
+            "224.0.0.1",
+            "255.255.255.255",
+        ] {
             let text = format!(
                 "{VALID}\nnetwork.host_ipv4_tcp_address = {address}\nnetwork.host_ipv4_tcp_port = 8080\nnetwork.host_ipv4_tcp_target_fd = 12"
             );

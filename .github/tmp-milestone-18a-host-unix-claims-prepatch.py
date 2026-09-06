@@ -10,15 +10,27 @@ def replace_one(path: str, old: str, new: str, label: str) -> None:
     p.write_text(text.replace(old, new, 1))
 
 
-# The 17A telemetry paragraph extends the generic evidence preamble. Keep the
-# main claims script exact-match based, but align its expected source string.
+# The 17A telemetry paragraph extends the generic evidence preamble. Patch the
+# unique replace_one block in the construction script rather than matching the
+# shorter source literal, which also appears inside that block's replacement.
 script = Path(".github/tmp-milestone-18a-host-unix-claims.py")
 text = script.read_text()
-old = "The integration probe is statically linked with `-nostdlib` and uses raw Linux x86_64 syscalls. The full suite runs on stable Rust and Rust 1.74.\\n\\nEvidence includes:\\n"
-new = "The integration probe is statically linked with `-nostdlib` and uses raw Linux x86_64 syscalls. The full suite runs on stable Rust and Rust 1.74. Milestone 17A adds a raw mode that `mmap`s 8 MiB anonymously and faults every 4 KiB page; the parent requires `max_child_rss_kib >= 4096`, while CLI integration validates the stable JSON structure plus unsigned-decimal telemetry fields without pretending live CPU/RSS values are deterministic.\\n\\nEvidence includes:\\n"
-if text.count(old) != 1:
-    raise SystemExit(f"claims evidence marker: expected exactly one match, got {text.count(old)}")
-script.write_text(text.replace(old, new, 1))
+old_block = r'''replace_one(
+    "THREAT_MODEL.md",
+    "The integration probe is statically linked with `-nostdlib` and uses raw Linux x86_64 syscalls. The full suite runs on stable Rust and Rust 1.74.\n\nEvidence includes:\n",
+    "The integration probe is statically linked with `-nostdlib` and uses raw Linux x86_64 syscalls. The full suite runs on stable Rust and Rust 1.74.\n\nEvidence includes:\n\n- an exact host-path AF_UNIX broker oracle: a trusted host listener accepts the launcher-created stream, exchanges exact request/reply bytes with target fd 10, and the raw target then independently creates a fresh AF_UNIX stream socket and requires `ENOENT` when trying the same original host pathname from inside the chroot;\n",
+    "threat UNIX broker evidence",
+)'''
+new_block = r'''replace_one(
+    "THREAT_MODEL.md",
+    "The integration probe is statically linked with `-nostdlib` and uses raw Linux x86_64 syscalls. The full suite runs on stable Rust and Rust 1.74. Milestone 17A adds a raw mode that `mmap`s 8 MiB anonymously and faults every 4 KiB page; the parent requires `max_child_rss_kib >= 4096`, while CLI integration validates the stable JSON structure plus unsigned-decimal telemetry fields without pretending live CPU/RSS values are deterministic.\n\nEvidence includes:\n",
+    "The integration probe is statically linked with `-nostdlib` and uses raw Linux x86_64 syscalls. The full suite runs on stable Rust and Rust 1.74. Milestone 17A adds a raw mode that `mmap`s 8 MiB anonymously and faults every 4 KiB page; the parent requires `max_child_rss_kib >= 4096`, while CLI integration validates the stable JSON structure plus unsigned-decimal telemetry fields without pretending live CPU/RSS values are deterministic.\n\nEvidence includes:\n\n- an exact host-path AF_UNIX broker oracle: a trusted host listener accepts the launcher-created stream, exchanges exact request/reply bytes with target fd 10, and the raw target then independently creates a fresh AF_UNIX stream socket and requires `ENOENT` when trying the same original host pathname from inside the chroot;\n",
+    "threat UNIX broker evidence",
+)'''
+count = text.count(old_block)
+if count != 1:
+    raise SystemExit(f"claims evidence block: expected exactly one match, got {count}")
+script.write_text(text.replace(old_block, new_block, 1))
 
 # Close stale Threat Model bookkeeping that predates already-integrated phases.
 replace_one(

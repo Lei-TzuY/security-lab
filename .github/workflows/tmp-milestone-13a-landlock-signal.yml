@@ -57,7 +57,9 @@ jobs:
               raise SystemExit(f'unscoped oracle block matches={text.count(old)}')
           p.write_text(text.replace(old, new, 1))
           PY
-      - name: Format
+      - name: Format generated Rust
+        run: cargo fmt --all
+      - name: Verify format
         run: cargo fmt --all -- --check
       - name: Enable user namespace capability tests
         run: |

@@ -136,7 +136,7 @@ Milestone 5A is sealed on `main`; do not farm identical argument masks across un
 
 ### Slice 6A — selected non-stdio handle passing
 
-**Current verified candidate.** Add an explicit launch-time object-capability surface without reopening ambient descriptor inheritance.
+**Status: complete on `main`.** Adds an explicit launch-time object-capability surface without reopening ambient descriptor inheritance.
 
 Acceptance evidence is executable:
 
@@ -152,8 +152,31 @@ Boundary: 6A is a deliberate grant of an already-open kernel object. It does not
 
 ### Milestone 6 promotion rule
 
-After 6A integrates, do not farm more descriptor numbers or object types merely to repeat the same remap path. Promote to a different executable boundary such as an external cancellation/control-plane primitive, evidence-backed persistent-volume policy, or controlled networking.
+Milestone 6A is sealed on `main`; do not farm more descriptor numbers or object types merely to repeat the same remap path.
+
+## Milestone 7 — external control plane
+
+### Slice 7A — external cancellation
+
+**Current verified candidate.** Add a caller-owned one-way cancellation primitive that integrates with launcher-owned PID 1 process-tree supervision without exposing the control descriptor to the target.
+
+Acceptance evidence is executable:
+
+- `CancellationToken` is cloneable and backed by `eventfd(EFD_CLOEXEC | EFD_NONBLOCK)` on Linux; signalling is one-way and readiness remains persistent because the launcher never drains the eventfd;
+- `run_report_with_cancel` / `run_with_cancel` add cancellable execution without changing existing `run_report` / `run` behavior;
+- the launcher pins a cancellation duplicate before fork, bootstrap closes it, namespace PID 1 alone retains it for supervision, and the direct target closes its copy before stdio/rlimit/capability/seccomp/exec setup;
+- PID 1 polls target pidfd, optional deadline timerfd, and optional cancellation eventfd with one deterministic arbitration rule: natural target exit > explicit cancellation > deadline;
+- cancellation ownership reports `ChildOutcome::Cancelled`, remains distinct from `TimedOut` and ordinary target signals, then reuses the owned process-tree kill/reap path before lifecycle readiness;
+- a raw target forks one paused descendant, publishes `cancellation-target-ready\n` through selected fd 9, and pauses. The parent reads the exact marker before signalling cancellation, then observes `Cancelled` and exactly one reaped descendant;
+- a separate uncancelled-token run preserves the fast target's natural `Exited(42)` outcome;
+- stable format/Clippy/full tests and the full Rust 1.74 suite remain green.
+
+Boundary: 7A is one-way cancellation only. It does not provide token reset/rearm, arbitrary signal forwarding, a bidirectional control protocol, or a bound on total latency from public API entry to termination.
+
+### Milestone 7 promotion rule
+
+After 7A integrates, do not farm cancellation aliases, signal numbers, or alternate wake primitives that repeat the same ownership path. Promote to a materially different executable boundary such as evidence-backed persistent-volume policy or controlled networking. Milestone 4A remains blocked on real unprivileged cgroup-v2 delegation, and supplementary-group isolation still requires a different user-namespace mapping architecture.
 
 ## Later frontiers
 
-External asynchronous cancellation, supplementary-group isolation with a viable mapping architecture, broader persistent-volume policy, and controlled networking remain separate evidence-backed frontiers. Do not add configuration-only names without executable kernel behavior and integration evidence.
+Supplementary-group isolation with a viable mapping architecture, broader persistent-volume policy, and controlled networking remain separate evidence-backed frontiers. Do not add configuration-only names without executable kernel behavior and integration evidence.

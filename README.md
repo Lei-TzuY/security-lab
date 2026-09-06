@@ -1,6 +1,6 @@
 # security-lab
 
-`security-lab` is a correctness-first systems-security laboratory. Milestone 1 established a bounded Linux process sandbox; Milestone 2 sealed ambient descriptor, launch, filesystem/identity, stdio, redirection, and bounded-capture authority; Milestone 3 sealed PID-tree lifecycle ownership plus a launcher-owned monotonic wall-clock deadline; Milestones 4B–4C added isolated Linux network and IPC namespace baselines; Milestone 4D added owned UTS nodename identity; and Milestone 5A added full-64-bit masked numeric seccomp argument narrowing. The current Milestone 6A candidate adds **explicit selected non-stdio handle passing**: the launcher may pin an already-open non-directory object before fork and expose it only at one declared target descriptor while undeclared descriptors remain sanitized. The project is **not** a penetration-testing toolkit, malware framework, container runtime, or production multi-tenant isolation boundary.
+`security-lab` is a correctness-first systems-security laboratory. Milestone 1 established a bounded Linux process sandbox; Milestone 2 sealed ambient descriptor, launch, filesystem/identity, stdio, redirection, and bounded-capture authority; Milestone 3 sealed PID-tree lifecycle ownership plus a launcher-owned monotonic wall-clock deadline; Milestones 4B–4C added isolated Linux network and IPC namespace baselines; Milestone 4D added owned UTS nodename identity; and Milestone 5A added full-64-bit masked numeric seccomp argument narrowing. Milestone 6A added **explicit selected non-stdio handle passing** without reopening ambient descriptor inheritance. The current Milestone 7A candidate adds **caller-owned external cancellation**: a cloneable one-way token can ask launcher-owned PID 1 to terminate and reap the sandbox process tree while the token itself remains outside target authority. The project is **not** a penetration-testing toolkit, malware framework, container runtime, or production multi-tenant isolation boundary.
 
 ## Current sandbox pipeline
 
@@ -12,12 +12,12 @@ The Linux x86_64 implementation launches one direct target under an explicit pol
 4. **Optional writable scratch** overlays one declared sandbox directory with a bounded private `nosuid,nodev,noexec` tmpfs.
 5. **Owned stdout redirection/capture** may map stdout to a private-scratch file or a launcher-created `pipe2(O_CLOEXEC)`. Temporary sources remain launcher-owned and do not survive as extra target descriptors.
 6. **PID-namespace lifecycle split** forks the first process in the new PID namespace as launcher-owned PID 1. That init forks the direct target as PID 2. PID 1 stays outside target stdio/rlimit/capability/seccomp setup.
-7. **Optional deadline supervision** after forking the target, PID 1 closes inherited setup descriptors, opens a pidfd for the direct target, creates and arms a `CLOCK_MONOTONIC` timerfd, and polls pidfd + timerfd. The timer starts at this supervision point; it is not a claim about total host-side launch latency before the target fork.
-8. **Deterministic deadline race** whenever supervision wakes, PID 1 first performs one `wait4(target, WNOHANG)`. If the direct target is already waitable, natural termination wins. Otherwise, when the timer is readable, deadline ownership begins; PID 1 sends `SIGKILL` to the direct target and the result is reported as `ChildOutcome::TimedOut`, not as an ordinary target signal.
+7. **Optional deadline/cancellation supervision** after forking the target, PID 1 closes inherited setup descriptors, opens a pidfd whenever deadline or external cancellation supervision is active, optionally creates and arms a `CLOCK_MONOTONIC` timerfd, and optionally retains the launcher-pinned cancellation eventfd. The direct target closes the cancellation control descriptor before stdio/rlimit/capability/seccomp/exec setup, so the token is not a target capability.
+8. **Deterministic supervision race** whenever supervision wakes, PID 1 first performs one `wait4(target, WNOHANG)`. If the direct target is already waitable, natural termination wins. Otherwise a readable cancellation eventfd wins before a simultaneously readable deadline timer; PID 1 terminates the direct target and reports `ChildOutcome::Cancelled` or `ChildOutcome::TimedOut` according to the winning control path.
 9. **Target enforcement** the direct target alone applies explicit stdio, installs declared selected handles with `dup3`, then applies rlimits, capability reduction, `no_new_privs`, default-deny seccomp, and pinned `execveat`. Optional `seccomp.arg.<syscall>.<0..5>` rules further narrow already-allowed syscalls with full 64-bit masked-equality checks. Handle installation is launcher setup before target seccomp and does not add `dup3` to `seccomp.allow`; later operations on an exposed object still require the corresponding target syscalls. A policy may explicitly grant target `socket`/`connect`, but those syscalls execute inside the isolated network namespace.
-10. **Owned process-tree teardown** after natural target termination or deadline termination, PID 1 repeatedly sends `SIGKILL` to remaining namespace processes and reaps children with `wait4` until `ECHILD`. It then publishes raw target wait status, timeout ownership, and the number of additional descendants reaped.
-11. **Bounded stdout capture** the host parent drains capture before waiting for bootstrap completion, retains only the declared byte ceiling, and discards excess bytes. A deadline can still fire while that host drain is blocking because deadline enforcement lives in PID 1; killing/reaping the target tree closes remaining capture writers and lets EOF converge.
-12. **Reporting** `run_report()` returns `Exited(code)`, `Signaled(signal)`, or `TimedOut`, plus captured stdout and `reaped_descendants`. The compatibility `run()` path returns the same `ChildOutcome`. The CLI maps `TimedOut` to exit status 124.
+10. **Owned process-tree teardown** after natural target termination, deadline termination, or external cancellation, PID 1 repeatedly sends `SIGKILL` to remaining namespace processes and reaps children with `wait4` until `ECHILD`. It then publishes raw target wait status, timeout/cancellation ownership, and the number of additional descendants reaped.
+11. **Bounded stdout capture** the host parent drains capture before waiting for bootstrap completion, retains only the declared byte ceiling, and discards excess bytes. Deadline or external cancellation can still fire while that host drain is blocking because supervision lives in PID 1; terminating/reaping the target tree closes remaining capture writers and lets EOF converge.
+12. **Reporting** `run_report()` / `run_report_with_cancel()` return `Exited(code)`, `Signaled(signal)`, `TimedOut`, or `Cancelled`, plus captured stdout and `reaped_descendants`. The compatibility status-only APIs return the same `ChildOutcome`. The CLI maps `TimedOut` to exit status 124 and `Cancelled` to 130.
 13. **Deterministic tests** use a statically linked raw-syscall x86_64 probe so syscall grants and observed behavior remain reviewable.
 
 ## Security invariants
@@ -35,8 +35,10 @@ For successful launch on a supported Linux x86_64 host:
 - If no wall-clock deadline is declared, natural completion semantics remain unchanged.
 - If a wall-clock deadline is declared, the runtime preflights required pidfd/timerfd kernel support before launch. Unsupported or denied mandatory mechanisms return an explicit unsupported/setup failure rather than silently dropping the deadline.
 - The deadline uses `CLOCK_MONOTONIC`, is armed by PID 1 after the direct-target fork and PID1 descriptor cleanup, and has one documented natural-exit/timeout arbitration point.
-- `TimedOut` is distinct from `Signaled(SIGKILL)`, even though `SIGKILL` is the kernel mechanism used after deadline ownership is established.
-- After either natural or timeout termination, PID 1 kills/reaps remaining descendants before lifecycle readiness is published.
+- `TimedOut` and `Cancelled` are distinct from `Signaled(SIGKILL)`, even though `SIGKILL` is the kernel mechanism used after either launcher control path wins.
+- `CancellationToken` is cloneable and one-way: once any clone calls `cancel()`, its eventfd remains readable and later cancellable runs using that token observe the already-cancelled state. The launcher pins a duplicate before fork, bootstrap drops it, PID 1 alone retains it for supervision, and the direct target closes it before untrusted execution.
+- Supervision arbitration is natural exit > explicit cancellation > deadline when readiness is observed in one poll cycle.
+- After natural, timeout, or cancelled termination, PID 1 kills/reaps remaining descendants before lifecycle readiness is published.
 - Undeclared inherited descriptors >= 3 do not survive successful target exec. Only policy-selected target descriptors are deliberately made non-`CLOEXEC`; their original source descriptor numbers and unrelated inherited high descriptors remain absent after exec.
 - `handle.<target_fd> = <source_fd>` grants an already-open kernel object capability, not a pathname. The launcher rejects directory descriptor sources, pins the source before fork, installs it only in the direct target, and does not retain its own duplicate in the host parent, bootstrap, or namespace PID 1 while the target runs.
 - stdin/stderr support explicit `inherit` or `closed`; stdout supports `inherit`, `closed`, `redirect`, or `capture`.
@@ -84,14 +86,16 @@ limit.open_files = 32
 seccomp.allow = execveat,read,write,close,fstat,lseek,mmap,mprotect,munmap,brk,rt_sigaction,rt_sigprocmask,rt_sigreturn,pread64,access,madvise,arch_prctl,set_tid_address,set_robust_list,prlimit64,getrandom,openat,newfstatat,exit,exit_group
 ```
 
-Library callers can distinguish deadline termination directly:
+Library callers can distinguish natural exit, deadline termination, and caller-requested cancellation. Existing `run` / `run_report` APIs remain unchanged; cancellable runs use `run_with_cancel` / `run_report_with_cancel`:
 
 ```rust
-let report = security_lab::run_report(&policy)?;
+let cancellation = security_lab::CancellationToken::new()?;
+let worker_token = cancellation.clone();
+// Another thread may call `cancellation.cancel()` after an application-defined readiness event.
+let report = security_lab::run_report_with_cancel(&policy, &worker_token)?;
 match report.outcome {
-    security_lab::ChildOutcome::TimedOut => {
-        // The launcher-owned monotonic deadline won the termination race.
-    }
+    security_lab::ChildOutcome::TimedOut => println!("deadline"),
+    security_lab::ChildOutcome::Cancelled => println!("cancelled"),
     security_lab::ChildOutcome::Exited(code) => println!("exit {code}"),
     security_lab::ChildOutcome::Signaled(signal) => println!("signal {signal}"),
 }
@@ -112,13 +116,14 @@ Linux x86_64 integration tests prove that:
 - a raw target observes `getpid() == 2` and `getppid() == 1`;
 - 3A kills/reaps a descendant that retains stdout after natural direct-target exit;
 - the 3B raw target writes `deadline target started\n`, forks a descendant that blocks indefinitely in `pause()`, and keeps the direct target alive for five seconds. With a **1,000 ms** policy deadline, the launcher returns `TimedOut`, reaps exactly one additional descendant, retains the exact marker, and reaches capture EOF;
-- a fast raw target under a **5,000 ms** deadline still reports its natural `Exited(42)` outcome.
+- a fast raw target under a **5,000 ms** deadline still reports its natural `Exited(42)` outcome;
+- external-cancellation evidence uses an exact readiness pipe rather than a sleep: the raw target forks one descendant, writes `cancellation-target-ready\n` through selected fd 9, and pauses. Only after the parent reads the full marker does it call `CancellationToken::cancel()`. PID 1 reports `Cancelled`, reaps exactly one descendant, and an uncancelled token separately preserves a fast target's natural `Exited(42)` result.
 
 The probe is assembled with `cc -nostdlib -static`, so supported integration tests require a native Linux x86_64 C toolchain.
 
 ## Platform support
 
-Real enforcement is implemented only for **Linux x86_64**. Required mechanisms include `openat2`, `open_tree`, `mount_setattr`, `move_mount`, tmpfs, user/mount/PID/network/IPC/UTS namespaces, `sethostname`, UID/GID maps, capability operations, `close_range`, `pipe2`, `dup2`, seccomp, `execveat`, shared anonymous mappings, `fork`, `kill`, `wait4`, and `waitpid`. Selected handles additionally use `fcntl(F_DUPFD_CLOEXEC)`, `fstat`, and `dup3`. When a wall-clock deadline is declared, `pidfd_open`, `timerfd_create`/`timerfd_settime`, `CLOCK_MONOTONIC`, and `poll` are additionally required.
+Real enforcement is implemented only for **Linux x86_64**. Required mechanisms include `openat2`, `open_tree`, `mount_setattr`, `move_mount`, tmpfs, user/mount/PID/network/IPC/UTS namespaces, `sethostname`, UID/GID maps, capability operations, `close_range`, `pipe2`, `dup2`, seccomp, `execveat`, shared anonymous mappings, `fork`, `kill`, `wait4`, and `waitpid`. Selected handles additionally use `fcntl(F_DUPFD_CLOEXEC)`, `fstat`, and `dup3`. When a wall-clock deadline is declared, `pidfd_open`, `timerfd_create`/`timerfd_settime`, `CLOCK_MONOTONIC`, and `poll` are additionally required. External cancellation additionally requires `eventfd`; cancellable supervision also uses `pidfd_open` and `poll`.
 
 If mandatory kernel primitives are unavailable or denied, launch returns an explicit unsupported/setup failure rather than dropping the requested boundary. CI enables the required user-namespace settings on its disposable Ubuntu runner so the real enforcement path is exercised rather than skipped.
 
@@ -130,7 +135,7 @@ This remains an educational sandbox, not a production container boundary. In par
 - the launcher creates an isolated network namespace but does **not** configure veth devices, routes, DNS, an endpoint allowlist, or a controlled egress path. This is a network-isolation baseline, not a complete network-policy subsystem;
 - only stdout has launcher-owned redirect/capture modes;
 - the capture ceiling bounds retained bytes, not total bytes the target can write;
-- `limit.wall_clock_milliseconds` is a launcher-owned deadline, **not** an externally-triggerable asynchronous cancellation handle or API;
+- external cancellation is a one-way launcher control primitive, not a resettable/rearmable token, arbitrary signal-forwarding API, general control RPC, or guarantee on end-to-end cancellation latency from API entry;
 - the deadline begins at PID1 supervision after the direct-target fork, not at initial API entry, and does not claim to bound all parent-side preparation latency;
 - `reaped_descendants` is not a total process-creation counter or process-limit/accounting mechanism;
 - there is no cgroup aggregate CPU/memory/process accounting or process-count quota. The current GitHub-hosted CI runner exposes cgroup v2 and the `pids` controller but does not delegate a writable child cgroup to the unprivileged workflow user, so cgroup-backed claims remain blocked rather than mocked;

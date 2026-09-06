@@ -1,12 +1,12 @@
-# Milestones 1–6A threat model
+# Milestones 1–7A threat model
 
 ## Purpose
 
-`security-lab` is an educational, correctness-first Linux sandbox. Milestone 1 established syscall/resource/environment controls; Milestone 2 sealed ambient descriptor, launch, filesystem/identity, stdio, redirection, and bounded-capture authority; Milestone 3 sealed PID-tree lifecycle ownership plus a policy-owned monotonic wall-clock deadline; Milestones 4B–4D added network/IPC/UTS namespace and identity baselines; and Milestone 5A added masked numeric syscall-argument constraints. The current Milestone 6A candidate adds explicit launch-time selected non-stdio object capabilities without reopening ambient descriptor inheritance. Every claimed property must correspond to a kernel mechanism and executable evidence.
+`security-lab` is an educational, correctness-first Linux sandbox. Milestone 1 established syscall/resource/environment controls; Milestone 2 sealed ambient descriptor, launch, filesystem/identity, stdio, redirection, and bounded-capture authority; Milestone 3 sealed PID-tree lifecycle ownership plus a policy-owned monotonic wall-clock deadline; Milestones 4B–4D added network/IPC/UTS namespace and identity baselines; Milestone 5A added masked numeric syscall-argument constraints; and Milestone 6A added explicit launch-time selected non-stdio object capabilities without reopening ambient descriptor inheritance. The current Milestone 7A candidate adds a caller-owned external cancellation control plane whose launcher-owned PID 1 supervision terminates and reaps the sandbox process tree. Every claimed property must correspond to a kernel mechanism and executable evidence.
 
 ## Protected boundary
 
-The trusted host parent launches one direct target through launcher-owned bootstrap and namespace-init processes. On supported Linux x86_64, the launcher constrains initial filesystem visibility/mutability, namespace identity including a policy-owned UTS nodename, network/IPC/UTS namespace membership, capabilities, target syscall numbers and selected numeric syscall arguments, selected resources, environment, cwd, ambient inherited descriptors, explicit selected non-stdio object handles, stdio, bounded capture, process-tree lifecycle, and—when declared—a wall-clock execution deadline while preserving fail-closed launch/lifecycle reporting.
+The trusted host parent launches one direct target through launcher-owned bootstrap and namespace-init processes. On supported Linux x86_64, the launcher constrains initial filesystem visibility/mutability, namespace identity including a policy-owned UTS nodename, network/IPC/UTS namespace membership, capabilities, target syscall numbers and selected numeric syscall arguments, selected resources, environment, cwd, ambient inherited descriptors, explicit selected non-stdio object handles, stdio, bounded capture, process-tree lifecycle, a wall-clock execution deadline when declared, and caller-requested external cancellation when the cancellable API is used, while preserving fail-closed launch/lifecycle reporting.
 
 ## Security properties claimed
 
@@ -19,10 +19,11 @@ The trusted host parent launches one direct target through launcher-owned bootst
 - **Inherited-FD minimization / explicit handle authority:** undeclared inherited descriptors >= 3 do not survive target exec. Stdio disposition is explicit; launcher-owned redirect/capture sources are tightly remapped and closed; only `handle.<target_fd>` destinations declared by policy are intentionally made visible as additional descriptors.
 - **Selected-object ownership:** each selected source is duplicated and inspected before fork, directory descriptors are rejected, and launcher storage descriptors are kept above every target destination. Host parent, bootstrap, and namespace PID 1 do not retain launcher-owned selected duplicates while the direct target runs.
 - **Bounded retained capture:** `stdio.stdout_capture_bytes` is 1 byte–16 MiB; excess bytes are drained/discarded rather than retained.
-- **Owned PID-tree lifecycle:** namespace PID 1 supervises the direct target and reaps descendants. After the direct target becomes terminal—naturally or by deadline—PID 1 repeatedly kills remaining namespace processes and reaps until `ECHILD`, then publishes readiness.
+- **Owned PID-tree lifecycle:** namespace PID 1 supervises the direct target and reaps descendants. After the direct target becomes terminal—naturally, by deadline, or by external cancellation—PID 1 repeatedly kills remaining namespace processes and reaps until `ECHILD`, then publishes readiness.
 - **Optional bounded deadline:** `limit.wall_clock_milliseconds` is either absent or 1–86,400,000 ms. When present, the launcher preflights pidfd/timerfd support and PID 1 arms a one-shot `CLOCK_MONOTONIC` timer after it forks the direct target and closes inherited setup descriptors.
-- **Deterministic timeout race:** each PID1 supervision wake performs `wait4(target, WNOHANG)` first. If target status is already available, natural termination wins. If the timer is readable and the target is not yet waitable, deadline ownership wins from that point forward.
-- **Distinct timeout result:** once deadline ownership wins, PID 1 uses `SIGKILL` to terminate the direct target, but shared lifecycle state marks the event and the host reports `ChildOutcome::TimedOut`.
+- **Optional external cancellation:** `CancellationToken` is a cloneable Linux eventfd-backed one-way control token. The launcher pins a duplicate before fork; only PID 1 retains that duplicate while the target runs, and the direct target closes its copy before untrusted execution.
+- **Deterministic supervision race:** each PID1 supervision wake performs `wait4(target, WNOHANG)` first. If target status is already available, natural termination wins. Otherwise cancellation readiness is checked before deadline readiness, yielding natural exit > explicit cancellation > deadline when multiple conditions are simultaneously observable.
+- **Distinct control results:** deadline ownership reports `ChildOutcome::TimedOut`; cancellation ownership reports `ChildOutcome::Cancelled`. Both may use `SIGKILL` after ownership is established, but neither is reported as an ordinary target signal.
 - **No target-policy widening:** namespace management, pidfd/timerfd/poll, mounts, capture/remapping, selected-handle installation, and teardown execute in trusted launcher processes outside target seccomp. `dup3` used to install a selected target descriptor is not silently added to `seccomp.allow`; subsequent operations on that object still require the target syscalls explicitly granted by policy. `socket` and `connect` are target syscalls only when the policy explicitly names them.
 - **Masked syscall-argument narrowing:** an argument rule applies only to a syscall already in `seccomp.allow`. Linux x86_64 cBPF evaluates the selected `seccomp_data.args[]` slot as two 32-bit words and requires the complete 64-bit `(argument & mask) == value` condition before returning `ALLOW`; a mismatch returns `EPERM`.
 - **Owned launch-error reporting:** pre-exec phase+errno travels through shared anonymous memory and does not depend on target stdout/stderr or a target `write` grant.
@@ -64,15 +65,15 @@ After the namespace PID 1 forks the direct target, only that direct target remap
 
 This is an explicit object-capability grant. It preserves the underlying open-file-description authority and state rather than mediating a new pathname lookup. Therefore a selected FD may intentionally expose an object outside the chroot/path namespace, and Milestone 6A does not claim rights attenuation, revocation, pathname confinement of that already-open object, post-launch descriptor transfer, or support for directory handles.
 
-## Deadline and lifecycle orchestration
+## Deadline, cancellation, and lifecycle orchestration
 
 Potentially allocating policy data, argv/envp, seccomp instructions, pinned descriptors, shared lifecycle state, and capture-pipe creation occur before the initial host `fork`.
 
 The launcher creates user/mount/PID/network/IPC/UTS namespaces, installs the policy UTS nodename, and constructs filesystem state before it forks launcher-owned namespace PID 1. PID 1 forks the direct target as PID 2. The target alone receives target stdio/rlimit/capability/seccomp setup; PID 1 closes inherited descriptors >= 3 so it cannot keep launcher capture writers alive.
 
-If no deadline is declared, PID 1 uses the existing blocking direct-target wait. If a deadline is declared, PID 1 opens a pidfd for the already-forked target, creates a `TFD_CLOEXEC` timerfd using `CLOCK_MONOTONIC`, arms it for the validated interval, and polls the pidfd and timerfd. These descriptors are created after target fork and are never inherited by the target.
+If neither a deadline nor external cancellation is active, PID 1 uses the existing blocking direct-target wait. Otherwise PID 1 opens a pidfd for the already-forked target. A declared deadline adds a `TFD_CLOEXEC` timerfd using `CLOCK_MONOTONIC`; a cancellable run adds the pre-fork pinned eventfd duplicate. PID 1 polls the active supervision descriptors. The direct target closes the cancellation fd before target setup, and pidfd/timerfd are created after target fork, so none of these control descriptors become untrusted target capabilities.
 
-When poll wakes, PID 1 performs one nonblocking target reap check as the race arbiter. An already-waitable target keeps its natural raw wait status. Otherwise a readable timer transfers ownership to the deadline path; PID 1 sends `SIGKILL`, waits specifically for the direct target, then runs the existing kill/reap loop for every remaining descendant. Shared lifecycle state records raw target status, `timed_out`, descendant reap count, and publishes `ready` last.
+When poll wakes, PID 1 performs one nonblocking target reap check as the race arbiter. An already-waitable target keeps its natural raw wait status. Otherwise a readable cancellation eventfd wins before a simultaneously readable timer; failing that, a readable timer transfers ownership to the deadline path. The winning launcher control path sends `SIGKILL`, waits specifically for the direct target, then runs the existing kill/reap loop for every remaining descendant. Shared lifecycle state records raw target status, mutually exclusive `timed_out` / `cancelled` flags, descendant reap count, and publishes `ready` last.
 
 ## Explicit non-goals and limitations
 
@@ -82,7 +83,7 @@ This sandbox is **not** a production multi-tenant container boundary. It does no
 - a configured veth/bridge, routes, DNS, endpoint allowlist, or controlled outbound/inbound network path. Milestone 4B only proves host-network-namespace separation;
 - stdin/stderr redirect or capture;
 - a total-output byte ceiling for captured stdout;
-- an externally-triggered cancellation handle/API. Milestone 3B implements policy-owned deadline expiration only;
+- reset/rearm semantics for external cancellation, arbitrary signal forwarding, a general bidirectional control RPC, or an end-to-end cancellation latency guarantee. Milestone 7A is deliberately one-way cancellation only;
 - an end-to-end API-call latency bound;
 - aggregate process-count accounting or a fork/pid quota;
 - cgroup-backed aggregate CPU, physical-memory, I/O, or process accounting;
@@ -107,6 +108,7 @@ Therefore the project does not claim `pids.max` enforcement from root/sudo-only 
 - The policy author is trusted to choose filesystem exposure, stdio exposure, selected already-open object handles, target data/syscall grants, resource ceilings, capture ceilings, and any wall-clock deadline. Selecting a handle intentionally grants the authority already represented by that open file description.
 - Choosing `inherit`, `redirect`, or `capture` intentionally grants their documented descriptor/output channels.
 - A declared deadline intentionally authorizes launcher PID 1 to terminate the direct target and descendants when the timer wins the documented race.
+- Supplying a `CancellationToken` to a cancellable run and signalling it intentionally authorizes launcher PID 1 to terminate the direct target and descendants when cancellation wins the documented race. The token is one-way and remains cancelled after it is signalled.
 - Root device/inode revalidation is not a subtree integrity proof.
 
 ## Test strategy and evidence
@@ -122,13 +124,14 @@ Evidence includes:
 - masked seccomp argument-rule parser/validator regressions plus a raw `lseek` oracle whose allowed offset matches the declared low/high 64-bit mask while separate low-bit and high-32-bit mismatches both return `EPERM`;
 - selected-handle policy regressions plus a raw pipe oracle in which target fd 9 reads the exact marker while the original selected source descriptor and an unrelated undeclared high descriptor both return `EBADF`; a directory descriptor source is separately rejected before launch;
 - all Milestones 1–3B descriptor, stdio, filesystem, capability, rlimit, launch-error, capture, PID identity, descendant cleanup, timeout, and exit-vs-signal regressions;
-- a raw deadline target that writes an exact stdout marker, forks a descendant that remains in `pause()`, and is preempted by a 1,000 ms policy deadline while a fast target under 5,000 ms still preserves `Exited(42)`.
+- a raw deadline target that writes an exact stdout marker, forks a descendant that remains in `pause()`, and is preempted by a 1,000 ms policy deadline while a fast target under 5,000 ms still preserves `Exited(42)`;
+- an external-cancellation target that forks one paused descendant and writes an exact readiness marker through selected fd 9. The parent waits for the full marker before signalling the token, then verifies `Cancelled` plus one reaped descendant; a separate uncancelled-token run preserves natural `Exited(42)`.
 
 CI explicitly enables the user-namespace settings required by its disposable Ubuntu runner. The runtime never weakens host policy when mandatory primitives are unavailable.
 
 ## Failure semantics
 
-Invalid policy is rejected before launch. Namespace creation, UTS hostname installation, selected-source pin/inspection, selected-target remapping, deadline support preflight, pidfd creation, timer creation/arming, supervision poll, namespace/bootstrap/init forks, descriptor cleanup, capture reads, mount/capability/seccomp setup, process-tree kill/reap, lifecycle publication, and target exec failures are terminal. A failed selected-handle setup never silently preserves ambient source descriptors or retries without the declared mapping. A failed network/IPC/UTS namespace transition or hostname installation never falls back to the corresponding host namespace/identity.
+Invalid policy is rejected before launch. Namespace creation, UTS hostname installation, selected-source pin/inspection, selected-target remapping, deadline/cancellation supervision preflight, cancellation eventfd pinning/signalling, pidfd creation, timer creation/arming, supervision poll, namespace/bootstrap/init forks, descriptor cleanup, capture reads, mount/capability/seccomp setup, process-tree kill/reap, lifecycle publication, and target exec failures are terminal. A failed selected-handle setup never silently preserves ambient source descriptors or retries without the declared mapping. A failed network/IPC/UTS namespace transition or hostname installation never falls back to the corresponding host namespace/identity.
 
 ## Phase promotion
 

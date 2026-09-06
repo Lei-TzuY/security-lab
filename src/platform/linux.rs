@@ -2438,6 +2438,7 @@ mod x86_64 {
             "tgkill" => libc::SYS_tgkill,
             "openat" => libc::SYS_openat,
             "unlink" => libc::SYS_unlink,
+            "truncate" => libc::SYS_truncate,
             "newfstatat" => libc::SYS_newfstatat,
             "set_robust_list" => libc::SYS_set_robust_list,
             "prlimit64" => libc::SYS_prlimit64,

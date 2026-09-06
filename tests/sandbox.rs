@@ -200,7 +200,9 @@ fn landlock_file_mutation_envelope_narrows_existing_writable_surfaces() {
     let mut confined = policy(
         "m",
         &[],
-        &["execveat", "openat", "write", "close", "unlink", "exit"],
+        &[
+            "execveat", "openat", "truncate", "write", "close", "unlink", "exit",
+        ],
     );
     confined.landlock_read_execute = vec![PathBuf::from("/probe")];
     confined.landlock_file_mutate =

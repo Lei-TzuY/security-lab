@@ -88,6 +88,10 @@ pub struct SandboxPolicy {
     /// rules restrict bind/connect syscalls without granting those syscalls.
     pub landlock_tcp_bind_ports: Vec<u16>,
     pub landlock_tcp_connect_ports: Vec<u16>,
+    /// Whether the direct target enters a Landlock abstract-UNIX-socket scope.
+    /// This attenuates connect authority toward abstract sockets outside the
+    /// same or a nested Landlock domain without granting connect itself.
+    pub landlock_scope_abstract_unix_socket: bool,
     /// Whether the direct target enters a Landlock signal scope. This attenuates
     /// signal authority toward processes outside the same or a nested domain.
     pub landlock_scope_signal: bool,
@@ -673,6 +677,7 @@ impl FromStr for SandboxPolicy {
         let mut landlock_file_mutate = Vec::new();
         let mut landlock_tcp_bind_ports = Vec::new();
         let mut landlock_tcp_connect_ports = Vec::new();
+        let mut landlock_scope_abstract_unix_socket = None;
         let mut landlock_scope_signal = None;
         let mut loopback_enabled = None;
         let mut host_loopback_tcp_port = None;
@@ -722,6 +727,12 @@ impl FromStr for SandboxPolicy {
                 "landlock.tcp_connect_port" => {
                     landlock_tcp_connect_ports.push(parse_tcp_port(value, line_no, key)?)
                 }
+                "landlock.scope_abstract_unix_socket" => set_once(
+                    &mut landlock_scope_abstract_unix_socket,
+                    parse_enabled_disabled(value, line_no, key)?,
+                    line_no,
+                    key,
+                )?,
                 "landlock.scope_signal" => set_once(
                     &mut landlock_scope_signal,
                     parse_enabled_disabled(value, line_no, key)?,
@@ -961,6 +972,8 @@ impl FromStr for SandboxPolicy {
                 .collect(),
             landlock_tcp_bind_ports,
             landlock_tcp_connect_ports,
+            landlock_scope_abstract_unix_socket: landlock_scope_abstract_unix_socket
+                .unwrap_or(false),
             landlock_scope_signal: landlock_scope_signal.unwrap_or(false),
             loopback_enabled: loopback_enabled.unwrap_or(false),
             host_loopback_tcp_port,
@@ -1205,6 +1218,7 @@ mod tests {
         assert!(policy.landlock_file_mutate.is_empty());
         assert!(policy.landlock_tcp_bind_ports.is_empty());
         assert!(policy.landlock_tcp_connect_ports.is_empty());
+        assert!(!policy.landlock_scope_abstract_unix_socket);
         assert!(!policy.landlock_scope_signal);
         assert_eq!(policy.readonly_volume_source, None);
         assert_eq!(policy.readonly_volume_target, None);
@@ -1318,6 +1332,37 @@ mod tests {
 
         let scratch_subdir = format!("{VALID}\nlandlock.file_mutate = /scratch/subdir");
         assert!(scratch_subdir.parse::<SandboxPolicy>().is_err());
+    }
+
+    #[test]
+    fn parses_landlock_abstract_unix_scope_mode() {
+        let enabled: SandboxPolicy =
+            format!("{VALID}\nlandlock.scope_abstract_unix_socket = enabled")
+                .parse()
+                .unwrap();
+        assert!(enabled.landlock_scope_abstract_unix_socket);
+
+        let disabled: SandboxPolicy =
+            format!("{VALID}\nlandlock.scope_abstract_unix_socket = disabled")
+                .parse()
+                .unwrap();
+        assert!(!disabled.landlock_scope_abstract_unix_socket);
+
+        let invalid = format!("{VALID}\nlandlock.scope_abstract_unix_socket = yes");
+        assert!(invalid.parse::<SandboxPolicy>().is_err());
+
+        let duplicate = format!(
+            "{VALID}\nlandlock.scope_abstract_unix_socket = enabled\nlandlock.scope_abstract_unix_socket = disabled"
+        );
+        assert!(duplicate.parse::<SandboxPolicy>().is_err());
+
+        let combined: SandboxPolicy = format!(
+            "{VALID}\nlandlock.scope_abstract_unix_socket = enabled\nlandlock.scope_signal = enabled"
+        )
+        .parse()
+        .unwrap();
+        assert!(combined.landlock_scope_abstract_unix_socket);
+        assert!(combined.landlock_scope_signal);
     }
 
     #[test]

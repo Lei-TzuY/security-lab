@@ -406,6 +406,59 @@ mod x86_64 {
         )
     }
 
+    fn connect_host_udp_ipv4(
+        address: Ipv4Addr,
+        port: u16,
+        target_fd: u32,
+        storage_floor: RawFd,
+    ) -> Result<PreparedSelectedHandle, SandboxError> {
+        let socket_fd =
+            unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+        if socket_fd == -1 {
+            return Err(SandboxError::SetupFailed(format!(
+                "cannot create brokered host-IPv4 UDP socket: {}",
+                io::Error::last_os_error()
+            )));
+        }
+        let socket_fd = OwnedFd(socket_fd);
+        let address_struct = libc::sockaddr_in {
+            sin_family: libc::AF_INET as libc::sa_family_t,
+            sin_port: port.to_be(),
+            sin_addr: libc::in_addr {
+                s_addr: u32::from_ne_bytes(address.octets()),
+            },
+            sin_zero: [0; 8],
+        };
+        loop {
+            let connected = unsafe {
+                libc::connect(
+                    socket_fd.raw(),
+                    (&address_struct as *const libc::sockaddr_in).cast::<libc::sockaddr>(),
+                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                )
+            };
+            if connected == 0 {
+                break;
+            }
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(SandboxError::SetupFailed(format!(
+                "cannot connect brokered host-IPv4 UDP socket to {address}:{port}: {error}"
+            )));
+        }
+        let storage_fd = move_owned_fd_to_selected_storage(
+            socket_fd,
+            storage_floor,
+            "brokered host-IPv4 UDP socket",
+        )?;
+        Ok(PreparedSelectedHandle {
+            storage_fd,
+            target_fd: target_fd as RawFd,
+        })
+    }
+
     fn listen_host_loopback_tcp(
         port: u16,
         target_fd: u32,
@@ -650,6 +703,7 @@ mod x86_64 {
                 .copied()
                 .chain(policy.host_loopback_tcp_target_fd.iter().copied())
                 .chain(policy.host_ipv4_tcp_target_fd.iter().copied())
+                .chain(policy.host_ipv4_udp_target_fd.iter().copied())
                 .chain(policy.host_loopback_tcp_listen_target_fd.iter().copied())
                 .max()
                 .map_or(FIRST_NON_STDIO_FD as RawFd, |target_fd| {
@@ -669,6 +723,11 @@ mod x86_64 {
                         0
                     }
                     + if policy.host_ipv4_tcp_target_fd.is_some() {
+                        1
+                    } else {
+                        0
+                    }
+                    + if policy.host_ipv4_udp_target_fd.is_some() {
                         1
                     } else {
                         0
@@ -720,6 +779,21 @@ mod x86_64 {
                 _ => {
                     return Err(SandboxError::InvalidPolicy(PolicyError::new(
                         "network.host_ipv4_tcp_address, network.host_ipv4_tcp_port, and network.host_ipv4_tcp_target_fd must be specified together",
+                    )));
+                }
+            }
+            match (
+                policy.host_ipv4_udp_address,
+                policy.host_ipv4_udp_port,
+                policy.host_ipv4_udp_target_fd,
+            ) {
+                (Some(address), Some(port), Some(target_fd)) => selected_handles.push(
+                    connect_host_udp_ipv4(address, port, target_fd, selected_storage_floor)?,
+                ),
+                (None, None, None) => {}
+                _ => {
+                    return Err(SandboxError::InvalidPolicy(PolicyError::new(
+                        "network.host_ipv4_udp_address, network.host_ipv4_udp_port, and network.host_ipv4_udp_target_fd must be specified together",
                     )));
                 }
             }

@@ -1,0 +1,130 @@
+name: probe Landlock enforcement
+
+on:
+  push:
+    branches: [tmp-10a-landlock-probe]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Probe real unprivileged Landlock enforcement
+        shell: bash
+        run: |
+          set -euo pipefail
+          uname -a
+          cat >/tmp/landlock_probe.c <<'EOF'
+          #define _GNU_SOURCE
+          #include <errno.h>
+          #include <fcntl.h>
+          #include <linux/landlock.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <sys/prctl.h>
+          #include <sys/stat.h>
+          #include <sys/syscall.h>
+          #include <unistd.h>
+
+          #ifndef SYS_landlock_create_ruleset
+          #define SYS_landlock_create_ruleset 444
+          #define SYS_landlock_add_rule 445
+          #define SYS_landlock_restrict_self 446
+          #endif
+
+          int main(void) {
+              int abi = (int)syscall(SYS_landlock_create_ruleset, NULL, 0,
+                                     LANDLOCK_CREATE_RULESET_VERSION);
+              if (abi < 1) {
+                  perror("landlock ABI query");
+                  return 1;
+              }
+              printf("landlock_abi=%d\n", abi);
+
+              char base[] = "/tmp/security-lab-landlock-XXXXXX";
+              if (mkdtemp(base) == NULL) {
+                  perror("mkdtemp");
+                  return 2;
+              }
+              char allowed[256];
+              char denied[256];
+              if (snprintf(allowed, sizeof(allowed), "%s/allowed", base) >= (int)sizeof(allowed) ||
+                  snprintf(denied, sizeof(denied), "%s/denied", base) >= (int)sizeof(denied)) {
+                  return 3;
+              }
+              if (mkdir(allowed, 0700) == -1 || mkdir(denied, 0700) == -1) {
+                  perror("mkdir");
+                  return 4;
+              }
+
+              const __u64 rights = LANDLOCK_ACCESS_FS_WRITE_FILE |
+                                   LANDLOCK_ACCESS_FS_MAKE_REG;
+              struct landlock_ruleset_attr ruleset = {
+                  .handled_access_fs = rights,
+              };
+              int ruleset_fd = (int)syscall(SYS_landlock_create_ruleset,
+                                            &ruleset, sizeof(ruleset), 0);
+              if (ruleset_fd == -1) {
+                  perror("landlock_create_ruleset");
+                  return 5;
+              }
+
+              int allowed_fd = open(allowed, O_PATH | O_CLOEXEC);
+              if (allowed_fd == -1) {
+                  perror("open allowed");
+                  return 6;
+              }
+              struct landlock_path_beneath_attr path = {
+                  .allowed_access = rights,
+                  .parent_fd = allowed_fd,
+              };
+              if (syscall(SYS_landlock_add_rule, ruleset_fd,
+                          LANDLOCK_RULE_PATH_BENEATH, &path, 0) == -1) {
+                  perror("landlock_add_rule");
+                  return 7;
+              }
+              if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == -1) {
+                  perror("PR_SET_NO_NEW_PRIVS");
+                  return 8;
+              }
+              if (syscall(SYS_landlock_restrict_self, ruleset_fd, 0) == -1) {
+                  perror("landlock_restrict_self");
+                  return 9;
+              }
+              close(allowed_fd);
+              close(ruleset_fd);
+
+              char allowed_file[320];
+              char denied_file[320];
+              snprintf(allowed_file, sizeof(allowed_file), "%s/ok", allowed);
+              snprintf(denied_file, sizeof(denied_file), "%s/blocked", denied);
+
+              int fd = open(allowed_file, O_CREAT | O_WRONLY | O_CLOEXEC, 0600);
+              if (fd == -1) {
+                  perror("allowed create");
+                  return 10;
+              }
+              close(fd);
+
+              errno = 0;
+              fd = open(denied_file, O_CREAT | O_WRONLY | O_CLOEXEC, 0600);
+              if (fd != -1) {
+                  close(fd);
+                  fputs("denied create unexpectedly succeeded\n", stderr);
+                  return 11;
+              }
+              if (errno != EACCES) {
+                  fprintf(stderr, "denied create errno=%d (%s), expected EACCES\n",
+                          errno, strerror(errno));
+                  return 12;
+              }
+              puts("landlock_write_enforcement=ok");
+              return 0;
+          }
+          EOF
+          cc -std=c11 -Wall -Wextra -Werror -O2 /tmp/landlock_probe.c -o /tmp/landlock_probe
+          /tmp/landlock_probe

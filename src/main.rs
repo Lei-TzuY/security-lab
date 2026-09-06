@@ -40,6 +40,7 @@ fn main() {
                 ChildOutcome::Exited(code) => process::exit(code),
                 ChildOutcome::Signaled(signal) => process::exit(128 + signal),
                 ChildOutcome::TimedOut => process::exit(124),
+                ChildOutcome::Cancelled => process::exit(130),
             }
         }
         Err(err) => {

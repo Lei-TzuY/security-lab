@@ -9,6 +9,7 @@
 #   A allowed write
 #   B assert 64-bit masked seccomp argument filtering on lseek offset
 #   G assert one selected non-stdio handle is remapped without ambient FD leakage
+#   c fork a descendant, publish cancellation readiness on fd 9, then pause
 #   F forbidden getpid; exits 77 only when seccomp returns -EPERM
 #   E validate sanitized environment
 #   C validate working directory against argv[2]
@@ -44,6 +45,8 @@ _start:
     je .seccomp_argument_filter
     cmp $71, %al
     je .selected_handle
+    cmp $99, %al
+    je .cancellation_tree
     cmp $70, %al
     je .forbidden
     cmp $69, %al
@@ -218,6 +221,30 @@ _start:
     jmp .parse_handle_fd_loop
 .parse_handle_fd_done:
     ret
+
+.cancellation_tree:
+    mov $57, %eax
+    syscall
+    test %rax, %rax
+    js .fail31
+    jz .cancellation_descendant_pause
+
+    mov $1, %eax
+    mov $9, %edi
+    lea cancellation_ready_message(%rip), %rsi
+    mov $cancellation_ready_message_len, %edx
+    syscall
+    cmp $cancellation_ready_message_len, %rax
+    jne .fail31
+.cancellation_parent_pause:
+    mov $34, %eax
+    syscall
+    jmp .cancellation_parent_pause
+
+.cancellation_descendant_pause:
+    mov $34, %eax
+    syscall
+    jmp .cancellation_descendant_pause
 
 .forbidden:
     mov $39, %eax
@@ -891,6 +918,9 @@ _start:
     jmp .exit
 .fail30:
     mov $30, %edi
+    jmp .exit
+.fail31:
+    mov $31, %edi
 
 .exit:
     mov $60, %eax
@@ -925,6 +955,9 @@ capture_chunk:
 selected_handle_message:
     .ascii "selected-handle-ok"
 .set selected_handle_message_len, . - selected_handle_message
+cancellation_ready_message:
+    .ascii "cancellation-target-ready\n"
+.set cancellation_ready_message_len, . - cancellation_ready_message
 deadline_message:
     .ascii "deadline target started\n"
 .set deadline_message_len, . - deadline_message

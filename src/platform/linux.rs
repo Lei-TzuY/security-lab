@@ -114,12 +114,16 @@ mod x86_64 {
     const PHASE_LANDLOCK_PATH: u32 = 49;
     const PHASE_LANDLOCK_RULE: u32 = 50;
     const PHASE_LANDLOCK_RESTRICT: u32 = 51;
+    const PHASE_LANDLOCK_NET_RULE: u32 = 52;
 
     const SYS_LANDLOCK_CREATE_RULESET: libc::c_long = 444;
     const SYS_LANDLOCK_ADD_RULE: libc::c_long = 445;
     const SYS_LANDLOCK_RESTRICT_SELF: libc::c_long = 446;
     const LANDLOCK_CREATE_RULESET_VERSION: libc::c_uint = 1;
     const LANDLOCK_RULE_PATH_BENEATH: libc::c_int = 1;
+    const LANDLOCK_RULE_NET_PORT: libc::c_int = 2;
+    const LANDLOCK_ACCESS_NET_BIND_TCP: u64 = 1 << 0;
+    const LANDLOCK_ACCESS_NET_CONNECT_TCP: u64 = 1 << 1;
     const LANDLOCK_ACCESS_FS_EXECUTE: u64 = 1 << 0;
     const LANDLOCK_ACCESS_FS_WRITE_FILE: u64 = 1 << 1;
     const LANDLOCK_ACCESS_FS_READ_FILE: u64 = 1 << 2;
@@ -157,6 +161,7 @@ mod x86_64 {
     #[repr(C)]
     struct LandlockRulesetAttr {
         handled_access_fs: u64,
+        handled_access_net: u64,
     }
 
     #[repr(C)]
@@ -164,6 +169,12 @@ mod x86_64 {
         allowed_access: u64,
         parent_fd: i32,
         reserved: u32,
+    }
+
+    #[repr(C)]
+    struct LandlockNetPortAttr {
+        allowed_access: u64,
+        port: u64,
     }
 
     #[repr(C, align(8))]
@@ -512,14 +523,20 @@ mod x86_64 {
         }
     }
 
+    struct PreparedLandlock {
+        read_execute: Vec<CString>,
+        file_mutate: Vec<CString>,
+        tcp_bind_ports: Vec<u16>,
+        tcp_connect_ports: Vec<u16>,
+    }
+
     struct PreparedLaunch {
         root_fd: OwnedFd,
         root_path: CString,
         executable_fd: OwnedFd,
         selected_handles: Vec<PreparedSelectedHandle>,
         selected_storage_floor: RawFd,
-        landlock_read_execute: Vec<CString>,
-        landlock_file_mutate: Vec<CString>,
+        landlock: PreparedLandlock,
         cancellation_fd: Option<OwnedFd>,
         volumes: Vec<PreparedVolume>,
         cwd_relative: CString,
@@ -793,8 +810,12 @@ mod x86_64 {
                 executable_fd,
                 selected_handles,
                 selected_storage_floor,
-                landlock_read_execute,
-                landlock_file_mutate,
+                landlock: PreparedLandlock {
+                    read_execute: landlock_read_execute,
+                    file_mutate: landlock_file_mutate,
+                    tcp_bind_ports: policy.landlock_tcp_bind_ports.clone(),
+                    tcp_connect_ports: policy.landlock_tcp_connect_ports.clone(),
+                },
                 cancellation_fd,
                 volumes,
                 cwd_relative,
@@ -1300,7 +1321,11 @@ mod x86_64 {
     }
 
     fn ensure_landlock_supported(policy: &SandboxPolicy) -> Result<(), SandboxError> {
-        if policy.landlock_read_execute.is_empty() && policy.landlock_file_mutate.is_empty() {
+        if policy.landlock_read_execute.is_empty()
+            && policy.landlock_file_mutate.is_empty()
+            && policy.landlock_tcp_bind_ports.is_empty()
+            && policy.landlock_tcp_connect_ports.is_empty()
+        {
             return Ok(());
         }
         let abi = unsafe {
@@ -1315,6 +1340,14 @@ mod x86_64 {
             if !policy.landlock_file_mutate.is_empty() && abi < 3 {
                 return Err(SandboxError::UnsupportedPlatform(format!(
                     "Landlock file-mutation enforcement requires ABI 3 for TRUNCATE control; kernel reports ABI {abi}"
+                )));
+            }
+            if (!policy.landlock_tcp_bind_ports.is_empty()
+                || !policy.landlock_tcp_connect_ports.is_empty())
+                && abi < 4
+            {
+                return Err(SandboxError::UnsupportedPlatform(format!(
+                    "Landlock TCP port enforcement requires ABI 4; kernel reports ABI {abi}"
                 )));
             }
             return Ok(());
@@ -1336,29 +1369,49 @@ mod x86_64 {
     }
 
     unsafe fn prepare_landlock_ruleset_or_fail(
-        read_execute_paths: &[CString],
-        file_mutate_paths: &[CString],
+        landlock: &PreparedLandlock,
         root_tree_fd: RawFd,
         storage_floor: RawFd,
         launch_error: *mut LaunchErrorRecord,
         error_exit_syscall: libc::c_long,
     ) -> RawFd {
-        if read_execute_paths.is_empty() && file_mutate_paths.is_empty() {
+        if landlock.read_execute.is_empty()
+            && landlock.file_mutate.is_empty()
+            && landlock.tcp_bind_ports.is_empty()
+            && landlock.tcp_connect_ports.is_empty()
+        {
             return -1;
         }
 
         let mut handled_access_fs = 0;
-        if !read_execute_paths.is_empty() {
+        if !landlock.read_execute.is_empty() {
             handled_access_fs |= LANDLOCK_READ_EXECUTE_RIGHTS;
         }
-        if !file_mutate_paths.is_empty() {
+        if !landlock.file_mutate.is_empty() {
             handled_access_fs |= LANDLOCK_FILE_MUTATE_RIGHTS;
         }
-        let ruleset = LandlockRulesetAttr { handled_access_fs };
+        let mut handled_access_net = 0;
+        if !landlock.tcp_bind_ports.is_empty() {
+            handled_access_net |= LANDLOCK_ACCESS_NET_BIND_TCP;
+        }
+        if !landlock.tcp_connect_ports.is_empty() {
+            handled_access_net |= LANDLOCK_ACCESS_NET_CONNECT_TCP;
+        }
+        let ruleset = LandlockRulesetAttr {
+            handled_access_fs,
+            handled_access_net,
+        };
+        // Preserve ABI 1-3 filesystem-only compatibility: handled_access_net
+        // was added in ABI 4, so only include the second u64 when it is used.
+        let ruleset_size = if handled_access_net == 0 {
+            std::mem::size_of::<u64>()
+        } else {
+            std::mem::size_of::<LandlockRulesetAttr>()
+        };
         let raw_ruleset_fd = libc::syscall(
             SYS_LANDLOCK_CREATE_RULESET,
             &ruleset as *const LandlockRulesetAttr,
-            std::mem::size_of::<LandlockRulesetAttr>(),
+            ruleset_size,
             0u32,
         );
         if raw_ruleset_fd == -1 {
@@ -1381,7 +1434,7 @@ mod x86_64 {
             mode: 0,
             resolve: RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS,
         };
-        for path in read_execute_paths {
+        for path in &landlock.read_execute {
             let path_fd = libc::syscall(
                 libc::SYS_openat2,
                 root_tree_fd,
@@ -1405,7 +1458,8 @@ mod x86_64 {
             } else {
                 child_fail(launch_error, PHASE_LANDLOCK_PATH, error_exit_syscall)
             };
-            let also_mutable = file_mutate_paths
+            let also_mutable = landlock
+                .file_mutate
                 .iter()
                 .any(|candidate| candidate.as_bytes() == path.as_bytes());
             if also_mutable {
@@ -1444,8 +1498,9 @@ mod x86_64 {
             mode: 0,
             resolve: RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS,
         };
-        for path in file_mutate_paths {
-            if read_execute_paths
+        for path in &landlock.file_mutate {
+            if landlock
+                .read_execute
                 .iter()
                 .any(|candidate| candidate.as_bytes() == path.as_bytes())
             {
@@ -1479,6 +1534,45 @@ mod x86_64 {
             }
             if libc::close(path_fd) == -1 {
                 child_fail(launch_error, PHASE_LANDLOCK_PATH, error_exit_syscall);
+            }
+        }
+        for &port in &landlock.tcp_bind_ports {
+            let mut allowed_access = LANDLOCK_ACCESS_NET_BIND_TCP;
+            if landlock.tcp_connect_ports.contains(&port) {
+                allowed_access |= LANDLOCK_ACCESS_NET_CONNECT_TCP;
+            }
+            let rule = LandlockNetPortAttr {
+                allowed_access,
+                port: u64::from(port),
+            };
+            if libc::syscall(
+                SYS_LANDLOCK_ADD_RULE,
+                ruleset_fd,
+                LANDLOCK_RULE_NET_PORT,
+                &rule as *const LandlockNetPortAttr,
+                0u32,
+            ) == -1
+            {
+                child_fail(launch_error, PHASE_LANDLOCK_NET_RULE, error_exit_syscall);
+            }
+        }
+        for &port in &landlock.tcp_connect_ports {
+            if landlock.tcp_bind_ports.contains(&port) {
+                continue;
+            }
+            let rule = LandlockNetPortAttr {
+                allowed_access: LANDLOCK_ACCESS_NET_CONNECT_TCP,
+                port: u64::from(port),
+            };
+            if libc::syscall(
+                SYS_LANDLOCK_ADD_RULE,
+                ruleset_fd,
+                LANDLOCK_RULE_NET_PORT,
+                &rule as *const LandlockNetPortAttr,
+                0u32,
+            ) == -1
+            {
+                child_fail(launch_error, PHASE_LANDLOCK_NET_RULE, error_exit_syscall);
             }
         }
         ruleset_fd
@@ -1765,8 +1859,7 @@ mod x86_64 {
         );
 
         let landlock_ruleset_fd = prepare_landlock_ruleset_or_fail(
-            &prepared.landlock_read_execute,
-            &prepared.landlock_file_mutate,
+            &prepared.landlock,
             root_tree_fd,
             prepared.selected_storage_floor,
             launch_error,
@@ -2453,6 +2546,7 @@ mod x86_64 {
             PHASE_LANDLOCK_PATH => "Landlock path pin",
             PHASE_LANDLOCK_RULE => "Landlock path-beneath rule installation",
             PHASE_LANDLOCK_RESTRICT => "Landlock self restriction",
+            PHASE_LANDLOCK_NET_RULE => "Landlock TCP port rule installation",
             _ => "unknown launch phase",
         };
         format!(

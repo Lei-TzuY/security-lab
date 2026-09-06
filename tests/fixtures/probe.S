@@ -18,6 +18,7 @@
 #   q accept one connection through a launcher-brokered host-loopback TCP listening fd
 #   r prove Landlock allows declared reads and returns EACCES for an undeclared visible file
 #   m prove Landlock narrows regular-file mutation inside scratch and a writable persistent volume
+#   s prove Landlock allows declared TCP bind/connect ports and denies undeclared ports
 #   F forbidden getpid; exits 77 only when seccomp returns -EPERM
 #   E validate sanitized environment
 #   C validate working directory against argv[2]
@@ -71,6 +72,8 @@ _start:
     je .landlock_read_envelope
     cmp $109, %al
     je .landlock_file_mutation
+    cmp $115, %al
+    je .landlock_tcp_ports
     cmp $70, %al
     je .forbidden
     cmp $69, %al
@@ -817,6 +820,167 @@ _start:
     xor %edi, %edi
     jmp .exit
 
+.landlock_tcp_ports:
+    movw $2, network_addr(%rip)
+    movw $0xb5a5, network_addr+2(%rip)
+    movl $0x0100007f, network_addr+4(%rip)
+    movw $2, network_addr_denied(%rip)
+    movw $0xb6a5, network_addr_denied+2(%rip)
+    movl $0x0100007f, network_addr_denied+4(%rip)
+
+    # Allowed local bind on TCP 42421 must succeed.
+    mov $41, %eax
+    mov $2, %edi
+    mov $1, %esi
+    xor %edx, %edx
+    syscall
+    test %rax, %rax
+    js .fail40
+    mov %rax, %r12
+
+    mov $49, %eax
+    mov %r12, %rdi
+    lea network_addr(%rip), %rsi
+    mov $16, %edx
+    syscall
+    test %rax, %rax
+    js .fail40
+
+    mov $50, %eax
+    mov %r12, %rdi
+    mov $1, %esi
+    syscall
+    test %rax, %rax
+    js .fail40
+
+    # Same network namespace and seccomp authority, but undeclared bind port
+    # 42422 must be denied specifically by Landlock with EACCES.
+    mov $41, %eax
+    mov $2, %edi
+    mov $1, %esi
+    xor %edx, %edx
+    syscall
+    test %rax, %rax
+    js .fail40
+    mov %rax, %r13
+
+    mov $49, %eax
+    mov %r13, %rdi
+    lea network_addr_denied(%rip), %rsi
+    mov $16, %edx
+    syscall
+    cmp $-13, %rax
+    jne .fail40
+
+    mov $3, %eax
+    mov %r13, %rdi
+    syscall
+    test %rax, %rax
+    js .fail40
+
+    # Undeclared remote TCP port must likewise return Landlock EACCES rather
+    # than the ordinary ECONNREFUSED result of an unserved loopback port.
+    mov $41, %eax
+    mov $2, %edi
+    mov $1, %esi
+    xor %edx, %edx
+    syscall
+    test %rax, %rax
+    js .fail40
+    mov %rax, %r13
+
+    mov $42, %eax
+    mov %r13, %rdi
+    lea network_addr_denied(%rip), %rsi
+    mov $16, %edx
+    syscall
+    cmp $-13, %rax
+    jne .fail40
+
+    mov $3, %eax
+    mov %r13, %rdi
+    syscall
+    test %rax, %rax
+    js .fail40
+
+    # Positive connect on the declared remote port proves the rule does not
+    # merely deny all target-created networking.
+    mov $57, %eax
+    syscall
+    test %rax, %rax
+    js .fail40
+    jz .landlock_tcp_client
+
+    mov $43, %eax
+    mov %r12, %rdi
+    xor %esi, %esi
+    xor %edx, %edx
+    syscall
+    test %rax, %rax
+    js .fail40
+    mov %rax, %r13
+
+    xor %eax, %eax
+    mov %r13, %rdi
+    lea network_buffer(%rip), %rsi
+    mov $loopback_message_len, %edx
+    syscall
+    cmp $loopback_message_len, %rax
+    jne .fail40
+
+    lea network_buffer(%rip), %rdi
+    lea loopback_message(%rip), %rsi
+    mov $loopback_message_len, %ecx
+    repe cmpsb
+    jne .fail40
+
+    mov $3, %eax
+    mov %r13, %rdi
+    syscall
+    test %rax, %rax
+    js .fail40
+    mov $3, %eax
+    mov %r12, %rdi
+    syscall
+    test %rax, %rax
+    js .fail40
+    xor %edi, %edi
+    jmp .exit
+
+.landlock_tcp_client:
+    mov $41, %eax
+    mov $2, %edi
+    mov $1, %esi
+    xor %edx, %edx
+    syscall
+    test %rax, %rax
+    js .fail40
+    mov %rax, %r13
+
+    mov $42, %eax
+    mov %r13, %rdi
+    lea network_addr(%rip), %rsi
+    mov $16, %edx
+    syscall
+    test %rax, %rax
+    js .fail40
+
+    mov $1, %eax
+    mov %r13, %rdi
+    lea loopback_message(%rip), %rsi
+    mov $loopback_message_len, %edx
+    syscall
+    cmp $loopback_message_len, %rax
+    jne .fail40
+
+    mov $3, %eax
+    mov %r13, %rdi
+    syscall
+    test %rax, %rax
+    js .fail40
+    xor %edi, %edi
+    jmp .exit
+
 .forbidden:
     mov $39, %eax
     syscall
@@ -1516,6 +1680,9 @@ _start:
     jmp .exit
 .fail39:
     mov $39, %edi
+    jmp .exit
+.fail40:
+    mov $40, %edi
 
 .exit:
     mov $60, %eax
@@ -1631,6 +1798,8 @@ uts_buffer:
     .skip 512
 .balign 16
 network_addr:
+    .skip 16
+network_addr_denied:
     .skip 16
 .balign 8
 network_ifreq:

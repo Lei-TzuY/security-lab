@@ -43,4 +43,14 @@ if text.count(dispatch_old) != 1:
     )
 text = text.replace(dispatch_old, dispatch_new, 1)
 
+oracle_prefix_old = '''    "    ret\\n\\n.forbidden:\\n",
+    "    ret\\n\\n.readonly_volume:\\n'''
+oracle_prefix_new = '''    ".cancellation_descendant_pause:\\n    mov $34, %eax\\n    syscall\\n    jmp .cancellation_descendant_pause\\n\\n.forbidden:\\n",
+    ".cancellation_descendant_pause:\\n    mov $34, %eax\\n    syscall\\n    jmp .cancellation_descendant_pause\\n\\n.readonly_volume:\\n'''
+if text.count(oracle_prefix_old) != 1:
+    raise SystemExit(
+        f"volume oracle-prefix fix expected one match, got {text.count(oracle_prefix_old)}"
+    )
+text = text.replace(oracle_prefix_old, oracle_prefix_new, 1)
+
 path.write_text(text)

@@ -48,6 +48,16 @@ for old, new in [
     ("tcp_connect_ports", "landlock.tcp_connect_ports"),
 ]:
     segment = segment.replace(old, new)
+segment = segment.replace(
+    "for port in landlock.tcp_bind_ports {",
+    "for &port in &landlock.tcp_bind_ports {",
+)
+segment = segment.replace(
+    "for port in landlock.tcp_connect_ports {",
+    "for &port in &landlock.tcp_connect_ports {",
+)
+segment = segment.replace(".contains(port)", ".contains(&port)")
+segment = segment.replace("u64::from(*port)", "u64::from(port)")
 text = text[:start] + segment + text[end:]
 
 path.write_text(text)

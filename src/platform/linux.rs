@@ -289,6 +289,58 @@ mod x86_64 {
         })
     }
 
+    fn connect_host_loopback_tcp(
+        port: u16,
+        target_fd: u32,
+        storage_floor: RawFd,
+    ) -> Result<PreparedSelectedHandle, SandboxError> {
+        let socket_fd =
+            unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+        if socket_fd == -1 {
+            return Err(SandboxError::SetupFailed(format!(
+                "cannot create brokered host-loopback TCP socket: {}",
+                io::Error::last_os_error()
+            )));
+        }
+        let socket_fd = OwnedFd(socket_fd);
+        let address = libc::sockaddr_in {
+            sin_family: libc::AF_INET as libc::sa_family_t,
+            sin_port: port.to_be(),
+            sin_addr: libc::in_addr {
+                s_addr: u32::from_ne_bytes([127, 0, 0, 1]),
+            },
+            sin_zero: [0; 8],
+        };
+        loop {
+            let connected = unsafe {
+                libc::connect(
+                    socket_fd.raw(),
+                    (&address as *const libc::sockaddr_in).cast::<libc::sockaddr>(),
+                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                )
+            };
+            if connected == 0 {
+                break;
+            }
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(SandboxError::SetupFailed(format!(
+                "cannot connect brokered host-loopback TCP endpoint 127.0.0.1:{port}: {error}"
+            )));
+        }
+        let storage_fd = move_owned_fd_to_selected_storage(
+            socket_fd,
+            storage_floor,
+            "brokered host-loopback TCP socket",
+        )?;
+        Ok(PreparedSelectedHandle {
+            storage_fd,
+            target_fd: target_fd as RawFd,
+        })
+    }
+
     fn prepare_volume(
         root_fd: RawFd,
         source: &Path,
@@ -412,9 +464,11 @@ mod x86_64 {
             let selected_storage_floor = policy
                 .selected_handles
                 .keys()
-                .next_back()
+                .copied()
+                .chain(policy.host_loopback_tcp_target_fd.iter().copied())
+                .max()
                 .map_or(FIRST_NON_STDIO_FD as RawFd, |target_fd| {
-                    *target_fd as RawFd + 1
+                    target_fd as RawFd + 1
                 });
             let executable_fd = move_owned_fd_to_selected_storage(
                 executable_fd,
@@ -422,13 +476,36 @@ mod x86_64 {
                 "pinned executable",
             )?;
 
-            let mut selected_handles = Vec::with_capacity(policy.selected_handles.len());
+            let mut selected_handles = Vec::with_capacity(
+                policy.selected_handles.len()
+                    + if policy.host_loopback_tcp_target_fd.is_some() {
+                        1
+                    } else {
+                        0
+                    },
+            );
             for (target_fd, source_fd) in &policy.selected_handles {
                 selected_handles.push(pin_selected_handle(
                     *source_fd,
                     *target_fd,
                     selected_storage_floor,
                 )?);
+            }
+            match (
+                policy.host_loopback_tcp_port,
+                policy.host_loopback_tcp_target_fd,
+            ) {
+                (Some(port), Some(target_fd)) => selected_handles.push(connect_host_loopback_tcp(
+                    port,
+                    target_fd,
+                    selected_storage_floor,
+                )?),
+                (None, None) => {}
+                _ => {
+                    return Err(SandboxError::InvalidPolicy(PolicyError::new(
+                        "network.host_loopback_tcp_port and network.host_loopback_tcp_target_fd must be specified together",
+                    )));
+                }
             }
             let cancellation_fd = cancellation
                 .map(|token| {

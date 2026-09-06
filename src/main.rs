@@ -12,15 +12,20 @@ fn main() {
     let command = args.next();
     let policy_path = args.next();
     let has_extra_args = args.next().is_some();
-    let json_requested = command.as_deref() == Some(OsStr::new("run-json"));
-    let human_requested = command.as_deref() == Some(OsStr::new("run"));
+    let run_json_requested = command.as_deref() == Some(OsStr::new("run-json"));
+    let run_requested = command.as_deref() == Some(OsStr::new("run"));
+    let check_json_requested = command.as_deref() == Some(OsStr::new("check-json"));
+    let check_requested = command.as_deref() == Some(OsStr::new("check"));
+    let machine_requested = run_json_requested || check_json_requested;
+    let recognized_command =
+        run_json_requested || run_requested || check_json_requested || check_requested;
 
-    if (!json_requested && !human_requested) || policy_path.is_none() || has_extra_args {
+    if !recognized_command || policy_path.is_none() || has_extra_args {
         let usage = format!(
-            "usage: {} <run|run-json> <policy-file>",
+            "usage: {} <run|run-json|check|check-json> <policy-file>",
             program.to_string_lossy()
         );
-        if json_requested {
+        if machine_requested {
             println!("{}", cli_json::error_json("usage", &usage));
         } else {
             eprintln!("{usage}");
@@ -32,7 +37,7 @@ fn main() {
     let text = match fs::read_to_string(&policy_path) {
         Ok(text) => text,
         Err(err) => {
-            if json_requested {
+            if machine_requested {
                 println!("{}", cli_json::error_json("policy_read", &err.to_string()));
             } else {
                 eprintln!("policy read failed: {err}");
@@ -43,7 +48,7 @@ fn main() {
     let policy: SandboxPolicy = match text.parse() {
         Ok(policy) => policy,
         Err(err) => {
-            if json_requested {
+            if machine_requested {
                 println!(
                     "{}",
                     cli_json::error_json("policy_rejected", &err.to_string())
@@ -55,7 +60,15 @@ fn main() {
         }
     };
 
-    if json_requested {
+    if check_json_requested {
+        println!("{}", cli_json::validation_json());
+        process::exit(0);
+    }
+    if check_requested {
+        println!("policy-valid");
+        process::exit(0);
+    }
+    if run_json_requested {
         run_json(&policy)
     } else {
         run_human(&policy)

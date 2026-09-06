@@ -44,7 +44,10 @@ fn main() {
         Ok(policy) => policy,
         Err(err) => {
             if json_requested {
-                println!("{}", cli_json::error_json("policy_rejected", &err.to_string()));
+                println!(
+                    "{}",
+                    cli_json::error_json("policy_rejected", &err.to_string())
+                );
             } else {
                 eprintln!("policy rejected: {err}");
             }

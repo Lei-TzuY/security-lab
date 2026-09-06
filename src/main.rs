@@ -1,6 +1,6 @@
 mod cli_json;
 
-use security_lab::{run, run_report, ChildOutcome, SandboxPolicy};
+use security_lab::{run, run_report, SandboxPolicy};
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
@@ -87,6 +87,3 @@ fn run_json(policy: &SandboxPolicy) -> ! {
         }
     }
 }
-
-#[allow(dead_code)]
-fn _assert_child_outcome_is_linked(_: ChildOutcome) {}

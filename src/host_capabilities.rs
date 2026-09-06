@@ -1,16 +1,4 @@
-from pathlib import Path
-
-
-def replace_one(path: str, old: str, new: str, label: str) -> None:
-    p = Path(path)
-    text = p.read_text()
-    count = text.count(old)
-    if count != 1:
-        raise SystemExit(f"{label}: expected exactly one match, got {count}")
-    p.write_text(text.replace(old, new, 1))
-
-
-Path("src/host_capabilities.rs").write_text(r'''use std::fmt::Write as _;
+use std::fmt::Write as _;
 use std::path::Path;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -88,8 +76,12 @@ impl HostCapabilities {
 
     pub(crate) fn to_human(&self) -> String {
         let mut output = String::from("host-capabilities:\n");
-        writeln!(&mut output, "target: {}/{}", self.target_os, self.target_arch)
-            .expect("write to String cannot fail");
+        writeln!(
+            &mut output,
+            "target: {}/{}",
+            self.target_os, self.target_arch
+        )
+        .expect("write to String cannot fail");
         writeln!(
             &mut output,
             "sandbox-target-supported: {}",
@@ -121,7 +113,11 @@ impl HostCapabilities {
 }
 
 fn bool_json(value: bool) -> &'static str {
-    if value { "true" } else { "false" }
+    if value {
+        "true"
+    } else {
+        "false"
+    }
 }
 
 fn push_optional_u32(output: &mut String, value: Option<u32>) {
@@ -263,135 +259,3 @@ mod tests {
         );
     }
 }
-''')
-
-replace_one(
-    "src/main.rs",
-    "mod cli_json;\n",
-    "mod cli_json;\nmod host_capabilities;\n",
-    "main module declaration",
-)
-
-replace_one(
-    "src/main.rs",
-    '''    let run_json_requested = command.as_deref() == Some(OsStr::new("run-json"));
-    let run_requested = command.as_deref() == Some(OsStr::new("run"));
-    let check_json_requested = command.as_deref() == Some(OsStr::new("check-json"));
-    let check_requested = command.as_deref() == Some(OsStr::new("check"));
-    let machine_requested = run_json_requested || check_json_requested;
-    let recognized_command =
-        run_json_requested || run_requested || check_json_requested || check_requested;
-
-    if !recognized_command || policy_path.is_none() || has_extra_args {
-        let usage = format!(
-            "usage: {} <run|run-json|check|check-json> <policy-file>",
-            program.to_string_lossy()
-        );
-''',
-    '''    let run_json_requested = command.as_deref() == Some(OsStr::new("run-json"));
-    let run_requested = command.as_deref() == Some(OsStr::new("run"));
-    let check_json_requested = command.as_deref() == Some(OsStr::new("check-json"));
-    let check_requested = command.as_deref() == Some(OsStr::new("check"));
-    let host_json_requested = command.as_deref() == Some(OsStr::new("host-json"));
-    let host_requested = command.as_deref() == Some(OsStr::new("host"));
-    let host_command = host_json_requested || host_requested;
-    let machine_requested = run_json_requested || check_json_requested || host_json_requested;
-    let recognized_command = run_json_requested
-        || run_requested
-        || check_json_requested
-        || check_requested
-        || host_json_requested
-        || host_requested;
-    let invalid_shape = if host_command {
-        policy_path.is_some() || has_extra_args
-    } else {
-        policy_path.is_none() || has_extra_args
-    };
-
-    if !recognized_command || invalid_shape {
-        let display_program = program.to_string_lossy();
-        let usage = format!(
-            "usage: {display_program} <run|run-json|check|check-json> <policy-file> | {display_program} <host|host-json>"
-        );
-''',
-    "main command dispatch",
-)
-
-replace_one(
-    "src/main.rs",
-    '''    let policy_path = policy_path.expect("policy path was checked above");
-''',
-    '''    if host_json_requested {
-        println!("{}", host_capabilities::probe().to_json());
-        return;
-    }
-    if host_requested {
-        print!("{}", host_capabilities::probe().to_human());
-        return;
-    }
-
-    let policy_path = policy_path.expect("policy path was checked above");
-''',
-    "main host dispatch",
-)
-
-with Path("tests/cli.rs").open("a") as out:
-    out.write(r'''
-
-#[test]
-fn host_json_reports_runtime_capabilities_without_reading_policy() {
-    let output = Command::new(binary())
-        .arg("host-json")
-        .output()
-        .expect("run host capability JSON CLI");
-
-    assert_eq!(output.status.code(), Some(0));
-    assert!(output.stderr.is_empty());
-    let stdout = String::from_utf8(output.stdout).expect("host JSON stdout is UTF-8");
-    assert!(stdout.starts_with(
-        "{\"ok\":true,\"host\":{\"kind\":\"runtime_capabilities\",\"policy_preflight\":false,\"target_os\":\"linux\",\"target_arch\":\"x86_64\",\"sandbox_target_supported\":true,\"landlock\":{\"abi\":"
-    ));
-    assert!(stdout.contains("\"pidfd_open\":{\"available\":true,\"errno\":null}"));
-    assert!(stdout.contains(
-        "\"timerfd_monotonic\":{\"available\":true,\"errno\":null}"
-    ));
-    assert!(stdout.contains("\"cgroup_v2\":{\"present\":true}"));
-    assert!(stdout.ends_with("}}}\n"));
-}
-
-#[test]
-fn host_human_report_is_explicitly_not_policy_preflight() {
-    let output = Command::new(binary())
-        .arg("host")
-        .output()
-        .expect("run host capability CLI");
-
-    assert_eq!(output.status.code(), Some(0));
-    assert!(output.stderr.is_empty());
-    let stdout = String::from_utf8(output.stdout).expect("host CLI stdout is UTF-8");
-    assert!(stdout.starts_with(
-        "host-capabilities:\ntarget: linux/x86_64\nsandbox-target-supported: true\nlandlock-abi: "
-    ));
-    assert!(stdout.contains("\npidfd-open: available\n"));
-    assert!(stdout.contains("timerfd-monotonic: available\n"));
-    assert!(stdout.contains("cgroup-v2: present\n"));
-    assert!(stdout.ends_with("policy-preflight: false\n"));
-}
-
-#[test]
-fn host_json_rejects_policy_argument_as_machine_usage_error() {
-    let output = Command::new(binary())
-        .args(["host-json", "unexpected-policy.conf"])
-        .output()
-        .expect("run malformed host capability invocation");
-
-    assert_eq!(output.status.code(), Some(2));
-    assert!(output.stderr.is_empty());
-    let stdout = String::from_utf8(output.stdout).expect("host usage JSON stdout is UTF-8");
-    assert!(stdout.starts_with(
-        "{\"ok\":false,\"error\":{\"kind\":\"usage\",\"message\":"
-    ));
-    assert!(stdout.contains("<host|host-json>"));
-    assert!(stdout.ends_with("}}\n"));
-}
-''')

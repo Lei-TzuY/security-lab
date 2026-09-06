@@ -1,4 +1,5 @@
 mod cli_json;
+mod host_capabilities;
 
 use security_lab::{run, run_report, SandboxPolicy};
 use std::env;
@@ -16,14 +17,26 @@ fn main() {
     let run_requested = command.as_deref() == Some(OsStr::new("run"));
     let check_json_requested = command.as_deref() == Some(OsStr::new("check-json"));
     let check_requested = command.as_deref() == Some(OsStr::new("check"));
-    let machine_requested = run_json_requested || check_json_requested;
-    let recognized_command =
-        run_json_requested || run_requested || check_json_requested || check_requested;
+    let host_json_requested = command.as_deref() == Some(OsStr::new("host-json"));
+    let host_requested = command.as_deref() == Some(OsStr::new("host"));
+    let host_command = host_json_requested || host_requested;
+    let machine_requested = run_json_requested || check_json_requested || host_json_requested;
+    let recognized_command = run_json_requested
+        || run_requested
+        || check_json_requested
+        || check_requested
+        || host_json_requested
+        || host_requested;
+    let invalid_shape = if host_command {
+        policy_path.is_some() || has_extra_args
+    } else {
+        policy_path.is_none() || has_extra_args
+    };
 
-    if !recognized_command || policy_path.is_none() || has_extra_args {
+    if !recognized_command || invalid_shape {
+        let display_program = program.to_string_lossy();
         let usage = format!(
-            "usage: {} <run|run-json|check|check-json> <policy-file>",
-            program.to_string_lossy()
+            "usage: {display_program} <run|run-json|check|check-json> <policy-file> | {display_program} <host|host-json>"
         );
         if machine_requested {
             println!("{}", cli_json::error_json("usage", &usage));
@@ -31,6 +44,15 @@ fn main() {
             eprintln!("{usage}");
         }
         process::exit(2);
+    }
+
+    if host_json_requested {
+        println!("{}", host_capabilities::probe().to_json());
+        return;
+    }
+    if host_requested {
+        print!("{}", host_capabilities::probe().to_human());
+        return;
     }
 
     let policy_path = policy_path.expect("policy path was checked above");

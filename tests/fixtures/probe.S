@@ -8,6 +8,7 @@
 # argv[1] mode:
 #   A allowed write
 #   B assert 64-bit masked seccomp argument filtering on lseek offset
+#   y assert unsigned 64-bit inclusive seccomp range filtering on lseek offset
 #   G assert one selected non-stdio handle is remapped without ambient FD leakage
 #   c fork a descendant, publish cancellation readiness on fd 9, then pause
 #   v read a declared persistent volume, prove it is read-only, and hide its host source path
@@ -96,6 +97,8 @@ _start:
     je .pidfd_signal_allowed
     cmp $117, %al
     je .pidfd_signal_denied
+    cmp $121, %al
+    je .seccomp_argument_range
     cmp $70, %al
     je .forbidden
     cmp $69, %al
@@ -187,6 +190,88 @@ _start:
     mov $8, %eax
     mov %r12, %rdi
     movabs $0x0000000212345678, %rsi
+    xor %edx, %edx
+    syscall
+    cmp $-1, %rax
+    jne .fail29
+
+    mov $3, %eax
+    mov %r12, %rdi
+    syscall
+    test %rax, %rax
+    js .fail29
+    xor %edi, %edi
+    jmp .exit
+
+.seccomp_argument_range:
+    mov $257, %eax
+    mov $-100, %edi
+    lea probe_path(%rip), %rsi
+    xor %edx, %edx
+    xor %r10d, %r10d
+    syscall
+    test %rax, %rax
+    js .fail29
+    mov %rax, %r12
+
+    # Exact inclusive lower bound (even, so the composed mask also passes).
+    mov $8, %eax
+    mov %r12, %rdi
+    movabs $0x00000000fffffff0, %rsi
+    xor %edx, %edx
+    syscall
+    test %rax, %rax
+    js .fail29
+
+    # Cross the 32-bit word boundary inside the allowed range.
+    mov $8, %eax
+    mov %r12, %rdi
+    movabs $0x0000000100000000, %rsi
+    xor %edx, %edx
+    syscall
+    test %rax, %rax
+    js .fail29
+
+    # Exact inclusive upper bound.
+    mov $8, %eax
+    mov %r12, %rdi
+    movabs $0x0000000100000010, %rsi
+    xor %edx, %edx
+    syscall
+    test %rax, %rax
+    js .fail29
+
+    # In-range odd value: range passes, composed masked equality must deny.
+    mov $8, %eax
+    mov %r12, %rdi
+    movabs $0x0000000100000001, %rsi
+    xor %edx, %edx
+    syscall
+    cmp $-1, %rax
+    jne .fail29
+
+    # Even value below lower bound: mask passes, range must deny.
+    mov $8, %eax
+    mov %r12, %rdi
+    movabs $0x00000000ffffffee, %rsi
+    xor %edx, %edx
+    syscall
+    cmp $-1, %rax
+    jne .fail29
+
+    # Even value above upper bound: mask passes, range must deny.
+    mov $8, %eax
+    mov %r12, %rdi
+    movabs $0x0000000100000012, %rsi
+    xor %edx, %edx
+    syscall
+    cmp $-1, %rax
+    jne .fail29
+
+    # High-32-bit mismatch proves the comparison is not truncated to low bits.
+    mov $8, %eax
+    mov %r12, %rdi
+    movabs $0x0000000200000000, %rsi
     xor %edx, %edx
     syscall
     cmp $-1, %rax

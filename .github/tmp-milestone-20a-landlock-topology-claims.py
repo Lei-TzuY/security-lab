@@ -36,8 +36,8 @@ replace_one(
 )
 replace_one(
     "README.md",
-    "The handled mutation rights are `WRITE_FILE`, `MAKE_REG`, `REMOVE_FILE`, and `TRUNCATE`; directory creation/removal, symlink/device/socket/FIFO creation, rename/link `REFER`, and broader metadata mutation remain outside this slice.",
-    "The base handled mutation rights are `WRITE_FILE`, `MAKE_REG`, `REMOVE_FILE`, and `TRUNCATE`. An optional matching `landlock.path_topology_mutate` entry adds only `MAKE_DIR`, `REMOVE_DIR`, `MAKE_SYM`, and `REFER` to that same directory rule; device/socket/FIFO creation and broader metadata mutation remain outside the model.",
+    "`landlock.device_ioctl = <absolute-sandbox-device>` is independently optional and repeatable up to 32 entries.",
+    "`landlock.path_topology_mutate = <absolute-sandbox-directory>` is independently optional and repeatable up to 32 entries, but every entry must exactly match a `landlock.file_mutate` directory. It adds only Landlock `MAKE_DIR`, `REMOVE_DIR`, `MAKE_SYM`, and `REFER` to that same final-tree rule; it does not create a new writable path or grant socket/FIFO/device creation. Target topology syscalls remain separately gated by seccomp.\n\n`landlock.device_ioctl = <absolute-sandbox-device>` is independently optional and repeatable up to 32 entries.",
     "README topology policy semantics",
 )
 

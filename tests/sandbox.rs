@@ -1150,6 +1150,19 @@ fn bounded_stdout_capture_drains_excess_without_deadlock() {
 }
 
 #[test]
+fn process_tree_resource_usage_reports_kernel_accounting() {
+    let report = run_report(&policy("x", &[], &["execveat", "mmap", "exit"])).unwrap();
+
+    assert_eq!(report.outcome, ChildOutcome::Exited(0));
+    assert_eq!(report.reaped_descendants, 0);
+    assert!(
+        report.process_tree_usage.max_child_rss_kib >= 4096,
+        "8 MiB touched mapping should produce at least 4 MiB max-child RSS, got {} KiB",
+        report.process_tree_usage.max_child_rss_kib
+    );
+}
+
+#[test]
 fn direct_target_is_pid2_under_launcher_owned_namespace_init() {
     let report = run_report(&policy(
         "Y",

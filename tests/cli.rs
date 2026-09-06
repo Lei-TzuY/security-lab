@@ -64,10 +64,30 @@ fn run_json_emits_deterministic_machine_report() {
         "unexpected stderr bytes: {:?}",
         output.stderr
     );
-    assert_eq!(
-        String::from_utf8(output.stdout).expect("JSON CLI stdout is UTF-8"),
-        "{\"ok\":true,\"outcome\":{\"kind\":\"exited\",\"code\":0},\"stdout\":{\"encoding\":\"hex\",\"data\":\"68656c6c6f2066726f6d2073656375726974792d6c61620a\",\"truncated\":false},\"reaped_descendants\":0}\n"
-    );
+    let stdout = String::from_utf8(output.stdout).expect("JSON CLI stdout is UTF-8");
+    let prefix = "{\"ok\":true,\"outcome\":{\"kind\":\"exited\",\"code\":0},\"stdout\":{\"encoding\":\"hex\",\"data\":\"68656c6c6f2066726f6d2073656375726974792d6c61620a\",\"truncated\":false},\"reaped_descendants\":0,\"process_tree_usage\":{\"user_cpu_micros\":";
+    let usage = stdout
+        .strip_prefix(prefix)
+        .unwrap_or_else(|| panic!("unexpected deterministic JSON prefix: {stdout}"));
+    let (user_cpu, usage) = usage
+        .split_once(",\"system_cpu_micros\":")
+        .unwrap_or_else(|| panic!("missing system CPU telemetry: {stdout}"));
+    let (system_cpu, usage) = usage
+        .split_once(",\"max_child_rss_kib\":")
+        .unwrap_or_else(|| panic!("missing RSS telemetry: {stdout}"));
+    let max_rss = usage
+        .strip_suffix("}}\n")
+        .unwrap_or_else(|| panic!("unexpected JSON telemetry suffix: {stdout}"));
+    for (label, value) in [
+        ("user_cpu_micros", user_cpu),
+        ("system_cpu_micros", system_cpu),
+        ("max_child_rss_kib", max_rss),
+    ] {
+        assert!(
+            !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()),
+            "{label} must be an unsigned decimal integer, got {value:?} in {stdout}"
+        );
+    }
 }
 
 #[test]

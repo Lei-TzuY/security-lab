@@ -20,8 +20,8 @@ mod x86_64 {
     };
     use crate::policy::{StdioMode, StdioPolicy};
     use crate::{
-        CancellationToken, CapturedOutput, ChildOutcome, PolicyError, ResourceLimits, RunReport,
-        SandboxError, SandboxPolicy,
+        CancellationToken, CapturedOutput, ChildOutcome, PolicyError, ProcessTreeUsage,
+        ResourceLimits, RunReport, SandboxError, SandboxPolicy,
     };
     use std::ffi::CString;
     use std::io;
@@ -116,6 +116,7 @@ mod x86_64 {
     const PHASE_LANDLOCK_RULE: u32 = 50;
     const PHASE_LANDLOCK_RESTRICT: u32 = 51;
     const PHASE_LANDLOCK_NET_RULE: u32 = 52;
+    const PHASE_PROCESS_TREE_USAGE: u32 = 53;
 
     const SYS_LANDLOCK_CREATE_RULESET: libc::c_long = 444;
     const SYS_LANDLOCK_ADD_RULE: libc::c_long = 445;
@@ -1060,6 +1061,7 @@ mod x86_64 {
                 outcome,
                 stdout: None,
                 reaped_descendants: 0,
+                process_tree_usage: ProcessTreeUsage::default(),
             });
         }
 
@@ -1088,6 +1090,11 @@ mod x86_64 {
             outcome,
             stdout,
             reaped_descendants: lifecycle_record.reaped_descendants,
+            process_tree_usage: ProcessTreeUsage {
+                user_cpu_micros: lifecycle_record.user_cpu_micros,
+                system_cpu_micros: lifecycle_record.system_cpu_micros,
+                max_child_rss_kib: lifecycle_record.max_child_rss_kib,
+            },
         })
     }
 
@@ -2070,6 +2077,7 @@ mod x86_64 {
                 poll: PHASE_DEADLINE_POLL,
                 cancellation_pidfd: PHASE_CANCELLATION_PIDFD,
                 cancellation_poll: PHASE_CANCELLATION_POLL,
+                usage: PHASE_PROCESS_TREE_USAGE,
             },
         );
 
@@ -2762,6 +2770,7 @@ mod x86_64 {
             PHASE_LANDLOCK_RULE => "Landlock path-beneath rule installation",
             PHASE_LANDLOCK_RESTRICT => "Landlock self restriction",
             PHASE_LANDLOCK_NET_RULE => "Landlock TCP port rule installation",
+            PHASE_PROCESS_TREE_USAGE => "process-tree resource usage collection",
             _ => "unknown launch phase",
         };
         format!(

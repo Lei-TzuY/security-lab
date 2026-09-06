@@ -34,6 +34,19 @@ pub struct CapturedOutput {
     pub truncated: bool,
 }
 
+/// Kernel resource usage attributed to the terminated/waited-for sandbox process tree.
+///
+/// CPU fields are cumulative `RUSAGE_CHILDREN` values observed by launcher-owned
+/// namespace PID 1 after it has reaped the direct target and remaining descendants.
+/// On Linux, `max_child_rss_kib` is the largest child's peak RSS, not a concurrent
+/// whole-tree memory high-water mark.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ProcessTreeUsage {
+    pub user_cpu_micros: u64,
+    pub system_cpu_micros: u64,
+    pub max_child_rss_kib: u64,
+}
+
 /// Detailed result for callers that need launcher-owned captured output or process-tree lifecycle evidence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunReport {
@@ -43,4 +56,6 @@ pub struct RunReport {
     pub stdout: Option<CapturedOutput>,
     /// Additional orphaned descendants reaped by the launcher-owned PID 1 after the direct target terminated.
     pub reaped_descendants: u32,
+    /// Kernel resource telemetry collected by namespace PID 1 only after the sandbox tree converges.
+    pub process_tree_usage: ProcessTreeUsage,
 }

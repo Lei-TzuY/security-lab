@@ -32,6 +32,7 @@
 #   N open until RLIMIT_NOFILE produces EMFILE
 #   P assert PR_GET_NO_NEW_PRIVS == 1
 #   R read back all configured resource limits
+#   x allocate and fault anonymous pages for launcher-owned resource-usage evidence
 #   W create argv[2] marker
 #   D assert descriptor number in argv[2] is closed after exec
 #   H assert absolute host path argv[2] is hidden by filesystem root
@@ -105,6 +106,8 @@ _start:
     je .no_new_privs
     cmp $82, %al
     je .resource_limits
+    cmp $120, %al
+    je .resource_usage
     cmp $87, %al
     je .write_marker
     cmp $68, %al
@@ -1330,6 +1333,27 @@ _start:
     syscall
     cmp $1, %rax
     jne .fail13
+    xor %edi, %edi
+    jmp .exit
+
+.resource_usage:
+    mov $9, %eax
+    xor %edi, %edi
+    mov $8388608, %esi
+    mov $3, %edx
+    mov $34, %r10d
+    mov $-1, %r8
+    xor %r9d, %r9d
+    syscall
+    test %rax, %rax
+    js .fail3
+    mov %rax, %r12
+    xor %ecx, %ecx
+.resource_usage_touch:
+    movb $1, (%r12,%rcx)
+    add $4096, %rcx
+    cmp $8388608, %rcx
+    jb .resource_usage_touch
     xor %edi, %edi
     jmp .exit
 

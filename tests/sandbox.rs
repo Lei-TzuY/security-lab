@@ -131,6 +131,7 @@ fn policy(mode: &str, extra_args: &[&str], syscalls: &[&str]) -> SandboxPolicy {
         args,
         environment: BTreeMap::new(),
         working_dir: PathBuf::from("/work"),
+        loopback_enabled: false,
         readonly_volume_source: None,
         readonly_volume_target: None,
         writable_volume_source: None,
@@ -376,9 +377,31 @@ fn network_namespace_cannot_reach_host_loopback_listener() {
         &[port.as_str()],
         &["execveat", "socket", "connect", "close", "exit"],
     );
+    isolated.loopback_enabled = true;
     isolated.wall_clock_milliseconds = Some(2000);
 
     assert_eq!(run(&isolated).unwrap(), ChildOutcome::Exited(0));
+}
+
+#[test]
+fn loopback_is_down_unless_policy_enables_it() {
+    let disabled = policy("o", &[], &["execveat", "socket", "ioctl", "close", "exit"]);
+    assert_eq!(run(&disabled).unwrap(), ChildOutcome::Exited(0));
+}
+
+#[test]
+fn enabled_loopback_supports_intra_sandbox_tcp() {
+    let mut local = policy(
+        "n",
+        &[],
+        &[
+            "execveat", "socket", "bind", "listen", "fork", "connect", "accept", "read", "write",
+            "close", "exit",
+        ],
+    );
+    local.loopback_enabled = true;
+    local.wall_clock_milliseconds = Some(2000);
+    assert_eq!(run(&local).unwrap(), ChildOutcome::Exited(0));
 }
 
 #[test]

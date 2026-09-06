@@ -197,7 +197,7 @@ Boundary: 8A is exactly one read-only existing host-directory mount. It does not
 
 ### Slice 8B — one writable persistent host volume
 
-**Current verified candidate.** Adds one explicit host-mutation capability rather than another read-only path variant.
+**Status: complete on `main`.** Adds one explicit host-mutation capability rather than another read-only path variant.
 
 Acceptance evidence is executable:
 
@@ -213,8 +213,30 @@ Boundary: 8B is at most one explicitly writable existing host directory. It does
 
 ### Milestone 8 promotion rule
 
-After 8B integrates, the persistent-volume authority model is sealed at this bounded laboratory scope. Do not farm extra mountpoints or access-mode aliases. Promote to a materially different executable frontier such as controlled networking with positive connectivity evidence, or revisit aggregate cgroup accounting only when real unprivileged delegation becomes available.
+Milestone 8 is sealed at this bounded laboratory scope. Do not farm extra mountpoints or access-mode aliases.
+
+## Milestone 9 — controlled networking
+
+### Slice 9A — policy-owned isolated loopback
+
+**Current verified candidate.** Adds real positive connectivity inside the private network namespace without attaching it to the host or an external network.
+
+Acceptance evidence is executable:
+
+- policy accepts optional `network.loopback = enabled|disabled`, defaults to disabled when absent, and rejects invalid or duplicate declarations;
+- after the combined user/network namespace transition and UID/GID mapping, the trusted launcher may use an IPv4 datagram management socket plus `SIOCGIFFLAGS`/`SIOCSIFFLAGS` to set only `IFF_UP` on `lo`; the socket is closed before target capability clearing/seccomp/exec, and unsupported or denied mandatory activation fails explicitly rather than falling back;
+- with loopback absent/default-disabled, a raw target explicitly granted `socket` and `ioctl` reads `lo` flags and requires `IFF_UP` to be clear;
+- with loopback enabled, a raw target explicitly granted the required TCP syscalls performs `socket` → `bind` → `listen` → `fork` → `connect` → `accept` and transfers exact `loopback-ok` bytes over `127.0.0.1`;
+- a separate enabled-loopback regression first proves a host `127.0.0.1` listener is reachable from the host, then requires the sandbox connection to that host port to fail only with network-stack separation outcomes (`ECONNREFUSED`, `ENETUNREACH`, or `EHOSTUNREACH`); seccomp `EPERM` or successful host reachability fails the oracle;
+- launcher-owned activation does not add target network syscalls or capabilities implicitly: target `socket`, `connect`, `bind`, `listen`, `accept`, and `ioctl` remain explicit seccomp grants;
+- all Milestones 1–8B regressions remain active; stable format/Clippy/full tests and the full Rust 1.74 suite are green.
+
+Boundary: 9A controls only `lo` inside the already-isolated network namespace. It does not configure a veth, host bridge, host/external routes, DNS, NAT, endpoint allowlist, ingress, or egress.
+
+### Milestone 9 promotion rule
+
+After 9A integrates, do not farm loopback ports, protocol variants, or aliases. The next networking slice must add a materially different topology or host/external endpoint capability with explicit positive and negative executable evidence. Milestone 4A aggregate cgroup accounting remains blocked until real unprivileged cgroup-v2 delegation is available; supplementary-group isolation remains a separate user-namespace mapping problem.
 
 ## Later frontiers
 
-Supplementary-group isolation with a viable mapping architecture, broader/generalized persistent-volume policy, and controlled networking remain separate evidence-backed frontiers. Do not add configuration-only names without executable kernel behavior and integration evidence.
+Supplementary-group isolation with a viable mapping architecture, broader/generalized persistent-volume policy, externally attached controlled networking, and delegated aggregate cgroup accounting remain separate evidence-backed frontiers. Do not add configuration-only names without executable kernel behavior and integration evidence.

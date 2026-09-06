@@ -75,6 +75,9 @@ pub struct SandboxPolicy {
     pub environment: BTreeMap<String, String>,
     /// Absolute path interpreted inside `root_dir`.
     pub working_dir: PathBuf,
+    /// Whether the launcher activates `lo` inside the isolated network namespace.
+    /// This does not attach the namespace to any host or external network.
+    pub loopback_enabled: bool,
     /// Optional trusted host directory exposed read-only at exactly one
     /// declared sandbox mountpoint. Source and target must be specified together.
     pub readonly_volume_source: Option<PathBuf>,
@@ -494,6 +497,7 @@ impl FromStr for SandboxPolicy {
         let mut args = Vec::new();
         let mut environment = BTreeMap::new();
         let mut working_dir = None;
+        let mut loopback_enabled = None;
         let mut readonly_volume_source = None;
         let mut readonly_volume_target = None;
         let mut writable_volume_source = None;
@@ -531,6 +535,12 @@ impl FromStr for SandboxPolicy {
             match key {
                 "filesystem.root" => set_once(&mut root_dir, value.to_owned(), line_no, key)?,
                 "identity.hostname" => set_once(&mut hostname, value.to_owned(), line_no, key)?,
+                "network.loopback" => set_once(
+                    &mut loopback_enabled,
+                    parse_enabled_disabled(value, line_no, key)?,
+                    line_no,
+                    key,
+                )?,
                 "volume.readonly_source" => {
                     set_once(&mut readonly_volume_source, value.to_owned(), line_no, key)?
                 }
@@ -718,6 +728,7 @@ impl FromStr for SandboxPolicy {
             args,
             environment,
             working_dir: PathBuf::from(required(working_dir, "working_dir")?),
+            loopback_enabled: loopback_enabled.unwrap_or(false),
             readonly_volume_source: readonly_volume_source.map(PathBuf::from),
             readonly_volume_target: readonly_volume_target.map(PathBuf::from),
             writable_volume_source: writable_volume_source.map(PathBuf::from),
@@ -800,6 +811,17 @@ fn parse_u64_literal(value: &str, line: usize, key: &str) -> Result<u64, PolicyE
         value
             .parse::<u64>()
             .map_err(|_| PolicyError::at(line, format!("{key} contains an invalid integer")))
+    }
+}
+
+fn parse_enabled_disabled(value: &str, line: usize, key: &str) -> Result<bool, PolicyError> {
+    match value {
+        "enabled" => Ok(true),
+        "disabled" => Ok(false),
+        _ => Err(PolicyError::at(
+            line,
+            format!("{key} must be enabled or disabled"),
+        )),
     }
 }
 
@@ -906,6 +928,7 @@ mod tests {
         let policy: SandboxPolicy = VALID.parse().unwrap();
         assert_eq!(policy.root_dir, PathBuf::from("/"));
         assert_eq!(policy.hostname, "security-lab");
+        assert!(!policy.loopback_enabled);
         assert_eq!(policy.readonly_volume_source, None);
         assert_eq!(policy.readonly_volume_target, None);
         assert_eq!(policy.writable_volume_source, None);
@@ -927,6 +950,29 @@ mod tests {
         );
         assert!(policy.seccomp.allowed_syscalls.contains("execveat"));
         assert!(policy.seccomp.argument_rules.is_empty());
+    }
+
+    #[test]
+    fn parses_loopback_networking_mode() {
+        let enabled: SandboxPolicy = format!("{VALID}\nnetwork.loopback = enabled")
+            .parse()
+            .unwrap();
+        assert!(enabled.loopback_enabled);
+
+        let disabled: SandboxPolicy = format!("{VALID}\nnetwork.loopback = disabled")
+            .parse()
+            .unwrap();
+        assert!(!disabled.loopback_enabled);
+    }
+
+    #[test]
+    fn rejects_invalid_or_duplicate_loopback_networking_mode() {
+        let invalid = format!("{VALID}\nnetwork.loopback = host");
+        let error = invalid.parse::<SandboxPolicy>().unwrap_err();
+        assert!(error.to_string().contains("must be enabled or disabled"));
+
+        let duplicate = format!("{VALID}\nnetwork.loopback = enabled\nnetwork.loopback = disabled");
+        assert!(duplicate.parse::<SandboxPolicy>().is_err());
     }
 
     #[test]

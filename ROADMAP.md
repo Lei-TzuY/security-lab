@@ -315,7 +315,7 @@ After 11A integrates, seal the single-listener object-capability slice. Do not f
 
 ### Slice 12A — Landlock TCP bind/connect port envelope
 
-**Current verified candidate.** Adds an independent kernel access-control layer for target-created TCP bind/connect operations rather than another launcher-brokered socket alias.
+**Status: complete on `main`.** Adds an independent kernel access-control layer for target-created TCP bind/connect operations rather than another launcher-brokered socket alias.
 
 Acceptance evidence is executable:
 
@@ -330,7 +330,28 @@ Boundary: Landlock ABI 4 TCP network rules match **ports, not IP addresses**. 12
 
 ### Milestone 12 promotion rule
 
-After 12A integrates, seal this bounded port-envelope mechanism. Do not farm more test ports, IPv4/IPv6 aliases, or port-count variants. A later networking slice must add a materially different, verifiable address/topology or protocol authority boundary; otherwise promote to another subsystem frontier.
+12A is sealed on `main`. Do not farm more test ports, IPv4/IPv6 aliases, or port-count variants. A later networking slice must add a materially different, verifiable address/topology or protocol authority boundary; otherwise promote to another subsystem frontier.
+
+## Milestone 13 — cross-domain IPC authority
+
+### Slice 13A — Landlock signal scope
+
+**Current verified candidate.** Adds a process-to-process authority boundary rather than another pathname, port, or brokered-socket variant.
+
+Acceptance evidence is executable:
+
+- policy accepts one optional `landlock.scope_signal = enabled|disabled`, defaults to disabled, and rejects invalid or duplicate declarations;
+- enabling the scope requires Landlock ABI 6 or newer; older or unavailable kernels fail explicitly rather than silently dropping the requested restriction;
+- the direct target adds only `LANDLOCK_SCOPE_SIGNAL` to the Landlock ruleset `scoped` field, preserves historical shorter ruleset structure sizes when the scope is unused, applies `no_new_privs`, and restricts itself before target seccomp and pinned exec;
+- signal scoping does not grant signal authority through seccomp: `pidfd_open` and `pidfd_send_signal` are available only when the target policy explicitly names them;
+- an unscoped raw target opens a pidfd for launcher-owned namespace PID 1 and succeeds at `pidfd_send_signal(..., 0, ...)`; the otherwise-identical target with signal scope enabled must receive exact `EPERM`; signal number 0 proves the permission boundary without delivering a signal or changing PID 1 state;
+- all Milestones 1–12A regressions plus deterministic `run-json` and offline `check`/`check-json` CLI tests remain active; stable format/Clippy/full tests and the full Rust 1.74 suite are green.
+
+Boundary: 13A is one Landlock signal scope with no per-process exception list. It does not grant signalling syscalls, replace PID-namespace lifecycle supervision, provide arbitrary signal forwarding/brokering, or claim Landlock scoping for abstract Unix sockets or another IPC class.
+
+### Milestone 13 promotion rule
+
+After 13A integrates, seal this signal-scope mechanism. Do not farm signal numbers, `kill`/`tgkill` aliases, or pidfd variants that repeat the same permission boundary. Promote only to a materially different IPC object boundary with executable positive/negative evidence or to another subsystem frontier; delegated cgroup accounting and supplementary-group isolation remain blocked until their external/kernel mapping prerequisites change.
 
 ## Later frontiers
 

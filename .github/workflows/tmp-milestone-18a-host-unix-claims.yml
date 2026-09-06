@@ -16,6 +16,8 @@ jobs:
         with:
           toolchain: stable
           components: rustfmt, clippy
+      - name: Align current claims source
+        run: python3 .github/tmp-milestone-18a-host-unix-claims-prepatch.py
       - name: Materialize claims
         run: python3 .github/tmp-milestone-18a-host-unix-claims.py
       - name: Enable user namespace capability tests
@@ -34,6 +36,7 @@ jobs:
         run: cargo test --locked --all-targets --all-features
       - name: Remove construction files and commit claims tree
         run: |
+          rm .github/tmp-milestone-18a-host-unix-claims-prepatch.py
           rm .github/tmp-milestone-18a-host-unix-claims.py
           rm .github/workflows/tmp-milestone-18a-host-unix-claims.yml
           git config user.name LeiZ

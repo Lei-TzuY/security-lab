@@ -30,6 +30,21 @@ fn captured_echo_policy() -> String {
     )
 }
 
+fn static_only_policy() -> (String, PathBuf) {
+    let root = std::env::temp_dir().join(format!("security-lab-cli-static-root-{}", process::id()));
+    let _ = fs::remove_dir_all(&root);
+
+    let text = captured_echo_policy();
+    let needle = "filesystem.root = /";
+    assert_eq!(
+        text.matches(needle).count(),
+        1,
+        "example policy should contain one root declaration"
+    );
+    let replacement = format!("filesystem.root = {}", root.display());
+    (text.replace(needle, &replacement), root)
+}
+
 fn binary() -> &'static str {
     env!("CARGO_BIN_EXE_security-lab")
 }
@@ -97,4 +112,68 @@ fn run_json_reports_policy_errors_as_json() {
         stdout.ends_with("}}\n"),
         "unexpected JSON error suffix: {stdout}"
     );
+}
+
+#[test]
+fn check_validates_policy_without_runtime_setup() {
+    let (policy, missing_root) = static_only_policy();
+    assert!(
+        !missing_root.exists(),
+        "static-check root unexpectedly exists"
+    );
+    let path = write_policy("check-success", &policy);
+    let output = Command::new(binary())
+        .args(["check", path.to_str().expect("UTF-8 temp policy path")])
+        .output()
+        .expect("run policy check CLI");
+    let _ = fs::remove_file(path);
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        output.stderr.is_empty(),
+        "unexpected stderr bytes: {:?}",
+        output.stderr
+    );
+    assert_eq!(output.stdout, b"policy-valid\n");
+    assert!(
+        !missing_root.exists(),
+        "static policy validation must not materialize runtime root state"
+    );
+}
+
+#[test]
+fn check_json_emits_explicit_static_validation_scope() {
+    let (policy, missing_root) = static_only_policy();
+    let path = write_policy("check-json-success", &policy);
+    let output = Command::new(binary())
+        .args(["check-json", path.to_str().expect("UTF-8 temp policy path")])
+        .output()
+        .expect("run JSON policy check CLI");
+    let _ = fs::remove_file(path);
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        output.stdout,
+        b"{\"ok\":true,\"validation\":{\"kind\":\"static_policy\",\"runtime_preflight\":false}}\n"
+    );
+    assert!(!missing_root.exists());
+}
+
+#[test]
+fn check_json_reports_policy_errors_as_json() {
+    let path = write_policy("check-json-policy-error", "unknown.field = value\n");
+    let output = Command::new(binary())
+        .args(["check-json", path.to_str().expect("UTF-8 temp policy path")])
+        .output()
+        .expect("run invalid JSON policy check");
+    let _ = fs::remove_file(path);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).expect("JSON CLI stdout is UTF-8");
+    assert!(
+        stdout.starts_with("{\"ok\":false,\"error\":{\"kind\":\"policy_rejected\",\"message\":")
+    );
+    assert!(stdout.ends_with("}}\n"));
 }

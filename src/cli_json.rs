@@ -21,6 +21,10 @@ pub(crate) fn report_json(report: &RunReport) -> String {
     output
 }
 
+pub(crate) fn validation_json() -> &'static str {
+    "{\"ok\":true,\"validation\":{\"kind\":\"static_policy\",\"runtime_preflight\":false}}"
+}
+
 pub(crate) fn error_json(kind: &str, message: &str) -> String {
     let mut output = String::from("{\"ok\":false,\"error\":{\"kind\":");
     push_json_string(&mut output, kind);
@@ -112,6 +116,14 @@ mod tests {
         assert_eq!(
             report_json(&report),
             "{\"ok\":true,\"outcome\":{\"kind\":\"exited\",\"code\":7},\"stdout\":{\"encoding\":\"hex\",\"data\":\"0022ff\",\"truncated\":true},\"reaped_descendants\":3}"
+        );
+    }
+
+    #[test]
+    fn serializes_static_validation_scope_explicitly() {
+        assert_eq!(
+            validation_json(),
+            "{\"ok\":true,\"validation\":{\"kind\":\"static_policy\",\"runtime_preflight\":false}}"
         );
     }
 

@@ -12,6 +12,7 @@ const MAX_HOSTNAME_BYTES: usize = 63;
 const MAX_SYSCALLS: usize = 128;
 const MAX_SECCOMP_ARG_RULES: usize = 64;
 const MAX_SELECTED_HANDLES: usize = 16;
+const MAX_LANDLOCK_READ_EXECUTE_PATHS: usize = 32;
 const MIN_SELECTED_TARGET_FD: u32 = 3;
 const MAX_SELECTED_TARGET_FD: u32 = 63;
 const MIN_SCRATCH_BYTES: u64 = 4096;
@@ -75,6 +76,9 @@ pub struct SandboxPolicy {
     pub environment: BTreeMap<String, String>,
     /// Absolute path interpreted inside `root_dir`.
     pub working_dir: PathBuf,
+    /// Optional Landlock read/execute allowlist. When non-empty, only these
+    /// sandbox paths may be read or executed after trusted setup completes.
+    pub landlock_read_execute: Vec<PathBuf>,
     /// Whether the launcher activates `lo` inside the isolated network namespace.
     /// This does not attach the namespace to any host or external network.
     pub loopback_enabled: bool,
@@ -155,6 +159,39 @@ impl SandboxPolicy {
         validate_hostname(&self.hostname)?;
         validate_absolute_path("executable", &self.executable)?;
         validate_absolute_path("working_dir", &self.working_dir)?;
+
+        if self.landlock_read_execute.len() > MAX_LANDLOCK_READ_EXECUTE_PATHS {
+            return Err(PolicyError::new(format!(
+                "too many landlock.read_execute paths: {} > {MAX_LANDLOCK_READ_EXECUTE_PATHS}",
+                self.landlock_read_execute.len()
+            )));
+        }
+        if !self.landlock_read_execute.is_empty() {
+            let mut seen = BTreeSet::new();
+            let mut executable_covered = false;
+            for path in &self.landlock_read_execute {
+                validate_absolute_path("landlock.read_execute", path)?;
+                if path == Path::new("/") {
+                    return Err(PolicyError::new(
+                        "landlock.read_execute must not grant the entire sandbox root",
+                    ));
+                }
+                if !seen.insert(path.clone()) {
+                    return Err(PolicyError::new(format!(
+                        "duplicate landlock.read_execute path: {}",
+                        path.display()
+                    )));
+                }
+                if self.executable.starts_with(path) {
+                    executable_covered = true;
+                }
+            }
+            if !executable_covered {
+                return Err(PolicyError::new(
+                    "landlock.read_execute must cover the initial executable",
+                ));
+            }
+        }
 
         match (
             self.host_loopback_tcp_port,
@@ -536,6 +573,7 @@ impl FromStr for SandboxPolicy {
         let mut args = Vec::new();
         let mut environment = BTreeMap::new();
         let mut working_dir = None;
+        let mut landlock_read_execute = Vec::new();
         let mut loopback_enabled = None;
         let mut host_loopback_tcp_port = None;
         let mut host_loopback_tcp_target_fd = None;
@@ -618,6 +656,7 @@ impl FromStr for SandboxPolicy {
                 "executable" => set_once(&mut executable, value.to_owned(), line_no, key)?,
                 "arg" => args.push(value.to_owned()),
                 "working_dir" => set_once(&mut working_dir, value.to_owned(), line_no, key)?,
+                "landlock.read_execute" => landlock_read_execute.push(value.to_owned()),
                 "stdio.stdin" => set_once(
                     &mut stdin,
                     parse_stdio_mode(value, line_no, key)?,
@@ -783,6 +822,10 @@ impl FromStr for SandboxPolicy {
             args,
             environment,
             working_dir: PathBuf::from(required(working_dir, "working_dir")?),
+            landlock_read_execute: landlock_read_execute
+                .into_iter()
+                .map(PathBuf::from)
+                .collect(),
             loopback_enabled: loopback_enabled.unwrap_or(false),
             host_loopback_tcp_port,
             host_loopback_tcp_target_fd,
@@ -999,6 +1042,7 @@ mod tests {
         assert!(!policy.loopback_enabled);
         assert_eq!(policy.host_loopback_tcp_port, None);
         assert_eq!(policy.host_loopback_tcp_target_fd, None);
+        assert!(policy.landlock_read_execute.is_empty());
         assert_eq!(policy.readonly_volume_source, None);
         assert_eq!(policy.readonly_volume_target, None);
         assert_eq!(policy.writable_volume_source, None);
@@ -1020,6 +1064,34 @@ mod tests {
         );
         assert!(policy.seccomp.allowed_syscalls.contains("execveat"));
         assert!(policy.seccomp.argument_rules.is_empty());
+    }
+
+    #[test]
+    fn parses_landlock_read_execute_paths() {
+        let text =
+            format!("{VALID}\nlandlock.read_execute = /bin\nlandlock.read_execute = /usr/share");
+        let policy: SandboxPolicy = text.parse().unwrap();
+        assert_eq!(
+            policy.landlock_read_execute,
+            [PathBuf::from("/bin"), PathBuf::from("/usr/share")]
+        );
+    }
+
+    #[test]
+    fn rejects_unsafe_landlock_read_execute_paths() {
+        let root = format!("{VALID}\nlandlock.read_execute = /");
+        assert!(root.parse::<SandboxPolicy>().is_err());
+
+        let relative = format!("{VALID}\nlandlock.read_execute = bin");
+        assert!(relative.parse::<SandboxPolicy>().is_err());
+
+        let duplicate =
+            format!("{VALID}\nlandlock.read_execute = /bin\nlandlock.read_execute = /bin");
+        assert!(duplicate.parse::<SandboxPolicy>().is_err());
+
+        let misses_executable = format!("{VALID}\nlandlock.read_execute = /tmp");
+        let error = misses_executable.parse::<SandboxPolicy>().unwrap_err();
+        assert!(error.to_string().contains("cover the initial executable"));
     }
 
     #[test]

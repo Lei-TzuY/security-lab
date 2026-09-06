@@ -110,6 +110,21 @@ mod x86_64 {
     const PHASE_VOLUME_TARGET_PIN: u32 = 45;
     const PHASE_VOLUME_ATTACH: u32 = 46;
     const PHASE_NETWORK_LOOPBACK: u32 = 47;
+    const PHASE_LANDLOCK_RULESET: u32 = 48;
+    const PHASE_LANDLOCK_PATH: u32 = 49;
+    const PHASE_LANDLOCK_RULE: u32 = 50;
+    const PHASE_LANDLOCK_RESTRICT: u32 = 51;
+
+    const SYS_LANDLOCK_CREATE_RULESET: libc::c_long = 444;
+    const SYS_LANDLOCK_ADD_RULE: libc::c_long = 445;
+    const SYS_LANDLOCK_RESTRICT_SELF: libc::c_long = 446;
+    const LANDLOCK_CREATE_RULESET_VERSION: libc::c_uint = 1;
+    const LANDLOCK_RULE_PATH_BENEATH: libc::c_int = 1;
+    const LANDLOCK_ACCESS_FS_EXECUTE: u64 = 1 << 0;
+    const LANDLOCK_ACCESS_FS_READ_FILE: u64 = 1 << 2;
+    const LANDLOCK_ACCESS_FS_READ_DIR: u64 = 1 << 3;
+    const LANDLOCK_READ_EXECUTE_RIGHTS: u64 =
+        LANDLOCK_ACCESS_FS_EXECUTE | LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR;
 
     const SIOCGIFFLAGS: libc::c_ulong = 0x8913;
     const SIOCSIFFLAGS: libc::c_ulong = 0x8914;
@@ -129,6 +144,18 @@ mod x86_64 {
         attr_clr: u64,
         propagation: u64,
         userns_fd: u64,
+    }
+
+    #[repr(C)]
+    struct LandlockRulesetAttr {
+        handled_access_fs: u64,
+    }
+
+    #[repr(C)]
+    struct LandlockPathBeneathAttr {
+        allowed_access: u64,
+        parent_fd: i32,
+        reserved: u32,
     }
 
     #[repr(C, align(8))]
@@ -418,6 +445,8 @@ mod x86_64 {
         root_path: CString,
         executable_fd: OwnedFd,
         selected_handles: Vec<PreparedSelectedHandle>,
+        selected_storage_floor: RawFd,
+        landlock_read_execute: Vec<CString>,
         cancellation_fd: Option<OwnedFd>,
         volumes: Vec<PreparedVolume>,
         cwd_relative: CString,
@@ -458,6 +487,34 @@ mod x86_64 {
                 "executable",
             )?;
             validate_executable_fd(executable_fd.raw(), &policy.executable)?;
+
+            let mut landlock_read_execute = Vec::with_capacity(policy.landlock_read_execute.len());
+            for path in &policy.landlock_read_execute {
+                let checked = open_beneath_root(
+                    root_fd.raw(),
+                    path,
+                    (libc::O_PATH | libc::O_CLOEXEC) as u64,
+                    "Landlock read/execute path",
+                )?;
+                let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
+                if unsafe { libc::fstat(checked.raw(), &mut stat) } == -1 {
+                    return Err(SandboxError::SetupFailed(format!(
+                        "cannot inspect Landlock read/execute path {}: {}",
+                        path.display(),
+                        io::Error::last_os_error()
+                    )));
+                }
+                let kind = stat.st_mode & libc::S_IFMT;
+                if kind != libc::S_IFDIR && kind != libc::S_IFREG {
+                    return Err(SandboxError::InvalidPolicy(PolicyError::new(format!(
+                        "landlock.read_execute path must name a regular file or directory: {}",
+                        path.display()
+                    ))));
+                }
+                drop(checked);
+                landlock_read_execute.push(sandbox_relative(path)?);
+            }
+
             // Keep every launcher-owned source above all target-visible handle
             // destinations. With no selected handles this floor is only 3, so
             // existing sandboxes do not gain an unnecessary fd>=64 requirement.
@@ -632,6 +689,8 @@ mod x86_64 {
                 root_path,
                 executable_fd,
                 selected_handles,
+                selected_storage_floor,
+                landlock_read_execute,
                 cancellation_fd,
                 volumes,
                 cwd_relative,
@@ -671,6 +730,7 @@ mod x86_64 {
     ) -> Result<RunReport, SandboxError> {
         ensure_fd_sanitization_supported()?;
         ensure_supervision_support(policy.wall_clock_milliseconds, cancellation.is_some())?;
+        ensure_landlock_supported(policy)?;
         let prepared = PreparedLaunch::new(policy, cancellation)?;
         let seccomp = compile_seccomp(policy)?;
         let launch_state = SharedLaunchState::new()?;
@@ -1135,6 +1195,134 @@ mod x86_64 {
         filter.push(stmt(BPF_RET_K, SECCOMP_RET_ERRNO | (libc::EPERM as u32)));
     }
 
+    fn ensure_landlock_supported(policy: &SandboxPolicy) -> Result<(), SandboxError> {
+        if policy.landlock_read_execute.is_empty() {
+            return Ok(());
+        }
+        let abi = unsafe {
+            libc::syscall(
+                SYS_LANDLOCK_CREATE_RULESET,
+                ptr::null::<libc::c_void>(),
+                0usize,
+                LANDLOCK_CREATE_RULESET_VERSION,
+            )
+        };
+        if abi >= 1 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::ENOSYS | libc::EOPNOTSUPP) => Err(SandboxError::UnsupportedPlatform(
+                format!("Landlock read/execute enforcement is unavailable: {error}"),
+            )),
+            _ => Err(SandboxError::SetupFailed(format!(
+                "cannot query Landlock ABI: {error}"
+            ))),
+        }
+    }
+
+    unsafe fn prepare_landlock_ruleset_or_fail(
+        paths: &[CString],
+        root_tree_fd: RawFd,
+        storage_floor: RawFd,
+        launch_error: *mut LaunchErrorRecord,
+        error_exit_syscall: libc::c_long,
+    ) -> RawFd {
+        if paths.is_empty() {
+            return -1;
+        }
+
+        let ruleset = LandlockRulesetAttr {
+            handled_access_fs: LANDLOCK_READ_EXECUTE_RIGHTS,
+        };
+        let raw_ruleset_fd = libc::syscall(
+            SYS_LANDLOCK_CREATE_RULESET,
+            &ruleset as *const LandlockRulesetAttr,
+            std::mem::size_of::<LandlockRulesetAttr>(),
+            0u32,
+        );
+        if raw_ruleset_fd == -1 {
+            child_fail(launch_error, PHASE_LANDLOCK_RULESET, error_exit_syscall);
+        }
+        let mut ruleset_fd = raw_ruleset_fd as RawFd;
+        if ruleset_fd < storage_floor {
+            let moved = libc::fcntl(ruleset_fd, libc::F_DUPFD_CLOEXEC, storage_floor);
+            if moved == -1 {
+                child_fail(launch_error, PHASE_LANDLOCK_RULESET, error_exit_syscall);
+            }
+            if libc::close(ruleset_fd) == -1 {
+                child_fail(launch_error, PHASE_LANDLOCK_RULESET, error_exit_syscall);
+            }
+            ruleset_fd = moved;
+        }
+
+        let path_how = OpenHow {
+            flags: (libc::O_PATH | libc::O_CLOEXEC) as u64,
+            mode: 0,
+            resolve: RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS,
+        };
+        for path in paths {
+            let path_fd = libc::syscall(
+                libc::SYS_openat2,
+                root_tree_fd,
+                path.as_ptr(),
+                &path_how as *const OpenHow,
+                std::mem::size_of::<OpenHow>(),
+            );
+            if path_fd == -1 {
+                child_fail(launch_error, PHASE_LANDLOCK_PATH, error_exit_syscall);
+            }
+            let path_fd = path_fd as RawFd;
+            let mut stat = std::mem::zeroed::<libc::stat>();
+            if libc::fstat(path_fd, &mut stat) == -1 {
+                child_fail(launch_error, PHASE_LANDLOCK_PATH, error_exit_syscall);
+            }
+            let kind = stat.st_mode & libc::S_IFMT;
+            let allowed_access = if kind == libc::S_IFDIR {
+                LANDLOCK_READ_EXECUTE_RIGHTS
+            } else if kind == libc::S_IFREG {
+                LANDLOCK_ACCESS_FS_EXECUTE | LANDLOCK_ACCESS_FS_READ_FILE
+            } else {
+                child_fail(launch_error, PHASE_LANDLOCK_PATH, error_exit_syscall)
+            };
+            let rule = LandlockPathBeneathAttr {
+                allowed_access,
+                parent_fd: path_fd,
+                reserved: 0,
+            };
+            if libc::syscall(
+                SYS_LANDLOCK_ADD_RULE,
+                ruleset_fd,
+                LANDLOCK_RULE_PATH_BENEATH,
+                &rule as *const LandlockPathBeneathAttr,
+                0u32,
+            ) == -1
+            {
+                child_fail(launch_error, PHASE_LANDLOCK_RULE, error_exit_syscall);
+            }
+            if libc::close(path_fd) == -1 {
+                child_fail(launch_error, PHASE_LANDLOCK_PATH, error_exit_syscall);
+            }
+        }
+        ruleset_fd
+    }
+
+    unsafe fn restrict_landlock_or_fail(
+        ruleset_fd: RawFd,
+        launch_error: *mut LaunchErrorRecord,
+        error_exit_syscall: libc::c_long,
+    ) {
+        if ruleset_fd < 0 {
+            return;
+        }
+        if libc::syscall(SYS_LANDLOCK_RESTRICT_SELF, ruleset_fd, 0u32) == -1 {
+            child_fail(launch_error, PHASE_LANDLOCK_RESTRICT, error_exit_syscall);
+        }
+        if libc::close(ruleset_fd) == -1 {
+            child_fail(launch_error, PHASE_LANDLOCK_RESTRICT, error_exit_syscall);
+        }
+    }
+
     unsafe fn child_exec(
         prepared: &PreparedLaunch,
         stdio: StdioPolicy,
@@ -1399,6 +1587,14 @@ mod x86_64 {
             },
         );
 
+        let landlock_ruleset_fd = prepare_landlock_ruleset_or_fail(
+            &prepared.landlock_read_execute,
+            root_tree_fd,
+            prepared.selected_storage_floor,
+            launch_error,
+            seccomp.error_exit_syscall,
+        );
+
         apply_stdio_policy_or_fail(
             stdio,
             stdout_redirect_fd,
@@ -1446,6 +1642,11 @@ mod x86_64 {
         if libc::syscall(libc::SYS_prctl, libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == -1 {
             child_fail(launch_error, PHASE_NO_NEW_PRIVS, seccomp.error_exit_syscall);
         }
+        restrict_landlock_or_fail(
+            landlock_ruleset_fd,
+            launch_error,
+            seccomp.error_exit_syscall,
+        );
 
         let program = libc::sock_fprog {
             len: seccomp.filter.len() as u16,
@@ -2070,6 +2271,10 @@ mod x86_64 {
             PHASE_VOLUME_TARGET_PIN => "persistent volume target pin",
             PHASE_VOLUME_ATTACH => "persistent volume mount attachment",
             PHASE_NETWORK_LOOPBACK => "policy-owned loopback activation",
+            PHASE_LANDLOCK_RULESET => "Landlock ruleset creation",
+            PHASE_LANDLOCK_PATH => "Landlock path pin",
+            PHASE_LANDLOCK_RULE => "Landlock path-beneath rule installation",
+            PHASE_LANDLOCK_RESTRICT => "Landlock self restriction",
             _ => "unknown launch phase",
         };
         format!(

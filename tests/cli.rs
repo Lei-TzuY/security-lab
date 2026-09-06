@@ -177,3 +177,56 @@ fn check_json_reports_policy_errors_as_json() {
     );
     assert!(stdout.ends_with("}}\n"));
 }
+
+#[test]
+fn host_json_reports_runtime_capabilities_without_reading_policy() {
+    let output = Command::new(binary())
+        .arg("host-json")
+        .output()
+        .expect("run host capability JSON CLI");
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).expect("host JSON stdout is UTF-8");
+    assert!(stdout.starts_with(
+        "{\"ok\":true,\"host\":{\"kind\":\"runtime_capabilities\",\"policy_preflight\":false,\"target_os\":\"linux\",\"target_arch\":\"x86_64\",\"sandbox_target_supported\":true,\"landlock\":{\"abi\":"
+    ));
+    assert!(stdout.contains("\"pidfd_open\":{\"available\":true,\"errno\":null}"));
+    assert!(stdout.contains("\"timerfd_monotonic\":{\"available\":true,\"errno\":null}"));
+    assert!(stdout.contains("\"cgroup_v2\":{\"present\":true}"));
+    assert!(stdout.ends_with("}}}\n"));
+}
+
+#[test]
+fn host_human_report_is_explicitly_not_policy_preflight() {
+    let output = Command::new(binary())
+        .arg("host")
+        .output()
+        .expect("run host capability CLI");
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).expect("host CLI stdout is UTF-8");
+    assert!(stdout.starts_with(
+        "host-capabilities:\ntarget: linux/x86_64\nsandbox-target-supported: true\nlandlock-abi: "
+    ));
+    assert!(stdout.contains("\npidfd-open: available\n"));
+    assert!(stdout.contains("timerfd-monotonic: available\n"));
+    assert!(stdout.contains("cgroup-v2: present\n"));
+    assert!(stdout.ends_with("policy-preflight: false\n"));
+}
+
+#[test]
+fn host_json_rejects_policy_argument_as_machine_usage_error() {
+    let output = Command::new(binary())
+        .args(["host-json", "unexpected-policy.conf"])
+        .output()
+        .expect("run malformed host capability invocation");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).expect("host usage JSON stdout is UTF-8");
+    assert!(stdout.starts_with("{\"ok\":false,\"error\":{\"kind\":\"usage\",\"message\":"));
+    assert!(stdout.contains("<host|host-json>"));
+    assert!(stdout.ends_with("}}\n"));
+}

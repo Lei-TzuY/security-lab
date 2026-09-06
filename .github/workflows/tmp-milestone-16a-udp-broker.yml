@@ -18,6 +18,28 @@ jobs:
           components: rustfmt, clippy
       - name: Materialize candidate
         run: python3 .github/tmp-milestone-16a-udp-broker.py
+      - name: Preserve generated UDP policy test line boundaries
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path("src/policy.rs")
+          text = path.read_text()
+          start = text.index("    fn parses_brokered_host_ipv4_udp_endpoint()")
+          end = text.index("    fn parses_brokered_host_loopback_tcp_listener()", start)
+          section = text[start:end]
+          for key in (
+              "network.host_ipv4_udp_address",
+              "network.host_ipv4_udp_port",
+              "network.host_ipv4_udp_target_fd",
+              "network.host_ipv4_tcp_address",
+              "network.host_ipv4_tcp_port",
+              "network.host_ipv4_tcp_target_fd",
+              "handle.13",
+          ):
+              section = section.replace("\\" + "\n" + key, r"\n" + key)
+          text = text[:start] + section + text[end:]
+          path.write_text(text)
+          PY
       - name: Format
         run: cargo fmt --all
       - name: Enable user namespace capability tests

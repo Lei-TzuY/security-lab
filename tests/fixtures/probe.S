@@ -20,6 +20,7 @@
 #   q accept one connection through a launcher-brokered host-loopback TCP listening fd
 #   r prove Landlock allows declared reads and returns EACCES for an undeclared visible file
 #   m prove Landlock narrows regular-file mutation inside scratch and a writable persistent volume
+#   h prove Landlock narrows directory/symlink/reparent topology mutation
 #   s prove Landlock allows declared TCP bind/connect ports and denies undeclared ports
 #   a connect selected fd 9 to argv[2] in the abstract UNIX socket namespace
 #   d prove Landlock device ioctl allows /devices/urandom and denies /devices/random
@@ -83,6 +84,8 @@ _start:
     je .landlock_read_envelope
     cmp $109, %al
     je .landlock_file_mutation
+    cmp $104, %al
+    je .landlock_path_topology_mutation
     cmp $115, %al
     je .landlock_tcp_ports
     cmp $97, %al
@@ -1020,6 +1023,58 @@ _start:
     syscall
     cmp $-13, %rax
     jne .fail38
+
+    xor %edi, %edi
+    jmp .exit
+
+.landlock_path_topology_mutation:
+    mov $83, %eax
+    lea landlock_topology_allowed_dir(%rip), %rdi
+    mov $448, %esi
+    syscall
+    test %rax, %rax
+    js .fail47
+
+    mov $88, %eax
+    lea landlock_topology_symlink_target(%rip), %rdi
+    lea landlock_topology_allowed_link(%rip), %rsi
+    syscall
+    test %rax, %rax
+    js .fail47
+
+    mov $82, %eax
+    lea landlock_topology_rename_source(%rip), %rdi
+    lea landlock_topology_rename_destination(%rip), %rsi
+    syscall
+    test %rax, %rax
+    js .fail47
+
+    mov $84, %eax
+    lea landlock_topology_allowed_dir(%rip), %rdi
+    syscall
+    test %rax, %rax
+    js .fail47
+
+    mov $83, %eax
+    lea landlock_topology_denied_dir(%rip), %rdi
+    mov $448, %esi
+    syscall
+    cmp $-13, %rax
+    jne .fail47
+
+    mov $88, %eax
+    lea landlock_topology_symlink_target(%rip), %rdi
+    lea landlock_topology_denied_link(%rip), %rsi
+    syscall
+    cmp $-13, %rax
+    jne .fail47
+
+    mov $82, %eax
+    lea landlock_topology_rename_destination(%rip), %rdi
+    lea landlock_topology_denied_rename(%rip), %rsi
+    syscall
+    cmp $-13, %rax
+    jne .fail47
 
     xor %edi, %edi
     jmp .exit
@@ -2062,6 +2117,9 @@ _start:
     jmp .exit
 .fail46:
     mov $46, %edi
+    jmp .exit
+.fail47:
+    mov $47, %edi
 
 .exit:
     mov $60, %eax
@@ -2164,6 +2222,22 @@ landlock_mutation_denied_remove:
 landlock_mutation_message:
     .ascii "landlock-persistent-write\n"
 .set landlock_mutation_message_len, . - landlock_mutation_message
+landlock_topology_allowed_dir:
+    .asciz "/persist/allowed/newdir"
+landlock_topology_allowed_link:
+    .asciz "/persist/allowed/newlink"
+landlock_topology_symlink_target:
+    .asciz "topology-target"
+landlock_topology_rename_source:
+    .asciz "/persist/allowed/from/item"
+landlock_topology_rename_destination:
+    .asciz "/persist/allowed/to/item"
+landlock_topology_denied_dir:
+    .asciz "/persist/denied/newdir"
+landlock_topology_denied_link:
+    .asciz "/persist/denied/newlink"
+landlock_topology_denied_rename:
+    .asciz "/persist/denied/item"
 deadline_message:
     .ascii "deadline target started\n"
 .set deadline_message_len, . - deadline_message

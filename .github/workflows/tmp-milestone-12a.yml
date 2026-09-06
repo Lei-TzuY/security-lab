@@ -16,6 +16,8 @@ jobs:
         with:
           toolchain: stable
           components: rustfmt, clippy
+      - name: Repair staged test separators
+        run: python3 .github/tmp-milestone-12a-test-string-fix.py
       - name: Stage policy acceptance test first
         run: python3 .github/tmp-milestone-12a.py tests
       - name: Prove the new policy spec is red before implementation
@@ -53,6 +55,7 @@ jobs:
         run: |
           rm .github/tmp-milestone-12a.py
           rm .github/tmp-milestone-12a-clippy-fix.py
+          rm .github/tmp-milestone-12a-test-string-fix.py
           rm .github/workflows/tmp-milestone-12a.yml
           git config user.name LeiZ
           git config user.email 52287354+Lei-TzuY@users.noreply.github.com

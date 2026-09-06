@@ -17,7 +17,9 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
       - name: Materialize candidate
-        run: python3 .github/tmp-milestone-13b-abstract-unix.py
+        run: |
+          python3 .github/tmp-milestone-13b-abstract-unix.py
+          sed -i 's/name.len() + 1 <= 108/name.len() < 108/' tests/sandbox.rs
       - name: Format
         run: cargo fmt --all
       - name: Enable user namespace capability tests

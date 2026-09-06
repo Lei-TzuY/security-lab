@@ -161,6 +161,8 @@ fn fixture_root() -> &'static Path {
         std::fs::create_dir_all(root.join("data")).expect("create sandbox volume mountpoint");
         std::fs::create_dir_all(root.join("persist"))
             .expect("create sandbox writable-volume mountpoint");
+        std::fs::create_dir_all(root.join("devices"))
+            .expect("create sandbox device-volume mountpoint");
         std::fs::create_dir_all(root.join("landlock-allowed"))
             .expect("create Landlock allowed directory");
         std::fs::create_dir_all(root.join("landlock-denied"))
@@ -228,6 +230,7 @@ fn policy(mode: &str, extra_args: &[&str], syscalls: &[&str]) -> SandboxPolicy {
         working_dir: PathBuf::from("/work"),
         landlock_read_execute: Vec::new(),
         landlock_file_mutate: Vec::new(),
+        landlock_device_ioctl: Vec::new(),
         landlock_tcp_bind_ports: Vec::new(),
         landlock_tcp_connect_ports: Vec::new(),
         landlock_scope_abstract_unix_socket: false,
@@ -263,6 +266,31 @@ fn policy(mode: &str, extra_args: &[&str], syscalls: &[&str]) -> SandboxPolicy {
             argument_rules: BTreeMap::new(),
         },
     }
+}
+
+fn assert_random_device_ioctl_available(path: &str) {
+    const RNDGETENTCNT: libc::c_ulong = 0x80045200;
+    let device = std::fs::File::open(path).expect("open host random device");
+    let mut entropy_bits: libc::c_int = 0;
+    assert_eq!(
+        unsafe { libc::ioctl(device.as_raw_fd(), RNDGETENTCNT, &mut entropy_bits) },
+        0,
+        "host random-device ioctl baseline failed for {path}: {}",
+        std::io::Error::last_os_error()
+    );
+}
+
+#[test]
+fn landlock_device_ioctl_envelope_binds_rights_at_post_restriction_open() {
+    assert_random_device_ioctl_available("/dev/urandom");
+    assert_random_device_ioctl_available("/dev/random");
+
+    let mut confined = policy("d", &[], &["execveat", "openat", "ioctl", "close", "exit"]);
+    confined.readonly_volume_source = Some(PathBuf::from("/dev"));
+    confined.readonly_volume_target = Some(PathBuf::from("/devices"));
+    confined.landlock_device_ioctl = vec![PathBuf::from("/devices/urandom")];
+
+    assert_eq!(run(&confined).unwrap(), ChildOutcome::Exited(0));
 }
 
 #[test]

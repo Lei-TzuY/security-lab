@@ -10,6 +10,7 @@
 #   B assert 64-bit masked seccomp argument filtering on lseek offset
 #   G assert one selected non-stdio handle is remapped without ambient FD leakage
 #   c fork a descendant, publish cancellation readiness on fd 9, then pause
+#   v read a declared persistent volume, prove it is read-only, and hide its host source path
 #   F forbidden getpid; exits 77 only when seccomp returns -EPERM
 #   E validate sanitized environment
 #   C validate working directory against argv[2]
@@ -47,6 +48,8 @@ _start:
     je .selected_handle
     cmp $99, %al
     je .cancellation_tree
+    cmp $118, %al
+    je .readonly_volume
     cmp $70, %al
     je .forbidden
     cmp $69, %al
@@ -245,6 +248,60 @@ _start:
     mov $34, %eax
     syscall
     jmp .cancellation_descendant_pause
+
+.readonly_volume:
+    mov $257, %eax
+    mov $-100, %edi
+    lea volume_marker_path(%rip), %rsi
+    xor %edx, %edx
+    xor %r10d, %r10d
+    syscall
+    test %rax, %rax
+    js .fail32
+    mov %rax, %r12
+
+    xor %eax, %eax
+    mov %r12, %rdi
+    lea volume_buffer(%rip), %rsi
+    mov $volume_marker_len, %edx
+    syscall
+    cmp $volume_marker_len, %rax
+    jne .fail32
+
+    lea volume_buffer(%rip), %rdi
+    lea volume_marker_expected(%rip), %rsi
+    mov $volume_marker_len, %ecx
+    repe cmpsb
+    jne .fail32
+
+    mov $3, %eax
+    mov %r12, %rdi
+    syscall
+    test %rax, %rax
+    js .fail32
+
+    mov $257, %eax
+    mov $-100, %edi
+    lea volume_forbidden_write(%rip), %rsi
+    mov $577, %edx
+    mov $384, %r10d
+    syscall
+    cmp $-30, %rax
+    jne .fail32
+
+    mov 24(%rsp), %rsi
+    test %rsi, %rsi
+    je .fail32
+    mov $257, %eax
+    mov $-100, %edi
+    xor %edx, %edx
+    xor %r10d, %r10d
+    syscall
+    cmp $-2, %rax
+    jne .fail32
+
+    xor %edi, %edi
+    jmp .exit
 
 .forbidden:
     mov $39, %eax
@@ -921,6 +978,9 @@ _start:
     jmp .exit
 .fail31:
     mov $31, %edi
+    jmp .exit
+.fail32:
+    mov $32, %edi
 
 .exit:
     mov $60, %eax
@@ -958,6 +1018,13 @@ selected_handle_message:
 cancellation_ready_message:
     .ascii "cancellation-target-ready\n"
 .set cancellation_ready_message_len, . - cancellation_ready_message
+volume_marker_path:
+    .asciz "/data/marker"
+volume_forbidden_write:
+    .asciz "/data/write-must-fail"
+volume_marker_expected:
+    .ascii "volume-marker\n"
+.set volume_marker_len, . - volume_marker_expected
 deadline_message:
     .ascii "deadline target started\n"
 .set deadline_message_len, . - deadline_message
@@ -978,6 +1045,8 @@ cap_data:
     .skip 24
 redirect_buffer:
     .skip 1
+volume_buffer:
+    .skip 32
 selected_handle_buffer:
     .skip 64
 .balign 16

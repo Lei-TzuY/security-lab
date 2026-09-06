@@ -256,7 +256,7 @@ After 9B integrates, do not farm extra ports, target-fd aliases, or protocol-nam
 
 ### Slice 10A — Landlock read/execute envelope
 
-**Current verified candidate.** Adds a kernel-enforced pathname access layer inside the already-constructed sandbox filesystem rather than another mount or networking variant.
+**Status: complete on `main`.** Adds a kernel-enforced pathname access layer inside the already-constructed sandbox filesystem rather than another mount or networking variant.
 
 Acceptance evidence is executable:
 
@@ -269,9 +269,25 @@ Acceptance evidence is executable:
 
 Boundary: 10A is a read/execute pathname envelope only. It does not attenuate already-open stdio/selected/brokered object capabilities, does not add write/create/remove Landlock policy, does not prove filesystem aliases/canonicalization or subtree immutability, and is not a production multi-tenant container boundary.
 
+### Slice 10B — Landlock regular-file mutation envelope
+
+**Current verified candidate.** Adds a separate pathname-mutation authority dimension that composes with the two existing writable surfaces rather than broadening them.
+
+Acceptance evidence is executable:
+
+- repeatable `landlock.file_mutate = <absolute-sandbox-directory>` entries are bounded to 32, reject `/`, duplicates, relative paths, and any path that is not exactly the private scratch root or equal to/beneath `volume.writable_target`;
+- requested mutation enforcement requires Landlock ABI 3 or newer so `WRITE_FILE` and `TRUNCATE` are both controlled; older ABIs fail explicitly rather than degrading the security claim;
+- mutation paths are pinned against the final mounted tree after scratch/persistent-volume construction, with symlink/magic-link traversal forbidden, because writable-volume subdirectories may not exist in the pre-mount root placeholder;
+- the ruleset handles only regular-file `WRITE_FILE`, `MAKE_REG`, `REMOVE_FILE`, and `TRUNCATE` for this slice, while 10A read/execute rights remain independently optional and exact duplicate paths combine both requested authority sets;
+- a raw target creates inside `/scratch`, truncates+rewrites `/persist/allowed/existing` to exact `landlock-persistent-write\n`, and removes `/persist/allowed/remove-me`; create and unlink in sibling `/persist/denied` on the same writable host mount each require exact `EACCES`;
+- parent-side evidence proves the exact allowed bytes persisted, the allowed removal occurred, the denied sentinel remained byte-for-byte unchanged, and no denied file was created; target seccomp explicitly grants every syscall used by the oracle;
+- all Milestones 1–10A regressions remain active; stable format/Clippy/full tests and the full Rust 1.74 suite are green.
+
+Boundary: 10B is a regular-file pathname mutation envelope only. It does not handle directory creation/removal, symlink/device/socket/FIFO creation, rename/link `REFER`, rights revocation for pre-opened descriptors, filesystem alias/canonicalization proof, or subtree immutability.
+
 ### Milestone 10 promotion rule
 
-After 10A integrates, do not farm extra path-count limits or equivalent read/execute aliases. Further Landlock work must add a materially different executable authority dimension, such as an intentionally designed mutation envelope with interactions against scratch/persistent volumes, or the project should promote to another independent frontier.
+After 10B integrates, seal this bounded pathname-envelope phase. Do not farm more regular-file mutation aliases or path-count variants. Promote to a materially different authority or resource frontier; delegated cgroup accounting and supplementary-group isolation remain blocked until their external/kernel mapping prerequisites change.
 
 ## Later frontiers
 

@@ -271,7 +271,7 @@ Boundary: 10A is a read/execute pathname envelope only. It does not attenuate al
 
 ### Slice 10B — Landlock regular-file mutation envelope
 
-**Current verified candidate.** Adds a separate pathname-mutation authority dimension that composes with the two existing writable surfaces rather than broadening them.
+**Status: complete on `main`.** Adds a separate pathname-mutation authority dimension that composes with the two existing writable surfaces rather than broadening them.
 
 Acceptance evidence is executable:
 
@@ -287,8 +287,30 @@ Boundary: 10B is a regular-file pathname mutation envelope only. It does not han
 
 ### Milestone 10 promotion rule
 
-After 10B integrates, seal this bounded pathname-envelope phase. Do not farm more regular-file mutation aliases or path-count variants. Promote to a materially different authority or resource frontier; delegated cgroup accounting and supplementary-group isolation remain blocked until their external/kernel mapping prerequisites change.
+Milestone 10B is integrated; seal this bounded pathname-envelope phase. Do not farm more regular-file mutation aliases or path-count variants. Promote to a materially different authority or resource frontier; delegated cgroup accounting and supplementary-group isolation remain blocked until their external/kernel mapping prerequisites change.
+
+## Milestone 11 — host-loopback ingress object authority
+
+### Slice 11A — one brokered host-loopback TCP listener
+
+**Current verified candidate.** Adds a materially different inbound object capability without attaching the target network namespace to host or external routing.
+
+Acceptance evidence is executable:
+
+- policy accepts the all-or-nothing pair `network.host_loopback_tcp_listen_port` / `network.host_loopback_tcp_listen_target_fd`; the port is 1–65535, the fd is 3–63 and below `limit.open_files`, and the target cannot collide with selected handles or the 9B connected-broker target;
+- the trusted parent creates `SOCK_STREAM|SOCK_CLOEXEC`, binds only host IPv4 `127.0.0.1:<declared-port>`, calls `listen`, and moves the listener onto the same collision-safe launcher storage plane used by selected handles and the 9B broker; bind/listen failure is terminal rather than a fallback;
+- only the direct target receives the listener at the declared fd; its use remains subject to explicit target seccomp grants such as `accept`, `read`, `write`, and `close`;
+- the raw target publishes exact `brokered-host-ingress-ready\n` bytes on selected fd 9 before calling `accept` on fd 10. Only after the host reads readiness does a host-loopback client connect, send exact `brokered-host-ingress-request` bytes, and receive exact `brokered-host-ingress-ok` reply bytes;
+- a separately occupied host-loopback port causes `SetupFailed` before untrusted execution, proving the listener is not silently omitted;
+- the target's own sockets remain in its isolated network namespace: 11A is one pre-opened listener object capability, not a veth/bridge, host route, NAT, DNS, arbitrary endpoint allowlist, or external ingress path;
+- all Milestones 1–10B regressions remain active; stable format/Clippy/full tests and the full Rust 1.74 suite are green.
+
+Boundary: 11A grants one host-loopback TCP listening object. It does not promise exactly one accepted connection, expose non-loopback interfaces, provide UDP/TLS/application authentication, or configure general inbound routing.
+
+### Milestone 11 promotion rule
+
+After 11A integrates, seal the single-listener object-capability slice. Do not farm additional port numbers, backlog values, or equivalent listener aliases. Promote only to a materially different network topology/endpoint authority or another evidence-backed resource frontier.
 
 ## Later frontiers
 
-Supplementary-group isolation with a viable mapping architecture, broader/generalized persistent-volume policy, network authority beyond one preconnected host-loopback stream, and delegated aggregate cgroup accounting remain separate evidence-backed frontiers. Do not add configuration-only names without executable kernel behavior and integration evidence.
+Supplementary-group isolation with a viable mapping architecture, broader/generalized persistent-volume policy, network authority beyond one preconnected host-loopback stream plus one host-loopback listener, and delegated aggregate cgroup accounting remain separate evidence-backed frontiers. Do not add configuration-only names without executable kernel behavior and integration evidence.

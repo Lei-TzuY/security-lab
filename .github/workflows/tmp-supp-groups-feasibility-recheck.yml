@@ -1,0 +1,119 @@
+name: supplementary groups feasibility recheck
+
+on:
+  push:
+    branches: [tmp-supp-groups-feasibility-recheck]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Enable unprivileged user namespace tests
+        shell: bash
+        run: |
+          if [ -e /proc/sys/kernel/unprivileged_userns_clone ]; then
+            sudo sysctl -w kernel.unprivileged_userns_clone=1
+          fi
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - name: Probe clear-before-deny group mapping sequence
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(id -u)" -ne 0
+          cat > /tmp/security-lab-supp-groups-probe.c <<'EOF'
+          #define _GNU_SOURCE
+          #include <errno.h>
+          #include <fcntl.h>
+          #include <grp.h>
+          #include <sched.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <sys/types.h>
+          #include <unistd.h>
+
+          static void write_exact(const char *path, const char *text, int code) {
+              int fd = open(path, O_WRONLY | O_CLOEXEC);
+              if (fd < 0) {
+                  fprintf(stderr, "%s open failed: %s\n", path, strerror(errno));
+                  exit(code);
+              }
+              size_t len = strlen(text);
+              ssize_t written = write(fd, text, len);
+              int saved = errno;
+              close(fd);
+              if (written != (ssize_t)len) {
+                  fprintf(stderr, "%s write failed: %s\n", path, strerror(saved));
+                  exit(code);
+              }
+          }
+
+          int main(void) {
+              uid_t outer_uid = geteuid();
+              gid_t outer_gid = getegid();
+              int before = getgroups(0, NULL);
+              if (before < 0) {
+                  perror("getgroups before");
+                  return 20;
+              }
+              printf("outer uid=%u gid=%u supplementary_count=%d\n",
+                     (unsigned)outer_uid, (unsigned)outer_gid, before);
+
+              if (unshare(CLONE_NEWUSER) != 0) {
+                  perror("unshare(CLONE_NEWUSER)");
+                  return 21;
+              }
+
+              int inherited = getgroups(0, NULL);
+              if (inherited < 0) {
+                  perror("getgroups after unshare");
+                  return 22;
+              }
+              printf("after unshare supplementary_count=%d\n", inherited);
+
+              if (setgroups(0, NULL) != 0) {
+                  perror("setgroups(0,NULL) before deny");
+                  return 23;
+              }
+              int cleared = getgroups(0, NULL);
+              if (cleared != 0) {
+                  fprintf(stderr, "supplementary groups not empty after clear: %d\n", cleared);
+                  return 24;
+              }
+
+              write_exact("/proc/self/setgroups", "deny\n", 25);
+
+              char map[128];
+              snprintf(map, sizeof(map), "0 %u 1\n", (unsigned)outer_uid);
+              write_exact("/proc/self/uid_map", map, 26);
+              snprintf(map, sizeof(map), "0 %u 1\n", (unsigned)outer_gid);
+              write_exact("/proc/self/gid_map", map, 27);
+
+              if (geteuid() != 0 || getegid() != 0) {
+                  fprintf(stderr, "namespace uid/gid were not mapped to zero: %u/%u\n",
+                          (unsigned)geteuid(), (unsigned)getegid());
+                  return 28;
+              }
+              if (getgroups(0, NULL) != 0) {
+                  fprintf(stderr, "supplementary groups reappeared after mapping\n");
+                  return 29;
+              }
+
+              errno = 0;
+              if (setgroups(0, NULL) == 0 || errno != EPERM) {
+                  fprintf(stderr, "setgroups deny was not irreversible as expected: rc/errno mismatch errno=%d\n", errno);
+                  return 30;
+              }
+
+              puts("SUPPLEMENTARY_GROUP_CLEAR_BEFORE_DENY_USABLE=1");
+              return 0;
+          }
+          EOF
+          cc -O2 -Wall -Wextra -Werror -o /tmp/security-lab-supp-groups-probe /tmp/security-lab-supp-groups-probe.c
+          /tmp/security-lab-supp-groups-probe

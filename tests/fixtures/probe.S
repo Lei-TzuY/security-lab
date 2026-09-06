@@ -16,6 +16,7 @@
 #   o prove loopback remains down unless policy explicitly enables it
 #   p write through a brokered host-loopback TCP fd while direct host reachability stays isolated
 #   r prove Landlock allows declared reads and returns EACCES for an undeclared visible file
+#   m prove Landlock narrows regular-file mutation inside scratch and a writable persistent volume
 #   F forbidden getpid; exits 77 only when seccomp returns -EPERM
 #   E validate sanitized environment
 #   C validate working directory against argv[2]
@@ -65,6 +66,8 @@ _start:
     je .brokered_host_loopback
     cmp $114, %al
     je .landlock_read_envelope
+    cmp $109, %al
+    je .landlock_file_mutation
     cmp $70, %al
     je .forbidden
     cmp $69, %al
@@ -622,6 +625,108 @@ _start:
     syscall
     cmp $-13, %rax
     jne .fail37
+
+    xor %edi, %edi
+    jmp .exit
+
+.landlock_file_mutation:
+    # Private scratch is an existing writable surface; creation must succeed.
+    mov $257, %eax
+    mov $-100, %edi
+    lea landlock_mutation_scratch(%rip), %rsi
+    mov $577, %edx
+    mov $384, %r10d
+    syscall
+    test %rax, %rax
+    js .fail38
+    mov %rax, %r12
+
+    mov $1, %eax
+    mov %r12, %rdi
+    lea landlock_mutation_scratch_byte(%rip), %rsi
+    mov $1, %edx
+    syscall
+    cmp $1, %rax
+    jne .fail38
+
+    mov $3, %eax
+    mov %r12, %rdi
+    syscall
+    test %rax, %rax
+    js .fail38
+
+    # Exercise TRUNCATE independently from WRITE_FILE on the allowed file.
+    mov $76, %eax
+    lea landlock_mutation_existing(%rip), %rdi
+    xor %esi, %esi
+    syscall
+    test %rax, %rax
+    js .fail38
+
+    mov $257, %eax
+    mov $-100, %edi
+    lea landlock_mutation_existing(%rip), %rsi
+    mov $1, %edx
+    xor %r10d, %r10d
+    syscall
+    test %rax, %rax
+    js .fail38
+    mov %rax, %r12
+
+    mov $1, %eax
+    mov %r12, %rdi
+    lea landlock_mutation_message(%rip), %rsi
+    mov $landlock_mutation_message_len, %edx
+    syscall
+    cmp $landlock_mutation_message_len, %rax
+    jne .fail38
+
+    mov $3, %eax
+    mov %r12, %rdi
+    syscall
+    test %rax, %rax
+    js .fail38
+
+    # REMOVE_FILE is independently granted beneath /persist/allowed.
+    mov $87, %eax
+    lea landlock_mutation_remove(%rip), %rdi
+    syscall
+    test %rax, %rax
+    js .fail38
+
+    # The sibling directory is on the same writable mount, so EACCES is Landlock evidence.
+    mov $257, %eax
+    mov $-100, %edi
+    lea landlock_mutation_denied_create(%rip), %rsi
+    mov $577, %edx
+    mov $384, %r10d
+    syscall
+    cmp $-13, %rax
+    jne .fail38
+
+    mov $87, %eax
+    lea landlock_mutation_denied_remove(%rip), %rdi
+    syscall
+    cmp $-13, %rax
+    jne .fail38
+
+    # WRITE_FILE must be independently denied on an existing sibling file.
+    mov $257, %eax
+    mov $-100, %edi
+    lea landlock_mutation_denied_remove(%rip), %rsi
+    mov $1, %edx
+    xor %r10d, %r10d
+    syscall
+    cmp $-13, %rax
+    jne .fail38
+
+    # TRUNCATE must also be independently denied, proving the ABI-3 right is active.
+    mov $76, %eax
+    lea landlock_mutation_denied_remove(%rip), %rdi
+    xor %esi, %esi
+    syscall
+    cmp $-13, %rax
+    jne .fail38
 
     xor %edi, %edi
     jmp .exit
@@ -1319,6 +1424,9 @@ _start:
     jmp .exit
 .fail37:
     mov $37, %edi
+    jmp .exit
+.fail38:
+    mov $38, %edi
 
 .exit:
     mov $60, %eax
@@ -1381,6 +1489,21 @@ landlock_denied_path:
 landlock_allowed_message:
     .ascii "landlock-allowed\n"
 .set landlock_allowed_message_len, . - landlock_allowed_message
+landlock_mutation_scratch:
+    .asciz "/scratch/landlock-created"
+landlock_mutation_scratch_byte:
+    .ascii "s"
+landlock_mutation_existing:
+    .asciz "/persist/allowed/existing"
+landlock_mutation_remove:
+    .asciz "/persist/allowed/remove-me"
+landlock_mutation_denied_create:
+    .asciz "/persist/denied/created"
+landlock_mutation_denied_remove:
+    .asciz "/persist/denied/blocked"
+landlock_mutation_message:
+    .ascii "landlock-persistent-write\n"
+.set landlock_mutation_message_len, . - landlock_mutation_message
 deadline_message:
     .ascii "deadline target started\n"
 .set deadline_message_len, . - deadline_message

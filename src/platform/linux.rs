@@ -121,10 +121,18 @@ mod x86_64 {
     const LANDLOCK_CREATE_RULESET_VERSION: libc::c_uint = 1;
     const LANDLOCK_RULE_PATH_BENEATH: libc::c_int = 1;
     const LANDLOCK_ACCESS_FS_EXECUTE: u64 = 1 << 0;
+    const LANDLOCK_ACCESS_FS_WRITE_FILE: u64 = 1 << 1;
     const LANDLOCK_ACCESS_FS_READ_FILE: u64 = 1 << 2;
     const LANDLOCK_ACCESS_FS_READ_DIR: u64 = 1 << 3;
+    const LANDLOCK_ACCESS_FS_REMOVE_FILE: u64 = 1 << 5;
+    const LANDLOCK_ACCESS_FS_MAKE_REG: u64 = 1 << 8;
+    const LANDLOCK_ACCESS_FS_TRUNCATE: u64 = 1 << 14;
     const LANDLOCK_READ_EXECUTE_RIGHTS: u64 =
         LANDLOCK_ACCESS_FS_EXECUTE | LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR;
+    const LANDLOCK_FILE_MUTATE_RIGHTS: u64 = LANDLOCK_ACCESS_FS_WRITE_FILE
+        | LANDLOCK_ACCESS_FS_REMOVE_FILE
+        | LANDLOCK_ACCESS_FS_MAKE_REG
+        | LANDLOCK_ACCESS_FS_TRUNCATE;
 
     const SIOCGIFFLAGS: libc::c_ulong = 0x8913;
     const SIOCSIFFLAGS: libc::c_ulong = 0x8914;
@@ -447,6 +455,7 @@ mod x86_64 {
         selected_handles: Vec<PreparedSelectedHandle>,
         selected_storage_floor: RawFd,
         landlock_read_execute: Vec<CString>,
+        landlock_file_mutate: Vec<CString>,
         cancellation_fd: Option<OwnedFd>,
         volumes: Vec<PreparedVolume>,
         cwd_relative: CString,
@@ -513,6 +522,14 @@ mod x86_64 {
                 }
                 drop(checked);
                 landlock_read_execute.push(sandbox_relative(path)?);
+            }
+
+            // Mutation paths may live inside the final scratch tmpfs or a mounted
+            // writable persistent volume, so only prepare lexical relative paths
+            // here. The direct target pins the final directory after mount setup.
+            let mut landlock_file_mutate = Vec::with_capacity(policy.landlock_file_mutate.len());
+            for path in &policy.landlock_file_mutate {
+                landlock_file_mutate.push(sandbox_relative(path)?);
             }
 
             // Keep every launcher-owned source above all target-visible handle
@@ -691,6 +708,7 @@ mod x86_64 {
                 selected_handles,
                 selected_storage_floor,
                 landlock_read_execute,
+                landlock_file_mutate,
                 cancellation_fd,
                 volumes,
                 cwd_relative,
@@ -1196,7 +1214,7 @@ mod x86_64 {
     }
 
     fn ensure_landlock_supported(policy: &SandboxPolicy) -> Result<(), SandboxError> {
-        if policy.landlock_read_execute.is_empty() {
+        if policy.landlock_read_execute.is_empty() && policy.landlock_file_mutate.is_empty() {
             return Ok(());
         }
         let abi = unsafe {
@@ -1208,12 +1226,22 @@ mod x86_64 {
             )
         };
         if abi >= 1 {
+            if !policy.landlock_file_mutate.is_empty() && abi < 3 {
+                return Err(SandboxError::UnsupportedPlatform(format!(
+                    "Landlock file-mutation enforcement requires ABI 3 for TRUNCATE control; kernel reports ABI {abi}"
+                )));
+            }
             return Ok(());
+        }
+        if abi != -1 {
+            return Err(SandboxError::SetupFailed(format!(
+                "Landlock ABI query returned invalid version {abi}"
+            )));
         }
         let error = io::Error::last_os_error();
         match error.raw_os_error() {
             Some(libc::ENOSYS | libc::EOPNOTSUPP) => Err(SandboxError::UnsupportedPlatform(
-                format!("Landlock read/execute enforcement is unavailable: {error}"),
+                format!("Landlock enforcement is unavailable: {error}"),
             )),
             _ => Err(SandboxError::SetupFailed(format!(
                 "cannot query Landlock ABI: {error}"
@@ -1222,19 +1250,25 @@ mod x86_64 {
     }
 
     unsafe fn prepare_landlock_ruleset_or_fail(
-        paths: &[CString],
+        read_execute_paths: &[CString],
+        file_mutate_paths: &[CString],
         root_tree_fd: RawFd,
         storage_floor: RawFd,
         launch_error: *mut LaunchErrorRecord,
         error_exit_syscall: libc::c_long,
     ) -> RawFd {
-        if paths.is_empty() {
+        if read_execute_paths.is_empty() && file_mutate_paths.is_empty() {
             return -1;
         }
 
-        let ruleset = LandlockRulesetAttr {
-            handled_access_fs: LANDLOCK_READ_EXECUTE_RIGHTS,
-        };
+        let mut handled_access_fs = 0;
+        if !read_execute_paths.is_empty() {
+            handled_access_fs |= LANDLOCK_READ_EXECUTE_RIGHTS;
+        }
+        if !file_mutate_paths.is_empty() {
+            handled_access_fs |= LANDLOCK_FILE_MUTATE_RIGHTS;
+        }
+        let ruleset = LandlockRulesetAttr { handled_access_fs };
         let raw_ruleset_fd = libc::syscall(
             SYS_LANDLOCK_CREATE_RULESET,
             &ruleset as *const LandlockRulesetAttr,
@@ -1261,7 +1295,7 @@ mod x86_64 {
             mode: 0,
             resolve: RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS,
         };
-        for path in paths {
+        for path in read_execute_paths {
             let path_fd = libc::syscall(
                 libc::SYS_openat2,
                 root_tree_fd,
@@ -1278,15 +1312,72 @@ mod x86_64 {
                 child_fail(launch_error, PHASE_LANDLOCK_PATH, error_exit_syscall);
             }
             let kind = stat.st_mode & libc::S_IFMT;
-            let allowed_access = if kind == libc::S_IFDIR {
+            let mut allowed_access = if kind == libc::S_IFDIR {
                 LANDLOCK_READ_EXECUTE_RIGHTS
             } else if kind == libc::S_IFREG {
                 LANDLOCK_ACCESS_FS_EXECUTE | LANDLOCK_ACCESS_FS_READ_FILE
             } else {
                 child_fail(launch_error, PHASE_LANDLOCK_PATH, error_exit_syscall)
             };
+            let also_mutable = file_mutate_paths
+                .iter()
+                .any(|candidate| candidate.as_bytes() == path.as_bytes());
+            if also_mutable {
+                if kind != libc::S_IFDIR {
+                    child_fail_errno(
+                        launch_error,
+                        PHASE_LANDLOCK_PATH,
+                        libc::ENOTDIR,
+                        error_exit_syscall,
+                    );
+                }
+                allowed_access |= LANDLOCK_FILE_MUTATE_RIGHTS;
+            }
             let rule = LandlockPathBeneathAttr {
                 allowed_access,
+                parent_fd: path_fd,
+                reserved: 0,
+            };
+            if libc::syscall(
+                SYS_LANDLOCK_ADD_RULE,
+                ruleset_fd,
+                LANDLOCK_RULE_PATH_BENEATH,
+                &rule as *const LandlockPathBeneathAttr,
+                0u32,
+            ) == -1
+            {
+                child_fail(launch_error, PHASE_LANDLOCK_RULE, error_exit_syscall);
+            }
+            if libc::close(path_fd) == -1 {
+                child_fail(launch_error, PHASE_LANDLOCK_PATH, error_exit_syscall);
+            }
+        }
+
+        let mutation_path_how = OpenHow {
+            flags: (libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
+            mode: 0,
+            resolve: RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS,
+        };
+        for path in file_mutate_paths {
+            if read_execute_paths
+                .iter()
+                .any(|candidate| candidate.as_bytes() == path.as_bytes())
+            {
+                continue;
+            }
+            let path_fd = libc::syscall(
+                libc::SYS_openat2,
+                root_tree_fd,
+                path.as_ptr(),
+                &mutation_path_how as *const OpenHow,
+                std::mem::size_of::<OpenHow>(),
+            );
+            if path_fd == -1 {
+                child_fail(launch_error, PHASE_LANDLOCK_PATH, error_exit_syscall);
+            }
+            let path_fd = path_fd as RawFd;
+            let rule = LandlockPathBeneathAttr {
+                allowed_access: LANDLOCK_FILE_MUTATE_RIGHTS,
                 parent_fd: path_fd,
                 reserved: 0,
             };
@@ -1589,6 +1680,7 @@ mod x86_64 {
 
         let landlock_ruleset_fd = prepare_landlock_ruleset_or_fail(
             &prepared.landlock_read_execute,
+            &prepared.landlock_file_mutate,
             root_tree_fd,
             prepared.selected_storage_floor,
             launch_error,
@@ -2345,6 +2437,8 @@ mod x86_64 {
             "exit" => libc::SYS_exit,
             "tgkill" => libc::SYS_tgkill,
             "openat" => libc::SYS_openat,
+            "unlink" => libc::SYS_unlink,
+            "truncate" => libc::SYS_truncate,
             "newfstatat" => libc::SYS_newfstatat,
             "set_robust_list" => libc::SYS_set_robust_list,
             "prlimit64" => libc::SYS_prlimit64,

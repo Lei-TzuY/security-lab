@@ -13,6 +13,7 @@ const MAX_SYSCALLS: usize = 128;
 const MAX_SECCOMP_ARG_RULES: usize = 64;
 const MAX_SELECTED_HANDLES: usize = 16;
 const MAX_LANDLOCK_READ_EXECUTE_PATHS: usize = 32;
+const MAX_LANDLOCK_FILE_MUTATE_PATHS: usize = 32;
 const MIN_SELECTED_TARGET_FD: u32 = 3;
 const MAX_SELECTED_TARGET_FD: u32 = 63;
 const MIN_SCRATCH_BYTES: u64 = 4096;
@@ -79,6 +80,9 @@ pub struct SandboxPolicy {
     /// Optional Landlock read/execute allowlist. When non-empty, only these
     /// sandbox paths may be read or executed after trusted setup completes.
     pub landlock_read_execute: Vec<PathBuf>,
+    /// Optional Landlock regular-file mutation allowlist. Each path names a
+    /// directory within an already-writable scratch or persistent-volume surface.
+    pub landlock_file_mutate: Vec<PathBuf>,
     /// Whether the launcher activates `lo` inside the isolated network namespace.
     /// This does not attach the namespace to any host or external network.
     pub loopback_enabled: bool,
@@ -190,6 +194,40 @@ impl SandboxPolicy {
                 return Err(PolicyError::new(
                     "landlock.read_execute must cover the initial executable",
                 ));
+            }
+        }
+
+        if self.landlock_file_mutate.len() > MAX_LANDLOCK_FILE_MUTATE_PATHS {
+            return Err(PolicyError::new(format!(
+                "too many landlock.file_mutate paths: {} > {MAX_LANDLOCK_FILE_MUTATE_PATHS}",
+                self.landlock_file_mutate.len()
+            )));
+        }
+        if !self.landlock_file_mutate.is_empty() {
+            let mut seen = BTreeSet::new();
+            for path in &self.landlock_file_mutate {
+                validate_absolute_path("landlock.file_mutate", path)?;
+                if path == Path::new("/") {
+                    return Err(PolicyError::new(
+                        "landlock.file_mutate must not grant the entire sandbox root",
+                    ));
+                }
+                if !seen.insert(path.clone()) {
+                    return Err(PolicyError::new(format!(
+                        "duplicate landlock.file_mutate path: {}",
+                        path.display()
+                    )));
+                }
+                let in_scratch = self.scratch_dir.as_ref() == Some(path);
+                let in_writable_volume = self
+                    .writable_volume_target
+                    .as_ref()
+                    .is_some_and(|target| path.starts_with(target));
+                if !in_scratch && !in_writable_volume {
+                    return Err(PolicyError::new(
+                        "landlock.file_mutate must be within filesystem.scratch or volume.writable_target",
+                    ));
+                }
             }
         }
 
@@ -574,6 +612,7 @@ impl FromStr for SandboxPolicy {
         let mut environment = BTreeMap::new();
         let mut working_dir = None;
         let mut landlock_read_execute = Vec::new();
+        let mut landlock_file_mutate = Vec::new();
         let mut loopback_enabled = None;
         let mut host_loopback_tcp_port = None;
         let mut host_loopback_tcp_target_fd = None;
@@ -657,6 +696,7 @@ impl FromStr for SandboxPolicy {
                 "arg" => args.push(value.to_owned()),
                 "working_dir" => set_once(&mut working_dir, value.to_owned(), line_no, key)?,
                 "landlock.read_execute" => landlock_read_execute.push(value.to_owned()),
+                "landlock.file_mutate" => landlock_file_mutate.push(value.to_owned()),
                 "stdio.stdin" => set_once(
                     &mut stdin,
                     parse_stdio_mode(value, line_no, key)?,
@@ -823,6 +863,10 @@ impl FromStr for SandboxPolicy {
             environment,
             working_dir: PathBuf::from(required(working_dir, "working_dir")?),
             landlock_read_execute: landlock_read_execute
+                .into_iter()
+                .map(PathBuf::from)
+                .collect(),
+            landlock_file_mutate: landlock_file_mutate
                 .into_iter()
                 .map(PathBuf::from)
                 .collect(),
@@ -1043,6 +1087,7 @@ mod tests {
         assert_eq!(policy.host_loopback_tcp_port, None);
         assert_eq!(policy.host_loopback_tcp_target_fd, None);
         assert!(policy.landlock_read_execute.is_empty());
+        assert!(policy.landlock_file_mutate.is_empty());
         assert_eq!(policy.readonly_volume_source, None);
         assert_eq!(policy.readonly_volume_target, None);
         assert_eq!(policy.writable_volume_source, None);
@@ -1092,6 +1137,47 @@ mod tests {
         let misses_executable = format!("{VALID}\nlandlock.read_execute = /tmp");
         let error = misses_executable.parse::<SandboxPolicy>().unwrap_err();
         assert!(error.to_string().contains("cover the initial executable"));
+    }
+
+    #[test]
+    fn parses_landlock_file_mutation_paths() {
+        let scratch: SandboxPolicy = format!("{VALID}\nlandlock.file_mutate = /scratch")
+            .parse()
+            .unwrap();
+        assert_eq!(scratch.landlock_file_mutate, [PathBuf::from("/scratch")]);
+
+        let base = volume_valid();
+        let persistent: SandboxPolicy = format!(
+            "{base}\nvolume.writable_source = /srv/state\nvolume.writable_target = /persist\nlandlock.file_mutate = /persist/allowed"
+        )
+        .parse()
+        .unwrap();
+        assert_eq!(
+            persistent.landlock_file_mutate,
+            [PathBuf::from("/persist/allowed")]
+        );
+    }
+
+    #[test]
+    fn rejects_unsafe_landlock_file_mutation_paths() {
+        let root = format!("{VALID}\nlandlock.file_mutate = /");
+        assert!(root.parse::<SandboxPolicy>().is_err());
+
+        let relative = format!("{VALID}\nlandlock.file_mutate = scratch");
+        assert!(relative.parse::<SandboxPolicy>().is_err());
+
+        let duplicate =
+            format!("{VALID}\nlandlock.file_mutate = /scratch\nlandlock.file_mutate = /scratch");
+        assert!(duplicate.parse::<SandboxPolicy>().is_err());
+
+        let undeclared_surface = format!("{VALID}\nlandlock.file_mutate = /tmp");
+        let error = undeclared_surface.parse::<SandboxPolicy>().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("must be within filesystem.scratch or volume.writable_target"));
+
+        let scratch_subdir = format!("{VALID}\nlandlock.file_mutate = /scratch/subdir");
+        assert!(scratch_subdir.parse::<SandboxPolicy>().is_err());
     }
 
     #[test]

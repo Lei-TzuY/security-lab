@@ -19,6 +19,8 @@
 #   r prove Landlock allows declared reads and returns EACCES for an undeclared visible file
 #   m prove Landlock narrows regular-file mutation inside scratch and a writable persistent volume
 #   s prove Landlock allows declared TCP bind/connect ports and denies undeclared ports
+#   t permission-check namespace PID1 through a target-opened pidfd; unscoped succeeds
+#   u repeat the PID1 signal permission check; Landlock scope requires exact EPERM
 #   F forbidden getpid; exits 77 only when seccomp returns -EPERM
 #   E validate sanitized environment
 #   C validate working directory against argv[2]
@@ -74,6 +76,10 @@ _start:
     je .landlock_file_mutation
     cmp $115, %al
     je .landlock_tcp_ports
+    cmp $116, %al
+    je .pidfd_signal_allowed
+    cmp $117, %al
+    je .pidfd_signal_denied
     cmp $70, %al
     je .forbidden
     cmp $69, %al
@@ -981,6 +987,58 @@ _start:
     xor %edi, %edi
     jmp .exit
 
+.pidfd_signal_allowed:
+    mov $434, %eax
+    mov $1, %edi
+    xor %esi, %esi
+    syscall
+    test %rax, %rax
+    js .pidfd_open_errno
+    mov %eax, %edi
+    mov $424, %eax
+    xor %esi, %esi
+    xor %edx, %edx
+    xor %r10d, %r10d
+    syscall
+    test %rax, %rax
+    jns .pidfd_signal_ok
+    neg %eax
+    mov %eax, %edi
+    jmp .exit
+.pidfd_signal_ok:
+    xor %edi, %edi
+    jmp .exit
+
+.pidfd_signal_denied:
+    mov $434, %eax
+    mov $1, %edi
+    xor %esi, %esi
+    syscall
+    test %rax, %rax
+    js .pidfd_open_errno
+    mov %eax, %edi
+    mov $424, %eax
+    xor %esi, %esi
+    xor %edx, %edx
+    xor %r10d, %r10d
+    syscall
+    cmp $-1, %rax
+    je .pidfd_signal_ok
+    test %rax, %rax
+    jns .pidfd_signal_unexpected_success
+    neg %eax
+    mov %eax, %edi
+    jmp .exit
+.pidfd_signal_unexpected_success:
+    mov $42, %edi
+    jmp .exit
+
+.pidfd_open_errno:
+    neg %eax
+    add $100, %eax
+    mov %eax, %edi
+    jmp .exit
+
 .forbidden:
     mov $39, %eax
     syscall
@@ -1683,6 +1741,9 @@ _start:
     jmp .exit
 .fail40:
     mov $40, %edi
+    jmp .exit
+.fail41:
+    mov $41, %edi
 
 .exit:
     mov $60, %eax

@@ -124,6 +124,7 @@ mod x86_64 {
     const LANDLOCK_RULE_NET_PORT: libc::c_int = 2;
     const LANDLOCK_ACCESS_NET_BIND_TCP: u64 = 1 << 0;
     const LANDLOCK_ACCESS_NET_CONNECT_TCP: u64 = 1 << 1;
+    const LANDLOCK_SCOPE_SIGNAL: u64 = 1 << 1;
     const LANDLOCK_ACCESS_FS_EXECUTE: u64 = 1 << 0;
     const LANDLOCK_ACCESS_FS_WRITE_FILE: u64 = 1 << 1;
     const LANDLOCK_ACCESS_FS_READ_FILE: u64 = 1 << 2;
@@ -162,6 +163,7 @@ mod x86_64 {
     struct LandlockRulesetAttr {
         handled_access_fs: u64,
         handled_access_net: u64,
+        scoped: u64,
     }
 
     #[repr(C)]
@@ -528,6 +530,7 @@ mod x86_64 {
         file_mutate: Vec<CString>,
         tcp_bind_ports: Vec<u16>,
         tcp_connect_ports: Vec<u16>,
+        scope_signal: bool,
     }
 
     struct PreparedLaunch {
@@ -815,6 +818,7 @@ mod x86_64 {
                     file_mutate: landlock_file_mutate,
                     tcp_bind_ports: policy.landlock_tcp_bind_ports.clone(),
                     tcp_connect_ports: policy.landlock_tcp_connect_ports.clone(),
+                    scope_signal: policy.landlock_scope_signal,
                 },
                 cancellation_fd,
                 volumes,
@@ -1325,6 +1329,7 @@ mod x86_64 {
             && policy.landlock_file_mutate.is_empty()
             && policy.landlock_tcp_bind_ports.is_empty()
             && policy.landlock_tcp_connect_ports.is_empty()
+            && !policy.landlock_scope_signal
         {
             return Ok(());
         }
@@ -1348,6 +1353,11 @@ mod x86_64 {
             {
                 return Err(SandboxError::UnsupportedPlatform(format!(
                     "Landlock TCP port enforcement requires ABI 4; kernel reports ABI {abi}"
+                )));
+            }
+            if policy.landlock_scope_signal && abi < 6 {
+                return Err(SandboxError::UnsupportedPlatform(format!(
+                    "Landlock signal scoping requires ABI 6; kernel reports ABI {abi}"
                 )));
             }
             return Ok(());
@@ -1379,6 +1389,7 @@ mod x86_64 {
             && landlock.file_mutate.is_empty()
             && landlock.tcp_bind_ports.is_empty()
             && landlock.tcp_connect_ports.is_empty()
+            && !landlock.scope_signal
         {
             return -1;
         }
@@ -1397,16 +1408,24 @@ mod x86_64 {
         if !landlock.tcp_connect_ports.is_empty() {
             handled_access_net |= LANDLOCK_ACCESS_NET_CONNECT_TCP;
         }
+        let scoped = if landlock.scope_signal {
+            LANDLOCK_SCOPE_SIGNAL
+        } else {
+            0
+        };
         let ruleset = LandlockRulesetAttr {
             handled_access_fs,
             handled_access_net,
+            scoped,
         };
-        // Preserve ABI 1-3 filesystem-only compatibility: handled_access_net
-        // was added in ABI 4, so only include the second u64 when it is used.
-        let ruleset_size = if handled_access_net == 0 {
-            std::mem::size_of::<u64>()
-        } else {
+        // Preserve old-ABI struct sizing: handled_access_net was appended in
+        // ABI 4 and scoped in ABI 6. Only expose fields the active policy uses.
+        let ruleset_size = if scoped != 0 {
             std::mem::size_of::<LandlockRulesetAttr>()
+        } else if handled_access_net != 0 {
+            2 * std::mem::size_of::<u64>()
+        } else {
+            std::mem::size_of::<u64>()
         };
         let raw_ruleset_fd = libc::syscall(
             SYS_LANDLOCK_CREATE_RULESET,
@@ -2632,6 +2651,8 @@ mod x86_64 {
             "clock_gettime" => libc::SYS_clock_gettime,
             "uname" => libc::SYS_uname,
             "readlinkat" => libc::SYS_readlinkat,
+            "pidfd_open" => libc::SYS_pidfd_open,
+            "pidfd_send_signal" => libc::SYS_pidfd_send_signal,
             _ => return None,
         })
     }

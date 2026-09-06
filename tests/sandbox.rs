@@ -165,6 +165,7 @@ fn policy(mode: &str, extra_args: &[&str], syscalls: &[&str]) -> SandboxPolicy {
         landlock_file_mutate: Vec::new(),
         landlock_tcp_bind_ports: Vec::new(),
         landlock_tcp_connect_ports: Vec::new(),
+        landlock_scope_signal: false,
         loopback_enabled: false,
         host_loopback_tcp_port: None,
         host_loopback_tcp_target_fd: None,
@@ -196,6 +197,24 @@ fn policy(mode: &str, extra_args: &[&str], syscalls: &[&str]) -> SandboxPolicy {
             argument_rules: BTreeMap::new(),
         },
     }
+}
+
+#[test]
+fn landlock_signal_scope_attenuates_namespace_init_signal_permission() {
+    let unscoped = policy(
+        "t",
+        &[],
+        &["execveat", "pidfd_open", "pidfd_send_signal", "exit"],
+    );
+    assert_eq!(run(&unscoped).unwrap(), ChildOutcome::Exited(0));
+
+    let mut scoped = policy(
+        "u",
+        &[],
+        &["execveat", "pidfd_open", "pidfd_send_signal", "exit"],
+    );
+    scoped.landlock_scope_signal = true;
+    assert_eq!(run(&scoped).unwrap(), ChildOutcome::Exited(0));
 }
 
 #[test]

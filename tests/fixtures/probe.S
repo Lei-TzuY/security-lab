@@ -15,6 +15,7 @@
 #   n prove policy-owned loopback supports positive intra-sandbox TCP
 #   o prove loopback remains down unless policy explicitly enables it
 #   p write through a brokered host-loopback TCP fd while direct host reachability stays isolated
+#   e write one brokered host-IPv4 UDP datagram while fresh target UDP stays isolated
 #   q accept one connection through a launcher-brokered host-loopback TCP listening fd
 #   r prove Landlock allows declared reads and returns EACCES for an undeclared visible file
 #   m prove Landlock narrows regular-file mutation inside scratch and a writable persistent volume
@@ -70,6 +71,8 @@ _start:
     je .loopback_disabled
     cmp $112, %al
     je .brokered_host_loopback
+    cmp $101, %al
+    je .brokered_host_udp
     cmp $113, %al
     je .brokered_host_loopback_ingress
     cmp $114, %al
@@ -603,6 +606,102 @@ _start:
     js .fail36
     xor %edi, %edi
     jmp .exit
+
+.brokered_host_udp:
+    mov $1, %eax
+    mov $10, %edi
+    lea brokered_host_udp_message(%rip), %rsi
+    mov $brokered_host_udp_message_len, %edx
+    syscall
+    cmp $brokered_host_udp_message_len, %rax
+    jne .fail45
+
+    mov $3, %eax
+    mov $10, %edi
+    syscall
+    test %rax, %rax
+    js .fail45
+
+    mov 24(%rsp), %rdi
+    test %rdi, %rdi
+    je .fail45
+    xor %r12d, %r12d
+.brokered_udp_port_parse_loop:
+    movzbl (%rdi), %eax
+    test %al, %al
+    je .brokered_udp_port_parsed
+    sub $48, %eax
+    cmp $9, %eax
+    ja .fail45
+    imul $10, %r12d, %r12d
+    add %eax, %r12d
+    cmp $65535, %r12d
+    ja .fail45
+    inc %rdi
+    jmp .brokered_udp_port_parse_loop
+.brokered_udp_port_parsed:
+    test %r12d, %r12d
+    je .fail45
+    movw $2, network_addr(%rip)
+    rolw $8, %r12w
+    movw %r12w, network_addr+2(%rip)
+    movl $0x0200007f, network_addr+4(%rip)
+
+    mov $41, %eax
+    mov $2, %edi
+    mov $2, %esi
+    xor %edx, %edx
+    syscall
+    test %rax, %rax
+    js .fail45
+    mov %rax, %r13
+
+    mov $42, %eax
+    mov %r13, %rdi
+    lea network_addr(%rip), %rsi
+    mov $16, %edx
+    syscall
+    test %rax, %rax
+    js .brokered_udp_direct_error
+
+    mov $1, %eax
+    mov %r13, %rdi
+    lea brokered_host_udp_direct_probe(%rip), %rsi
+    mov $brokered_host_udp_direct_probe_len, %edx
+    syscall
+    cmp $brokered_host_udp_direct_probe_len, %rax
+    je .brokered_udp_direct_done
+    cmp $-101, %rax
+    je .brokered_udp_direct_done
+    cmp $-111, %rax
+    je .brokered_udp_direct_done
+    cmp $-113, %rax
+    je .brokered_udp_direct_done
+    jmp .brokered_udp_direct_fail
+
+.brokered_udp_direct_error:
+    cmp $-101, %rax
+    je .brokered_udp_direct_done
+    cmp $-111, %rax
+    je .brokered_udp_direct_done
+    cmp $-113, %rax
+    je .brokered_udp_direct_done
+    jmp .brokered_udp_direct_fail
+
+.brokered_udp_direct_done:
+    mov $3, %eax
+    mov %r13, %rdi
+    syscall
+    test %rax, %rax
+    js .fail45
+    xor %edi, %edi
+    jmp .exit
+
+.brokered_udp_direct_fail:
+    mov $3, %eax
+    mov %r13, %rdi
+    syscall
+    jmp .fail45
 
 .brokered_host_loopback_ingress:
     mov $1, %eax
@@ -1843,6 +1942,9 @@ _start:
     jmp .exit
 .fail44:
     mov $44, %edi
+    jmp .exit
+.fail45:
+    mov $45, %edi
 
 .exit:
     mov $60, %eax
@@ -1898,6 +2000,12 @@ loopback_message:
 brokered_host_message:
     .ascii "brokered-host-loopback-ok"
 .set brokered_host_message_len, . - brokered_host_message
+brokered_host_udp_message:
+    .ascii "brokered-host-udp-ok"
+.set brokered_host_udp_message_len, . - brokered_host_udp_message
+brokered_host_udp_direct_probe:
+    .ascii "direct-host-udp-probe"
+.set brokered_host_udp_direct_probe_len, . - brokered_host_udp_direct_probe
 brokered_ingress_ready:
     .ascii "brokered-host-ingress-ready\n"
 .set brokered_ingress_ready_len, . - brokered_ingress_ready

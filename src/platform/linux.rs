@@ -1,6 +1,7 @@
 #[cfg(not(target_arch = "x86_64"))]
 pub(crate) fn run_report(
     _policy: &crate::SandboxPolicy,
+    _cancellation: Option<&crate::CancellationToken>,
 ) -> Result<crate::RunReport, crate::SandboxError> {
     Err(crate::SandboxError::UnsupportedPlatform(
         "sandbox enforcement currently supports Linux x86_64 only".to_owned(),
@@ -19,8 +20,8 @@ mod x86_64 {
     };
     use crate::policy::{StdioMode, StdioPolicy};
     use crate::{
-        CapturedOutput, ChildOutcome, PolicyError, ResourceLimits, RunReport, SandboxError,
-        SandboxPolicy,
+        CancellationToken, CapturedOutput, ChildOutcome, PolicyError, ResourceLimits, RunReport,
+        SandboxError, SandboxPolicy,
     };
     use std::ffi::CString;
     use std::io;
@@ -101,6 +102,8 @@ mod x86_64 {
     const PHASE_DEADLINE_POLL: u32 = 37;
     const PHASE_HOSTNAME: u32 = 38;
     const PHASE_SELECTED_HANDLES: u32 = 39;
+    const PHASE_CANCELLATION_PIDFD: u32 = 40;
+    const PHASE_CANCELLATION_POLL: u32 = 41;
 
     #[repr(C)]
     struct OpenHow {
@@ -307,6 +310,7 @@ mod x86_64 {
         root_path: CString,
         executable_fd: OwnedFd,
         selected_handles: Vec<PreparedSelectedHandle>,
+        cancellation_fd: Option<OwnedFd>,
         cwd_relative: CString,
         scratch_relative: Option<CString>,
         scratch_options: Option<CString>,
@@ -322,7 +326,10 @@ mod x86_64 {
     }
 
     impl PreparedLaunch {
-        fn new(policy: &SandboxPolicy) -> Result<Self, SandboxError> {
+        fn new(
+            policy: &SandboxPolicy,
+            cancellation: Option<&CancellationToken>,
+        ) -> Result<Self, SandboxError> {
             let root_fd = open_root(&policy.root_dir)?;
             let root_path =
                 cstring_bytes("filesystem.root", policy.root_dir.as_os_str().as_bytes())?;
@@ -365,6 +372,25 @@ mod x86_64 {
                     selected_storage_floor,
                 )?);
             }
+            let cancellation_fd = cancellation
+                .map(|token| {
+                    let pinned = unsafe {
+                        libc::fcntl(
+                            token.raw_fd(),
+                            libc::F_DUPFD_CLOEXEC,
+                            selected_storage_floor,
+                        )
+                    };
+                    if pinned == -1 {
+                        Err(SandboxError::SetupFailed(format!(
+                            "cannot pin external cancellation eventfd before fork: {}",
+                            io::Error::last_os_error()
+                        )))
+                    } else {
+                        Ok(OwnedFd(pinned))
+                    }
+                })
+                .transpose()?;
 
             let cwd_relative = sandbox_relative(&policy.working_dir)?;
             let (scratch_relative, scratch_options) = match (
@@ -429,6 +455,7 @@ mod x86_64 {
                 root_path,
                 executable_fd,
                 selected_handles,
+                cancellation_fd,
                 cwd_relative,
                 scratch_relative,
                 scratch_options,
@@ -459,10 +486,13 @@ mod x86_64 {
         wall_clock_milliseconds: u64,
     }
 
-    pub(crate) fn run_report(policy: &SandboxPolicy) -> Result<RunReport, SandboxError> {
+    pub(crate) fn run_report(
+        policy: &SandboxPolicy,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<RunReport, SandboxError> {
         ensure_fd_sanitization_supported()?;
-        ensure_deadline_support(policy.wall_clock_milliseconds)?;
-        let prepared = PreparedLaunch::new(policy)?;
+        ensure_supervision_support(policy.wall_clock_milliseconds, cancellation.is_some())?;
+        let prepared = PreparedLaunch::new(policy, cancellation)?;
         let seccomp = compile_seccomp(policy)?;
         let launch_state = SharedLaunchState::new()?;
         let lifecycle = SharedTargetLifecycle::new().map_err(|err| {
@@ -548,12 +578,13 @@ mod x86_64 {
             Some(result) => Some(result?),
             None => None,
         };
-        let outcome = match lifecycle_record.timed_out {
-            0 => decode_wait_status(lifecycle_record.status)?,
-            1 => ChildOutcome::TimedOut,
-            value => {
+        let outcome = match (lifecycle_record.timed_out, lifecycle_record.cancelled) {
+            (0, 0) => decode_wait_status(lifecycle_record.status)?,
+            (1, 0) => ChildOutcome::TimedOut,
+            (0, 1) => ChildOutcome::Cancelled,
+            (timed_out, cancelled) => {
                 return Err(SandboxError::SetupFailed(format!(
-                    "PID namespace lifecycle published invalid timeout flag {value}"
+                    "PID namespace lifecycle published invalid termination flags timed_out={timed_out} cancelled={cancelled}"
                 )));
             }
         };
@@ -726,25 +757,38 @@ mod x86_64 {
         }
     }
 
-    fn ensure_deadline_support(deadline: Option<u64>) -> Result<(), SandboxError> {
-        if deadline.is_none() {
+    fn ensure_supervision_support(
+        deadline: Option<u64>,
+        cancellable: bool,
+    ) -> Result<(), SandboxError> {
+        if deadline.is_none() && !cancellable {
             return Ok(());
         }
 
+        let purpose = match (deadline.is_some(), cancellable) {
+            (true, true) => "deadline/cancellation supervision",
+            (true, false) => "wall-clock deadline",
+            (false, true) => "external cancellation",
+            (false, false) => unreachable!(),
+        };
         let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, libc::getpid(), 0u32) };
         if pidfd == -1 {
-            return Err(deadline_support_error(
+            return Err(supervision_support_error(
+                purpose,
                 "pidfd_open",
                 io::Error::last_os_error(),
             ));
         }
         if unsafe { libc::close(pidfd as RawFd) } == -1 {
             return Err(SandboxError::SetupFailed(format!(
-                "cannot close wall-clock deadline pidfd probe: {}",
+                "cannot close {purpose} pidfd probe: {}",
                 io::Error::last_os_error()
             )));
         }
 
+        if deadline.is_none() {
+            return Ok(());
+        }
         let timerfd = unsafe {
             libc::syscall(
                 libc::SYS_timerfd_create,
@@ -753,31 +797,30 @@ mod x86_64 {
             )
         };
         if timerfd == -1 {
-            return Err(deadline_support_error(
+            return Err(supervision_support_error(
+                purpose,
                 "timerfd_create(CLOCK_MONOTONIC)",
                 io::Error::last_os_error(),
             ));
         }
         if unsafe { libc::close(timerfd as RawFd) } == -1 {
             return Err(SandboxError::SetupFailed(format!(
-                "cannot close wall-clock deadline timerfd probe: {}",
+                "cannot close {purpose} timerfd probe: {}",
                 io::Error::last_os_error()
             )));
         }
         Ok(())
     }
 
-    fn deadline_support_error(mechanism: &str, error: io::Error) -> SandboxError {
+    fn supervision_support_error(purpose: &str, mechanism: &str, error: io::Error) -> SandboxError {
         if matches!(
             error.raw_os_error(),
             Some(libc::ENOSYS | libc::EINVAL | libc::EPERM | libc::EACCES)
         ) {
-            SandboxError::UnsupportedPlatform(format!(
-                "wall-clock deadline requires {mechanism}: {error}"
-            ))
+            SandboxError::UnsupportedPlatform(format!("{purpose} requires {mechanism}: {error}"))
         } else {
             SandboxError::SetupFailed(format!(
-                "cannot verify wall-clock deadline mechanism {mechanism}: {error}"
+                "cannot verify {purpose} mechanism {mechanism}: {error}"
             ))
         }
     }
@@ -1129,6 +1172,7 @@ mod x86_64 {
             target_lifecycle,
             launch_error,
             wall_clock_milliseconds,
+            prepared.cancellation_fd.as_ref().map_or(-1, |fd| fd.raw()),
             TargetSupervisionPhases {
                 fork: PHASE_TARGET_FORK,
                 kill: PHASE_PROCESS_TREE_KILL,
@@ -1138,6 +1182,8 @@ mod x86_64 {
                 timerfd: PHASE_DEADLINE_TIMERFD,
                 timer_arm: PHASE_DEADLINE_TIMER_ARM,
                 poll: PHASE_DEADLINE_POLL,
+                cancellation_pidfd: PHASE_CANCELLATION_PIDFD,
+                cancellation_poll: PHASE_CANCELLATION_POLL,
             },
         );
 
@@ -1613,6 +1659,8 @@ mod x86_64 {
             PHASE_DEADLINE_POLL => "wall-clock deadline supervision poll",
             PHASE_HOSTNAME => "UTS hostname installation",
             PHASE_SELECTED_HANDLES => "selected non-stdio handle installation",
+            PHASE_CANCELLATION_PIDFD => "external cancellation pidfd supervision",
+            PHASE_CANCELLATION_POLL => "external cancellation supervision poll",
             _ => "unknown launch phase",
         };
         format!(

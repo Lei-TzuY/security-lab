@@ -3,6 +3,7 @@
 //! The policy model is platform-neutral. Enforcement is delegated to a
 //! platform layer which either applies every requested boundary or fails.
 
+mod cancellation;
 mod platform;
 pub mod policy;
 pub mod report;
@@ -10,6 +11,7 @@ pub mod report;
 use std::error::Error;
 use std::fmt;
 
+pub use cancellation::CancellationToken;
 pub use policy::{
     PolicyError, ResourceLimits, SandboxPolicy, SeccompArgRule, SeccompPolicy, StdioMode,
     StdioPolicy,
@@ -52,7 +54,17 @@ impl From<PolicyError> for SandboxError {
 /// returning terminal status plus any launcher-owned captured output.
 pub fn run_report(policy: &SandboxPolicy) -> Result<RunReport, SandboxError> {
     policy.validate()?;
-    platform::run_report(policy)
+    platform::run_report(policy, None)
+}
+
+/// Validate and execute the invocation while allowing another thread holding a
+/// clone of `cancellation` to request launcher-owned process-tree termination.
+pub fn run_report_with_cancel(
+    policy: &SandboxPolicy,
+    cancellation: &CancellationToken,
+) -> Result<RunReport, SandboxError> {
+    policy.validate()?;
+    platform::run_report(policy, Some(cancellation))
 }
 
 /// Validate and execute exactly the invocation described by `policy`.
@@ -62,4 +74,12 @@ pub fn run_report(policy: &SandboxPolicy) -> Result<RunReport, SandboxError> {
 /// terminal; execution never retries without the requested restrictions.
 pub fn run(policy: &SandboxPolicy) -> Result<ChildOutcome, SandboxError> {
     Ok(run_report(policy)?.outcome)
+}
+
+/// Status-only counterpart to [`run_report_with_cancel`].
+pub fn run_with_cancel(
+    policy: &SandboxPolicy,
+    cancellation: &CancellationToken,
+) -> Result<ChildOutcome, SandboxError> {
+    Ok(run_report_with_cancel(policy, cancellation)?.outcome)
 }

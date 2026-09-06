@@ -1,8 +1,8 @@
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 
 use security_lab::{
-    run, run_report, ChildOutcome, ResourceLimits, SandboxError, SandboxPolicy, SeccompArgRule,
-    SeccompPolicy, StdioMode, StdioPolicy,
+    run, run_report, run_report_with_cancel, CancellationToken, ChildOutcome, ResourceLimits,
+    SandboxError, SandboxPolicy, SeccompArgRule, SeccompPolicy, StdioMode, StdioPolicy,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CString;
@@ -12,6 +12,7 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::process::{self, Command};
 use std::sync::OnceLock;
+use std::thread;
 
 const SCRATCH_BYTES: u64 = 16 * 1024 * 1024;
 
@@ -39,6 +40,28 @@ fn duplicate_fd_at_least(fd: RawFd, minimum: RawFd, label: &str) -> TestFd {
         std::io::Error::last_os_error()
     );
     TestFd(duplicated)
+}
+
+fn read_exact_fd(fd: RawFd, buffer: &mut [u8]) {
+    let mut offset = 0usize;
+    while offset < buffer.len() {
+        let read = unsafe {
+            libc::read(
+                fd,
+                buffer[offset..].as_mut_ptr().cast::<libc::c_void>(),
+                buffer.len() - offset,
+            )
+        };
+        if read == -1 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            panic!("ready-handshake read failed: {error}");
+        }
+        assert!(read > 0, "ready-handshake pipe reached EOF early");
+        offset += read as usize;
+    }
 }
 
 fn fixture_root() -> &'static Path {
@@ -158,6 +181,57 @@ fn selected_handle_rejects_directory_source() {
         }
         other => panic!("unexpected directory-source result: {other}"),
     }
+}
+
+#[test]
+fn external_cancellation_owns_process_tree_after_ready_handshake() {
+    let mut pipe = [-1; 2];
+    assert_eq!(
+        unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) },
+        0,
+        "create cancellation readiness pipe"
+    );
+    let read_end = TestFd(pipe[0]);
+    let write_end = TestFd(pipe[1]);
+    let cancellation = CancellationToken::new().expect("create cancellation token");
+    let runner_token = cancellation.clone();
+
+    let runner = thread::spawn(move || {
+        let mut cancellable = policy("c", &[], &["execveat", "write", "fork", "pause", "exit"]);
+        cancellable
+            .selected_handles
+            .insert(9, write_end.raw() as u32);
+        // A watchdog makes a broken cancellation path fail as TimedOut rather
+        // than hanging CI; the ready handshake ensures cancellation itself is
+        // never timing-based.
+        cancellable.wall_clock_milliseconds = Some(5000);
+        run_report_with_cancel(&cancellable, &runner_token)
+    });
+
+    let mut marker = [0u8; 26];
+    read_exact_fd(read_end.raw(), &mut marker);
+    assert_eq!(
+        &marker,
+        b"cancellation-target-ready
+"
+    );
+    cancellation.cancel().expect("signal cancellation");
+
+    let report = runner
+        .join()
+        .expect("cancellable sandbox thread panicked")
+        .expect("cancellable sandbox run failed");
+    assert_eq!(report.outcome, ChildOutcome::Cancelled);
+    assert_eq!(report.reaped_descendants, 1);
+}
+
+#[test]
+fn uncancelled_token_preserves_natural_completion() {
+    let cancellation = CancellationToken::new().expect("create cancellation token");
+    let report = run_report_with_cancel(&policy("X", &[], &["execveat", "exit"]), &cancellation)
+        .expect("uncancelled run failed");
+    assert_eq!(report.outcome, ChildOutcome::Exited(42));
+    assert_eq!(report.reaped_descendants, 0);
 }
 
 #[test]

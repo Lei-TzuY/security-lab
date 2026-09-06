@@ -166,6 +166,19 @@ mod x86_64 {
         target_fd: RawFd,
     }
 
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum VolumeAccess {
+        ReadOnly,
+        Writable,
+    }
+
+    struct PreparedVolume {
+        source_fd: OwnedFd,
+        source_path: CString,
+        target_relative: CString,
+        access: VolumeAccess,
+    }
+
     impl CapturePipe {
         fn new(limit: u64) -> Result<Self, SandboxError> {
             let mut fds = [-1; 2];
@@ -263,6 +276,31 @@ mod x86_64 {
         })
     }
 
+    fn prepare_volume(
+        root_fd: RawFd,
+        source: &Path,
+        target: &Path,
+        source_field: &str,
+        source_label: &str,
+        target_label: &str,
+        access: VolumeAccess,
+    ) -> Result<PreparedVolume, SandboxError> {
+        let source_fd = open_host_directory(source, source_label)?;
+        let target_check = open_beneath_root(
+            root_fd,
+            target,
+            (libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
+            target_label,
+        )?;
+        drop(target_check);
+        Ok(PreparedVolume {
+            source_fd,
+            source_path: cstring_bytes(source_field, source.as_os_str().as_bytes())?,
+            target_relative: sandbox_relative(target)?,
+            access,
+        })
+    }
+
     struct SharedLaunchState {
         record: *mut LaunchErrorRecord,
     }
@@ -316,9 +354,7 @@ mod x86_64 {
         executable_fd: OwnedFd,
         selected_handles: Vec<PreparedSelectedHandle>,
         cancellation_fd: Option<OwnedFd>,
-        readonly_volume_source_fd: Option<OwnedFd>,
-        readonly_volume_source_path: Option<CString>,
-        readonly_volume_target_relative: Option<CString>,
+        volumes: Vec<PreparedVolume>,
         cwd_relative: CString,
         scratch_relative: Option<CString>,
         scratch_options: Option<CString>,
@@ -400,35 +436,47 @@ mod x86_64 {
                 })
                 .transpose()?;
 
-            let (
-                readonly_volume_source_fd,
-                readonly_volume_source_path,
-                readonly_volume_target_relative,
-            ) = match (
+            let mut volumes = Vec::with_capacity(2);
+            match (
                 &policy.readonly_volume_source,
                 &policy.readonly_volume_target,
             ) {
-                (Some(source), Some(target)) => {
-                    let source_fd = open_host_directory(source, "read-only volume source")?;
-                    let target_check = open_beneath_root(
-                        root_fd.raw(),
-                        target,
-                        (libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
-                        "read-only volume target",
-                    )?;
-                    drop(target_check);
-                    let source_path =
-                        cstring_bytes("volume.readonly_source", source.as_os_str().as_bytes())?;
-                    let target_relative = sandbox_relative(target)?;
-                    (Some(source_fd), Some(source_path), Some(target_relative))
-                }
-                (None, None) => (None, None, None),
+                (Some(source), Some(target)) => volumes.push(prepare_volume(
+                    root_fd.raw(),
+                    source,
+                    target,
+                    "volume.readonly_source",
+                    "read-only volume source",
+                    "read-only volume target",
+                    VolumeAccess::ReadOnly,
+                )?),
+                (None, None) => {}
                 _ => {
                     return Err(SandboxError::InvalidPolicy(PolicyError::new(
                         "volume.readonly_source and volume.readonly_target must be specified together",
                     )));
                 }
-            };
+            }
+            match (
+                &policy.writable_volume_source,
+                &policy.writable_volume_target,
+            ) {
+                (Some(source), Some(target)) => volumes.push(prepare_volume(
+                    root_fd.raw(),
+                    source,
+                    target,
+                    "volume.writable_source",
+                    "writable volume source",
+                    "writable volume target",
+                    VolumeAccess::Writable,
+                )?),
+                (None, None) => {}
+                _ => {
+                    return Err(SandboxError::InvalidPolicy(PolicyError::new(
+                        "volume.writable_source and volume.writable_target must be specified together",
+                    )));
+                }
+            }
 
             let cwd_relative = sandbox_relative(&policy.working_dir)?;
             let (scratch_relative, scratch_options) = match (
@@ -494,9 +542,7 @@ mod x86_64 {
                 executable_fd,
                 selected_handles,
                 cancellation_fd,
-                readonly_volume_source_fd,
-                readonly_volume_source_path,
-                readonly_volume_target_relative,
+                volumes,
                 cwd_relative,
                 scratch_relative,
                 scratch_options,
@@ -1155,12 +1201,14 @@ mod x86_64 {
             child_fail(launch_error, PHASE_ROOT_FCHDIR, seccomp.error_exit_syscall);
         }
 
-        install_readonly_volume_or_fail(
-            prepared,
-            root_tree_fd,
-            launch_error,
-            seccomp.error_exit_syscall,
-        );
+        for volume in &prepared.volumes {
+            install_volume_or_fail(
+                volume,
+                root_tree_fd,
+                launch_error,
+                seccomp.error_exit_syscall,
+            );
+        }
 
         if let (Some(scratch), Some(options)) =
             (&prepared.scratch_relative, &prepared.scratch_options)
@@ -1330,20 +1378,12 @@ mod x86_64 {
         child_fail(launch_error, PHASE_EXECVEAT, seccomp.error_exit_syscall)
     }
 
-    unsafe fn install_readonly_volume_or_fail(
-        prepared: &PreparedLaunch,
+    unsafe fn install_volume_or_fail(
+        volume: &PreparedVolume,
         root_tree_fd: RawFd,
         launch_error: *mut LaunchErrorRecord,
         error_exit_syscall: libc::c_long,
     ) {
-        let (Some(pinned_source), Some(source_path), Some(target_relative)) = (
-            &prepared.readonly_volume_source_fd,
-            &prepared.readonly_volume_source_path,
-            &prepared.readonly_volume_target_relative,
-        ) else {
-            return;
-        };
-
         let source_how = OpenHow {
             flags: (libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
             mode: 0,
@@ -1352,7 +1392,7 @@ mod x86_64 {
         let current_source_fd = libc::syscall(
             libc::SYS_openat2,
             libc::AT_FDCWD,
-            source_path.as_ptr(),
+            volume.source_path.as_ptr(),
             &source_how as *const OpenHow,
             std::mem::size_of::<OpenHow>(),
         );
@@ -1365,7 +1405,7 @@ mod x86_64 {
         }
         let current_source_fd = current_source_fd as RawFd;
         revalidate_fd_identity_or_fail(
-            pinned_source.raw(),
+            volume.source_fd.raw(),
             current_source_fd,
             PHASE_VOLUME_SOURCE_REVALIDATE,
             launch_error,
@@ -1383,22 +1423,24 @@ mod x86_64 {
         }
         let volume_tree_fd = volume_tree_fd as RawFd;
 
-        let volume_attr = MountAttr {
-            attr_set: MOUNT_ATTR_RDONLY,
-            attr_clr: 0,
-            propagation: 0,
-            userns_fd: 0,
-        };
-        if libc::syscall(
-            libc::SYS_mount_setattr,
-            volume_tree_fd,
-            b"\0".as_ptr().cast::<libc::c_char>(),
-            AT_EMPTY_PATH | AT_RECURSIVE,
-            &volume_attr as *const MountAttr,
-            std::mem::size_of::<MountAttr>(),
-        ) == -1
-        {
-            child_fail(launch_error, PHASE_VOLUME_READONLY, error_exit_syscall);
+        if volume.access == VolumeAccess::ReadOnly {
+            let volume_attr = MountAttr {
+                attr_set: MOUNT_ATTR_RDONLY,
+                attr_clr: 0,
+                propagation: 0,
+                userns_fd: 0,
+            };
+            if libc::syscall(
+                libc::SYS_mount_setattr,
+                volume_tree_fd,
+                b"\0".as_ptr().cast::<libc::c_char>(),
+                AT_EMPTY_PATH | AT_RECURSIVE,
+                &volume_attr as *const MountAttr,
+                std::mem::size_of::<MountAttr>(),
+            ) == -1
+            {
+                child_fail(launch_error, PHASE_VOLUME_READONLY, error_exit_syscall);
+            }
         }
 
         let target_how = OpenHow {
@@ -1412,7 +1454,7 @@ mod x86_64 {
         let target_fd = libc::syscall(
             libc::SYS_openat2,
             root_tree_fd,
-            target_relative.as_ptr(),
+            volume.target_relative.as_ptr(),
             &target_how as *const OpenHow,
             std::mem::size_of::<OpenHow>(),
         );
@@ -1856,11 +1898,11 @@ mod x86_64 {
             PHASE_SELECTED_HANDLES => "selected non-stdio handle installation",
             PHASE_CANCELLATION_PIDFD => "external cancellation pidfd supervision",
             PHASE_CANCELLATION_POLL => "external cancellation supervision poll",
-            PHASE_VOLUME_SOURCE_REVALIDATE => "read-only volume source revalidation",
-            PHASE_VOLUME_CLONE => "detached read-only volume mount clone",
+            PHASE_VOLUME_SOURCE_REVALIDATE => "persistent volume source revalidation",
+            PHASE_VOLUME_CLONE => "detached persistent volume mount clone",
             PHASE_VOLUME_READONLY => "recursive read-only volume attributes",
-            PHASE_VOLUME_TARGET_PIN => "read-only volume target pin",
-            PHASE_VOLUME_ATTACH => "read-only volume mount attachment",
+            PHASE_VOLUME_TARGET_PIN => "persistent volume target pin",
+            PHASE_VOLUME_ATTACH => "persistent volume mount attachment",
             _ => "unknown launch phase",
         };
         format!(

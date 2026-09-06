@@ -79,6 +79,10 @@ pub struct SandboxPolicy {
     /// declared sandbox mountpoint. Source and target must be specified together.
     pub readonly_volume_source: Option<PathBuf>,
     pub readonly_volume_target: Option<PathBuf>,
+    /// Optional trusted host directory deliberately exposed writable at one
+    /// declared sandbox mountpoint. This grants host mutation authority.
+    pub writable_volume_source: Option<PathBuf>,
+    pub writable_volume_target: Option<PathBuf>,
     /// Optional absolute path inside `root_dir` replaced by a private writable
     /// tmpfs after the root mount tree has been made recursively read-only.
     pub scratch_dir: Option<PathBuf>,
@@ -150,6 +154,11 @@ impl SandboxPolicy {
             (Some(source), Some(target)) => {
                 validate_absolute_path("volume.readonly_source", source)?;
                 validate_absolute_path("volume.readonly_target", target)?;
+                if source.starts_with(&self.root_dir) || self.root_dir.starts_with(source) {
+                    return Err(PolicyError::new(
+                        "volume.readonly_source must not overlap filesystem.root",
+                    ));
+                }
                 if target == Path::new("/") {
                     return Err(PolicyError::new(
                         "volume.readonly_target must not replace the sandbox root",
@@ -171,6 +180,68 @@ impl SandboxPolicy {
             _ => {
                 return Err(PolicyError::new(
                     "volume.readonly_source and volume.readonly_target must be specified together",
+                ));
+            }
+        }
+
+        match (&self.writable_volume_source, &self.writable_volume_target) {
+            (None, None) => {}
+            (Some(source), Some(target)) => {
+                validate_absolute_path("volume.writable_source", source)?;
+                validate_absolute_path("volume.writable_target", target)?;
+                if source.starts_with(&self.root_dir) || self.root_dir.starts_with(source) {
+                    return Err(PolicyError::new(
+                        "volume.writable_source must not overlap filesystem.root",
+                    ));
+                }
+                if target == Path::new("/") {
+                    return Err(PolicyError::new(
+                        "volume.writable_target must not replace the sandbox root",
+                    ));
+                }
+                if self.executable.starts_with(target) || self.working_dir.starts_with(target) {
+                    return Err(PolicyError::new(
+                        "volume.writable_target must not contain the executable or working_dir",
+                    ));
+                }
+                if let Some(scratch) = &self.scratch_dir {
+                    if target.starts_with(scratch) || scratch.starts_with(target) {
+                        return Err(PolicyError::new(
+                            "volume.writable_target must not overlap filesystem.scratch",
+                        ));
+                    }
+                }
+            }
+            _ => {
+                return Err(PolicyError::new(
+                    "volume.writable_source and volume.writable_target must be specified together",
+                ));
+            }
+        }
+
+        if let (
+            Some(readonly_source),
+            Some(readonly_target),
+            Some(writable_source),
+            Some(writable_target),
+        ) = (
+            &self.readonly_volume_source,
+            &self.readonly_volume_target,
+            &self.writable_volume_source,
+            &self.writable_volume_target,
+        ) {
+            if readonly_target.starts_with(writable_target)
+                || writable_target.starts_with(readonly_target)
+            {
+                return Err(PolicyError::new(
+                    "read-only and writable volume targets must not overlap",
+                ));
+            }
+            if readonly_source.starts_with(writable_source)
+                || writable_source.starts_with(readonly_source)
+            {
+                return Err(PolicyError::new(
+                    "read-only and writable volume sources must not overlap",
                 ));
             }
         }
@@ -425,6 +496,8 @@ impl FromStr for SandboxPolicy {
         let mut working_dir = None;
         let mut readonly_volume_source = None;
         let mut readonly_volume_target = None;
+        let mut writable_volume_source = None;
+        let mut writable_volume_target = None;
         let mut scratch_dir = None;
         let mut scratch_bytes = None;
         let mut stdin = None;
@@ -463,6 +536,12 @@ impl FromStr for SandboxPolicy {
                 }
                 "volume.readonly_target" => {
                     set_once(&mut readonly_volume_target, value.to_owned(), line_no, key)?
+                }
+                "volume.writable_source" => {
+                    set_once(&mut writable_volume_source, value.to_owned(), line_no, key)?
+                }
+                "volume.writable_target" => {
+                    set_once(&mut writable_volume_target, value.to_owned(), line_no, key)?
                 }
                 "filesystem.scratch" => set_once(&mut scratch_dir, value.to_owned(), line_no, key)?,
                 "filesystem.scratch_bytes" => set_once(
@@ -641,6 +720,8 @@ impl FromStr for SandboxPolicy {
             working_dir: PathBuf::from(required(working_dir, "working_dir")?),
             readonly_volume_source: readonly_volume_source.map(PathBuf::from),
             readonly_volume_target: readonly_volume_target.map(PathBuf::from),
+            writable_volume_source: writable_volume_source.map(PathBuf::from),
+            writable_volume_target: writable_volume_target.map(PathBuf::from),
             scratch_dir: scratch_dir.map(PathBuf::from),
             scratch_bytes,
             stdio: StdioPolicy {
@@ -816,6 +897,10 @@ mod tests {
         seccomp.allow = execveat,read,write,exit_group
     "#;
 
+    fn volume_valid() -> String {
+        VALID.replace("filesystem.root = /", "filesystem.root = /sandbox/root")
+    }
+
     #[test]
     fn parses_complete_policy() {
         let policy: SandboxPolicy = VALID.parse().unwrap();
@@ -823,6 +908,8 @@ mod tests {
         assert_eq!(policy.hostname, "security-lab");
         assert_eq!(policy.readonly_volume_source, None);
         assert_eq!(policy.readonly_volume_target, None);
+        assert_eq!(policy.writable_volume_source, None);
+        assert_eq!(policy.writable_volume_target, None);
         assert_eq!(policy.scratch_dir, Some(PathBuf::from("/scratch")));
         assert_eq!(policy.scratch_bytes, Some(16 * 1024 * 1024));
         assert_eq!(policy.executable, PathBuf::from("/bin/echo"));
@@ -844,8 +931,9 @@ mod tests {
 
     #[test]
     fn parses_readonly_volume_pair() {
+        let base = volume_valid();
         let text =
-            format!("{VALID}\nvolume.readonly_source = /srv/data\nvolume.readonly_target = /data");
+            format!("{base}\nvolume.readonly_source = /srv/data\nvolume.readonly_target = /data");
         let policy: SandboxPolicy = text.parse().unwrap();
         assert_eq!(
             policy.readonly_volume_source,
@@ -856,25 +944,99 @@ mod tests {
 
     #[test]
     fn rejects_incomplete_or_unsafe_readonly_volume() {
-        let incomplete = format!("{VALID}\nvolume.readonly_source = /srv/data");
+        let base = volume_valid();
+        let incomplete = format!("{base}\nvolume.readonly_source = /srv/data");
         assert!(incomplete.parse::<SandboxPolicy>().is_err());
 
         let root_target =
-            format!("{VALID}\nvolume.readonly_source = /srv/data\nvolume.readonly_target = /");
+            format!("{base}\nvolume.readonly_source = /srv/data\nvolume.readonly_target = /");
         assert!(root_target.parse::<SandboxPolicy>().is_err());
 
         let relative_source =
-            format!("{VALID}\nvolume.readonly_source = relative\nvolume.readonly_target = /data");
+            format!("{base}\nvolume.readonly_source = relative\nvolume.readonly_target = /data");
         assert!(relative_source.parse::<SandboxPolicy>().is_err());
 
         let hides_cwd =
-            format!("{VALID}\nvolume.readonly_source = /srv/data\nvolume.readonly_target = /tmp");
+            format!("{base}\nvolume.readonly_source = /srv/data\nvolume.readonly_target = /tmp");
         assert!(hides_cwd.parse::<SandboxPolicy>().is_err());
 
         let overlaps_scratch = format!(
-            "{VALID}\nvolume.readonly_source = /srv/data\nvolume.readonly_target = /scratch/data"
+            "{base}\nvolume.readonly_source = /srv/data\nvolume.readonly_target = /scratch/data"
         );
         assert!(overlaps_scratch.parse::<SandboxPolicy>().is_err());
+
+        let source_inside_root = format!(
+            "{base}\nvolume.readonly_source = /sandbox/root/source\nvolume.readonly_target = /data"
+        );
+        let err = source_inside_root.parse::<SandboxPolicy>().unwrap_err();
+        assert!(err.to_string().contains("must not overlap filesystem.root"));
+
+        let source_contains_root =
+            format!("{base}\nvolume.readonly_source = /sandbox\nvolume.readonly_target = /data");
+        let err = source_contains_root.parse::<SandboxPolicy>().unwrap_err();
+        assert!(err.to_string().contains("must not overlap filesystem.root"));
+    }
+
+    #[test]
+    fn parses_writable_volume_pair() {
+        let base = volume_valid();
+        let text = format!(
+            "{base}\nvolume.writable_source = /srv/state\nvolume.writable_target = /persist"
+        );
+        let policy: SandboxPolicy = text.parse().unwrap();
+        assert_eq!(
+            policy.writable_volume_source,
+            Some(PathBuf::from("/srv/state"))
+        );
+        assert_eq!(
+            policy.writable_volume_target,
+            Some(PathBuf::from("/persist"))
+        );
+    }
+
+    #[test]
+    fn rejects_incomplete_or_unsafe_writable_volume() {
+        let base = volume_valid();
+        let incomplete = format!("{base}\nvolume.writable_source = /srv/state");
+        assert!(incomplete.parse::<SandboxPolicy>().is_err());
+
+        let host_root =
+            format!("{base}\nvolume.writable_source = /\nvolume.writable_target = /persist");
+        assert!(host_root.parse::<SandboxPolicy>().is_err());
+
+        let root_target =
+            format!("{base}\nvolume.writable_source = /srv/state\nvolume.writable_target = /");
+        assert!(root_target.parse::<SandboxPolicy>().is_err());
+
+        let hides_cwd =
+            format!("{base}\nvolume.writable_source = /srv/state\nvolume.writable_target = /tmp");
+        assert!(hides_cwd.parse::<SandboxPolicy>().is_err());
+
+        let overlaps_scratch = format!(
+            "{base}\nvolume.writable_source = /srv/state\nvolume.writable_target = /scratch/state"
+        );
+        assert!(overlaps_scratch.parse::<SandboxPolicy>().is_err());
+
+        let overlaps_readonly_target = format!(
+            "{base}\nvolume.readonly_source = /srv/data\nvolume.readonly_target = /data\nvolume.writable_source = /srv/state\nvolume.writable_target = /data/state"
+        );
+        assert!(overlaps_readonly_target.parse::<SandboxPolicy>().is_err());
+
+        let overlaps_readonly_source = format!(
+            "{base}\nvolume.readonly_source = /srv/data\nvolume.readonly_target = /data\nvolume.writable_source = /srv/data/state\nvolume.writable_target = /persist"
+        );
+        assert!(overlaps_readonly_source.parse::<SandboxPolicy>().is_err());
+
+        let source_inside_root = format!(
+            "{base}\nvolume.writable_source = /sandbox/root/state\nvolume.writable_target = /persist"
+        );
+        let err = source_inside_root.parse::<SandboxPolicy>().unwrap_err();
+        assert!(err.to_string().contains("must not overlap filesystem.root"));
+
+        let source_contains_root =
+            format!("{base}\nvolume.writable_source = /sandbox\nvolume.writable_target = /persist");
+        let err = source_contains_root.parse::<SandboxPolicy>().unwrap_err();
+        assert!(err.to_string().contains("must not overlap filesystem.root"));
     }
 
     #[test]

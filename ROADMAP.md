@@ -158,7 +158,7 @@ Milestone 6A is sealed on `main`; do not farm more descriptor numbers or object 
 
 ### Slice 7A — external cancellation
 
-**Current verified candidate.** Add a caller-owned one-way cancellation primitive that integrates with launcher-owned PID 1 process-tree supervision without exposing the control descriptor to the target.
+**Status: complete on `main`.** Adds a caller-owned one-way cancellation primitive that integrates with launcher-owned PID 1 process-tree supervision without exposing the control descriptor to the target.
 
 Acceptance evidence is executable:
 
@@ -175,8 +175,30 @@ Boundary: 7A is one-way cancellation only. It does not provide token reset/rearm
 
 ### Milestone 7 promotion rule
 
-After 7A integrates, do not farm cancellation aliases, signal numbers, or alternate wake primitives that repeat the same ownership path. Promote to a materially different executable boundary such as evidence-backed persistent-volume policy or controlled networking. Milestone 4A remains blocked on real unprivileged cgroup-v2 delegation, and supplementary-group isolation still requires a different user-namespace mapping architecture.
+7A is sealed on `main`; do not farm cancellation aliases, signal numbers, or alternate wake primitives that repeat the same ownership path. Promotion is now a materially different executable data-plane boundary. Milestone 4A remains blocked on real unprivileged cgroup-v2 delegation, and supplementary-group isolation still requires a different user-namespace mapping architecture.
+
+## Milestone 8 — explicit persistent data exposure
+
+### Slice 8A — one read-only persistent host volume
+
+**Current verified candidate.** Adds one explicit host-directory exposure without weakening the recursively read-only sandbox-root invariant.
+
+Acceptance evidence is executable:
+
+- policy accepts the all-or-nothing pair `volume.readonly_source` / `volume.readonly_target`; the source is an absolute trusted host directory, while the target is an absolute sandbox path that cannot be `/`, contain the executable/working directory, or overlap private scratch;
+- before fork, the launcher pins the source with `openat2(O_PATH|O_DIRECTORY|O_CLOEXEC)` while forbidding symlink/magic-link traversal, and independently verifies the target beneath the pinned sandbox root;
+- after the private user/mount namespace exists, the launcher reopens the trusted source pathname and requires its `(st_dev, st_ino)` to match the pre-fork pin before using it;
+- the source mount tree is recursively cloned with `open_tree`, recursively marked `MOUNT_ATTR_RDONLY`, and attached with `move_mount` only to the prevalidated target inside the cloned sandbox root;
+- the raw target reads exact `volume-marker\n` bytes from `/data/marker`, requires `EROFS` when creating `/data/write-must-fail`, and requires `ENOENT` when opening the original absolute host source pathname;
+- the trusted parent proves the host marker is byte-for-byte unchanged and the forbidden host file was never created;
+- all Milestones 1–7A regressions, stable format/Clippy/full tests, and the full Rust 1.74 suite remain green.
+
+Boundary: 8A is exactly one read-only existing host-directory mount. It does not provide writable persistence, multiple-volume composition, snapshots/copy-on-write, durability/atomicity guarantees, or special network-filesystem semantics.
+
+### Milestone 8 promotion rule
+
+After 8A integrates, do not farm extra target paths that repeat the same read-only mount mechanism. Promote only to a materially different data-plane capability such as a carefully bounded writable persistent volume or controlled networking with positive connectivity evidence.
 
 ## Later frontiers
 
-Supplementary-group isolation with a viable mapping architecture, broader persistent-volume policy, and controlled networking remain separate evidence-backed frontiers. Do not add configuration-only names without executable kernel behavior and integration evidence.
+Supplementary-group isolation with a viable mapping architecture, writable/broader persistent-volume policy, and controlled networking remain separate evidence-backed frontiers. Do not add configuration-only names without executable kernel behavior and integration evidence.

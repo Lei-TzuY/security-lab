@@ -39,6 +39,7 @@ jobs:
           import pwd
           import signal
           import subprocess
+          import traceback
 
           CLONE_NEWNS = 0x00020000
           CLONE_NEWUTS = 0x04000000
@@ -48,14 +49,7 @@ jobs:
           CLONE_NEWNET = 0x40000000
           MS_REC = 16384
           MS_PRIVATE = 1 << 18
-          flags = (
-              CLONE_NEWUSER
-              | CLONE_NEWNS
-              | CLONE_NEWPID
-              | CLONE_NEWNET
-              | CLONE_NEWIPC
-              | CLONE_NEWUTS
-          )
+          flags = CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWNET | CLONE_NEWIPC | CLONE_NEWUTS
 
           libc = ctypes.CDLL(None, use_errno=True)
           host_uid = os.getuid()
@@ -71,12 +65,15 @@ jobs:
                           return int(start)
               raise RuntimeError(f"no delegation in {path}")
 
+          def ns_snapshot(prefix):
+              return {
+                  name: os.readlink(f"{prefix}/{name}")
+                  for name in ("user", "mnt", "net", "ipc", "uts")
+              }
+
           subuid = delegated_start("/etc/subuid")
           subgid = delegated_start("/etc/subgid")
-          host_ns = {
-              name: os.readlink(f"/proc/self/ns/{name}")
-              for name in ("user", "mnt", "net", "ipc", "uts")
-          }
+          host_ns = ns_snapshot("/proc/self/ns")
           host_pid_for_children = os.readlink("/proc/self/ns/pid_for_children")
           print(
               f"host uid={host_uid} gid={host_gid} groups={host_groups} "
@@ -89,9 +86,9 @@ jobs:
           go_r, go_w = os.pipe()
           pid = os.fork()
           if pid == 0:
+              os.close(ready_r)
+              os.close(go_w)
               try:
-                  os.close(ready_r)
-                  os.close(go_w)
                   if libc.unshare(flags) != 0:
                       err = ctypes.get_errno()
                       print(
@@ -100,18 +97,9 @@ jobs:
                       )
                       os._exit(31)
 
-                  child_ns = {
-                      name: os.readlink(f"/proc/self/ns/{name}")
-                      for name in ("user", "mnt", "net", "ipc", "uts")
-                  }
-                  child_pid_for_children = os.readlink("/proc/self/ns/pid_for_children")
-                  if any(child_ns[name] == host_ns[name] for name in child_ns):
-                      print(f"namespace transition incomplete: {child_ns}", flush=True)
-                      os._exit(32)
-                  if child_pid_for_children == host_pid_for_children:
-                      print("PID-for-children namespace did not change", flush=True)
-                      os._exit(33)
-
+                  # Before UID/GID maps exist, do not perform procfs introspection
+                  # in the child. The trusted parent owns that observation and
+                  # helper-mapping phase, matching the proposed launcher design.
                   os.write(ready_w, b"R")
                   if os.read(go_r, 1) != b"G":
                       os._exit(34)
@@ -123,10 +111,13 @@ jobs:
                   rc = libc.setgroups(0, None)
                   err = ctypes.get_errno()
                   after_groups = os.getgroups()
+                  child_ns = ns_snapshot("/proc/self/ns")
+                  child_pid_for_children = os.readlink("/proc/self/ns/pid_for_children")
                   print(
                       f"mapped uid={os.getuid()} gid={os.getgid()} "
                       f"setgroups_state={setgroups_state} before_groups={before_groups} "
-                      f"clear_rc={rc} errno={err} after_groups={after_groups}",
+                      f"clear_rc={rc} errno={err} after_groups={after_groups} "
+                      f"namespaces={child_ns} pid_for_children={child_pid_for_children}",
                       flush=True,
                   )
                   if os.getuid() != 0 or os.getgid() != 0:
@@ -155,10 +146,7 @@ jobs:
                       text=True,
                       capture_output=True,
                   )
-                  print(
-                      f"loopback_setup_rc={net.returncode} stderr={net.stderr.strip()!r}",
-                      flush=True,
-                  )
+                  print(f"loopback_setup_rc={net.returncode} stderr={net.stderr.strip()!r}", flush=True)
                   if net.returncode != 0:
                       os._exit(45)
 
@@ -166,10 +154,7 @@ jobs:
                   if namespace_init == 0:
                       actual_pid = os.getpid()
                       actual_groups = os.getgroups()
-                      print(
-                          f"namespace_init_pid={actual_pid} groups={actual_groups}",
-                          flush=True,
-                      )
+                      print(f"namespace_init_pid={actual_pid} groups={actual_groups}", flush=True)
                       os._exit(0 if actual_pid == 1 and not actual_groups else 46)
                   _, status = os.waitpid(namespace_init, 0)
                   if os.waitstatus_to_exitcode(status) != 0:
@@ -182,8 +167,10 @@ jobs:
                       flush=True,
                   )
                   os._exit(0)
-              finally:
-                  os._exit(60)
+              except BaseException as exc:
+                  print(f"child_exception={type(exc).__name__}: {exc}", flush=True)
+                  traceback.print_exc()
+                  os._exit(59)
 
           os.close(ready_w)
           os.close(go_r)
@@ -191,16 +178,24 @@ jobs:
               _, status = os.waitpid(pid, 0)
               raise SystemExit(f"child failed before mapping: {os.waitstatus_to_exitcode(status)}")
 
-          uid_cmd = [
-              "newuidmap", str(pid),
-              "0", str(host_uid), "1",
-              "1", str(subuid), "1",
-          ]
-          gid_cmd = [
-              "newgidmap", str(pid),
-              "0", str(host_gid), "1",
-              "1", str(subgid), "1",
-          ]
+          child_ns = ns_snapshot(f"/proc/{pid}/ns")
+          child_pid_for_children = os.readlink(f"/proc/{pid}/ns/pid_for_children")
+          print(
+              f"parent observed child namespaces={child_ns} "
+              f"pid_for_children={child_pid_for_children}",
+              flush=True,
+          )
+          if any(child_ns[name] == host_ns[name] for name in child_ns):
+              os.kill(pid, signal.SIGKILL)
+              os.waitpid(pid, 0)
+              raise SystemExit("combined namespace transition was incomplete")
+          if child_pid_for_children == host_pid_for_children:
+              os.kill(pid, signal.SIGKILL)
+              os.waitpid(pid, 0)
+              raise SystemExit("PID-for-children namespace did not change")
+
+          uid_cmd = ["newuidmap", str(pid), "0", str(host_uid), "1", "1", str(subuid), "1"]
+          gid_cmd = ["newgidmap", str(pid), "0", str(host_gid), "1", "1", str(subgid), "1"]
           uid = subprocess.run(uid_cmd, text=True, capture_output=True)
           print(f"newuidmap_rc={uid.returncode} stderr={uid.stderr.strip()!r}", flush=True)
           if uid.returncode != 0:

@@ -16,6 +16,7 @@
 #   o prove loopback remains down unless policy explicitly enables it
 #   p write through a brokered host-loopback TCP fd while direct host reachability stays isolated
 #   e write one brokered host-IPv4 UDP datagram while fresh target UDP stays isolated
+#   b exchange bytes over a brokered host pathname AF_UNIX stream; direct host path stays hidden
 #   q accept one connection through a launcher-brokered host-loopback TCP listening fd
 #   r prove Landlock allows declared reads and returns EACCES for an undeclared visible file
 #   m prove Landlock narrows regular-file mutation inside scratch and a writable persistent volume
@@ -74,6 +75,8 @@ _start:
     je .brokered_host_loopback
     cmp $101, %al
     je .brokered_host_udp
+    cmp $98, %al
+    je .brokered_host_unix
     cmp $113, %al
     je .brokered_host_loopback_ingress
     cmp $114, %al
@@ -705,6 +708,93 @@ _start:
     mov %r13, %rdi
     syscall
     jmp .fail45
+
+.brokered_host_unix:
+    mov $1, %eax
+    mov $10, %edi
+    lea brokered_host_unix_message(%rip), %rsi
+    mov $brokered_host_unix_message_len, %edx
+    syscall
+    cmp $brokered_host_unix_message_len, %rax
+    jne .fail46
+
+    xor %r12d, %r12d
+.brokered_host_unix_read_reply:
+    xor %eax, %eax
+    mov $10, %edi
+    lea brokered_host_unix_buffer(%rip), %rsi
+    add %r12, %rsi
+    mov $brokered_host_unix_reply_len, %edx
+    sub %r12d, %edx
+    syscall
+    test %rax, %rax
+    jle .fail46
+    add %rax, %r12
+    cmp $brokered_host_unix_reply_len, %r12d
+    jne .brokered_host_unix_read_reply
+
+    lea brokered_host_unix_buffer(%rip), %rdi
+    lea brokered_host_unix_reply(%rip), %rsi
+    mov $brokered_host_unix_reply_len, %ecx
+    repe cmpsb
+    jne .fail46
+
+    mov $3, %eax
+    mov $10, %edi
+    syscall
+    test %rax, %rax
+    js .fail46
+
+    mov 24(%rsp), %rsi
+    test %rsi, %rsi
+    je .fail46
+    lea host_unix_addr(%rip), %r13
+    movw $1, (%r13)
+    lea 2(%r13), %rdi
+    xor %r15d, %r15d
+.brokered_host_unix_copy_path:
+    movzbl (%rsi,%r15,1), %eax
+    test %al, %al
+    je .brokered_host_unix_path_done
+    cmp $107, %r15d
+    jae .fail46
+    movb %al, (%rdi,%r15,1)
+    inc %r15d
+    jmp .brokered_host_unix_copy_path
+.brokered_host_unix_path_done:
+    movb $0, (%rdi,%r15,1)
+    add $3, %r15d
+
+    mov $41, %eax
+    mov $1, %edi
+    mov $1, %esi
+    xor %edx, %edx
+    syscall
+    test %rax, %rax
+    js .fail46
+    mov %rax, %r12
+
+    mov $42, %eax
+    mov %r12, %rdi
+    lea host_unix_addr(%rip), %rsi
+    mov %r15d, %edx
+    syscall
+    cmp $-2, %rax
+    jne .brokered_host_unix_direct_fail
+
+    mov $3, %eax
+    mov %r12, %rdi
+    syscall
+    test %rax, %rax
+    js .fail46
+    xor %edi, %edi
+    jmp .exit
+
+.brokered_host_unix_direct_fail:
+    mov $3, %eax
+    mov %r12, %rdi
+    syscall
+    jmp .fail46
 
 .brokered_host_loopback_ingress:
     mov $1, %eax
@@ -1969,6 +2059,9 @@ _start:
     jmp .exit
 .fail45:
     mov $45, %edi
+    jmp .exit
+.fail46:
+    mov $46, %edi
 
 .exit:
     mov $60, %eax
@@ -2027,6 +2120,12 @@ brokered_host_message:
 brokered_host_udp_message:
     .ascii "brokered-host-udp-ok"
 .set brokered_host_udp_message_len, . - brokered_host_udp_message
+brokered_host_unix_message:
+    .ascii "brokered-host-unix-ok"
+.set brokered_host_unix_message_len, . - brokered_host_unix_message
+brokered_host_unix_reply:
+    .ascii "host-unix-reply"
+.set brokered_host_unix_reply_len, . - brokered_host_unix_reply
 brokered_host_udp_direct_probe:
     .ascii "direct-host-udp-probe"
 .set brokered_host_udp_direct_probe_len, . - brokered_host_udp_direct_probe
@@ -2074,6 +2173,11 @@ deadline_watchdog_sleep:
     .quad 0
 
 .section .bss
+.balign 8
+host_unix_addr:
+    .zero 110
+brokered_host_unix_buffer:
+    .zero brokered_host_unix_reply_len
 landlock_ioctl_entropy:
     .zero 4
 .balign 16

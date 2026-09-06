@@ -460,6 +460,64 @@ mod x86_64 {
         })
     }
 
+    fn connect_host_unix_stream(
+        path: &Path,
+        target_fd: u32,
+        storage_floor: RawFd,
+    ) -> Result<PreparedSelectedHandle, SandboxError> {
+        let path_bytes = path.as_os_str().as_bytes();
+        if path_bytes.is_empty() || path_bytes.len() >= 108 || path_bytes.contains(&0) {
+            return Err(SandboxError::InvalidPolicy(PolicyError::new(
+                "ipc.host_unix_stream_path must be a nonempty Linux pathname of at most 107 bytes without NUL",
+            )));
+        }
+        let socket_fd =
+            unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+        if socket_fd == -1 {
+            return Err(SandboxError::SetupFailed(format!(
+                "cannot create brokered host-UNIX stream socket: {}",
+                io::Error::last_os_error()
+            )));
+        }
+        let socket_fd = OwnedFd(socket_fd);
+        let mut address = unsafe { std::mem::zeroed::<libc::sockaddr_un>() };
+        address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        for (index, byte) in path_bytes.iter().copied().enumerate() {
+            address.sun_path[index] = byte as libc::c_char;
+        }
+        let address_length =
+            (std::mem::size_of::<libc::sa_family_t>() + path_bytes.len() + 1) as libc::socklen_t;
+        loop {
+            let connected = unsafe {
+                libc::connect(
+                    socket_fd.raw(),
+                    (&address as *const libc::sockaddr_un).cast::<libc::sockaddr>(),
+                    address_length,
+                )
+            };
+            if connected == 0 {
+                break;
+            }
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(SandboxError::SetupFailed(format!(
+                "cannot connect brokered host-UNIX stream endpoint {}: {error}",
+                path.display()
+            )));
+        }
+        let storage_fd = move_owned_fd_to_selected_storage(
+            socket_fd,
+            storage_floor,
+            "brokered host-UNIX stream socket",
+        )?;
+        Ok(PreparedSelectedHandle {
+            storage_fd,
+            target_fd: target_fd as RawFd,
+        })
+    }
+
     fn listen_host_loopback_tcp(
         port: u16,
         target_fd: u32,
@@ -705,6 +763,7 @@ mod x86_64 {
                 .chain(policy.host_loopback_tcp_target_fd.iter().copied())
                 .chain(policy.host_ipv4_tcp_target_fd.iter().copied())
                 .chain(policy.host_ipv4_udp_target_fd.iter().copied())
+                .chain(policy.host_unix_stream_target_fd.iter().copied())
                 .chain(policy.host_loopback_tcp_listen_target_fd.iter().copied())
                 .max()
                 .map_or(FIRST_NON_STDIO_FD as RawFd, |target_fd| {
@@ -729,6 +788,11 @@ mod x86_64 {
                         0
                     }
                     + if policy.host_ipv4_udp_target_fd.is_some() {
+                        1
+                    } else {
+                        0
+                    }
+                    + if policy.host_unix_stream_target_fd.is_some() {
                         1
                     } else {
                         0
@@ -795,6 +859,22 @@ mod x86_64 {
                 _ => {
                     return Err(SandboxError::InvalidPolicy(PolicyError::new(
                         "network.host_ipv4_udp_address, network.host_ipv4_udp_port, and network.host_ipv4_udp_target_fd must be specified together",
+                    )));
+                }
+            }
+            match (
+                &policy.host_unix_stream_path,
+                policy.host_unix_stream_target_fd,
+            ) {
+                (Some(path), Some(target_fd)) => selected_handles.push(connect_host_unix_stream(
+                    path,
+                    target_fd,
+                    selected_storage_floor,
+                )?),
+                (None, None) => {}
+                _ => {
+                    return Err(SandboxError::InvalidPolicy(PolicyError::new(
+                        "ipc.host_unix_stream_path and ipc.host_unix_stream_target_fd must be specified together",
                     )));
                 }
             }

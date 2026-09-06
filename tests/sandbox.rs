@@ -9,6 +9,7 @@ use std::ffi::CString;
 use std::net::{Ipv4Addr, TcpListener, TcpStream, UdpSocket};
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command};
 use std::sync::OnceLock;
@@ -270,6 +271,8 @@ fn policy(mode: &str, extra_args: &[&str], syscalls: &[&str]) -> SandboxPolicy {
         host_ipv4_udp_address: None,
         host_ipv4_udp_port: None,
         host_ipv4_udp_target_fd: None,
+        host_unix_stream_path: None,
+        host_unix_stream_target_fd: None,
         host_loopback_tcp_listen_port: None,
         host_loopback_tcp_listen_target_fd: None,
         readonly_volume_source: None,
@@ -310,6 +313,39 @@ fn assert_random_device_ioctl_available(path: &str) {
         "host random-device ioctl baseline failed for {path}: {}",
         std::io::Error::last_os_error()
     );
+}
+
+#[test]
+fn brokered_host_unix_stream_is_usable_while_host_path_stays_hidden() {
+    let socket_path =
+        std::env::temp_dir().join(format!("security-lab-host-unix-{}.sock", process::id()));
+    let _ = std::fs::remove_file(&socket_path);
+    let listener = UnixListener::bind(&socket_path).expect("bind host UNIX stream endpoint");
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept brokered UNIX connection");
+        let expected = b"brokered-host-unix-ok";
+        let mut request = vec![0u8; expected.len()];
+        read_exact_fd(stream.as_raw_fd(), &mut request);
+        assert_eq!(&request, expected);
+        write_all_fd(stream.as_raw_fd(), b"host-unix-reply");
+    });
+
+    let socket_argument = socket_path.to_string_lossy().into_owned();
+    let mut brokered = policy(
+        "b",
+        &[socket_argument.as_str()],
+        &[
+            "execveat", "read", "write", "close", "socket", "connect", "exit",
+        ],
+    );
+    brokered.host_unix_stream_path = Some(socket_path.clone());
+    brokered.host_unix_stream_target_fd = Some(10);
+    brokered.wall_clock_milliseconds = Some(2000);
+
+    let result = run(&brokered);
+    server.join().expect("host UNIX server thread failed");
+    let _ = std::fs::remove_file(&socket_path);
+    assert_eq!(result.unwrap(), ChildOutcome::Exited(0));
 }
 
 #[test]

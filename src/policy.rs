@@ -2,6 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 use std::net::Ipv4Addr;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 
@@ -118,6 +120,10 @@ pub struct SandboxPolicy {
     pub host_ipv4_udp_address: Option<Ipv4Addr>,
     pub host_ipv4_udp_port: Option<u16>,
     pub host_ipv4_udp_target_fd: Option<u32>,
+    /// Optional launcher-brokered connected filesystem-path AF_UNIX stream.
+    /// Host pathname and target descriptor are all-or-nothing.
+    pub host_unix_stream_path: Option<PathBuf>,
+    pub host_unix_stream_target_fd: Option<u32>,
     /// Optional launcher-brokered TCP listener bound only to host 127.0.0.1.
     /// The port and target descriptor must be specified together.
     pub host_loopback_tcp_listen_port: Option<u16>,
@@ -433,6 +439,57 @@ impl SandboxPolicy {
             _ => {
                 return Err(PolicyError::new(
                     "network.host_ipv4_udp_address, network.host_ipv4_udp_port, and network.host_ipv4_udp_target_fd must be specified together",
+                ));
+            }
+        }
+
+        match (&self.host_unix_stream_path, self.host_unix_stream_target_fd) {
+            (None, None) => {}
+            (Some(path), Some(target_fd)) => {
+                validate_unix_socket_path("ipc.host_unix_stream_path", path)?;
+                if path.starts_with(&self.root_dir) || self.root_dir.starts_with(path) {
+                    return Err(PolicyError::new(
+                        "ipc.host_unix_stream_path must not overlap filesystem.root",
+                    ));
+                }
+                if !(MIN_SELECTED_TARGET_FD..=MAX_SELECTED_TARGET_FD).contains(&target_fd) {
+                    return Err(PolicyError::new(format!(
+                        "ipc.host_unix_stream_target_fd must be between {MIN_SELECTED_TARGET_FD} and {MAX_SELECTED_TARGET_FD}: {target_fd}"
+                    )));
+                }
+                if u64::from(target_fd) >= self.limits.open_files {
+                    return Err(PolicyError::new(format!(
+                        "ipc.host_unix_stream_target_fd {target_fd} must be below limit.open_files {}",
+                        self.limits.open_files
+                    )));
+                }
+                if self.selected_handles.contains_key(&target_fd) {
+                    return Err(PolicyError::new(format!(
+                        "IPC host-UNIX stream target fd {target_fd} collides with a selected handle target"
+                    )));
+                }
+                for (label, existing) in [
+                    (
+                        "host-loopback TCP connection",
+                        self.host_loopback_tcp_target_fd,
+                    ),
+                    ("host-IPv4 TCP connection", self.host_ipv4_tcp_target_fd),
+                    ("host-IPv4 UDP connection", self.host_ipv4_udp_target_fd),
+                    (
+                        "host-loopback TCP listener",
+                        self.host_loopback_tcp_listen_target_fd,
+                    ),
+                ] {
+                    if existing == Some(target_fd) {
+                        return Err(PolicyError::new(format!(
+                            "IPC host-UNIX stream target fd {target_fd} collides with the brokered {label} target"
+                        )));
+                    }
+                }
+            }
+            _ => {
+                return Err(PolicyError::new(
+                    "ipc.host_unix_stream_path and ipc.host_unix_stream_target_fd must be specified together",
                 ));
             }
         }
@@ -838,6 +895,8 @@ impl FromStr for SandboxPolicy {
         let mut host_ipv4_udp_address = None;
         let mut host_ipv4_udp_port = None;
         let mut host_ipv4_udp_target_fd = None;
+        let mut host_unix_stream_path = None;
+        let mut host_unix_stream_target_fd = None;
         let mut host_loopback_tcp_listen_port = None;
         let mut host_loopback_tcp_listen_target_fd = None;
         let mut readonly_volume_source = None;
@@ -949,6 +1008,17 @@ impl FromStr for SandboxPolicy {
                 )?,
                 "network.host_ipv4_udp_target_fd" => set_once(
                     &mut host_ipv4_udp_target_fd,
+                    value.parse::<u32>().map_err(|_| {
+                        PolicyError::at(line_no, format!("{key} must be an unsigned integer"))
+                    })?,
+                    line_no,
+                    key,
+                )?,
+                "ipc.host_unix_stream_path" => {
+                    set_once(&mut host_unix_stream_path, value.to_owned(), line_no, key)?
+                }
+                "ipc.host_unix_stream_target_fd" => set_once(
+                    &mut host_unix_stream_target_fd,
                     value.parse::<u32>().map_err(|_| {
                         PolicyError::at(line_no, format!("{key} must be an unsigned integer"))
                     })?,
@@ -1185,6 +1255,8 @@ impl FromStr for SandboxPolicy {
             host_ipv4_udp_address,
             host_ipv4_udp_port,
             host_ipv4_udp_target_fd,
+            host_unix_stream_path: host_unix_stream_path.map(PathBuf::from),
+            host_unix_stream_target_fd,
             host_loopback_tcp_listen_port,
             host_loopback_tcp_listen_target_fd,
             readonly_volume_source: readonly_volume_source.map(PathBuf::from),
@@ -1342,6 +1414,20 @@ fn parse_stdio_mode(value: &str, line: usize, key: &str) -> Result<StdioMode, Po
     }
 }
 
+fn validate_unix_socket_path(label: &str, path: &Path) -> Result<(), PolicyError> {
+    validate_absolute_path(label, path)?;
+    #[cfg(unix)]
+    let path_bytes = path.as_os_str().as_bytes();
+    #[cfg(not(unix))]
+    let path_bytes = path.as_os_str().to_string_lossy().as_bytes();
+    if path_bytes.len() >= 108 {
+        return Err(PolicyError::new(format!(
+            "{label} must fit Linux sockaddr_un.sun_path (at most 107 pathname bytes)"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_absolute_path(label: &str, path: &Path) -> Result<(), PolicyError> {
     if !path.is_absolute() {
         return Err(PolicyError::new(format!(
@@ -1441,6 +1527,8 @@ mod tests {
         assert_eq!(policy.host_ipv4_udp_address, None);
         assert_eq!(policy.host_ipv4_udp_port, None);
         assert_eq!(policy.host_ipv4_udp_target_fd, None);
+        assert_eq!(policy.host_unix_stream_path, None);
+        assert_eq!(policy.host_unix_stream_target_fd, None);
         assert!(policy.landlock_read_execute.is_empty());
         assert!(policy.landlock_file_mutate.is_empty());
         assert!(policy.landlock_device_ioctl.is_empty());
@@ -1841,6 +1929,64 @@ mod tests {
         assert!(error
             .to_string()
             .contains("collides with the brokered connection target"));
+    }
+
+    #[test]
+    fn parses_brokered_host_unix_stream_endpoint() {
+        let base = volume_valid();
+        let text = format!(
+            "{base}\nipc.host_unix_stream_path = /run/security-lab.sock\nipc.host_unix_stream_target_fd = 14"
+        );
+        let policy: SandboxPolicy = text.parse().unwrap();
+        assert_eq!(
+            policy.host_unix_stream_path,
+            Some(PathBuf::from("/run/security-lab.sock"))
+        );
+        assert_eq!(policy.host_unix_stream_target_fd, Some(14));
+    }
+
+    #[test]
+    fn rejects_incomplete_unsafe_or_colliding_host_unix_stream_endpoint() {
+        let base = volume_valid();
+        let incomplete = format!("{base}\nipc.host_unix_stream_path = /run/security-lab.sock");
+        assert!(incomplete.parse::<SandboxPolicy>().is_err());
+
+        let relative = format!(
+            "{base}\nipc.host_unix_stream_path = run/security-lab.sock\nipc.host_unix_stream_target_fd = 14"
+        );
+        assert!(relative.parse::<SandboxPolicy>().is_err());
+
+        let inside_root = format!(
+            "{base}\nipc.host_unix_stream_path = /sandbox/root/run/service.sock\nipc.host_unix_stream_target_fd = 14"
+        );
+        let error = inside_root.parse::<SandboxPolicy>().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("must not overlap filesystem.root"));
+
+        let too_long = format!("/run/{}", "x".repeat(108));
+        let oversized = format!(
+            "{base}\nipc.host_unix_stream_path = {too_long}\nipc.host_unix_stream_target_fd = 14"
+        );
+        assert!(oversized.parse::<SandboxPolicy>().is_err());
+
+        let stdio_target = format!(
+            "{base}\nipc.host_unix_stream_path = /run/security-lab.sock\nipc.host_unix_stream_target_fd = 2"
+        );
+        assert!(stdio_target.parse::<SandboxPolicy>().is_err());
+
+        let selected_collision = format!(
+            "{base}\nhandle.14 = 0\nipc.host_unix_stream_path = /run/security-lab.sock\nipc.host_unix_stream_target_fd = 14"
+        );
+        assert!(selected_collision.parse::<SandboxPolicy>().is_err());
+
+        let broker_collision = format!(
+            "{base}\nnetwork.host_ipv4_tcp_address = 127.0.0.2\nnetwork.host_ipv4_tcp_port = 8080\nnetwork.host_ipv4_tcp_target_fd = 14\nipc.host_unix_stream_path = /run/security-lab.sock\nipc.host_unix_stream_target_fd = 14"
+        );
+        let error = broker_collision.parse::<SandboxPolicy>().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("collides with the brokered host-IPv4 TCP connection target"));
     }
 
     #[test]

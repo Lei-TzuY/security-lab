@@ -1,0 +1,25 @@
+name: materialize milestone 7A claims
+
+on:
+  push:
+    branches: [tmp-7a-claims-generator]
+
+permissions:
+  contents: write
+
+jobs:
+  claims:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Synchronize verified claims
+        run: python3 .github/tmp-milestone-7a-claims.py
+      - name: Remove construction files and commit claim tree
+        run: |
+          rm .github/tmp-milestone-7a-claims.py
+          rm .github/workflows/tmp-milestone-7a-claims.yml
+          git config user.name LeiZ
+          git config user.email 52287354+Lei-TzuY@users.noreply.github.com
+          git add -A
+          git commit -m "docs: synchronize external cancellation boundary"
+          git push origin HEAD:tmp-7a-claims-generator

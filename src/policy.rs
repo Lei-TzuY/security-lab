@@ -17,6 +17,7 @@ const MAX_SECCOMP_ARG_RULES: usize = 64;
 const MAX_SELECTED_HANDLES: usize = 16;
 const MAX_LANDLOCK_READ_EXECUTE_PATHS: usize = 32;
 const MAX_LANDLOCK_FILE_MUTATE_PATHS: usize = 32;
+const MAX_LANDLOCK_PATH_TOPOLOGY_MUTATE_PATHS: usize = 32;
 const MAX_LANDLOCK_DEVICE_IOCTL_PATHS: usize = 32;
 const MAX_LANDLOCK_TCP_PORTS: usize = 32;
 const MIN_SELECTED_TARGET_FD: u32 = 3;
@@ -88,6 +89,9 @@ pub struct SandboxPolicy {
     /// Optional Landlock regular-file mutation allowlist. Each path names a
     /// directory within an already-writable scratch or persistent-volume surface.
     pub landlock_file_mutate: Vec<PathBuf>,
+    /// Optional Landlock directory/symlink/reparent mutation augmentation. Each
+    /// entry must exactly match an existing `landlock_file_mutate` directory.
+    pub landlock_path_topology_mutate: Vec<PathBuf>,
     /// Optional Landlock device-ioctl allowlist. Each entry names a character
     /// or block device in the final mounted sandbox tree. When non-empty,
     /// ioctl on newly opened devices is denied unless covered by one entry.
@@ -268,6 +272,39 @@ impl SandboxPolicy {
                 if !in_scratch && !in_writable_volume {
                     return Err(PolicyError::new(
                         "landlock.file_mutate must be within filesystem.scratch or volume.writable_target",
+                    ));
+                }
+            }
+        }
+
+        if self.landlock_path_topology_mutate.len() > MAX_LANDLOCK_PATH_TOPOLOGY_MUTATE_PATHS {
+            return Err(PolicyError::new(format!(
+                "too many landlock.path_topology_mutate paths: {} > {MAX_LANDLOCK_PATH_TOPOLOGY_MUTATE_PATHS}",
+                self.landlock_path_topology_mutate.len()
+            )));
+        }
+        if !self.landlock_path_topology_mutate.is_empty() {
+            let mut seen = BTreeSet::new();
+            for path in &self.landlock_path_topology_mutate {
+                validate_absolute_path("landlock.path_topology_mutate", path)?;
+                if path == Path::new("/") {
+                    return Err(PolicyError::new(
+                        "landlock.path_topology_mutate must not grant the entire sandbox root",
+                    ));
+                }
+                if !seen.insert(path.clone()) {
+                    return Err(PolicyError::new(format!(
+                        "duplicate landlock.path_topology_mutate path: {}",
+                        path.display()
+                    )));
+                }
+                if !self
+                    .landlock_file_mutate
+                    .iter()
+                    .any(|mutable| mutable == path)
+                {
+                    return Err(PolicyError::new(
+                        "landlock.path_topology_mutate must exactly match a landlock.file_mutate path",
                     ));
                 }
             }
@@ -905,6 +942,7 @@ impl FromStr for SandboxPolicy {
         let mut working_dir = None;
         let mut landlock_read_execute = Vec::new();
         let mut landlock_file_mutate = Vec::new();
+        let mut landlock_path_topology_mutate = Vec::new();
         let mut landlock_device_ioctl = Vec::new();
         let mut landlock_tcp_bind_ports = Vec::new();
         let mut landlock_tcp_connect_ports = Vec::new();
@@ -1105,6 +1143,9 @@ impl FromStr for SandboxPolicy {
                 "working_dir" => set_once(&mut working_dir, value.to_owned(), line_no, key)?,
                 "landlock.read_execute" => landlock_read_execute.push(value.to_owned()),
                 "landlock.file_mutate" => landlock_file_mutate.push(value.to_owned()),
+                "landlock.path_topology_mutate" => {
+                    landlock_path_topology_mutate.push(value.to_owned())
+                }
                 "landlock.device_ioctl" => landlock_device_ioctl.push(value.to_owned()),
                 "stdio.stdin" => set_once(
                     &mut stdin,
@@ -1276,6 +1317,10 @@ impl FromStr for SandboxPolicy {
                 .map(PathBuf::from)
                 .collect(),
             landlock_file_mutate: landlock_file_mutate
+                .into_iter()
+                .map(PathBuf::from)
+                .collect(),
+            landlock_path_topology_mutate: landlock_path_topology_mutate
                 .into_iter()
                 .map(PathBuf::from)
                 .collect(),
@@ -1694,6 +1739,43 @@ mod tests {
 
         let scratch_subdir = format!("{VALID}\nlandlock.file_mutate = /scratch/subdir");
         assert!(scratch_subdir.parse::<SandboxPolicy>().is_err());
+    }
+
+    #[test]
+    fn parses_landlock_path_topology_mutation_paths() {
+        let policy: SandboxPolicy = format!(
+            "{VALID}\nlandlock.file_mutate = /scratch\nlandlock.path_topology_mutate = /scratch"
+        )
+        .parse()
+        .unwrap();
+        assert_eq!(
+            policy.landlock_path_topology_mutate,
+            [PathBuf::from("/scratch")]
+        );
+    }
+
+    #[test]
+    fn rejects_unanchored_or_unsafe_landlock_path_topology_mutation() {
+        for invalid in [
+            format!("{VALID}\nlandlock.path_topology_mutate = /scratch"),
+            format!("{VALID}\nlandlock.file_mutate = /scratch\nlandlock.path_topology_mutate = /"),
+            format!("{VALID}\nlandlock.file_mutate = /scratch\nlandlock.path_topology_mutate = scratch"),
+            format!("{VALID}\nlandlock.file_mutate = /scratch\nlandlock.path_topology_mutate = /scratch/subdir"),
+            format!("{VALID}\nlandlock.file_mutate = /scratch\nlandlock.path_topology_mutate = /scratch\nlandlock.path_topology_mutate = /scratch"),
+        ] {
+            assert!(invalid.parse::<SandboxPolicy>().is_err());
+        }
+
+        let mut oversized = VALID.to_owned();
+        for index in 0..=MAX_LANDLOCK_PATH_TOPOLOGY_MUTATE_PATHS {
+            oversized.push_str(&format!("\nlandlock.file_mutate = /persist/path-{index}"));
+            oversized.push_str(&format!(
+                "\nlandlock.path_topology_mutate = /persist/path-{index}"
+            ));
+        }
+        oversized
+            .push_str("\nvolume.writable_source = /srv/state\nvolume.writable_target = /persist");
+        assert!(oversized.parse::<SandboxPolicy>().is_err());
     }
 
     #[test]

@@ -1,0 +1,213 @@
+name: probe Landlock signal scope
+
+on:
+  push:
+    branches: [tmp-13a-landlock-signal-probe]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Prove pidfd signal attenuation
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/security-lab-landlock-signal-probe.c <<'EOF'
+          #define _GNU_SOURCE
+          #include <errno.h>
+          #include <linux/landlock.h>
+          #include <signal.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <sys/prctl.h>
+          #include <sys/syscall.h>
+          #include <sys/types.h>
+          #include <sys/wait.h>
+          #include <unistd.h>
+
+          #ifndef SYS_pidfd_send_signal
+          #define SYS_pidfd_send_signal 424
+          #endif
+          #ifndef SYS_pidfd_open
+          #define SYS_pidfd_open 434
+          #endif
+          #ifndef SYS_landlock_create_ruleset
+          #define SYS_landlock_create_ruleset 444
+          #endif
+          #ifndef SYS_landlock_restrict_self
+          #define SYS_landlock_restrict_self 446
+          #endif
+          #ifndef LANDLOCK_SCOPE_SIGNAL
+          #define LANDLOCK_SCOPE_SIGNAL (1ULL << 1)
+          #endif
+
+          static pid_t spawn_ready_helper(int ready_write) {
+              pid_t pid = fork();
+              if (pid < 0) {
+                  perror("fork helper");
+                  exit(20);
+              }
+              if (pid == 0) {
+                  char marker = 'R';
+                  if (write(ready_write, &marker, 1) != 1)
+                      _exit(21);
+                  close(ready_write);
+                  for (;;)
+                      pause();
+              }
+              return pid;
+          }
+
+          static void wait_ready(int ready_read) {
+              char marker = 0;
+              if (read(ready_read, &marker, 1) != 1 || marker != 'R') {
+                  fprintf(stderr, "helper readiness failed\n");
+                  exit(22);
+              }
+              close(ready_read);
+          }
+
+          static int open_pidfd(pid_t pid) {
+              int fd = (int)syscall(SYS_pidfd_open, pid, 0);
+              if (fd < 0) {
+                  perror("pidfd_open");
+                  exit(23);
+              }
+              return fd;
+          }
+
+          static void wait_sender(pid_t sender, const char *label) {
+              int status = 0;
+              if (waitpid(sender, &status, 0) != sender) {
+                  perror("waitpid sender");
+                  exit(24);
+              }
+              if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+                  fprintf(stderr, "%s sender failed: status=0x%x\n", label, status);
+                  exit(25);
+              }
+          }
+
+          static void prove_unscoped_pidfd_signal(void) {
+              int ready[2];
+              if (pipe(ready) != 0) {
+                  perror("pipe baseline");
+                  exit(30);
+              }
+              pid_t helper = spawn_ready_helper(ready[1]);
+              close(ready[1]);
+              wait_ready(ready[0]);
+              int pidfd = open_pidfd(helper);
+
+              pid_t sender = fork();
+              if (sender < 0) {
+                  perror("fork baseline sender");
+                  exit(31);
+              }
+              if (sender == 0) {
+                  if (syscall(SYS_pidfd_send_signal, pidfd, SIGUSR1, NULL, 0) != 0) {
+                      perror("unscoped pidfd_send_signal");
+                      _exit(32);
+                  }
+                  _exit(0);
+              }
+              wait_sender(sender, "unscoped");
+              close(pidfd);
+
+              int status = 0;
+              if (waitpid(helper, &status, 0) != helper) {
+                  perror("waitpid baseline helper");
+                  exit(33);
+              }
+              if (!WIFSIGNALED(status) || WTERMSIG(status) != SIGUSR1) {
+                  fprintf(stderr, "baseline helper was not terminated by SIGUSR1: status=0x%x\n", status);
+                  exit(34);
+              }
+              puts("UNSCOPED_PIDFD_SIGNAL_ALLOWED=1");
+          }
+
+          static void prove_landlock_signal_scope_denies(void) {
+              long abi = syscall(SYS_landlock_create_ruleset, NULL, 0,
+                                 LANDLOCK_CREATE_RULESET_VERSION);
+              if (abi < 6) {
+                  fprintf(stderr, "Landlock signal scope requires ABI >= 6; runner provides %ld\n", abi);
+                  exit(40);
+              }
+              printf("landlock_abi=%ld\n", abi);
+
+              int ready[2];
+              if (pipe(ready) != 0) {
+                  perror("pipe scoped");
+                  exit(41);
+              }
+              pid_t helper = spawn_ready_helper(ready[1]);
+              close(ready[1]);
+              wait_ready(ready[0]);
+              int pidfd = open_pidfd(helper);
+
+              pid_t sender = fork();
+              if (sender < 0) {
+                  perror("fork scoped sender");
+                  exit(42);
+              }
+              if (sender == 0) {
+                  struct landlock_ruleset_attr attr = {0};
+                  attr.scoped = LANDLOCK_SCOPE_SIGNAL;
+                  int ruleset = (int)syscall(SYS_landlock_create_ruleset,
+                                             &attr,
+                                             offsetof(struct landlock_ruleset_attr, scoped) + sizeof(attr.scoped),
+                                             0);
+                  if (ruleset < 0) {
+                      perror("landlock_create_ruleset scoped signal");
+                      _exit(43);
+                  }
+                  if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
+                      perror("PR_SET_NO_NEW_PRIVS");
+                      _exit(44);
+                  }
+                  if (syscall(SYS_landlock_restrict_self, ruleset, 0) != 0) {
+                      perror("landlock_restrict_self");
+                      _exit(45);
+                  }
+                  close(ruleset);
+
+                  errno = 0;
+                  long rc = syscall(SYS_pidfd_send_signal, pidfd, SIGUSR1, NULL, 0);
+                  if (rc != -1 || errno != EPERM) {
+                      fprintf(stderr, "expected Landlock EPERM, got rc=%ld errno=%d\n", rc, errno);
+                      _exit(46);
+                  }
+                  _exit(0);
+              }
+              wait_sender(sender, "scoped");
+              close(pidfd);
+
+              int status = 0;
+              pid_t reaped = waitpid(helper, &status, WNOHANG);
+              if (reaped != 0) {
+                  fprintf(stderr, "scoped helper unexpectedly changed state: waitpid=%d status=0x%x\n", reaped, status);
+                  exit(47);
+              }
+              if (kill(helper, SIGKILL) != 0) {
+                  perror("kill scoped helper");
+                  exit(48);
+              }
+              if (waitpid(helper, &status, 0) != helper) {
+                  perror("waitpid scoped helper cleanup");
+                  exit(49);
+              }
+              puts("LANDLOCK_SIGNAL_SCOPE_DENIED_PIDFD_SIGNAL=1");
+          }
+
+          int main(void) {
+              prove_unscoped_pidfd_signal();
+              prove_landlock_signal_scope_denies();
+              return 0;
+          }
+          EOF
+          cc -O2 -Wall -Wextra -Werror -o /tmp/security-lab-landlock-signal-probe /tmp/security-lab-landlock-signal-probe.c
+          /tmp/security-lab-landlock-signal-probe

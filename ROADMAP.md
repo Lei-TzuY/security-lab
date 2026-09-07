@@ -593,7 +593,7 @@ Boundary: this is static observability, not runtime capability preflight or proo
 Acceptance evidence is executable:
 
 - `preflight` / `preflight-json` validate the policy first, derive requested Landlock ABI plus deadline/stdout-budget/time-namespace requirements, and compare them with the existing host capability snapshot; `eventfd` is now also probed and surfaced because stdout-total enforcement depends on it;
-- preflight never launches the target, creates sandbox namespaces, materializes the configured root, or mutates runtime filesystem state; machine and human reports explicitly carry `launch_attempted=false` and `launch_preflight_complete=false`;
+- Slice 24B itself never launched the target, created sandbox namespaces, materialized the configured root, or mutated runtime filesystem state; machine and human reports explicitly carried `launch_attempted=false` and `launch_preflight_complete=false`;
 - the mandatory launch core is first-class evidence state. The real probe path currently marks it `unprobed` with reason `mandatory_runtime_prerequisites_not_probed`, so green optional probes cannot produce a false-positive `satisfied` verdict;
 - known unavailable represented prerequisites produce `incompatible` with exit status 3; any unprobed mandatory prerequisite produces `indeterminate` with exit status 4. Exit status 0 / `satisfied` is reserved for evaluator state where complete mandatory-core evidence is explicitly present, and is unreachable from the current production probe path;
 - deterministic evaluator regressions prove Linux/x86_64 plus available Landlock/pidfd/timerfd/eventfd still remains indeterminate when the mandatory core is unknown, while an explicitly unavailable mandatory core is incompatible;
@@ -602,9 +602,24 @@ Acceptance evidence is executable:
 
 Boundary: 24B is a conservative partial preflight, not a dry-run, launch simulator, or complete kernel compatibility oracle. It does not independently establish unprivileged user/mount/PID/network/IPC/UTS/time namespace creation, `openat2`/mount API behavior, descriptor sanitization, final filesystem identity, or target enforcement. Those mechanisms remain authoritative only when the real launch path executes successfully.
 
+### Slice 24C — isolated mandatory launch-primitive probe
+
+**Current verified candidate.** Adds positive compatibility evidence for a representative mandatory Linux setup core without relabeling that evidence as a complete launch preflight.
+
+Acceptance evidence is executable:
+
+- `preflight` / `preflight-json` fork a throwaway helper on Linux x86_64; the helper never receives the configured policy root, never executes the target, and confines its filesystem mutation to child-owned namespaces and a private tmpfs;
+- the staged helper exercises the production-relevant primitive classes for user/mount/PID/network/IPC/UTS namespace creation, `setgroups`/UID/GID mapping, UTS hostname setup, private mount propagation, `openat2`, `open_tree`, recursive read-only `mount_setattr`, `move_mount`, an `EROFS` write oracle, PID-namespace PID1 creation, `chroot`/`chdir`, `close_range(..., CLOEXEC)`, all four rlimit syscalls, capability bounding/ambient/current-set reduction, `no_new_privs`, and seccomp-filter installation;
+- the first failed stage plus errno is surfaced as an explicit unsupported probe result; a supported result requires a complete report and clean helper exit;
+- a deterministic CLI regression uses a deliberately nonexistent `filesystem.root`, requires the helper to report `supported` / `stage=complete`, requires `configured_root_touched=false` and `target_executed=false`, and proves the configured root remains absent;
+- the primary `mandatory_launch_core` state deliberately remains `unprobed`, `launch_attempted=false`, and `launch_preflight_complete=false`, so the real CLI remains `indeterminate` with exit status 4 rather than converting isolated primitive success into a false-positive `satisfied` verdict;
+- the exact implementation candidate passed stable rustfmt/Clippy/full tests and the full Rust 1.74 suite.
+
+Boundary: 24C is an isolated primitive-compatibility probe, not a launch dry-run or complete kernel compatibility oracle. It does not establish that the configured root exists or is pinnable, prove the exact configured executable/cwd/volume/Landlock/time/procfs path, reproduce the full launcher/PID1 orchestration, prove the production seccomp program for a policy, or prove successful `execveat`. Actual successful runtime execution remains authoritative for those properties.
+
 ### Milestone 24 promotion rule
 
-24A–24B are sealed on `main`. Do not farm output aliases or relabel partial probes as conformance. A later preflight slice must add genuinely safe positive evidence for previously unprobed mandatory mechanisms. Milestone 25A is deliberately different: it reports kernel stages positively observed during an actual run rather than predicting launch compatibility.
+24A–24B are sealed on `main`; 24C is the current integration candidate. After 24C integrates, do not farm additional syscall aliases or fixture variants around the same isolated-helper mechanism. A later preflight slice is justified only if it safely closes a currently unprobed prerequisite toward a sound complete verdict; otherwise promote to a materially different executable authority/enforcement frontier. Milestone 25A remains a separate evidence class because it records stages positively observed during an actual run.
 
 ## Milestone 25 — runtime enforcement evidence
 
@@ -632,7 +647,7 @@ After 25A integrates, seal this receipt schema at the current stage granularity.
 
 ### Slice 26A — private procfs with PID1 control-descriptor closure
 
-**Current verified candidate.** Adds an optional procfs view backed by the sandbox PID namespace while preserving launcher-owned PID 1 control authority.
+**Status: complete on `main`.** Adds an optional procfs view backed by the sandbox PID namespace while preserving launcher-owned PID 1 control authority.
 
 Acceptance evidence is executable:
 
@@ -648,6 +663,24 @@ Boundary: 26A is PID-namespace proc observability with explicit closure of PID1'
 ### Milestone 26 promotion rule
 
 After 26A integrates, seal the private-procfs/PID-visibility slice. Do not farm proc mount-option aliases or additional metadata files. Promote to a materially different executable authority/enforcement frontier; delegated cgroup accounting and supplementary-group isolation remain blocked until their prerequisites change.
+
+## Milestone 27 — policy/runtime assurance tooling
+
+### Slice 27C — conservative static authority delta
+
+**Status: complete on `main`.** The standalone `security-lab-authority-delta` validates both policies fail-closed, classifies modeled declaration changes as unchanged/reduced/widened/incomparable, and uses distinct CI exit codes without launching the sandbox. Ambiguous endpoint/path substitutions and mixed widen/reduce changes remain incomparable rather than being guessed safe.
+
+Boundary: 27C is static declaration analysis. It explicitly does not claim effective kernel-state comparison, filesystem alias proof, theorem-proved implication, or a code-review waiver.
+
+### Slice 27D — runtime receipt completeness gate
+
+**Status: complete on `main`.** The standalone `security-lab-runtime-receipt-gate` performs a real `run_report`, derives the receipt-modeled enforcement stages required by the validated policy, rejects missing required stages and unexpected optional evidence, and preserves distinct runtime/setup failure reporting.
+
+Boundary: 27D checks only the current enforcement-receipt model. It explicitly does not claim full-policy attestation, successful exec, continued kernel-state effectiveness, or cryptographic/conformance certification.
+
+### Milestone 27 promotion rule
+
+27C–27D are sealed tooling slices. Do not farm comparator status aliases, receipt-field aliases, or extra output encodings. Future 27-series work must add a materially different executable authority/enforcement boundary or a genuinely stronger evidence model with implementation-backed semantics.
 
 ## Later frontiers
 

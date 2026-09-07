@@ -265,11 +265,12 @@ fn preflight_json_remains_indeterminate_without_mandatory_core_probe() {
 }
 
 #[test]
-fn preflight_json_marks_requested_time_namespace_unprobed() {
-    let (policy, root) = preflight_policy("preflight_json_marks_requested_time_namespace_unprobed");
+fn preflight_json_positively_probes_requested_time_namespace() {
+    let (policy, root) =
+        preflight_policy("preflight_json_positively_probes_requested_time_namespace");
     let policy =
         format!("{policy}\ntime.monotonic_offset_seconds = 1\ntime.boottime_offset_seconds = 2\n");
-    let path = write_policy("preflight-time-unprobed", &policy);
+    let path = write_policy("preflight-time-probed", &policy);
     let output = Command::new(binary())
         .args([
             "preflight-json",
@@ -287,7 +288,7 @@ fn preflight_json_marks_requested_time_namespace_unprobed() {
         "\"mandatory_launch_core\":{\"status\":\"unprobed\",\"reason\":\"mandatory_runtime_prerequisites_not_probed\"}"
     ));
     assert!(stdout.contains(
-        "\"time_namespace\":{\"status\":\"unprobed\",\"reason\":\"independent_safe_probe_not_implemented\"}"
+        "\"time_namespace\":{\"status\":\"supported\",\"reason\":null,\"probe\":{\"stage\":\"complete\",\"errno\":null,\"isolated_helper\":true,\"configured_root_touched\":false,\"target_executed\":false,\"requested_monotonic_offset_seconds\":1,\"requested_boottime_offset_seconds\":2}}"
     ));
     assert_eq!(
         fs::read(root.join("bin/probe")).expect("read time-preflight executable after probe"),

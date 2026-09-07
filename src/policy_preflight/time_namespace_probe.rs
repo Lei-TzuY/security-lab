@@ -264,14 +264,17 @@ unsafe fn probe_child(
 
     let monotonic_after = clock_nanos_or_fail(report_fd, 16, libc::CLOCK_MONOTONIC);
     let boottime_after = clock_nanos_or_fail(report_fd, 16, libc::CLOCK_BOOTTIME);
-    let observed_monotonic =
-        timespec_parts_nanos(observation.monotonic_seconds, observation.monotonic_nanoseconds);
-    let observed_boottime =
-        timespec_parts_nanos(observation.boottime_seconds, observation.boottime_nanoseconds);
+    let observed_monotonic = timespec_parts_nanos(
+        observation.monotonic_seconds,
+        observation.monotonic_nanoseconds,
+    );
+    let observed_boottime = timespec_parts_nanos(
+        observation.boottime_seconds,
+        observation.boottime_nanoseconds,
+    );
     let monotonic_adjusted =
         observed_monotonic - i128::from(monotonic_offset_seconds) * 1_000_000_000;
-    let boottime_adjusted =
-        observed_boottime - i128::from(boottime_offset_seconds) * 1_000_000_000;
+    let boottime_adjusted = observed_boottime - i128::from(boottime_offset_seconds) * 1_000_000_000;
 
     if monotonic_adjusted < monotonic_before
         || monotonic_adjusted > monotonic_after
@@ -287,11 +290,7 @@ unsafe fn probe_child(
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-unsafe fn clock_nanos_or_fail(
-    report_fd: libc::c_int,
-    stage: i32,
-    clock: libc::clockid_t,
-) -> i128 {
+unsafe fn clock_nanos_or_fail(report_fd: libc::c_int, stage: i32, clock: libc::clockid_t) -> i128 {
     let mut value = std::mem::zeroed::<libc::timespec>();
     if libc::clock_gettime(clock, &mut value) != 0 {
         fail(report_fd, stage, errno());
@@ -305,12 +304,7 @@ fn timespec_parts_nanos(seconds: i64, nanoseconds: i64) -> i128 {
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-unsafe fn write_file(
-    report_fd: libc::c_int,
-    stage: i32,
-    path: &'static [u8],
-    bytes: &[u8],
-) {
+unsafe fn write_file(report_fd: libc::c_int, stage: i32, path: &'static [u8], bytes: &[u8]) {
     let fd = libc::open(
         path.as_ptr().cast::<libc::c_char>(),
         libc::O_WRONLY | libc::O_CLOEXEC,

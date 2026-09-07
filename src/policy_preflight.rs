@@ -1,11 +1,13 @@
 mod configured_filesystem_probe;
 mod mandatory_core_probe;
+mod time_namespace_probe;
 
 use crate::host_capabilities::{self, CapabilityProbe, HostCapabilities};
 use configured_filesystem_probe::ConfiguredFilesystemProbe;
 use mandatory_core_probe::StagedCapabilityProbe;
 use security_lab::SandboxPolicy;
 use std::fmt::Write as _;
+use time_namespace_probe::TimeNamespaceProbe;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RequirementStatus {
@@ -117,12 +119,21 @@ pub(crate) struct PolicyPreflight {
     mandatory_launch_core: RequirementStatus,
     configured_filesystem: Option<ConfiguredFilesystemProbe>,
     mandatory_namespace_mount_core: Option<StagedCapabilityProbe>,
+    time_namespace_probe: Option<TimeNamespaceProbe>,
 }
 
 pub(crate) fn probe(policy: &SandboxPolicy) -> PolicyPreflight {
     let mut evaluated = evaluate(policy, host_capabilities::probe());
     evaluated.configured_filesystem = Some(configured_filesystem_probe::probe(policy));
     evaluated.mandatory_namespace_mount_core = Some(mandatory_core_probe::probe());
+    evaluated.time_namespace_probe = match (
+        policy.time_monotonic_offset_seconds,
+        policy.time_boottime_offset_seconds,
+    ) {
+        (Some(monotonic), Some(boottime)) => Some(time_namespace_probe::probe(monotonic, boottime)),
+        (None, None) => None,
+        _ => unreachable!("validated time namespace policy must be all-or-nothing"),
+    };
     evaluated
 }
 
@@ -145,6 +156,7 @@ fn evaluate_with_core(
         mandatory_launch_core,
         configured_filesystem: None,
         mandatory_namespace_mount_core: None,
+        time_namespace_probe: None,
     }
 }
 
@@ -176,10 +188,13 @@ impl PolicyPreflight {
     }
 
     fn time_namespace_status(&self) -> RequirementStatus {
-        if self.requirements.time_namespace {
-            RequirementStatus::Unprobed
-        } else {
-            RequirementStatus::NotRequested
+        if !self.requirements.time_namespace {
+            return RequirementStatus::NotRequested;
+        }
+        match self.time_namespace_probe {
+            Some(probe) if probe.available => RequirementStatus::Supported,
+            Some(_) => RequirementStatus::Unsupported,
+            None => RequirementStatus::Unprobed,
         }
     }
 
@@ -210,6 +225,7 @@ impl PolicyPreflight {
             || self.landlock_status() == RequirementStatus::Unsupported
             || self.deadline_status() == RequirementStatus::Unsupported
             || self.output_limit_status() == RequirementStatus::Unsupported
+            || self.time_namespace_status() == RequirementStatus::Unsupported
         {
             Verdict::Incompatible
         } else if self.mandatory_launch_core_status() == RequirementStatus::Unprobed
@@ -278,15 +294,14 @@ impl PolicyPreflight {
         push_probe_json(&mut output, self.host.pidfd_open);
         output.push_str(",\"eventfd\":");
         push_probe_json(&mut output, self.host.eventfd);
-        output.push_str("},\"time_namespace\":{\"status\":\"");
-        output.push_str(self.time_namespace_status().as_str());
-        output.push_str("\",\"reason\":");
-        if self.requirements.time_namespace {
-            output.push_str("\"independent_safe_probe_not_implemented\"");
-        } else {
-            output.push_str("null");
-        }
-        output.push_str("},\"private_procfs\":{\"status\":\"");
+        output.push_str("},\"time_namespace\":");
+        push_time_namespace_probe_json(
+            &mut output,
+            self.time_namespace_status(),
+            self.requirements.time_namespace,
+            self.time_namespace_probe,
+        );
+        output.push_str(",\"private_procfs\":{\"status\":\"");
         output.push_str(self.private_procfs_status().as_str());
         output.push_str("\",\"reason\":");
         if self.requirements.private_procfs {
@@ -388,8 +403,21 @@ impl PolicyPreflight {
         );
         output.push_str("time-namespace: ");
         output.push_str(self.time_namespace_status().as_str());
-        if self.requirements.time_namespace {
-            output.push_str(" (independent-safe-probe-not-implemented)");
+        if let Some(probe) = self.time_namespace_probe {
+            write!(
+                &mut output,
+                " (stage={} isolated-helper=true configured-root-touched=false target-executed=false monotonic-offset-seconds={} boottime-offset-seconds={}",
+                probe.stage,
+                probe.monotonic_offset_seconds,
+                probe.boottime_offset_seconds
+            )
+            .expect("write to String cannot fail");
+            if let Some(errno) = probe.errno {
+                write!(&mut output, " errno={errno}").expect("write to String cannot fail");
+            }
+            output.push(')');
+        } else if self.requirements.time_namespace {
+            output.push_str(" (independent-safe-probe-not-run)");
         }
         output.push('\n');
         output.push_str("private-procfs: ");
@@ -444,6 +472,40 @@ fn push_staged_probe_json(output: &mut String, probe: StagedCapabilityProbe) {
     output.push_str(
         ",\"isolated_helper\":true,\"configured_root_touched\":false,\"target_executed\":false}",
     );
+}
+
+fn push_time_namespace_probe_json(
+    output: &mut String,
+    status: RequirementStatus,
+    requested: bool,
+    probe: Option<TimeNamespaceProbe>,
+) {
+    output.push_str("{\"status\":\"");
+    output.push_str(status.as_str());
+    output.push_str("\",\"reason\":");
+    match status {
+        RequirementStatus::Supported | RequirementStatus::NotRequested => output.push_str("null"),
+        RequirementStatus::Unsupported => output.push_str("\"independent_safe_probe_failed\""),
+        RequirementStatus::Unprobed if requested => {
+            output.push_str("\"independent_safe_probe_not_run\"")
+        }
+        RequirementStatus::Unprobed => output.push_str("null"),
+    }
+    if let Some(probe) = probe {
+        output.push_str(",\"probe\":{\"stage\":\"");
+        output.push_str(probe.stage);
+        output.push_str("\",\"errno\":");
+        push_optional_i32(output, probe.errno);
+        write!(
+            output,
+            ",\"isolated_helper\":true,\"configured_root_touched\":false,\"target_executed\":false,\"requested_monotonic_offset_seconds\":{},\"requested_boottime_offset_seconds\":{}",
+            probe.monotonic_offset_seconds,
+            probe.boottime_offset_seconds
+        )
+        .expect("write to String cannot fail");
+        output.push('}');
+    }
+    output.push('}');
 }
 
 fn push_probe_json(output: &mut String, probe: CapabilityProbe) {
@@ -635,13 +697,45 @@ seccomp.allow = execveat,exit
     }
 
     #[test]
-    fn requested_time_namespace_is_explicitly_indeterminate_until_probed() {
+    fn requested_time_namespace_is_indeterminate_until_probe_runs() {
         let policy = policy("time.monotonic_offset_seconds = 1\ntime.boottime_offset_seconds = 2");
         let report = evaluate(&policy, host(Some(7)));
         assert_eq!(report.verdict(), Verdict::Indeterminate);
         assert_eq!(report.exit_code(), 4);
         assert!(report
             .to_human()
-            .contains("time-namespace: unprobed (independent-safe-probe-not-implemented)\n"));
+            .contains("time-namespace: unprobed (independent-safe-probe-not-run)\n"));
+    }
+
+    #[test]
+    fn supported_time_namespace_probe_closes_optional_preflight_gap() {
+        let policy =
+            policy("time.monotonic_offset_seconds = 60\ntime.boottime_offset_seconds = 120");
+        let mut report = evaluate_with_core(&policy, host(Some(7)), RequirementStatus::Supported);
+        report.time_namespace_probe = Some(TimeNamespaceProbe::available(60, 120));
+        assert_eq!(report.time_namespace_status(), RequirementStatus::Supported);
+        assert_eq!(report.verdict(), Verdict::Satisfied);
+        assert!(report.to_json().contains(
+            "\"time_namespace\":{\"status\":\"supported\",\"reason\":null,\"probe\":{\"stage\":\"complete\",\"errno\":null,\"isolated_helper\":true,\"configured_root_touched\":false,\"target_executed\":false,\"requested_monotonic_offset_seconds\":60,\"requested_boottime_offset_seconds\":120}}"
+        ));
+    }
+
+    #[test]
+    fn unsupported_time_namespace_probe_is_incompatible() {
+        let policy =
+            policy("time.monotonic_offset_seconds = 60\ntime.boottime_offset_seconds = 120");
+        let mut report = evaluate_with_core(&policy, host(Some(7)), RequirementStatus::Supported);
+        report.time_namespace_probe = Some(TimeNamespaceProbe::unavailable(
+            "timens_monotonic",
+            Some(1),
+            60,
+            120,
+        ));
+        assert_eq!(
+            report.time_namespace_status(),
+            RequirementStatus::Unsupported
+        );
+        assert_eq!(report.verdict(), Verdict::Incompatible);
+        assert_eq!(report.exit_code(), 3);
     }
 }

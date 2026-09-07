@@ -718,7 +718,7 @@ Boundary: 27D checks only the current enforcement-receipt model. It explicitly d
 
 ### Slice 29A — forbidden masked bit patterns
 
-**Current verified candidate.** Adds a negative raw-argument predicate that cannot be expressed by the existing single conjunctive masked-equality/range rule families without enumerating allowed alternatives.
+**Status: complete on `main`.** Adds a negative raw-argument predicate that cannot be expressed by the existing single conjunctive masked-equality/range rule families without enumerating allowed alternatives.
 
 Acceptance evidence is executable:
 
@@ -734,6 +734,29 @@ Boundary: 29A is one additional numeric predicate family, not pointer/string ins
 ### Milestone 29 promotion rule
 
 After 29A integrates, do not farm inverse-equality aliases, extra masks, W^X-specific names, or Boolean spelling variants. A later seccomp slice must add materially different executable semantics with raw positive/negative evidence; otherwise promote to another independent authority/enforcement frontier.
+
+## Milestone 30 — ephemeral filesystem mutation
+
+### Slice 30A — bounded copy-on-write root
+
+**Current verified candidate.** Adds one materially different filesystem authority mode: policy may explicitly widen the default recursively read-only root into bounded, private, ephemeral target-side mutation without granting host-lower write-through authority.
+
+Acceptance evidence is executable:
+
+- `filesystem.cow_root_bytes` is optional and fail-closed validated from 4096 bytes through 1 GiB; absence preserves the existing read-only-root behavior;
+- the launcher pins/revalidates the configured root, recursively clones and marks the lower tree read-only, then for COW mode creates a size-bounded private tmpfs backing mount, `upper`/`work` directories, and an OverlayFS merged mount through `fsopen`/`fsconfig`/`fsmount`, finally attaching it with `move_mount`; every construction phase has explicit launch-error reporting and no writable-host-root fallback;
+- the backing tmpfs receives `nosuid,nodev,noexec`; the project does not claim that the merged OverlayFS root itself is globally `noexec`;
+- a raw target modifies, creates, and removes paths in the merged root while the trusted parent proves the original lower marker remains byte-for-byte unchanged and no new file persists across two independent runs;
+- the existing private scratch mount composes above the COW root, and an explicit read-only persistent volume attached afterward still returns `EROFS` on mutation and leaves its host source unchanged;
+- the runtime enforcement receipt publishes `copy_on_write_root` only after final OverlayFS attachment and rejects simultaneous `readonly_root`; the runtime receipt-completeness gate binds the required final-root bit to policy;
+- static preflight reports requested COW support as `unprobed` because the real user/mount namespace is required, the authority manifest records its byte budget, and authority-delta classifies enabling or enlarging COW authority as widening;
+- fixture dispatch selectors are regression-checked for uniqueness; stable rustfmt/Clippy/full tests and the full Rust 1.74 suite are green on the exact implementation head.
+
+Boundary: 30A is ephemeral root mutation only. It does not provide persistence, export/commit, snapshots, copy-on-write image management, transaction/atomicity/durability semantics, immutable/cryptographic lower-tree identity, or generalized OverlayFS policy.
+
+### Milestone 30 promotion rule
+
+After 30A integrates, do not farm byte-ceiling variants, extra upper/work directory names, or repeated mutation path oracles. A later filesystem slice must add materially different executable semantics such as a real bounded export/snapshot/diff lifecycle with integrity evidence; otherwise promote to another independent authority/enforcement frontier.
 
 ## Later frontiers
 

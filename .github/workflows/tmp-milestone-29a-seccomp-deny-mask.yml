@@ -17,7 +17,9 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
       - name: Materialize candidate
-        run: python3 .github/tmp-milestone-29a-seccomp-deny-mask.py
+        run: |
+          python3 .github/tmp-milestone-29a-seccomp-deny-mask.py
+          python3 .github/tmp-milestone-29a-escape-fix.py
       - name: Format
         run: cargo fmt --all
       - name: Enable user namespace capability tests
@@ -36,6 +38,7 @@ jobs:
         if: success()
         run: |
           rm .github/tmp-milestone-29a-seccomp-deny-mask.py
+          rm .github/tmp-milestone-29a-escape-fix.py
           rm .github/workflows/tmp-milestone-29a-seccomp-deny-mask.yml
           git config user.name LeiZ
           git config user.email 52287354+Lei-TzuY@users.noreply.github.com

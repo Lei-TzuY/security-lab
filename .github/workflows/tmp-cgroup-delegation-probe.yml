@@ -1,0 +1,86 @@
+name: probe unprivileged cgroup delegation
+
+on:
+  push:
+    branches: [tmp-26-cgroup-delegation-probe]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Probe current-user cgroup v2 delegation
+        shell: bash
+        run: |
+          set -u
+          echo "PROBE_UID=$(id -u)"
+          echo "PROBE_GID=$(id -g)"
+          echo "PROBE_GROUPS=$(id -G)"
+          echo "PROC_SELF_CGROUP_BEGIN"
+          cat /proc/self/cgroup
+          echo "PROC_SELF_CGROUP_END"
+
+          mountpoint=$(awk '$0 ~ / - cgroup2 / { print $5; exit }' /proc/self/mountinfo)
+          if [ -z "${mountpoint:-}" ]; then
+            echo "CGROUP2_MOUNT=absent"
+            exit 0
+          fi
+          echo "CGROUP2_MOUNT=$mountpoint"
+
+          relative=$(awk -F: '$1 == "0" { print $3; exit }' /proc/self/cgroup)
+          current="${mountpoint}${relative}"
+          echo "CURRENT_CGROUP=$current"
+          stat -c 'CURRENT_MODE=%A CURRENT_UID=%u CURRENT_GID=%g' "$current"
+          printf 'CURRENT_CONTROLLERS='; cat "$current/cgroup.controllers" 2>/dev/null || true
+          printf 'CURRENT_SUBTREE_CONTROL='; cat "$current/cgroup.subtree_control" 2>/dev/null || true
+
+          child="$current/security-lab-probe-$$"
+          if mkdir "$child" 2>/tmp/cgroup-mkdir.err; then
+            echo "CHILD_CREATE=success"
+          else
+            rc=$?
+            echo "CHILD_CREATE=failure"
+            echo "CHILD_CREATE_RC=$rc"
+            printf 'CHILD_CREATE_ERROR='; tr '\n' ' ' </tmp/cgroup-mkdir.err; echo
+            exit 0
+          fi
+
+          cleanup() { rmdir "$child" 2>/dev/null || true; }
+          trap cleanup EXIT
+          stat -c 'CHILD_MODE=%A CHILD_UID=%u CHILD_GID=%g' "$child"
+          printf 'CHILD_CONTROLLERS='; cat "$child/cgroup.controllers" 2>/dev/null || true
+
+          if [ -e "$child/pids.max" ]; then
+            old=$(cat "$child/pids.max")
+            if printf '8\n' >"$child/pids.max" 2>/tmp/pids.err; then
+              echo "PIDS_MAX_WRITE=success"
+              echo "PIDS_MAX_VALUE=$(cat "$child/pids.max")"
+              printf '%s\n' "$old" >"$child/pids.max" 2>/dev/null || true
+            else
+              rc=$?
+              echo "PIDS_MAX_WRITE=failure"
+              echo "PIDS_MAX_WRITE_RC=$rc"
+              printf 'PIDS_MAX_WRITE_ERROR='; tr '\n' ' ' </tmp/pids.err; echo
+            fi
+          else
+            echo "PIDS_MAX=absent"
+          fi
+
+          if [ -e "$child/memory.max" ]; then
+            old=$(cat "$child/memory.max")
+            if printf '67108864\n' >"$child/memory.max" 2>/tmp/memory.err; then
+              echo "MEMORY_MAX_WRITE=success"
+              echo "MEMORY_MAX_VALUE=$(cat "$child/memory.max")"
+              printf '%s\n' "$old" >"$child/memory.max" 2>/dev/null || true
+            else
+              rc=$?
+              echo "MEMORY_MAX_WRITE=failure"
+              echo "MEMORY_MAX_WRITE_RC=$rc"
+              printf 'MEMORY_MAX_WRITE_ERROR='; tr '\n' ' ' </tmp/memory.err; echo
+            fi
+          else
+            echo "MEMORY_MAX=absent"
+          fi

@@ -129,12 +129,27 @@ fn assess(policy: &SandboxPolicy, receipt: &EnforcementReceipt) -> ReceiptAssess
         "private_mount_propagation",
         receipt.private_mount_propagation,
     );
-    require(
-        &mut required,
-        &mut missing,
-        "readonly_root",
-        receipt.readonly_root,
-    );
+    if policy.cow_root_bytes.is_some() {
+        require(
+            &mut required,
+            &mut missing,
+            "copy_on_write_root",
+            receipt.copy_on_write_root,
+        );
+        if receipt.readonly_root {
+            unexpected.push("readonly_root");
+        }
+    } else {
+        require(
+            &mut required,
+            &mut missing,
+            "readonly_root",
+            receipt.readonly_root,
+        );
+        if receipt.copy_on_write_root {
+            unexpected.push("copy_on_write_root");
+        }
+    }
     require(&mut required, &mut missing, "chroot", receipt.chroot);
     require(
         &mut required,
@@ -336,6 +351,7 @@ mod tests {
             hostname: true,
             private_mount_propagation: true,
             readonly_root: true,
+            copy_on_write_root: false,
             chroot: true,
             fd_sanitization: true,
             private_procfs: false,
@@ -361,6 +377,22 @@ mod tests {
         let assessment = assess(&policy(""), &receipt);
         assert_eq!(assessment.missing, vec!["seccomp"]);
         assert_eq!(assessment.exit_code(), EXIT_RECEIPT_INCOMPLETE);
+    }
+
+    #[test]
+    fn requested_copy_on_write_root_replaces_readonly_root_requirement() {
+        let mut receipt = complete_base_receipt();
+        receipt.readonly_root = false;
+        receipt.copy_on_write_root = true;
+        let assessment = assess(&policy("filesystem.cow_root_bytes = 16777216"), &receipt);
+        assert!(assessment.complete());
+        assert!(assessment.required.contains(&"copy_on_write_root"));
+        assert!(!assessment.required.contains(&"readonly_root"));
+
+        receipt.readonly_root = true;
+        let assessment = assess(&policy("filesystem.cow_root_bytes = 16777216"), &receipt);
+        assert_eq!(assessment.unexpected, vec!["readonly_root"]);
+        assert_eq!(assessment.exit_code(), EXIT_RECEIPT_UNEXPECTED);
     }
 
     #[test]

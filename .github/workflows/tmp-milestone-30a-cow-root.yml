@@ -35,6 +35,7 @@ jobs:
           test "$(grep -c '^PORT-SKIP ' /tmp/cow-port.log)" -eq 1
           grep -Fx 'PORT-SKIP preflight cow json: expected exactly one match, got 0' /tmp/cow-port.log
           python3 .github/tmp-milestone-30a-current-port.py
+          python3 .github/tmp-milestone-30a-fixture-port.py
       - name: Format
         run: cargo fmt --all
       - name: Enable user namespace capability tests

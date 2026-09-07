@@ -519,7 +519,7 @@ After 20A integrates, seal this bounded pathname-topology slice. Do not farm add
 
 ### Slice 21A — inclusive unsigned 64-bit seccomp argument ranges
 
-**Current verified candidate.** Adds a materially different numeric predicate model beyond 5A masked equality without widening the syscall allowlist.
+**Status: complete on `main`.** Adds a materially different numeric predicate model beyond 5A masked equality without widening the syscall allowlist.
 
 Acceptance evidence is executable:
 
@@ -533,7 +533,29 @@ Boundary: 21A compares one raw syscall argument against an unsigned inclusive in
 
 ### Milestone 21 promotion rule
 
-After 21A integrates, seal this bounded numeric-range slice. Do not farm `<`, `<=`, `>`, `>=`, endpoint aliases, or more fixture values around the same cBPF comparison mechanism. A later seccomp slice must introduce materially different executable semantics; otherwise promote to another subsystem frontier such as routed/broader networking only when explicit topology/endpoint evidence is available.
+21A is sealed on `main`. Do not farm `<`, `<=`, `>`, `>=`, endpoint aliases, or more fixture values around the same cBPF comparison mechanism. A later seccomp slice must introduce materially different executable semantics.
+
+## Milestone 22 — launcher-owned output enforcement
+
+### Slice 22B — observed stdout total-output budget
+
+**Current verified candidate.** Converts captured-stdout overrun from unbounded drain work into an explicit launcher-owned termination result without changing target seccomp authority.
+
+Acceptance evidence is executable:
+
+- optional `limit.stdout_total_bytes` is valid only with `stdio.stdout = capture`, is bounded to 1 byte–1 GiB, and requires the retained `stdio.stdout_capture_bytes` ceiling to be no larger than the total threshold;
+- the host creates a private output-limit eventfd only when the policy requests this control, while the direct target closes its inherited control copy before untrusted execution;
+- the capture reader counts bytes actually returned from the pipe, retains at most the existing memory ceiling, and signals PID 1 on the first read that makes observed stdout exceed the total threshold;
+- PID 1 owns termination/reaping through its existing pidfd supervision path and publishes `ChildOutcome::OutputLimitExceeded`; output-limit readiness wins once overrun was already observed, while cancellation/deadline keep their existing natural-exit-first arbitration;
+- a raw target forks one paused descendant and continuously writes stdout; with a 4 KiB observed budget and 1 KiB retained ceiling the run reports `OutputLimitExceeded`, returns exactly 1 KiB retained/truncated capture, and reports exactly one additional descendant reaped;
+- the pre-existing no-total-budget stress test still drains/discards excess output and completes naturally, proving backwards-compatible capture semantics;
+- stable rustfmt/Clippy/full tests and the full Rust 1.74 suite are green on the exact implementation head.
+
+Boundary: 22B is host-observed enforcement, not a precise kernel byte meter. Pipe-buffered bytes may already have been emitted beyond the configured threshold before the parent reads them. It does not throttle bandwidth or CPU, and it does not apply to stderr, inherited stdout, or redirected stdout.
+
+### Milestone 22B promotion rule
+
+After 22B integrates, do not farm alternate byte units, stderr copies, or extra output-result spellings without a materially new output-control architecture. Re-evaluate the reserved supplementary-group/user-namespace frontier separately, or promote to another independent subsystem frontier with executable evidence.
 
 ## Later frontiers
 

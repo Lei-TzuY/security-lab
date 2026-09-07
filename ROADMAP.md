@@ -635,7 +635,7 @@ Boundary: 24D is point-in-time read-only path/type/mode prerequisite evidence. I
 
 ### Slice 24E — configured time-namespace offset preflight
 
-**Current verified candidate.** Closes the separately requested time-namespace prerequisite without converting preflight into target execution or a privileged launch simulation.
+**Status: complete on `main`.** Closes the separately requested time-namespace prerequisite without converting preflight into target execution or a privileged launch simulation.
 
 Acceptance evidence is executable:
 
@@ -651,7 +651,7 @@ Boundary: 24E proves that the current host can create an isolated user/time name
 
 ### Milestone 24 promotion rule
 
-24A–24D are sealed on `main`; 24E is the current integration candidate. After 24E integrates, do not farm clock IDs, offset values, path aliases, errno cases, or duplicate isolated probes. Another preflight slice is justified only if it closes a materially different mandatory prerequisite without turning preflight into a privileged/destructive launch simulation; otherwise promote to a different executable authority/enforcement frontier. Milestone 25A remains a separate evidence class because it records stages positively observed during an actual run.
+24A–24E are sealed on `main`. Do not farm clock IDs, offset values, path aliases, errno cases, or duplicate isolated probes. Another preflight slice is justified only if it closes a materially different mandatory prerequisite without turning preflight into a privileged/destructive launch simulation; otherwise promote to a different executable authority/enforcement frontier. Milestone 25A remains a separate evidence class because it records stages positively observed during an actual run.
 
 ## Milestone 25 — runtime enforcement evidence
 
@@ -713,6 +713,27 @@ Boundary: 27D checks only the current enforcement-receipt model. It explicitly d
 ### Milestone 27 promotion rule
 
 27C–27D are sealed tooling slices. Do not farm comparator status aliases, receipt-field aliases, or extra output encodings. Future 27-series work must add a materially different executable authority/enforcement boundary or a genuinely stronger evidence model with implementation-backed semantics.
+
+## Milestone 29 — negative seccomp argument predicates
+
+### Slice 29A — forbidden masked bit patterns
+
+**Current verified candidate.** Adds a negative raw-argument predicate that cannot be expressed by the existing single conjunctive masked-equality/range rule families without enumerating allowed alternatives.
+
+Acceptance evidence is executable:
+
+- policy accepts `seccomp.deny_mask.<syscall>.<0..5> = <mask>:<value>` only for a syscall already present in `seccomp.allow`; zero masks, values with bits outside the mask, invalid argument indices, launcher-critical syscalls, duplicates, and aggregate predicate counts above the existing ceiling fail closed;
+- Linux x86_64 cBPF evaluates the complete raw 64-bit selected argument and returns seccomp `EPERM` only when every masked bit matches the forbidden value; a non-match continues through the remaining conjunctive constraints and can reach `ALLOW`;
+- a raw `mmap` oracle declares `mask=0x6,value=0x6` on protection argument 2, proves RW and RX anonymous mappings succeed, and requires exact `EPERM` for RWX;
+- a second raw `lseek` oracle declares `mask=0xffffffff00000001,value=0x0000000200000001`, proves a low participating-bit mismatch and a high-word mismatch each continue successfully, and requires exact `EPERM` only when both 32-bit halves match the forbidden 64-bit pattern;
+- the static authority manifest emits forbidden masks deterministically, and the authority-delta checker classifies adding the restriction as `reduced` and removing it as `widened` rather than silently treating the new predicate as unchanged;
+- all prior seccomp, sandbox, manifest, delta, preflight, receipt, and runtime regressions remain active; stable rustfmt/Clippy/full tests and the full Rust 1.74 suite are green on the exact implementation head.
+
+Boundary: 29A is one additional numeric predicate family, not pointer/string inspection, signed comparison, cross-argument relations, a general Boolean expression language, or pathname/socket-address content filtering. Rules still only narrow syscalls already named by `seccomp.allow`.
+
+### Milestone 29 promotion rule
+
+After 29A integrates, do not farm inverse-equality aliases, extra masks, W^X-specific names, or Boolean spelling variants. A later seccomp slice must add materially different executable semantics with raw positive/negative evidence; otherwise promote to another independent authority/enforcement frontier.
 
 ## Later frontiers
 

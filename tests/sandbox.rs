@@ -332,6 +332,7 @@ fn policy(mode: &str, extra_args: &[&str], syscalls: &[&str]) -> SandboxPolicy {
             allowed_syscalls: syscall_set(syscalls),
             argument_rules: BTreeMap::new(),
             argument_range_rules: BTreeMap::new(),
+            argument_forbidden_mask_rules: BTreeMap::new(),
         },
     }
 }
@@ -1340,6 +1341,44 @@ fn uts_namespace_uses_policy_hostname_without_changing_host() {
         "sandbox UTS hostname changed host hostname"
     );
     assert_eq!(result.unwrap(), ChildOutcome::Exited(0));
+}
+
+#[test]
+fn seccomp_forbidden_mask_checks_full_64_bit_pattern_without_overblocking() {
+    let mut filtered = policy(
+        "k",
+        &[],
+        &[
+            "execveat", "mmap", "munmap", "openat", "lseek", "close", "exit",
+        ],
+    );
+    let mut mmap_rules = BTreeMap::new();
+    mmap_rules.insert(
+        2,
+        SeccompArgRule {
+            mask: 0x6,
+            value: 0x6,
+        },
+    );
+    filtered
+        .seccomp
+        .argument_forbidden_mask_rules
+        .insert("mmap".to_owned(), mmap_rules);
+
+    let mut lseek_rules = BTreeMap::new();
+    lseek_rules.insert(
+        1,
+        SeccompArgRule {
+            mask: 0xffff_ffff_0000_0001,
+            value: 0x0000_0002_0000_0001,
+        },
+    );
+    filtered
+        .seccomp
+        .argument_forbidden_mask_rules
+        .insert("lseek".to_owned(), lseek_rules);
+
+    assert_eq!(run(&filtered).unwrap(), ChildOutcome::Exited(0));
 }
 
 #[test]

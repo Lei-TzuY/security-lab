@@ -82,6 +82,10 @@ pub struct SeccompPolicy {
     /// Optional inclusive unsigned 64-bit ranges keyed by syscall and argument
     /// index. Range rules compose conjunctively with masked-equality rules.
     pub argument_range_rules: BTreeMap<String, BTreeMap<u8, SeccompArgRangeRule>>,
+    /// Optional forbidden masked bit patterns keyed by syscall and argument index.
+    /// A matching pattern is denied; non-matching values continue through the
+    /// remaining conjunctive seccomp constraints for that already-allowed syscall.
+    pub argument_forbidden_mask_rules: BTreeMap<String, BTreeMap<u8, SeccompArgRule>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -981,7 +985,13 @@ impl SandboxPolicy {
             .values()
             .map(BTreeMap::len)
             .sum::<usize>();
-        let argument_rule_count = masked_rule_count + range_rule_count;
+        let forbidden_mask_rule_count = self
+            .seccomp
+            .argument_forbidden_mask_rules
+            .values()
+            .map(BTreeMap::len)
+            .sum::<usize>();
+        let argument_rule_count = masked_rule_count + range_rule_count + forbidden_mask_rule_count;
         if argument_rule_count > MAX_SECCOMP_ARG_RULES {
             return Err(PolicyError::new(format!(
                 "too many seccomp argument rules: {argument_rule_count} > {MAX_SECCOMP_ARG_RULES}"
@@ -1017,6 +1027,40 @@ impl SandboxPolicy {
                 if rule.value & !rule.mask != 0 {
                     return Err(PolicyError::new(format!(
                         "seccomp argument value for {syscall}.{argument_index} sets bits outside its mask"
+                    )));
+                }
+            }
+        }
+        for (syscall, rules) in &self.seccomp.argument_forbidden_mask_rules {
+            if !valid_syscall_name(syscall) {
+                return Err(PolicyError::new(format!(
+                    "invalid seccomp forbidden-mask syscall name: {syscall:?}"
+                )));
+            }
+            if !self.seccomp.allowed_syscalls.contains(syscall) {
+                return Err(PolicyError::new(format!(
+                    "seccomp forbidden-mask rule for {syscall} requires that syscall in seccomp.allow"
+                )));
+            }
+            if matches!(syscall.as_str(), "execveat" | "exit" | "exit_group") {
+                return Err(PolicyError::new(format!(
+                    "seccomp forbidden-mask rules may not constrain launcher-critical syscall {syscall}"
+                )));
+            }
+            for (argument_index, rule) in rules {
+                if *argument_index > 5 {
+                    return Err(PolicyError::new(format!(
+                        "seccomp forbidden-mask argument index for {syscall} must be between 0 and 5"
+                    )));
+                }
+                if rule.mask == 0 {
+                    return Err(PolicyError::new(format!(
+                        "seccomp forbidden-mask for {syscall}.{argument_index} must not be zero"
+                    )));
+                }
+                if rule.value & !rule.mask != 0 {
+                    return Err(PolicyError::new(format!(
+                        "seccomp forbidden-mask value for {syscall}.{argument_index} sets bits outside its mask"
                     )));
                 }
             }
@@ -1119,6 +1163,10 @@ impl FromStr for SandboxPolicy {
             BTreeMap::new();
         let mut seccomp_argument_range_rules: BTreeMap<String, BTreeMap<u8, SeccompArgRangeRule>> =
             BTreeMap::new();
+        let mut seccomp_argument_forbidden_mask_rules: BTreeMap<
+            String,
+            BTreeMap<u8, SeccompArgRule>,
+        > = BTreeMap::new();
 
         for (index, raw_line) in input.lines().enumerate() {
             let line_no = index + 1;
@@ -1403,6 +1451,47 @@ impl FromStr for SandboxPolicy {
                     }
                     seccomp_allow = Some(names);
                 }
+                _ if key.starts_with("seccomp.deny_mask.") => {
+                    let spec = key
+                        .strip_prefix("seccomp.deny_mask.")
+                        .expect("prefix checked above");
+                    let (syscall, index_text) = spec.rsplit_once('.').ok_or_else(|| {
+                        PolicyError::at(
+                            line_no,
+                            "seccomp forbidden-mask key must be seccomp.deny_mask.<syscall>.<0..5>",
+                        )
+                    })?;
+                    if !valid_syscall_name(syscall) {
+                        return Err(PolicyError::at(
+                            line_no,
+                            format!("invalid seccomp forbidden-mask syscall name: {syscall:?}"),
+                        ));
+                    }
+                    let argument_index = index_text.parse::<u8>().map_err(|_| {
+                        PolicyError::at(
+                            line_no,
+                            "seccomp forbidden-mask argument index must be between 0 and 5",
+                        )
+                    })?;
+                    if argument_index > 5 {
+                        return Err(PolicyError::at(
+                            line_no,
+                            "seccomp forbidden-mask argument index must be between 0 and 5",
+                        ));
+                    }
+                    let rule = parse_seccomp_arg_rule(value, line_no, key)?;
+                    let syscall_rules = seccomp_argument_forbidden_mask_rules
+                        .entry(syscall.to_owned())
+                        .or_default();
+                    if syscall_rules.insert(argument_index, rule).is_some() {
+                        return Err(PolicyError::at(
+                            line_no,
+                            format!(
+                                "duplicate seccomp forbidden-mask rule: {syscall}.{argument_index}"
+                            ),
+                        ));
+                    }
+                }
                 _ if key.starts_with("seccomp.range.") => {
                     let spec = key
                         .strip_prefix("seccomp.range.")
@@ -1576,6 +1665,7 @@ impl FromStr for SandboxPolicy {
                 allowed_syscalls: required(seccomp_allow, "seccomp.allow")?,
                 argument_rules: seccomp_argument_rules,
                 argument_range_rules: seccomp_argument_range_rules,
+                argument_forbidden_mask_rules: seccomp_argument_forbidden_mask_rules,
             },
         };
         policy.validate()?;
@@ -2793,6 +2883,43 @@ mod tests {
 
         let critical = format!("{VALID}\nseccomp.range.execveat.0 = 1:2");
         assert!(critical.parse::<SandboxPolicy>().is_err());
+    }
+
+    #[test]
+    fn parses_and_rejects_forbidden_seccomp_mask_rule() {
+        let text = VALID.replace(
+            "seccomp.allow = execveat,read,write,exit_group",
+            "seccomp.allow = execveat,mmap,exit_group
+        seccomp.deny_mask.mmap.2 = 0x6:0x6",
+        );
+        let policy: SandboxPolicy = text.parse().unwrap();
+        let rule = policy
+            .seccomp
+            .argument_forbidden_mask_rules
+            .get("mmap")
+            .and_then(|rules| rules.get(&2))
+            .copied()
+            .expect("parsed mmap protection forbidden mask");
+        assert_eq!(
+            rule,
+            SeccompArgRule {
+                mask: 0x6,
+                value: 0x6
+            }
+        );
+
+        for invalid in [
+            "seccomp.deny_mask.mmap.2 = 0:0",
+            "seccomp.deny_mask.mmap.2 = 0x2:0x4",
+            "seccomp.deny_mask.read.6 = 1:1",
+            "seccomp.deny_mask.execveat.0 = 1:1",
+        ] {
+            let text = VALID.replace(
+                "seccomp.allow = execveat,read,write,exit_group",
+                &format!("seccomp.allow = execveat,mmap,read,write,exit_group\n        {invalid}"),
+            );
+            assert!(text.parse::<SandboxPolicy>().is_err(), "accepted {invalid}");
+        }
     }
 
     #[test]

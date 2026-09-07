@@ -725,6 +725,7 @@ Acceptance evidence is executable:
 - policy accepts `seccomp.deny_mask.<syscall>.<0..5> = <mask>:<value>` only for a syscall already present in `seccomp.allow`; zero masks, values with bits outside the mask, invalid argument indices, launcher-critical syscalls, duplicates, and aggregate predicate counts above the existing ceiling fail closed;
 - Linux x86_64 cBPF evaluates the complete raw 64-bit selected argument and returns seccomp `EPERM` only when every masked bit matches the forbidden value; a non-match continues through the remaining conjunctive constraints and can reach `ALLOW`;
 - a raw `mmap` oracle declares `mask=0x6,value=0x6` on protection argument 2, proves RW and RX anonymous mappings succeed, and requires exact `EPERM` for RWX;
+- a second raw `lseek` oracle declares `mask=0xffffffff00000001,value=0x0000000200000001`, proves a low participating-bit mismatch and a high-word mismatch each continue successfully, and requires exact `EPERM` only when both 32-bit halves match the forbidden 64-bit pattern;
 - the static authority manifest emits forbidden masks deterministically, and the authority-delta checker classifies adding the restriction as `reduced` and removing it as `widened` rather than silently treating the new predicate as unchanged;
 - all prior seccomp, sandbox, manifest, delta, preflight, receipt, and runtime regressions remain active; stable rustfmt/Clippy/full tests and the full Rust 1.74 suite are green on the exact implementation head.
 

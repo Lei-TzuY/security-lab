@@ -619,7 +619,7 @@ Boundary: 24C is an isolated primitive-compatibility probe, not a launch dry-run
 
 ### Slice 24D — configured filesystem anchor preflight
 
-**Current verified candidate.** Adds a policy-specific read-only prerequisite probe for configured filesystem anchors without converting preflight into a launch dry-run.
+**Status: complete on `main`.** Adds a policy-specific read-only prerequisite probe for configured filesystem anchors without converting preflight into a launch dry-run.
 
 Acceptance evidence is executable:
 
@@ -633,9 +633,25 @@ Acceptance evidence is executable:
 
 Boundary: 24D is point-in-time read-only path/type/mode prerequisite evidence. It does not pin these descriptors for a later launch, prove cross-time inode identity, inspect the final post-mount Landlock tree, establish time/procfs mount success, reproduce PID1/target orchestration, validate the exact production seccomp program, or prove successful `execveat`.
 
+### Slice 24E — configured time-namespace offset preflight
+
+**Current verified candidate.** Closes the separately requested time-namespace prerequisite without converting preflight into target execution or a privileged launch simulation.
+
+Acceptance evidence is executable:
+
+- when both policy time offsets are requested, `preflight` / `preflight-json` fork a throwaway helper that receives only those numeric offsets; the helper never receives the configured root and never executes the target;
+- the helper mirrors the production permission sequence with `unshare(CLONE_NEWUSER | CLONE_NEWTIME)`, `setgroups=deny`, UID/GID mapping, then writes exact `monotonic <seconds> 0` and `boottime <seconds> 0` entries to `/proc/self/timens_offsets`;
+- because the caller of `unshare(CLONE_NEWTIME)` remains on the original clock view while subsequently created descendants enter the prepared child time namespace, the helper brackets host `CLOCK_MONOTONIC` / `CLOCK_BOOTTIME` immediately before and after one observer descendant reads both clocks; subtracting each declared offset from the observer value must fall inside the matching host-clock bracket;
+- the probe reports its exact first failed stage plus errno. A requested unsupported/denied time prerequisite is `incompatible`; a complete observer oracle reports `supported`;
+- machine evidence records `isolated_helper=true`, `configured_root_touched=false`, `target_executed=false`, and the exact requested offset pair. Existing CLI regression coverage requires even 1/2-second offsets to pass the strict bracket oracle rather than relying on a broad timing tolerance;
+- the primary `mandatory_launch_core` deliberately remains `unprobed`, so real production preflight with otherwise positive 24C/24D/24E evidence remains `indeterminate` / exit status 4 and keeps `launch_attempted=false` / `launch_preflight_complete=false`;
+- stable rustfmt/Clippy/full tests and the full Rust 1.74 suite are green on the exact implementation head.
+
+Boundary: 24E proves that the current host can create an isolated user/time namespace and install/observe the exact requested MONOTONIC/BOOTTIME offsets in a descendant. It does not prove private procfs setup, the complete namespace/mount/PID1/target orchestration, final filesystem/Landlock state, the exact production seccomp program, or successful `execveat`; actual runtime execution and enforcement receipts remain a separate evidence class.
+
 ### Milestone 24 promotion rule
 
-24A–24C are sealed on `main`; 24D is the current integration candidate. After 24D integrates, do not farm more path aliases, errno cases, or anchor spellings around the same read-only preflight mechanism. Another preflight slice is justified only if it closes a materially different mandatory prerequisite without turning preflight into a privileged/destructive launch simulation; otherwise promote to a different executable authority/enforcement frontier. Milestone 25A remains a separate evidence class because it records stages positively observed during an actual run.
+24A–24D are sealed on `main`; 24E is the current integration candidate. After 24E integrates, do not farm clock IDs, offset values, path aliases, errno cases, or duplicate isolated probes. Another preflight slice is justified only if it closes a materially different mandatory prerequisite without turning preflight into a privileged/destructive launch simulation; otherwise promote to a different executable authority/enforcement frontier. Milestone 25A remains a separate evidence class because it records stages positively observed during an actual run.
 
 ## Milestone 25 — runtime enforcement evidence
 

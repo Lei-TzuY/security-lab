@@ -9,22 +9,32 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Enable user namespace tests
+        run: |
+          if [ -e /proc/sys/kernel/unprivileged_userns_clone ]; then
+            sudo sysctl -w kernel.unprivileged_userns_clone=1
+          fi
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
       - name: Inspect helper mapping environment
         run: |
           set -eux
           id
           id -G
           grep '^CapEff:' /proc/self/status
-          command -v newgidmap || true
-          command -v newuidmap || true
-          grep -E '^(runner|1001):' /etc/subgid || true
-          grep -E '^(runner|1001):' /etc/subuid || true
-      - name: Probe setgroups/gid_map ordering
+          command -v newgidmap
+          command -v newuidmap
+          grep -E '^(runner|1001):' /etc/subgid
+          grep -E '^(runner|1001):' /etc/subuid
+          ls -l /usr/bin/newgidmap /usr/bin/newuidmap
+      - name: Prove self-mapping path cannot clear groups
         run: |
-          cat > /tmp/group_probe.c <<'EOF'
+          cat > /tmp/self_group_probe.c <<'EOF'
           #define _GNU_SOURCE
           #include <errno.h>
           #include <fcntl.h>
+          #include <grp.h>
           #include <sched.h>
           #include <stdio.h>
           #include <stdlib.h>
@@ -43,8 +53,7 @@ jobs:
           int main(void) {
               uid_t uid = geteuid();
               gid_t gid = getegid();
-              int n = getgroups(0, NULL);
-              printf("before_unshare_groups=%d uid=%u gid=%u\n", n, (unsigned)uid, (unsigned)gid);
+              printf("before_unshare_groups=%d uid=%u gid=%u\n", getgroups(0, NULL), (unsigned)uid, (unsigned)gid);
               if (unshare(CLONE_NEWUSER) != 0) { perror("unshare userns"); return 20; }
 
               errno = 0;
@@ -63,16 +72,105 @@ jobs:
               int rc_after = setgroups(0, NULL);
               printf("setgroups_after_deny_and_gid_map_rc=%d errno=%d (%s)\n", rc_after, errno, strerror(errno));
               if (rc_after != -1 || errno != EPERM) return 22;
-
-              printf("supplementary_group_clear_blocker_confirmed\n");
+              puts("self_mapping_clear_blocker_confirmed");
               return 0;
           }
           EOF
-          cc -Wall -Wextra -Werror -O2 /tmp/group_probe.c -o /tmp/group_probe
-          if [ -e /proc/sys/kernel/unprivileged_userns_clone ]; then
-            sudo sysctl -w kernel.unprivileged_userns_clone=1
-          fi
-          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
-            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-          fi
-          /tmp/group_probe
+          cc -Wall -Wextra -Werror -O2 /tmp/self_group_probe.c -o /tmp/self_group_probe
+          /tmp/self_group_probe
+      - name: Prove parent-assisted helper mapping can clear groups
+        run: |
+          SUBUID_START=$(awk -F: '$1=="runner" {print $2; exit}' /etc/subuid)
+          SUBGID_START=$(awk -F: '$1=="runner" {print $2; exit}' /etc/subgid)
+          cat > /tmp/helper_group_probe.c <<'EOF'
+          #define _GNU_SOURCE
+          #include <errno.h>
+          #include <grp.h>
+          #include <sched.h>
+          #include <signal.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <sys/types.h>
+          #include <sys/wait.h>
+          #include <unistd.h>
+
+          static int run_helper(const char *helper, pid_t target, const char *inside0,
+                                const char *outside0, const char *inside1,
+                                const char *outside1) {
+              pid_t pid = fork();
+              if (pid < 0) { perror("fork helper"); exit(30); }
+              if (pid == 0) {
+                  char target_s[32];
+                  snprintf(target_s, sizeof(target_s), "%d", target);
+                  execl(helper, helper, target_s,
+                        inside0, outside0, "1",
+                        inside1, outside1, "1", (char *)NULL);
+                  perror(helper);
+                  _exit(127);
+              }
+              int status = 0;
+              if (waitpid(pid, &status, 0) != pid) { perror("waitpid helper"); exit(31); }
+              if (!WIFEXITED(status)) return 128;
+              return WEXITSTATUS(status);
+          }
+
+          int main(int argc, char **argv) {
+              if (argc != 3) return 40;
+              uid_t uid = geteuid();
+              gid_t gid = getegid();
+              int ready[2], mapped[2];
+              if (pipe(ready) || pipe(mapped)) { perror("pipe"); return 41; }
+
+              pid_t child = fork();
+              if (child < 0) { perror("fork child"); return 42; }
+              if (child == 0) {
+                  close(ready[0]); close(mapped[1]);
+                  if (unshare(CLONE_NEWUSER) != 0) { perror("child unshare"); _exit(50); }
+                  char one = 'R';
+                  if (write(ready[1], &one, 1) != 1) _exit(51);
+                  if (read(mapped[0], &one, 1) != 1) _exit(52);
+
+                  FILE *f = fopen("/proc/self/setgroups", "re");
+                  char state[32] = {0};
+                  if (!f || !fgets(state, sizeof(state), f)) _exit(53);
+                  if (f) fclose(f);
+                  printf("child_setgroups_state=%s", state);
+
+                  errno = 0;
+                  int rc = setgroups(0, NULL);
+                  printf("child_setgroups_clear_rc=%d errno=%d (%s)\n", rc, errno, strerror(errno));
+                  int remaining = getgroups(0, NULL);
+                  printf("child_remaining_groups=%d euid=%u egid=%u\n", remaining,
+                         (unsigned)geteuid(), (unsigned)getegid());
+                  fflush(stdout);
+                  if (rc != 0 || remaining != 0 || geteuid() != 0 || getegid() != 0) _exit(54);
+                  _exit(0);
+              }
+
+              close(ready[1]); close(mapped[0]);
+              char one;
+              if (read(ready[0], &one, 1) != 1) { perror("parent ready read"); return 60; }
+
+              char uid_s[32], gid_s[32];
+              snprintf(uid_s, sizeof(uid_s), "%u", (unsigned)uid);
+              snprintf(gid_s, sizeof(gid_s), "%u", (unsigned)gid);
+              int uid_rc = run_helper("/usr/bin/newuidmap", child, "0", uid_s, "1", argv[1]);
+              int gid_rc = run_helper("/usr/bin/newgidmap", child, "0", gid_s, "1", argv[2]);
+              printf("newuidmap_rc=%d newgidmap_rc=%d child=%d\n", uid_rc, gid_rc, child);
+              fflush(stdout);
+              if (uid_rc != 0 || gid_rc != 0) { kill(child, SIGKILL); waitpid(child, NULL, 0); return 61; }
+              one = 'M';
+              if (write(mapped[1], &one, 1) != 1) { perror("parent mapped write"); return 62; }
+              int status = 0;
+              if (waitpid(child, &status, 0) != child) { perror("waitpid child"); return 63; }
+              if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+                  fprintf(stderr, "child_status=%d\n", status);
+                  return 64;
+              }
+              puts("parent_assisted_group_clear_confirmed");
+              return 0;
+          }
+          EOF
+          cc -Wall -Wextra -Werror -O2 /tmp/helper_group_probe.c -o /tmp/helper_group_probe
+          /tmp/helper_group_probe "$SUBUID_START" "$SUBGID_START"

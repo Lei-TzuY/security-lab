@@ -48,12 +48,7 @@ fn main() {
             "usage: {} <check|check-json> <policy>",
             program.to_string_lossy()
         );
-        fail(
-            json_requested,
-            EXIT_USAGE_OR_POLICY,
-            "usage",
-            &usage,
-        );
+        fail(json_requested, EXIT_USAGE_OR_POLICY, "usage", &usage);
     }
 
     let policy = load_policy(
@@ -111,7 +106,12 @@ fn assess(policy: &SandboxPolicy, receipt: &EnforcementReceipt) -> ReceiptAssess
     let mut missing = Vec::new();
     let mut unexpected = Vec::new();
 
-    require(&mut required, &mut missing, "base_namespaces", receipt.base_namespaces);
+    require(
+        &mut required,
+        &mut missing,
+        "base_namespaces",
+        receipt.base_namespaces,
+    );
     if policy.time_monotonic_offset_seconds.is_some() {
         require(
             &mut required,
@@ -129,7 +129,12 @@ fn assess(policy: &SandboxPolicy, receipt: &EnforcementReceipt) -> ReceiptAssess
         "private_mount_propagation",
         receipt.private_mount_propagation,
     );
-    require(&mut required, &mut missing, "readonly_root", receipt.readonly_root);
+    require(
+        &mut required,
+        &mut missing,
+        "readonly_root",
+        receipt.readonly_root,
+    );
     require(&mut required, &mut missing, "chroot", receipt.chroot);
     require(
         &mut required,
@@ -202,12 +207,15 @@ fn assessment_human(assessment: &ReceiptAssessment, outcome: &str) -> String {
     writeln!(&mut output, "runtime-receipt-gate:").expect("write to String cannot fail");
     writeln!(&mut output, "receipt-complete: {}", assessment.complete())
         .expect("write to String cannot fail");
-    writeln!(&mut output, "full-policy-attestation: false")
-        .expect("write to String cannot fail");
+    writeln!(&mut output, "full-policy-attestation: false").expect("write to String cannot fail");
     writeln!(&mut output, "exec-success-proof: false").expect("write to String cannot fail");
     writeln!(&mut output, "target-outcome: {outcome}").expect("write to String cannot fail");
-    writeln!(&mut output, "required: {}", join_names(&assessment.required))
-        .expect("write to String cannot fail");
+    writeln!(
+        &mut output,
+        "required: {}",
+        join_names(&assessment.required)
+    )
+    .expect("write to String cannot fail");
     writeln!(&mut output, "missing: {}", join_names(&assessment.missing))
         .expect("write to String cannot fail");
     writeln!(
@@ -221,10 +229,20 @@ fn assessment_human(assessment: &ReceiptAssessment, outcome: &str) -> String {
 
 fn assessment_json(assessment: &ReceiptAssessment, outcome: &str) -> String {
     let mut output = String::from("{\"ok\":");
-    output.push_str(if assessment.complete() { "true" } else { "false" });
+    output.push_str(if assessment.complete() {
+        "true"
+    } else {
+        "false"
+    });
     output.push_str(",\"kind\":\"runtime_receipt_gate\",\"receipt_complete\":");
-    output.push_str(if assessment.complete() { "true" } else { "false" });
-    output.push_str(",\"full_policy_attestation\":false,\"exec_success_proof\":false,\"target_outcome\":");
+    output.push_str(if assessment.complete() {
+        "true"
+    } else {
+        "false"
+    });
+    output.push_str(
+        ",\"full_policy_attestation\":false,\"exec_success_proof\":false,\"target_outcome\":",
+    );
     push_json_string(&mut output, outcome);
     output.push_str(",\"required\":");
     push_json_array(&mut output, &assessment.required);

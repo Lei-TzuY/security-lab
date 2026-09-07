@@ -66,6 +66,9 @@ pub struct EnforcementReceipt {
     pub hostname: bool,
     pub private_mount_propagation: bool,
     pub readonly_root: bool,
+    /// The final root is an ephemeral OverlayFS view with a launcher-owned,
+    /// bounded private tmpfs upper/work layer over a recursively read-only lower.
+    pub copy_on_write_root: bool,
     pub chroot: bool,
     pub fd_sanitization: bool,
     /// A fresh procfs was mounted by launcher-owned namespace PID 1 after

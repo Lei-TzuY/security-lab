@@ -59,6 +59,13 @@ mod x86_64 {
     const MOVE_MOUNT_F_EMPTY_PATH: libc::c_uint = 0x0000_0004;
     const MOVE_MOUNT_T_EMPTY_PATH: libc::c_uint = 0x0000_0040;
     const MOUNT_ATTR_RDONLY: u64 = 0x0000_0001;
+    const MOUNT_ATTR_NOSUID: u64 = 0x0000_0002;
+    const MOUNT_ATTR_NODEV: u64 = 0x0000_0004;
+    const MOUNT_ATTR_NOEXEC: u64 = 0x0000_0008;
+    const FSOPEN_CLOEXEC: libc::c_uint = 0x0000_0001;
+    const FSMOUNT_CLOEXEC: libc::c_uint = 0x0000_0001;
+    const FSCONFIG_SET_STRING: libc::c_uint = 1;
+    const FSCONFIG_CMD_CREATE: libc::c_uint = 6;
     const EXECVEAT_AT_EMPTY_PATH: libc::c_int = 0x1000;
     const CLONE_NEWTIME: libc::c_int = 0x0000_0080;
 
@@ -75,6 +82,7 @@ mod x86_64 {
     const ENFORCEMENT_LANDLOCK: u64 = 1 << 10;
     const ENFORCEMENT_SECCOMP: u64 = 1 << 11;
     const ENFORCEMENT_PRIVATE_PROCFS: u64 = 1 << 12;
+    const ENFORCEMENT_COW_ROOT: u64 = 1 << 13;
     const ENFORCEMENT_KNOWN: u64 = ENFORCEMENT_BASE_NAMESPACES
         | ENFORCEMENT_TIME_NAMESPACE
         | ENFORCEMENT_HOSTNAME
@@ -87,7 +95,8 @@ mod x86_64 {
         | ENFORCEMENT_NO_NEW_PRIVS
         | ENFORCEMENT_LANDLOCK
         | ENFORCEMENT_SECCOMP
-        | ENFORCEMENT_PRIVATE_PROCFS;
+        | ENFORCEMENT_PRIVATE_PROCFS
+        | ENFORCEMENT_COW_ROOT;
 
     const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
     const PR_CAPBSET_DROP: libc::c_int = 24;
@@ -152,6 +161,12 @@ mod x86_64 {
     const PHASE_TIME_OFFSETS: u32 = 56;
     const PHASE_PROCFS_MOUNT: u32 = 57;
     const PHASE_PROCFS_PID1_HARDEN: u32 = 58;
+    const PHASE_COW_TMPFS_CREATE: u32 = 59;
+    const PHASE_COW_TMPFS_MOUNT: u32 = 60;
+    const PHASE_COW_UPPER_WORK: u32 = 61;
+    const PHASE_COW_OVERLAY_CREATE: u32 = 62;
+    const PHASE_COW_OVERLAY_MOUNT: u32 = 63;
+    const PHASE_COW_ROOT_ATTACH: u32 = 64;
 
     const SYS_LANDLOCK_CREATE_RULESET: libc::c_long = 444;
     const SYS_LANDLOCK_ADD_RULE: libc::c_long = 445;
@@ -772,6 +787,7 @@ mod x86_64 {
             time_namespace_requested,
             landlock_requested,
             false,
+            false,
         )
     }
 
@@ -780,6 +796,7 @@ mod x86_64 {
         time_namespace_requested: bool,
         landlock_requested: bool,
         procfs_requested: bool,
+        cow_root_requested: bool,
     ) -> Result<EnforcementReceipt, SandboxError> {
         let unknown = bits & !ENFORCEMENT_KNOWN;
         if unknown != 0 {
@@ -813,7 +830,43 @@ mod x86_64 {
             ENFORCEMENT_PRIVATE_MOUNTS,
             "read-only root",
         )?;
-        require_predecessor(ENFORCEMENT_CHROOT, ENFORCEMENT_READONLY_ROOT, "chroot")?;
+        require_predecessor(
+            ENFORCEMENT_COW_ROOT,
+            ENFORCEMENT_PRIVATE_MOUNTS,
+            "copy-on-write root",
+        )?;
+        let readonly_root = observed(ENFORCEMENT_READONLY_ROOT);
+        let copy_on_write_root = observed(ENFORCEMENT_COW_ROOT);
+        if readonly_root && copy_on_write_root {
+            return Err(SandboxError::SetupFailed(
+                "runtime enforcement receipt observed both read-only and copy-on-write final roots"
+                    .to_owned(),
+            ));
+        }
+        if copy_on_write_root && !cow_root_requested {
+            return Err(SandboxError::SetupFailed(
+                "runtime enforcement receipt observed unrequested copy-on-write root".to_owned(),
+            ));
+        }
+        if readonly_root && cow_root_requested {
+            return Err(SandboxError::SetupFailed(
+                "runtime enforcement receipt observed read-only final root for requested copy-on-write policy"
+                    .to_owned(),
+            ));
+        }
+        if observed(ENFORCEMENT_CHROOT) {
+            let expected_root = if cow_root_requested {
+                copy_on_write_root
+            } else {
+                readonly_root
+            };
+            if !expected_root {
+                return Err(SandboxError::SetupFailed(
+                    "runtime enforcement receipt reached chroot without the requested final-root boundary"
+                        .to_owned(),
+                ));
+            }
+        }
         require_predecessor(
             ENFORCEMENT_FD_SANITIZATION,
             ENFORCEMENT_CHROOT,
@@ -889,7 +942,8 @@ mod x86_64 {
             time_namespace_offsets,
             hostname: bits & ENFORCEMENT_HOSTNAME != 0,
             private_mount_propagation: bits & ENFORCEMENT_PRIVATE_MOUNTS != 0,
-            readonly_root: bits & ENFORCEMENT_READONLY_ROOT != 0,
+            readonly_root,
+            copy_on_write_root,
             chroot: bits & ENFORCEMENT_CHROOT != 0,
             fd_sanitization: bits & ENFORCEMENT_FD_SANITIZATION != 0,
             private_procfs,
@@ -910,6 +964,7 @@ mod x86_64 {
             policy.time_monotonic_offset_seconds.is_some(),
             policy_requests_landlock(policy),
             policy.procfs_enabled,
+            policy.cow_root_bytes.is_some(),
         )
     }
 
@@ -927,6 +982,7 @@ mod x86_64 {
     struct PreparedLaunch {
         root_fd: OwnedFd,
         root_path: CString,
+        cow_root_size: Option<CString>,
         executable_fd: OwnedFd,
         selected_handles: Vec<PreparedSelectedHandle>,
         selected_storage_floor: RawFd,
@@ -983,6 +1039,12 @@ mod x86_64 {
             }
             let root_path =
                 cstring_bytes("filesystem.root", policy.root_dir.as_os_str().as_bytes())?;
+            let cow_root_size = policy
+                .cow_root_bytes
+                .map(|bytes| {
+                    cstring_bytes("filesystem.cow_root_bytes", bytes.to_string().as_bytes())
+                })
+                .transpose()?;
             let cwd_check = open_beneath_root(
                 root_fd.raw(),
                 &policy.working_dir,
@@ -1342,6 +1404,7 @@ mod x86_64 {
             Ok(Self {
                 root_fd,
                 root_path,
+                cow_root_size,
                 executable_fd,
                 selected_handles,
                 selected_storage_floor,
@@ -2428,6 +2491,279 @@ mod x86_64 {
         }
     }
 
+    unsafe fn close_setup_fd(fd: RawFd) {
+        if fd >= 0 {
+            libc::close(fd);
+        }
+    }
+
+    unsafe fn proc_fd_path(fd: RawFd, buffer: &mut [u8; 32]) -> *const libc::c_char {
+        const PREFIX: &[u8] = b"/proc/self/fd/";
+        let mut index = 0usize;
+        while index < PREFIX.len() {
+            buffer[index] = PREFIX[index];
+            index += 1;
+        }
+
+        let mut value = fd as u32;
+        let mut digits = [0u8; 10];
+        let mut count = 0usize;
+        loop {
+            digits[count] = b'0' + (value % 10) as u8;
+            count += 1;
+            value /= 10;
+            if value == 0 {
+                break;
+            }
+        }
+        while count > 0 {
+            count -= 1;
+            buffer[index] = digits[count];
+            index += 1;
+        }
+        buffer[index] = 0;
+        buffer.as_ptr().cast::<libc::c_char>()
+    }
+
+    unsafe fn fsconfig_string_or_fail(
+        fsfd: RawFd,
+        key: &'static [u8],
+        value: *const libc::c_char,
+        phase: u32,
+        launch_error: *mut LaunchErrorRecord,
+        error_exit_syscall: libc::c_long,
+    ) {
+        if libc::syscall(
+            libc::SYS_fsconfig,
+            fsfd,
+            FSCONFIG_SET_STRING,
+            key.as_ptr().cast::<libc::c_char>(),
+            value,
+            0,
+        ) == -1
+        {
+            child_fail(launch_error, phase, error_exit_syscall);
+        }
+    }
+
+    unsafe fn construct_final_root_or_fail(
+        prepared: &PreparedLaunch,
+        current_root_fd: RawFd,
+        launch_error: *mut LaunchErrorRecord,
+        error_exit_syscall: libc::c_long,
+    ) -> RawFd {
+        let lower_tree_fd = libc::syscall(
+            libc::SYS_open_tree,
+            current_root_fd,
+            b".\0".as_ptr().cast::<libc::c_char>(),
+            OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC | AT_RECURSIVE,
+        );
+        if lower_tree_fd == -1 {
+            child_fail(launch_error, PHASE_ROOT_CLONE, error_exit_syscall);
+        }
+        let lower_tree_fd = lower_tree_fd as RawFd;
+
+        let mount_attr = MountAttr {
+            attr_set: MOUNT_ATTR_RDONLY,
+            attr_clr: 0,
+            propagation: 0,
+            userns_fd: 0,
+        };
+        if libc::syscall(
+            libc::SYS_mount_setattr,
+            lower_tree_fd,
+            b"\0".as_ptr().cast::<libc::c_char>(),
+            AT_EMPTY_PATH | AT_RECURSIVE,
+            &mount_attr as *const MountAttr,
+            std::mem::size_of::<MountAttr>(),
+        ) == -1
+        {
+            child_fail(launch_error, PHASE_ROOT_READONLY, error_exit_syscall);
+        }
+
+        let Some(cow_size) = &prepared.cow_root_size else {
+            if libc::syscall(
+                libc::SYS_move_mount,
+                lower_tree_fd,
+                b"\0".as_ptr().cast::<libc::c_char>(),
+                current_root_fd,
+                b"\0".as_ptr().cast::<libc::c_char>(),
+                MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_EMPTY_PATH,
+            ) == -1
+            {
+                child_fail(launch_error, PHASE_ROOT_ATTACH, error_exit_syscall);
+            }
+            mark_enforcement(launch_error, ENFORCEMENT_READONLY_ROOT);
+            return lower_tree_fd;
+        };
+
+        let state_fsfd = libc::syscall(
+            libc::SYS_fsopen,
+            b"tmpfs\0".as_ptr().cast::<libc::c_char>(),
+            FSOPEN_CLOEXEC,
+        );
+        if state_fsfd == -1 {
+            child_fail(launch_error, PHASE_COW_TMPFS_CREATE, error_exit_syscall);
+        }
+        let state_fsfd = state_fsfd as RawFd;
+        fsconfig_string_or_fail(
+            state_fsfd,
+            b"size\0",
+            cow_size.as_ptr(),
+            PHASE_COW_TMPFS_CREATE,
+            launch_error,
+            error_exit_syscall,
+        );
+        fsconfig_string_or_fail(
+            state_fsfd,
+            b"mode\0",
+            b"0700\0".as_ptr().cast::<libc::c_char>(),
+            PHASE_COW_TMPFS_CREATE,
+            launch_error,
+            error_exit_syscall,
+        );
+        if libc::syscall(
+            libc::SYS_fsconfig,
+            state_fsfd,
+            FSCONFIG_CMD_CREATE,
+            ptr::null::<libc::c_char>(),
+            ptr::null::<libc::c_char>(),
+            0,
+        ) == -1
+        {
+            child_fail(launch_error, PHASE_COW_TMPFS_CREATE, error_exit_syscall);
+        }
+        let state_mount_fd = libc::syscall(
+            libc::SYS_fsmount,
+            state_fsfd,
+            FSMOUNT_CLOEXEC,
+            MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV | MOUNT_ATTR_NOEXEC,
+        );
+        if state_mount_fd == -1 {
+            child_fail(launch_error, PHASE_COW_TMPFS_MOUNT, error_exit_syscall);
+        }
+        let state_mount_fd = state_mount_fd as RawFd;
+        close_setup_fd(state_fsfd);
+
+        if libc::syscall(
+            libc::SYS_mkdirat,
+            state_mount_fd,
+            b"upper\0".as_ptr().cast::<libc::c_char>(),
+            0o700,
+        ) == -1
+        {
+            child_fail(launch_error, PHASE_COW_UPPER_WORK, error_exit_syscall);
+        }
+        if libc::syscall(
+            libc::SYS_mkdirat,
+            state_mount_fd,
+            b"work\0".as_ptr().cast::<libc::c_char>(),
+            0o700,
+        ) == -1
+        {
+            child_fail(launch_error, PHASE_COW_UPPER_WORK, error_exit_syscall);
+        }
+        let upper_fd = libc::syscall(
+            libc::SYS_openat,
+            state_mount_fd,
+            b"upper\0".as_ptr().cast::<libc::c_char>(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            0,
+        );
+        if upper_fd == -1 {
+            child_fail(launch_error, PHASE_COW_UPPER_WORK, error_exit_syscall);
+        }
+        let upper_fd = upper_fd as RawFd;
+        let work_fd = libc::syscall(
+            libc::SYS_openat,
+            state_mount_fd,
+            b"work\0".as_ptr().cast::<libc::c_char>(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            0,
+        );
+        if work_fd == -1 {
+            child_fail(launch_error, PHASE_COW_UPPER_WORK, error_exit_syscall);
+        }
+        let work_fd = work_fd as RawFd;
+
+        let mut lower_path_buffer = [0u8; 32];
+        let mut upper_path_buffer = [0u8; 32];
+        let mut work_path_buffer = [0u8; 32];
+        let lower_path = proc_fd_path(lower_tree_fd, &mut lower_path_buffer);
+        let upper_path = proc_fd_path(upper_fd, &mut upper_path_buffer);
+        let work_path = proc_fd_path(work_fd, &mut work_path_buffer);
+
+        let overlay_fsfd = libc::syscall(
+            libc::SYS_fsopen,
+            b"overlay\0".as_ptr().cast::<libc::c_char>(),
+            FSOPEN_CLOEXEC,
+        );
+        if overlay_fsfd == -1 {
+            child_fail(launch_error, PHASE_COW_OVERLAY_CREATE, error_exit_syscall);
+        }
+        let overlay_fsfd = overlay_fsfd as RawFd;
+        fsconfig_string_or_fail(
+            overlay_fsfd,
+            b"lowerdir\0",
+            lower_path,
+            PHASE_COW_OVERLAY_CREATE,
+            launch_error,
+            error_exit_syscall,
+        );
+        fsconfig_string_or_fail(
+            overlay_fsfd,
+            b"upperdir\0",
+            upper_path,
+            PHASE_COW_OVERLAY_CREATE,
+            launch_error,
+            error_exit_syscall,
+        );
+        fsconfig_string_or_fail(
+            overlay_fsfd,
+            b"workdir\0",
+            work_path,
+            PHASE_COW_OVERLAY_CREATE,
+            launch_error,
+            error_exit_syscall,
+        );
+        if libc::syscall(
+            libc::SYS_fsconfig,
+            overlay_fsfd,
+            FSCONFIG_CMD_CREATE,
+            ptr::null::<libc::c_char>(),
+            ptr::null::<libc::c_char>(),
+            0,
+        ) == -1
+        {
+            child_fail(launch_error, PHASE_COW_OVERLAY_CREATE, error_exit_syscall);
+        }
+        let overlay_fd = libc::syscall(libc::SYS_fsmount, overlay_fsfd, FSMOUNT_CLOEXEC, 0u64);
+        if overlay_fd == -1 {
+            child_fail(launch_error, PHASE_COW_OVERLAY_MOUNT, error_exit_syscall);
+        }
+        let overlay_fd = overlay_fd as RawFd;
+        close_setup_fd(overlay_fsfd);
+
+        if libc::syscall(
+            libc::SYS_move_mount,
+            overlay_fd,
+            b"\0".as_ptr().cast::<libc::c_char>(),
+            current_root_fd,
+            b"\0".as_ptr().cast::<libc::c_char>(),
+            MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_EMPTY_PATH,
+        ) == -1
+        {
+            child_fail(launch_error, PHASE_COW_ROOT_ATTACH, error_exit_syscall);
+        }
+
+        close_setup_fd(work_fd);
+        close_setup_fd(upper_fd);
+        close_setup_fd(state_mount_fd);
+        close_setup_fd(lower_tree_fd);
+        mark_enforcement(launch_error, ENFORCEMENT_COW_ROOT);
+        overlay_fd
+    }
+
     unsafe fn child_exec(
         prepared: &PreparedLaunch,
         stdio: StdioPolicy,
@@ -2566,51 +2902,12 @@ mod x86_64 {
             seccomp.error_exit_syscall,
         );
 
-        let root_tree_fd = libc::syscall(
-            libc::SYS_open_tree,
+        let root_tree_fd = construct_final_root_or_fail(
+            prepared,
             current_root_fd,
-            b".\0".as_ptr().cast::<libc::c_char>(),
-            OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC | AT_RECURSIVE,
+            launch_error,
+            seccomp.error_exit_syscall,
         );
-        if root_tree_fd == -1 {
-            child_fail(launch_error, PHASE_ROOT_CLONE, seccomp.error_exit_syscall);
-        }
-        let root_tree_fd = root_tree_fd as RawFd;
-
-        let mount_attr = MountAttr {
-            attr_set: MOUNT_ATTR_RDONLY,
-            attr_clr: 0,
-            propagation: 0,
-            userns_fd: 0,
-        };
-        if libc::syscall(
-            libc::SYS_mount_setattr,
-            root_tree_fd,
-            b"\0".as_ptr().cast::<libc::c_char>(),
-            AT_EMPTY_PATH | AT_RECURSIVE,
-            &mount_attr as *const MountAttr,
-            std::mem::size_of::<MountAttr>(),
-        ) == -1
-        {
-            child_fail(
-                launch_error,
-                PHASE_ROOT_READONLY,
-                seccomp.error_exit_syscall,
-            );
-        }
-
-        if libc::syscall(
-            libc::SYS_move_mount,
-            root_tree_fd,
-            b"\0".as_ptr().cast::<libc::c_char>(),
-            current_root_fd,
-            b"\0".as_ptr().cast::<libc::c_char>(),
-            MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_EMPTY_PATH,
-        ) == -1
-        {
-            child_fail(launch_error, PHASE_ROOT_ATTACH, seccomp.error_exit_syscall);
-        }
-        mark_enforcement(launch_error, ENFORCEMENT_READONLY_ROOT);
 
         if libc::syscall(libc::SYS_fchdir, root_tree_fd) == -1 {
             child_fail(launch_error, PHASE_ROOT_FCHDIR, seccomp.error_exit_syscall);
@@ -3368,6 +3665,12 @@ mod x86_64 {
                 | PHASE_VOLUME_CLONE
                 | PHASE_VOLUME_READONLY
                 | PHASE_VOLUME_ATTACH
+                | PHASE_COW_TMPFS_CREATE
+                | PHASE_COW_TMPFS_MOUNT
+                | PHASE_COW_UPPER_WORK
+                | PHASE_COW_OVERLAY_CREATE
+                | PHASE_COW_OVERLAY_MOUNT
+                | PHASE_COW_ROOT_ATTACH
         ) && matches!(
             record.errno,
             libc::EPERM | libc::EACCES | libc::ENOSYS | libc::ENODEV
@@ -3496,6 +3799,12 @@ mod x86_64 {
             PHASE_TIME_OFFSETS => "time namespace offset installation",
             PHASE_PROCFS_MOUNT => "private procfs mount in PID namespace",
             PHASE_PROCFS_PID1_HARDEN => "private procfs PID1 descriptor-access hardening",
+            PHASE_COW_TMPFS_CREATE => "copy-on-write root tmpfs state creation",
+            PHASE_COW_TMPFS_MOUNT => "copy-on-write root tmpfs state mount",
+            PHASE_COW_UPPER_WORK => "copy-on-write root upper/work preparation",
+            PHASE_COW_OVERLAY_CREATE => "copy-on-write root OverlayFS creation",
+            PHASE_COW_OVERLAY_MOUNT => "copy-on-write root OverlayFS mount",
+            PHASE_COW_ROOT_ATTACH => "copy-on-write final root attachment",
             _ => "unknown launch phase",
         };
         format!(
@@ -3628,6 +3937,7 @@ mod x86_64 {
                 false,
                 false,
                 false,
+                false,
             );
             assert!(unrequested.is_err());
 
@@ -3642,6 +3952,7 @@ mod x86_64 {
                 false,
                 false,
                 true,
+                false,
             );
             assert!(skipped.is_err());
 
@@ -3657,9 +3968,39 @@ mod x86_64 {
                 false,
                 false,
                 true,
+                false,
             )
             .expect("requested procfs progression should decode");
             assert!(observed.private_procfs);
+        }
+
+        #[test]
+        fn copy_on_write_receipt_is_request_bound_and_mutually_exclusive() {
+            let cow_bits = ENFORCEMENT_BASE_NAMESPACES
+                | ENFORCEMENT_HOSTNAME
+                | ENFORCEMENT_PRIVATE_MOUNTS
+                | ENFORCEMENT_COW_ROOT
+                | ENFORCEMENT_CHROOT
+                | ENFORCEMENT_FD_SANITIZATION
+                | ENFORCEMENT_RLIMITS;
+            let observed =
+                enforcement_receipt_from_bits_for_policy(cow_bits, false, false, false, true)
+                    .expect("requested COW-root progression should decode");
+            assert!(observed.copy_on_write_root);
+            assert!(!observed.readonly_root);
+
+            assert!(
+                enforcement_receipt_from_bits_for_policy(cow_bits, false, false, false, false,)
+                    .is_err()
+            );
+            assert!(enforcement_receipt_from_bits_for_policy(
+                cow_bits | ENFORCEMENT_READONLY_ROOT,
+                false,
+                false,
+                false,
+                true,
+            )
+            .is_err());
         }
 
         #[test]

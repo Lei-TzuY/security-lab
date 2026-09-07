@@ -16,6 +16,8 @@ jobs:
         with:
           toolchain: stable
           components: rustfmt, clippy
+      - name: Repair inherited generator anchor
+        run: python3 .github/tmp-milestone-24b-generator-anchor-fix.py
       - name: Materialize policy preflight
         run: python3 .github/tmp-milestone-24b-policy-preflight.py
       - name: Close mandatory-core false-positive gap
@@ -38,6 +40,7 @@ jobs:
         run: |
           rm .github/tmp-milestone-24b-policy-preflight.py
           rm .github/tmp-milestone-24b-preflight-correctness.py
+          rm .github/tmp-milestone-24b-generator-anchor-fix.py
           rm .github/workflows/tmp-milestone-24b-policy-preflight.yml
           git config user.name LeiZ
           git config user.email 52287354+Lei-TzuY@users.noreply.github.com

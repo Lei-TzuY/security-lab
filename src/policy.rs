@@ -27,6 +27,7 @@ const MAX_SCRATCH_BYTES: u64 = 1024 * 1024 * 1024;
 const MIN_CAPTURE_BYTES: u64 = 1;
 const MAX_CAPTURE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_STDOUT_TOTAL_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_TIME_OFFSET_SECONDS: u64 = 365 * 24 * 60 * 60;
 const MIN_WALL_CLOCK_MILLISECONDS: u64 = 1;
 const MAX_WALL_CLOCK_MILLISECONDS: u64 = 24 * 60 * 60 * 1000;
 
@@ -178,6 +179,11 @@ pub struct SandboxPolicy {
     /// requesting launcher-owned process-tree termination. This is distinct
     /// from the retained capture-memory ceiling.
     pub stdout_total_bytes: Option<u64>,
+    /// Optional nonnegative CLOCK_MONOTONIC/CLOCK_BOOTTIME offsets installed
+    /// for descendants in a dedicated Linux time namespace. The pair is
+    /// all-or-nothing and at least one offset must be non-zero.
+    pub time_monotonic_offset_seconds: Option<u64>,
+    pub time_boottime_offset_seconds: Option<u64>,
     /// Optional launcher-owned wall-clock deadline measured from PID 1
     /// beginning supervision of the direct target.
     pub wall_clock_milliseconds: Option<u64>,
@@ -812,6 +818,30 @@ impl SandboxPolicy {
             }
         }
 
+        match (
+            self.time_monotonic_offset_seconds,
+            self.time_boottime_offset_seconds,
+        ) {
+            (None, None) => {}
+            (Some(monotonic), Some(boottime)) => {
+                if monotonic > MAX_TIME_OFFSET_SECONDS || boottime > MAX_TIME_OFFSET_SECONDS {
+                    return Err(PolicyError::new(format!(
+                        "time namespace offsets must be between 0 and {MAX_TIME_OFFSET_SECONDS} seconds"
+                    )));
+                }
+                if monotonic == 0 && boottime == 0 {
+                    return Err(PolicyError::new(
+                        "time namespace offsets must not both be zero",
+                    ));
+                }
+            }
+            _ => {
+                return Err(PolicyError::new(
+                    "time.monotonic_offset_seconds and time.boottime_offset_seconds must be specified together",
+                ));
+            }
+        }
+
         if let Some(milliseconds) = self.wall_clock_milliseconds {
             if !(MIN_WALL_CLOCK_MILLISECONDS..=MAX_WALL_CLOCK_MILLISECONDS).contains(&milliseconds)
             {
@@ -1051,6 +1081,8 @@ impl FromStr for SandboxPolicy {
         let mut stdout_redirect = None;
         let mut stdout_capture_bytes = None;
         let mut stdout_total_bytes = None;
+        let mut time_monotonic_offset_seconds = None;
+        let mut time_boottime_offset_seconds = None;
         let mut wall_clock_milliseconds = None;
         let mut cpu_seconds = None;
         let mut address_space_bytes = None;
@@ -1254,6 +1286,18 @@ impl FromStr for SandboxPolicy {
                 )?,
                 "limit.stdout_total_bytes" => set_once(
                     &mut stdout_total_bytes,
+                    parse_u64(value, line_no, key)?,
+                    line_no,
+                    key,
+                )?,
+                "time.monotonic_offset_seconds" => set_once(
+                    &mut time_monotonic_offset_seconds,
+                    parse_u64(value, line_no, key)?,
+                    line_no,
+                    key,
+                )?,
+                "time.boottime_offset_seconds" => set_once(
+                    &mut time_boottime_offset_seconds,
                     parse_u64(value, line_no, key)?,
                     line_no,
                     key,
@@ -1486,6 +1530,8 @@ impl FromStr for SandboxPolicy {
             stdout_redirect: stdout_redirect.map(PathBuf::from),
             stdout_capture_bytes,
             stdout_total_bytes,
+            time_monotonic_offset_seconds,
+            time_boottime_offset_seconds,
             wall_clock_milliseconds,
             limits: ResourceLimits {
                 cpu_seconds: required(cpu_seconds, "limit.cpu_seconds")?,
@@ -1781,6 +1827,8 @@ mod tests {
         assert_eq!(policy.stdout_redirect, None);
         assert_eq!(policy.stdout_capture_bytes, None);
         assert_eq!(policy.stdout_total_bytes, None);
+        assert_eq!(policy.time_monotonic_offset_seconds, None);
+        assert_eq!(policy.time_boottime_offset_seconds, None);
         assert_eq!(policy.wall_clock_milliseconds, None);
         assert_eq!(
             policy.environment.get("LANG").map(String::as_str),
@@ -1788,6 +1836,31 @@ mod tests {
         );
         assert!(policy.seccomp.allowed_syscalls.contains("execveat"));
         assert!(policy.seccomp.argument_rules.is_empty());
+    }
+
+    #[test]
+    fn parses_time_namespace_offsets() {
+        let text = format!(
+            "{VALID}\ntime.monotonic_offset_seconds = 3600\ntime.boottime_offset_seconds = 7200"
+        );
+        let policy: SandboxPolicy = text.parse().unwrap();
+        assert_eq!(policy.time_monotonic_offset_seconds, Some(3600));
+        assert_eq!(policy.time_boottime_offset_seconds, Some(7200));
+    }
+
+    #[test]
+    fn rejects_incomplete_noop_or_oversized_time_namespace_offsets() {
+        for invalid in [
+            format!("{VALID}\ntime.monotonic_offset_seconds = 3600"),
+            format!("{VALID}\ntime.boottime_offset_seconds = 7200"),
+            format!("{VALID}\ntime.monotonic_offset_seconds = 0\ntime.boottime_offset_seconds = 0"),
+            format!(
+                "{VALID}\ntime.monotonic_offset_seconds = {}\ntime.boottime_offset_seconds = 0",
+                MAX_TIME_OFFSET_SECONDS + 1
+            ),
+        ] {
+            assert!(invalid.parse::<SandboxPolicy>().is_err());
+        }
     }
 
     #[test]

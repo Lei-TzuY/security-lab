@@ -22,7 +22,7 @@ fn copy_on_write_root_preserves_readonly_persistent_volume_semantics() {
         &[source_argument.as_str()],
         &["execveat", "openat", "read", "close", "exit"],
     );
-    mounted.cow_root_bytes = Some(COW_ROOT_BYTES);
+    mounted.cow_root_bytes = Some(16 * 1024 * 1024);
     mounted.readonly_volume_source = Some(source.clone());
     mounted.readonly_volume_target = Some(PathBuf::from("/data"));
 

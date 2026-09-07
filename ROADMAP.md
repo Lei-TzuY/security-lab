@@ -539,7 +539,7 @@ Boundary: 21A compares one raw syscall argument against an unsigned inclusive in
 
 ### Slice 22B — observed stdout total-output budget
 
-**Current verified candidate.** Converts captured-stdout overrun from unbounded drain work into an explicit launcher-owned termination result without changing target seccomp authority.
+**Status: complete on `main`.** Converts captured-stdout overrun from unbounded drain work into an explicit launcher-owned termination result without changing target seccomp authority.
 
 Acceptance evidence is executable:
 
@@ -555,7 +555,28 @@ Boundary: 22B is host-observed enforcement, not a precise kernel byte meter. Pip
 
 ### Milestone 22B promotion rule
 
-After 22B integrates, do not farm alternate byte units, stderr copies, or extra output-result spellings without a materially new output-control architecture. Re-evaluate the reserved supplementary-group/user-namespace frontier separately, or promote to another independent subsystem frontier with executable evidence.
+22B is sealed on `main`. Do not farm alternate byte units, stderr copies, or extra output-result spellings without a materially new output-control architecture. The supplementary-group frontier remains blocked by the current unprivileged user-namespace mapping semantics, so promotion moves to an independently executable kernel boundary.
+
+## Milestone 23 — policy-owned time domain
+
+### Slice 23A — descendant monotonic/boottime offsets
+
+**Current verified candidate.** Adds an optional Linux child time namespace rather than another resource/output variant.
+
+Acceptance evidence is executable:
+
+- policy accepts only the all-or-nothing pair `time.monotonic_offset_seconds` / `time.boottime_offset_seconds`; each value is nonnegative and bounded to 31,536,000 seconds, and an all-zero pair is rejected;
+- without the pair, the existing namespace flags and all prior execution behavior remain unchanged; with the pair, launcher setup adds `CLONE_NEWTIME`;
+- offset records are fully prepared before the initial fork, then written to `/proc/self/timens_offsets` after UID/GID mapping and before namespace PID 1 is created, so no policy formatting/allocation is introduced into the post-fork setup path;
+- Linux time-namespace child semantics keep the bootstrap in the parent clock domain while namespace PID 1 and the direct target inherit the configured child time namespace;
+- a raw target explicitly granted `clock_gettime`, `write`, `execveat`, and `exit` emits binary `CLOCK_MONOTONIC` and `CLOCK_BOOTTIME` timespecs. With +3600/+7200 second policy, each value must land inside the trusted host-before/host-after window plus its declared offset; the host monotonic interval itself must remain unshifted;
+- a five-second launcher-owned deadline is active in the same run, while all Milestones 1–22B regressions remain green; stable format/Clippy/full tests and the full Rust 1.74 suite pass on the exact implementation head.
+
+Boundary: 23A does not alter `CLOCK_REALTIME`, support negative offsets, rate scaling/freezing, clock stepping, deterministic virtual time, or a general scheduler/time API. The launcher wall-clock deadline remains a relative supervision control rather than a target-visible absolute time claim.
+
+### Milestone 23 promotion rule
+
+After 23A integrates, seal basic Linux time-offset ownership. Do not farm more offset values or clock-read fixture variants. Promote to a materially different executable subsystem; revisit supplementary groups, routed host networking, or cgroup accounting only when their documented environment prerequisites change.
 
 ## Later frontiers
 

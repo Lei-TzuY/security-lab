@@ -34,6 +34,30 @@ pub(crate) fn report_json(report: &RunReport) -> String {
         report.process_tree_usage.max_child_rss_kib
     )
     .expect("write to String cannot fail");
+    output.push_str("},\"enforcement\":{\"base_namespaces\":");
+    push_bool(&mut output, report.enforcement.base_namespaces);
+    output.push_str(",\"time_namespace_offsets\":");
+    push_bool(&mut output, report.enforcement.time_namespace_offsets);
+    output.push_str(",\"hostname\":");
+    push_bool(&mut output, report.enforcement.hostname);
+    output.push_str(",\"private_mount_propagation\":");
+    push_bool(&mut output, report.enforcement.private_mount_propagation);
+    output.push_str(",\"readonly_root\":");
+    push_bool(&mut output, report.enforcement.readonly_root);
+    output.push_str(",\"chroot\":");
+    push_bool(&mut output, report.enforcement.chroot);
+    output.push_str(",\"fd_sanitization\":");
+    push_bool(&mut output, report.enforcement.fd_sanitization);
+    output.push_str(",\"rlimits\":");
+    push_bool(&mut output, report.enforcement.rlimits);
+    output.push_str(",\"capabilities_reduced\":");
+    push_bool(&mut output, report.enforcement.capabilities_reduced);
+    output.push_str(",\"no_new_privs\":");
+    push_bool(&mut output, report.enforcement.no_new_privs);
+    output.push_str(",\"landlock\":");
+    push_bool(&mut output, report.enforcement.landlock);
+    output.push_str(",\"seccomp\":");
+    push_bool(&mut output, report.enforcement.seccomp);
     output.push_str("}}");
     output
 }
@@ -67,6 +91,10 @@ pub(crate) fn outcome_exit_code(outcome: ChildOutcome) -> i32 {
         ChildOutcome::Cancelled => 130,
         ChildOutcome::OutputLimitExceeded => 122,
     }
+}
+
+fn push_bool(output: &mut String, value: bool) {
+    output.push_str(if value { "true" } else { "false" });
 }
 
 fn push_outcome(output: &mut String, outcome: ChildOutcome) {
@@ -121,7 +149,7 @@ fn push_json_string(output: &mut String, value: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use security_lab::{CapturedOutput, ProcessTreeUsage, RunReport};
+    use security_lab::{CapturedOutput, EnforcementReceipt, ProcessTreeUsage, RunReport};
 
     #[test]
     fn serializes_binary_capture_without_loss() {
@@ -137,11 +165,12 @@ mod tests {
                 system_cpu_micros: 22,
                 max_child_rss_kib: 33,
             },
+            enforcement: EnforcementReceipt::default(),
         };
 
         assert_eq!(
             report_json(&report),
-            "{\"ok\":true,\"outcome\":{\"kind\":\"exited\",\"code\":7},\"stdout\":{\"encoding\":\"hex\",\"data\":\"0022ff\",\"truncated\":true},\"reaped_descendants\":3,\"process_tree_usage\":{\"user_cpu_micros\":11,\"system_cpu_micros\":22,\"max_child_rss_kib\":33}}"
+            "{\"ok\":true,\"outcome\":{\"kind\":\"exited\",\"code\":7},\"stdout\":{\"encoding\":\"hex\",\"data\":\"0022ff\",\"truncated\":true},\"reaped_descendants\":3,\"process_tree_usage\":{\"user_cpu_micros\":11,\"system_cpu_micros\":22,\"max_child_rss_kib\":33},\"enforcement\":{\"base_namespaces\":false,\"time_namespace_offsets\":false,\"hostname\":false,\"private_mount_propagation\":false,\"readonly_root\":false,\"chroot\":false,\"fd_sanitization\":false,\"rlimits\":false,\"capabilities_reduced\":false,\"no_new_privs\":false,\"landlock\":false,\"seccomp\":false}}"
         );
     }
 
@@ -163,6 +192,7 @@ mod tests {
             }),
             reaped_descendants: 1,
             process_tree_usage: ProcessTreeUsage::default(),
+            enforcement: EnforcementReceipt::default(),
         };
         assert!(report_json(&report).contains("\"kind\":\"output_limit_exceeded\""));
     }

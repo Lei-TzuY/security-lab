@@ -588,7 +588,7 @@ Boundary: this is static observability, not runtime capability preflight or proo
 
 ### Slice 24B — conservative policy-specific host preflight
 
-**Current verified candidate.** Adds non-destructive policy/host capability matching without claiming that partial probing proves the full sandbox launch path.
+**Status: complete on `main`.** Adds non-destructive policy/host capability matching without claiming that partial probing proves the full sandbox launch path.
 
 Acceptance evidence is executable:
 
@@ -604,7 +604,29 @@ Boundary: 24B is a conservative partial preflight, not a dry-run, launch simulat
 
 ### Milestone 24 promotion rule
 
-After 24B integrates, seal the current policy-observability layer. Do not farm output aliases or relabel partial probes as conformance. A later preflight slice must add genuinely safe positive evidence for previously unprobed mandatory mechanisms; otherwise promote to a materially different executable authority/enforcement frontier.
+24A–24B are sealed on `main`. Do not farm output aliases or relabel partial probes as conformance. A later preflight slice must add genuinely safe positive evidence for previously unprobed mandatory mechanisms. Milestone 25A is deliberately different: it reports kernel stages positively observed during an actual run rather than predicting launch compatibility.
+
+## Milestone 25 — runtime enforcement evidence
+
+### Slice 25A — post-attempt enforcement receipt
+
+**Current verified candidate.** Adds structured positive evidence for launcher-owned setup stages that actually completed during a sandbox invocation.
+
+Acceptance evidence is executable:
+
+- `RunReport` gains an `EnforcementReceipt` covering base namespaces, optional time-namespace offsets, hostname, private mount propagation, read-only root, chroot, FD sanitization, all configured rlimits, capability reduction, `no_new_privs`, optional Landlock restriction, and seccomp installation;
+- each bit is published only after the corresponding kernel/setup stage returns success through the existing shared launch-state channel; unknown bits, impossible predecessor progressions, unrequested optional bits, and missing requested optional predecessors fail closed during receipt decoding;
+- early launcher-owned termination may therefore yield a valid partial receipt. A false field means only `not positively observed before termination`, not `unsupported`, `disabled`, or `failed`;
+- the receipt intentionally does not record successful `execveat`: a deadline/cancellation/output-limit control path can win after seccomp is installed but before the non-returning exec syscall, so claiming exec success from setup progress would be unsound;
+- time-namespace and Landlock integration tests require their respective positive receipt bits after successful real runs, while receipt-decoder unit tests reject corrupted/impossible progressions;
+- `run-json` serializes the complete receipt in deterministic field order, and the real example-policy CLI regression requires the expected true/false stage set rather than merely checking JSON shape;
+- Milestone 24B preflight remains distinct and non-destructive, while 25A is post-attempt evidence from the actual run path; stable rustfmt/Clippy/full tests and the full Rust 1.74 suite are green on the exact candidate.
+
+Boundary: 25A is positive setup-stage telemetry, not a cryptographic attestation, kernel-state snapshot, complete conformance proof, successful-exec receipt, or guarantee that a stage remains effective after its observation point. It does not turn false bits into negative capability claims.
+
+### Milestone 25 promotion rule
+
+After 25A integrates, seal this receipt schema at the current stage granularity. Do not farm aliases, duplicate per-syscall bits, or relabel the receipt as attestation/conformance. Promote to a materially different executable authority/enforcement frontier unless a new receipt field corresponds to a genuinely new kernel boundary.
 
 ## Later frontiers
 

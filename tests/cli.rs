@@ -75,9 +75,9 @@ fn run_json_emits_deterministic_machine_report() {
     let (system_cpu, usage) = usage
         .split_once(",\"max_child_rss_kib\":")
         .unwrap_or_else(|| panic!("missing RSS telemetry: {stdout}"));
-    let max_rss = usage
-        .strip_suffix("}}\n")
-        .unwrap_or_else(|| panic!("unexpected JSON telemetry suffix: {stdout}"));
+    let (max_rss, enforcement) = usage
+        .split_once("},\"enforcement\":")
+        .unwrap_or_else(|| panic!("missing runtime enforcement receipt: {stdout}"));
     for (label, value) in [
         ("user_cpu_micros", user_cpu),
         ("system_cpu_micros", system_cpu),
@@ -88,6 +88,10 @@ fn run_json_emits_deterministic_machine_report() {
             "{label} must be an unsigned decimal integer, got {value:?} in {stdout}"
         );
     }
+    assert_eq!(
+        enforcement,
+        "{\"base_namespaces\":true,\"time_namespace_offsets\":false,\"hostname\":true,\"private_mount_propagation\":true,\"readonly_root\":true,\"chroot\":true,\"fd_sanitization\":true,\"rlimits\":true,\"capabilities_reduced\":true,\"no_new_privs\":true,\"landlock\":false,\"seccomp\":true}}\n"
+    );
 }
 
 #[test]

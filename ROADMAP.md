@@ -539,7 +539,7 @@ Boundary: 21A compares one raw syscall argument against an unsigned inclusive in
 
 ### Slice 22B — observed stdout total-output budget
 
-**Current verified candidate.** Converts captured-stdout overrun from unbounded drain work into an explicit launcher-owned termination result without changing target seccomp authority.
+**Status: complete on `main`.** Converts captured-stdout overrun from unbounded drain work into an explicit launcher-owned termination result without changing target seccomp authority.
 
 Acceptance evidence is executable:
 
@@ -555,7 +555,36 @@ Boundary: 22B is host-observed enforcement, not a precise kernel byte meter. Pip
 
 ### Milestone 22B promotion rule
 
-After 22B integrates, do not farm alternate byte units, stderr copies, or extra output-result spellings without a materially new output-control architecture. Re-evaluate the reserved supplementary-group/user-namespace frontier separately, or promote to another independent subsystem frontier with executable evidence.
+22B is sealed on `main`. Do not farm alternate byte units, stderr copies, or extra output-result spellings without a materially new output-control architecture. Promote to another independent subsystem frontier with executable evidence.
+
+## Milestone 23 — descendant time virtualization
+
+### Slice 23A — policy-owned MONOTONIC/BOOTTIME offsets
+
+**Current verified candidate.** Adds one optional Linux time namespace for subsequently created sandbox descendants without changing host clocks or the launcher's own clock view.
+
+Acceptance evidence is executable:
+
+- policy accepts the all-or-nothing pair `time.monotonic_offset_seconds` / `time.boottime_offset_seconds`, bounds each nonnegative value to 365 days, and rejects an all-zero pair;
+- only when requested, launcher namespace setup adds `CLONE_NEWTIME`; after UID/GID mapping and before namespace PID 1 exists, bootstrap writes the declared `monotonic` and `boottime` offsets to `/proc/self/timens_offsets`;
+- launcher-owned PID 1 and the direct target are created after offset installation and therefore enter the prepared child time namespace, while bootstrap and trusted host samples remain on the original clock view;
+- a raw target explicitly granted `clock_gettime` emits `CLOCK_MONOTONIC` and `CLOCK_BOOTTIME`; the parent requires values within two seconds of host samples plus exact 3,600-second and 7,200-second configured offsets;
+- static `manifest` / `manifest-json` output exposes the declared time-namespace authority without changing `runtime_preflight=false`;
+- all prior sandbox/tooling regressions, stable rustfmt/Clippy/full tests, and the full Rust 1.74 suite are green on the exact integrated candidate.
+
+Boundary: 23A does not virtualize `CLOCK_REALTIME`, set RTC/wall-clock time, support negative offsets or clock-rate scaling, or claim deterministic virtual scheduling.
+
+### Milestone 23 promotion rule
+
+After 23A integrates, seal this bounded clock-offset model. Do not farm more clock IDs, unit aliases, or offset spellings; promote only to a materially different executable frontier.
+
+## Milestone 24 — policy observability tooling
+
+### Slice 24A — static policy authority manifest
+
+**Status: complete on `main`.** `manifest` and `manifest-json` validate policy fail-closed and emit deterministic declared-authority summaries without launching the sandbox or probing kernel support. Argument contents and environment values remain redacted, while authority-bearing filesystem, broker, Landlock, resource, output, seccomp, and time-namespace fields are reviewable.
+
+Boundary: this is static observability, not runtime capability preflight or proof of effective kernel state.
 
 ## Later frontiers
 

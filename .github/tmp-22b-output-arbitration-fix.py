@@ -131,7 +131,22 @@ test_module = '''
         }
     }
 '''
-if not text.endswith("}\n"):
-    raise SystemExit("linux x86_64 module does not end with the expected closing brace")
-text = text[:-2] + test_module + "}\n"
+tail_marker = '''
+}
+
+#[cfg(target_arch = "x86_64")]
+pub(crate) use x86_64::run_report;
+'''
+if text.count(tail_marker) != 1:
+    raise SystemExit(f"x86_64 module boundary: expected 1 match, got {text.count(tail_marker)}")
+text = text.replace(
+    tail_marker,
+    test_module + '''
+}
+
+#[cfg(target_arch = "x86_64")]
+pub(crate) use x86_64::run_report;
+''',
+    1,
+)
 path.write_text(text)

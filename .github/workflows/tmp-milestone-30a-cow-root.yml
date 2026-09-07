@@ -31,7 +31,10 @@ jobs:
               raise SystemExit('unable to patch replace_one for drift inventory')
           p.write_text(text.replace(old, new, 1))
           PY
-          python3 /tmp/materialize-cow-root.py
+          python3 /tmp/materialize-cow-root.py | tee /tmp/cow-port.log
+          test "$(grep -c '^PORT-SKIP ' /tmp/cow-port.log)" -eq 1
+          grep -Fx 'PORT-SKIP preflight cow json: expected exactly one match, got 0' /tmp/cow-port.log
+          python3 .github/tmp-milestone-30a-current-port.py
       - name: Format
         run: cargo fmt --all
       - name: Enable user namespace capability tests

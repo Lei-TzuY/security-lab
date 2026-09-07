@@ -26,6 +26,7 @@ const MIN_SCRATCH_BYTES: u64 = 4096;
 const MAX_SCRATCH_BYTES: u64 = 1024 * 1024 * 1024;
 const MIN_CAPTURE_BYTES: u64 = 1;
 const MAX_CAPTURE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_STDOUT_TOTAL_BYTES: u64 = 1024 * 1024 * 1024;
 const MIN_WALL_CLOCK_MILLISECONDS: u64 = 1;
 const MAX_WALL_CLOCK_MILLISECONDS: u64 = 24 * 60 * 60 * 1000;
 
@@ -173,6 +174,10 @@ pub struct SandboxPolicy {
     /// Maximum number of stdout bytes retained by the parent when stdout is
     /// `Capture`. Excess output is drained and discarded rather than retained.
     pub stdout_capture_bytes: Option<u64>,
+    /// Optional total number of stdout bytes the launcher may observe before
+    /// requesting launcher-owned process-tree termination. This is distinct
+    /// from the retained capture-memory ceiling.
+    pub stdout_total_bytes: Option<u64>,
     /// Optional launcher-owned wall-clock deadline measured from PID 1
     /// beginning supervision of the direct target.
     pub wall_clock_milliseconds: Option<u64>,
@@ -738,6 +743,12 @@ impl SandboxPolicy {
             ));
         }
 
+        if self.stdio.stdout != StdioMode::Capture && self.stdout_total_bytes.is_some() {
+            return Err(PolicyError::new(
+                "limit.stdout_total_bytes is only valid when stdio.stdout = capture",
+            ));
+        }
+
         match self.stdio.stdout {
             StdioMode::Redirect => {
                 if self.stdout_capture_bytes.is_some() {
@@ -773,6 +784,18 @@ impl SandboxPolicy {
                     return Err(PolicyError::new(format!(
                         "stdio.stdout_capture_bytes must be between {MIN_CAPTURE_BYTES} and {MAX_CAPTURE_BYTES}"
                     )));
+                }
+                if let Some(total_bytes) = self.stdout_total_bytes {
+                    if !(MIN_CAPTURE_BYTES..=MAX_STDOUT_TOTAL_BYTES).contains(&total_bytes) {
+                        return Err(PolicyError::new(format!(
+                            "limit.stdout_total_bytes must be between {MIN_CAPTURE_BYTES} and {MAX_STDOUT_TOTAL_BYTES}"
+                        )));
+                    }
+                    if bytes > total_bytes {
+                        return Err(PolicyError::new(
+                            "stdio.stdout_capture_bytes must not exceed limit.stdout_total_bytes",
+                        ));
+                    }
                 }
             }
             StdioMode::Inherit | StdioMode::Closed => {
@@ -1027,6 +1050,7 @@ impl FromStr for SandboxPolicy {
         let mut selected_handles = BTreeMap::new();
         let mut stdout_redirect = None;
         let mut stdout_capture_bytes = None;
+        let mut stdout_total_bytes = None;
         let mut wall_clock_milliseconds = None;
         let mut cpu_seconds = None;
         let mut address_space_bytes = None;
@@ -1224,6 +1248,12 @@ impl FromStr for SandboxPolicy {
                 }
                 "stdio.stdout_capture_bytes" => set_once(
                     &mut stdout_capture_bytes,
+                    parse_u64(value, line_no, key)?,
+                    line_no,
+                    key,
+                )?,
+                "limit.stdout_total_bytes" => set_once(
+                    &mut stdout_total_bytes,
                     parse_u64(value, line_no, key)?,
                     line_no,
                     key,
@@ -1455,6 +1485,7 @@ impl FromStr for SandboxPolicy {
             selected_handles,
             stdout_redirect: stdout_redirect.map(PathBuf::from),
             stdout_capture_bytes,
+            stdout_total_bytes,
             wall_clock_milliseconds,
             limits: ResourceLimits {
                 cpu_seconds: required(cpu_seconds, "limit.cpu_seconds")?,
@@ -1749,6 +1780,7 @@ mod tests {
         assert!(policy.selected_handles.is_empty());
         assert_eq!(policy.stdout_redirect, None);
         assert_eq!(policy.stdout_capture_bytes, None);
+        assert_eq!(policy.stdout_total_bytes, None);
         assert_eq!(policy.wall_clock_milliseconds, None);
         assert_eq!(
             policy.environment.get("LANG").map(String::as_str),
@@ -2387,6 +2419,41 @@ mod tests {
         let policy: SandboxPolicy = text.parse().unwrap();
         assert_eq!(policy.stdio.stdout, StdioMode::Capture);
         assert_eq!(policy.stdout_capture_bytes, Some(4096));
+    }
+
+    #[test]
+    fn parses_and_bounds_stdout_total_budget() {
+        let text = VALID.replace(
+            "stdio.stdout = inherit",
+            "stdio.stdout = capture\n        stdio.stdout_capture_bytes = 1024\n        limit.stdout_total_bytes = 65536",
+        );
+        let policy: SandboxPolicy = text.parse().unwrap();
+        assert_eq!(policy.stdout_capture_bytes, Some(1024));
+        assert_eq!(policy.stdout_total_bytes, Some(65536));
+
+        let wrong_mode = format!("{VALID}\nlimit.stdout_total_bytes = 4096");
+        assert!(wrong_mode.parse::<SandboxPolicy>().is_err());
+
+        let zero = VALID.replace(
+            "stdio.stdout = inherit",
+            "stdio.stdout = capture\n        stdio.stdout_capture_bytes = 1\n        limit.stdout_total_bytes = 0",
+        );
+        assert!(zero.parse::<SandboxPolicy>().is_err());
+
+        let retained_exceeds_total = VALID.replace(
+            "stdio.stdout = inherit",
+            "stdio.stdout = capture\n        stdio.stdout_capture_bytes = 4096\n        limit.stdout_total_bytes = 1024",
+        );
+        assert!(retained_exceeds_total.parse::<SandboxPolicy>().is_err());
+
+        let oversized = VALID.replace(
+            "stdio.stdout = inherit",
+            &format!(
+                "stdio.stdout = capture\n        stdio.stdout_capture_bytes = 1\n        limit.stdout_total_bytes = {}",
+                MAX_STDOUT_TOTAL_BYTES + 1
+            ),
+        );
+        assert!(oversized.parse::<SandboxPolicy>().is_err());
     }
 
     #[test]

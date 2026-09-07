@@ -65,6 +65,7 @@ pub(crate) fn outcome_exit_code(outcome: ChildOutcome) -> i32 {
         ChildOutcome::Signaled(signal) => 128 + signal,
         ChildOutcome::TimedOut => 124,
         ChildOutcome::Cancelled => 130,
+        ChildOutcome::OutputLimitExceeded => 122,
     }
 }
 
@@ -82,6 +83,9 @@ fn push_outcome(output: &mut String, outcome: ChildOutcome) {
         }
         ChildOutcome::TimedOut => output.push_str("{\"kind\":\"timed_out\"}"),
         ChildOutcome::Cancelled => output.push_str("{\"kind\":\"cancelled\"}"),
+        ChildOutcome::OutputLimitExceeded => {
+            output.push_str("{\"kind\":\"output_limit_exceeded\"}")
+        }
     }
 }
 
@@ -150,6 +154,20 @@ mod tests {
     }
 
     #[test]
+    fn serializes_stdout_output_limit_outcome() {
+        let report = RunReport {
+            outcome: ChildOutcome::OutputLimitExceeded,
+            stdout: Some(CapturedOutput {
+                bytes: b"prefix".to_vec(),
+                truncated: true,
+            }),
+            reaped_descendants: 1,
+            process_tree_usage: ProcessTreeUsage::default(),
+        };
+        assert!(report_json(&report).contains("\"kind\":\"output_limit_exceeded\""));
+    }
+
+    #[test]
     fn escapes_json_error_strings() {
         assert_eq!(
             error_json("bad\"kind", "line\\path\n\u{0001}µ"),
@@ -163,5 +181,6 @@ mod tests {
         assert_eq!(outcome_exit_code(ChildOutcome::Signaled(9)), 137);
         assert_eq!(outcome_exit_code(ChildOutcome::TimedOut), 124);
         assert_eq!(outcome_exit_code(ChildOutcome::Cancelled), 130);
+        assert_eq!(outcome_exit_code(ChildOutcome::OutputLimitExceeded), 122);
     }
 }

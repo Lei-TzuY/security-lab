@@ -15,6 +15,7 @@
 #   f emit CLOCK_MONOTONIC and CLOCK_BOOTTIME timespecs for time-namespace evidence
 #   v read a declared persistent volume, prove it is read-only, and hide its host source path
 #   w write through a declared persistent volume while root and host source paths stay confined
+#   z prove three named persistent volumes compose: two read-only plus one writable
 #   n prove policy-owned loopback supports positive intra-sandbox TCP
 #   o prove loopback remains down unless policy explicitly enables it
 #   p write through a brokered host-loopback TCP fd while direct host reachability stays isolated
@@ -77,6 +78,8 @@ _start:
     je .readonly_volume
     cmp $119, %al
     je .writable_volume
+    cmp $122, %al
+    je .named_volume_graph
     cmp $110, %al
     je .loopback_networking
     cmp $111, %al
@@ -672,6 +675,98 @@ _start:
     cmp $-2, %rax
     jne .fail33
 
+    xor %edi, %edi
+    jmp .exit
+
+.named_volume_graph:
+    # First read-only mount.
+    mov $257, %eax
+    mov $-100, %edi
+    lea volume_marker_path(%rip), %rsi
+    xor %edx, %edx
+    xor %r10d, %r10d
+    syscall
+    test %rax, %rax
+    js .fail49
+    mov %rax, %r12
+    xor %eax, %eax
+    mov %r12, %rdi
+    lea volume_buffer(%rip), %rsi
+    mov $volume_marker_len, %edx
+    syscall
+    cmp $volume_marker_len, %rax
+    jne .fail49
+    mov $3, %eax
+    mov %r12, %rdi
+    syscall
+    test %rax, %rax
+    js .fail49
+
+    # Second read-only mount proves the graph exceeds the legacy one-RO slot.
+    mov $257, %eax
+    mov $-100, %edi
+    lea volume_marker_path_two(%rip), %rsi
+    xor %edx, %edx
+    xor %r10d, %r10d
+    syscall
+    test %rax, %rax
+    js .fail49
+    mov %rax, %r12
+    xor %eax, %eax
+    mov %r12, %rdi
+    lea volume_buffer(%rip), %rsi
+    mov $volume_marker_len, %edx
+    syscall
+    cmp $volume_marker_len, %rax
+    jne .fail49
+    mov $3, %eax
+    mov %r12, %rdi
+    syscall
+    test %rax, %rax
+    js .fail49
+
+    # Read-only enforcement remains active.
+    mov $257, %eax
+    mov $-100, %edi
+    lea volume_forbidden_write(%rip), %rsi
+    mov $577, %edx
+    mov $384, %r10d
+    syscall
+    cmp $-30, %rax
+    jne .fail49
+
+    # Named writable mount persists bytes.
+    mov $257, %eax
+    mov $-100, %edi
+    lea writable_volume_output(%rip), %rsi
+    mov $577, %edx
+    mov $384, %r10d
+    syscall
+    test %rax, %rax
+    js .fail49
+    mov %rax, %r12
+    mov $1, %eax
+    mov %r12, %rdi
+    lea writable_volume_message(%rip), %rsi
+    mov $writable_volume_message_len, %edx
+    syscall
+    cmp $writable_volume_message_len, %rax
+    jne .fail49
+    mov $3, %eax
+    mov %r12, %rdi
+    syscall
+    test %rax, %rax
+    js .fail49
+
+    # Surrounding root stays read-only.
+    mov $257, %eax
+    mov $-100, %edi
+    lea forbidden_create(%rip), %rsi
+    mov $577, %edx
+    mov $384, %r10d
+    syscall
+    cmp $-30, %rax
+    jne .fail49
     xor %edi, %edi
     jmp .exit
 
@@ -2399,6 +2494,9 @@ _start:
     jmp .exit
 .fail48:
     mov $48, %edi
+    jmp .exit
+.fail49:
+    mov $49, %edi
 
 .exit:
     mov $60, %eax
@@ -2440,6 +2538,8 @@ volume_marker_path:
     .asciz "/data/marker"
 volume_forbidden_write:
     .asciz "/data/write-must-fail"
+volume_marker_path_two:
+    .asciz "/data2/marker"
 volume_marker_expected:
     .ascii "volume-marker\n"
 .set volume_marker_len, . - volume_marker_expected

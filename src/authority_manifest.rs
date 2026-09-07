@@ -1,4 +1,4 @@
-use security_lab::{SandboxPolicy, StdioMode};
+use security_lab::{PersistentVolumeAccess, SandboxPolicy, StdioMode};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -49,7 +49,30 @@ pub(crate) fn to_json(policy: &SandboxPolicy) -> String {
         policy.writable_volume_target.as_deref(),
         "writable",
     );
-    output.push('}');
+    output.push_str(",\"persistent_volumes\":[");
+    let mut first_volume = true;
+    for (name, volume) in &policy.persistent_volumes {
+        if !first_volume {
+            output.push(',');
+        }
+        first_volume = false;
+        output.push_str("{\"name\":");
+        push_json_string(&mut output, name);
+        output.push_str(",\"source\":");
+        push_path(&mut output, &volume.source);
+        output.push_str(",\"target\":");
+        push_path(&mut output, &volume.target);
+        output.push_str(",\"access\":");
+        push_json_string(
+            &mut output,
+            match volume.access {
+                PersistentVolumeAccess::ReadOnly => "read_only",
+                PersistentVolumeAccess::Writable => "writable",
+            },
+        );
+        output.push('}');
+    }
+    output.push_str("]}");
 
     output.push_str(",\"network\":{\"isolated_loopback_enabled\":");
     push_bool(&mut output, policy.loopback_enabled);
@@ -319,9 +342,10 @@ pub(crate) fn to_human(policy: &SandboxPolicy) -> String {
     .expect("write to String cannot fail");
     writeln!(
         &mut output,
-        "host-filesystem-volumes: read-only={} writable={}",
+        "host-filesystem-volumes: read-only={} writable={} named={}",
         policy.readonly_volume_source.is_some() as u8,
-        policy.writable_volume_source.is_some() as u8
+        policy.writable_volume_source.is_some() as u8,
+        policy.persistent_volumes.len()
     )
     .expect("write to String cannot fail");
     writeln!(

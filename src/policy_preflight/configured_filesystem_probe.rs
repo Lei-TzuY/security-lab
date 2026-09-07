@@ -229,6 +229,21 @@ mod linux_x86_64 {
             }
         }
 
+        for volume in policy.persistent_volumes.values() {
+            if let Err(result) =
+                require_host_directory(&volume.source, "persistent_volume_source_open")
+            {
+                return result;
+            }
+            if let Err(result) = require_beneath_directory(
+                root.raw(),
+                &volume.target,
+                "persistent_volume_target_open",
+            ) {
+                return result;
+            }
+        }
+
         ConfiguredFilesystemProbe::available()
     }
 }

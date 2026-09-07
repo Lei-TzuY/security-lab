@@ -164,6 +164,23 @@ fn mixed_widening_and_reduction_is_incomparable() {
 }
 
 #[test]
+fn added_named_persistent_volume_is_detected_as_authority_widening() {
+    let root = unique_absent_root("named-volume");
+    let baseline_text = base_policy(&root);
+    let candidate_text = format!(
+        "{baseline_text}volume.mount.assets.source = /srv/assets\nvolume.mount.assets.target = /assets\nvolume.mount.assets.access = read-only\n"
+    );
+    let baseline = TempPolicy::new("baseline", &baseline_text);
+    let candidate = TempPolicy::new("candidate", &candidate_text);
+
+    let output = run_json(&baseline, &candidate);
+    assert_eq!(output.status.code(), Some(5));
+    let stdout = String::from_utf8(output.stdout).expect("utf8 output");
+    assert!(stdout.contains("\"status\":\"widened\""));
+    assert!(stdout.contains("\"field\":\"filesystem.persistent_volumes\",\"class\":\"widened\""));
+}
+
+#[test]
 fn invalid_candidate_fails_closed_before_comparison() {
     let root = unique_absent_root("invalid");
     let baseline_text = base_policy(&root);

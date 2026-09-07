@@ -12,3 +12,7 @@ libc = "0.2"
 [[bin]]
 name = "security-lab"
 path = "src/main.rs"
+
+[[bin]]
+name = "security-lab-authority-delta"
+path = "src/authority_delta_main.rs"

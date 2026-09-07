@@ -405,6 +405,24 @@ fn copy_on_write_root_is_ephemeral_and_preserves_host_lower() {
     }
 }
 
+#[test]
+fn copy_on_write_root_byte_budget_is_kernel_enforced() {
+    const COW_BUDGET_BYTES: u64 = 64 * 1024;
+    let created = fixture_root().join("cow-capacity");
+    let _ = std::fs::remove_file(&created);
+
+    let mut cow = policy("l", &[], &["execveat", "openat", "write", "close", "exit"]);
+    cow.cow_root_bytes = Some(COW_BUDGET_BYTES);
+    let report = run_report(&cow).expect("copy-on-write root budget sandbox failed");
+    assert_eq!(report.outcome, ChildOutcome::Exited(0));
+    assert!(report.enforcement.copy_on_write_root);
+    assert!(!report.enforcement.readonly_root);
+    assert!(
+        !created.exists(),
+        "COW budget oracle persisted its upper-layer file into the host lower tree"
+    );
+}
+
 fn clock_nanos(clock_id: libc::clockid_t) -> i128 {
     let mut value = unsafe { std::mem::zeroed::<libc::timespec>() };
     assert_eq!(

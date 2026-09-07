@@ -71,6 +71,12 @@ helper = '''    fn resolve_lifecycle_outcome(
         }
     }
 
+'''
+if text.count(marker) != 1:
+    raise SystemExit(f"decode marker: expected 1 match, got {text.count(marker)}")
+text = text.replace(marker, helper + marker, 1)
+
+test_module = '''
     #[cfg(test)]
     mod output_outcome_tests {
         use super::*;
@@ -124,9 +130,8 @@ helper = '''    fn resolve_lifecycle_outcome(
             );
         }
     }
-
 '''
-if text.count(marker) != 1:
-    raise SystemExit(f"decode marker: expected 1 match, got {text.count(marker)}")
-text = text.replace(marker, helper + marker, 1)
+if not text.endswith("}\n"):
+    raise SystemExit("linux x86_64 module does not end with the expected closing brace")
+text = text[:-2] + test_module + "}\n"
 path.write_text(text)

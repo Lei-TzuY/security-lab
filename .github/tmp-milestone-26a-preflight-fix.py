@@ -19,3 +19,29 @@ new_json = r'''\"time_namespace\":{\"status\":\"not_requested\",\"reason\":null}
 if text.count(old_json) != 1:
     raise SystemExit("preflight exact JSON fixture: expected one match")
 p.write_text(text.replace(old_json, new_json, 1))
+
+probe = Path("tests/fixtures/probe.S")
+probe_text = probe.read_text()
+old_probe = '''landlock_buffer:
+    .skip 32
+proc_pid1_path:
+    .asciz "/proc/1"
+proc_pid2_path:
+    .asciz "/proc/2"
+
+.section .note.GNU-stack,"",@progbits
+'''
+new_probe = '''landlock_buffer:
+    .skip 32
+
+.section .rodata
+proc_pid1_path:
+    .asciz "/proc/1"
+proc_pid2_path:
+    .asciz "/proc/2"
+
+.section .note.GNU-stack,"",@progbits
+'''
+if probe_text.count(old_probe) != 1:
+    raise SystemExit("procfs fixture string section: expected one match")
+probe.write_text(probe_text.replace(old_probe, new_probe, 1))

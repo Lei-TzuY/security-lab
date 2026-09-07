@@ -70,7 +70,10 @@ fn identical_policy_is_unchanged_and_static() {
     assert!(stdout.contains("\"kernel_effective_state\":false"));
     assert!(stdout.contains("\"filesystem_alias_proof\":false"));
     assert!(stdout.contains("\"safe_for_unreviewed_update\":true"));
-    assert!(!root.exists(), "static comparison must not materialize the root");
+    assert!(
+        !root.exists(),
+        "static comparison must not materialize the root"
+    );
 }
 
 #[test]
@@ -172,7 +175,10 @@ fn invalid_candidate_fails_closed_before_comparison() {
     let stdout = String::from_utf8(output.stdout).expect("utf8 output");
     assert!(stdout.contains("\"ok\":false"));
     assert!(stdout.contains("\"kind\":\"candidate_policy_rejected\""));
-    assert!(!root.exists(), "rejected comparison must not launch the sandbox");
+    assert!(
+        !root.exists(),
+        "rejected comparison must not launch the sandbox"
+    );
 }
 
 fn unique_absent_root(label: &str) -> PathBuf {

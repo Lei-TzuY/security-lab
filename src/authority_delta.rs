@@ -51,7 +51,7 @@ impl AuthorityDelta {
             "{\"ok\":true,\"authority_delta\":{\"kind\":\"static_policy_authority_delta\",\"kernel_effective_state\":false,\"filesystem_alias_proof\":false,\"status\":\"",
         );
         output.push_str(self.status.as_str());
-        output.push_str("\",\"safe_for_unreviewed_update\":");
+        output.push_str("\",\"static_non_widening\":");
         output.push_str(
             if matches!(self.status, DeltaClass::Unchanged | DeltaClass::Reduced) {
                 "true"
@@ -84,7 +84,7 @@ impl AuthorityDelta {
             .expect("write to String cannot fail");
         writeln!(
             &mut output,
-            "safe-for-unreviewed-update: {}",
+            "static-non-widening: {}",
             if matches!(self.status, DeltaClass::Unchanged | DeltaClass::Reduced) {
                 "true"
             } else {

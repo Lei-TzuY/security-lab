@@ -1,4 +1,7 @@
+mod mandatory_core_probe;
+
 use crate::host_capabilities::{self, CapabilityProbe, HostCapabilities};
+use mandatory_core_probe::StagedCapabilityProbe;
 use security_lab::SandboxPolicy;
 use std::fmt::Write as _;
 
@@ -110,10 +113,13 @@ pub(crate) struct PolicyPreflight {
     host: HostCapabilities,
     requirements: PolicyRequirements,
     mandatory_launch_core: RequirementStatus,
+    mandatory_namespace_mount_core: Option<StagedCapabilityProbe>,
 }
 
 pub(crate) fn probe(policy: &SandboxPolicy) -> PolicyPreflight {
-    evaluate(policy, host_capabilities::probe())
+    let mut evaluated = evaluate(policy, host_capabilities::probe());
+    evaluated.mandatory_namespace_mount_core = Some(mandatory_core_probe::probe());
+    evaluated
 }
 
 fn evaluate(policy: &SandboxPolicy, host: HostCapabilities) -> PolicyPreflight {
@@ -133,6 +139,7 @@ fn evaluate_with_core(
         host,
         requirements: PolicyRequirements::from_policy(policy),
         mandatory_launch_core,
+        mandatory_namespace_mount_core: None,
     }
 }
 
@@ -236,7 +243,12 @@ impl PolicyPreflight {
         } else {
             output.push_str("null");
         }
-        output.push_str("},\"landlock\":{\"status\":\"");
+        output.push('}');
+        if let Some(probe) = self.mandatory_namespace_mount_core {
+            output.push_str(",\"mandatory_namespace_mount_core_probe\":");
+            push_staged_probe_json(&mut output, probe);
+        }
+        output.push_str(",\"landlock\":{\"status\":\"");
         output.push_str(self.landlock_status().as_str());
         output.push_str("\",\"required_abi\":");
         push_optional_u32(&mut output, self.requirements.landlock_abi);
@@ -300,6 +312,20 @@ impl PolicyPreflight {
             write!(&mut output, " ({reason})").expect("write to String cannot fail");
         }
         output.push('\n');
+        if let Some(probe) = self.mandatory_namespace_mount_core {
+            output.push_str("mandatory-namespace-mount-core-probe: ");
+            if probe.available {
+                writeln!(&mut output, "supported (stage={})", probe.stage)
+                    .expect("write to String cannot fail");
+            } else {
+                write!(&mut output, "unsupported (stage={}", probe.stage)
+                    .expect("write to String cannot fail");
+                if let Some(errno) = probe.errno {
+                    write!(&mut output, " errno={errno}").expect("write to String cannot fail");
+                }
+                output.push_str(")\n");
+            }
+        }
         output.push_str("landlock: ");
         output.push_str(self.landlock_status().as_str());
         output.push_str(" (required-abi=");
@@ -356,6 +382,22 @@ fn probe_pair_status(
     } else {
         RequirementStatus::Unsupported
     }
+}
+
+fn push_staged_probe_json(output: &mut String, probe: StagedCapabilityProbe) {
+    output.push_str("{\"status\":\"");
+    output.push_str(if probe.available {
+        "supported"
+    } else {
+        "unsupported"
+    });
+    output.push_str("\",\"stage\":\"");
+    output.push_str(probe.stage);
+    output.push_str("\",\"errno\":");
+    push_optional_i32(output, probe.errno);
+    output.push_str(
+        ",\"isolated_helper\":true,\"configured_root_touched\":false,\"target_executed\":false}",
+    );
 }
 
 fn push_probe_json(output: &mut String, probe: CapabilityProbe) {

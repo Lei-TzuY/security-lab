@@ -2,20 +2,20 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct CapabilityProbe {
-    available: bool,
-    errno: Option<i32>,
+pub(crate) struct CapabilityProbe {
+    pub(crate) available: bool,
+    pub(crate) errno: Option<i32>,
 }
 
 impl CapabilityProbe {
-    const fn available() -> Self {
+    pub(crate) const fn available() -> Self {
         Self {
             available: true,
             errno: None,
         }
     }
 
-    const fn unavailable(errno: Option<i32>) -> Self {
+    pub(crate) const fn unavailable(errno: Option<i32>) -> Self {
         Self {
             available: false,
             errno,
@@ -25,18 +25,19 @@ impl CapabilityProbe {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct HostCapabilities {
-    target_os: &'static str,
-    target_arch: &'static str,
-    sandbox_target_supported: bool,
-    landlock_abi: Option<u32>,
-    landlock_errno: Option<i32>,
-    pidfd_open: CapabilityProbe,
-    timerfd_monotonic: CapabilityProbe,
-    cgroup_v2: bool,
+    pub(crate) target_os: &'static str,
+    pub(crate) target_arch: &'static str,
+    pub(crate) sandbox_target_supported: bool,
+    pub(crate) landlock_abi: Option<u32>,
+    pub(crate) landlock_errno: Option<i32>,
+    pub(crate) pidfd_open: CapabilityProbe,
+    pub(crate) timerfd_monotonic: CapabilityProbe,
+    pub(crate) eventfd: CapabilityProbe,
+    pub(crate) cgroup_v2: bool,
 }
 
 pub(crate) fn probe() -> HostCapabilities {
-    let (landlock_abi, landlock_errno, pidfd_open, timerfd_monotonic, cgroup_v2) =
+    let (landlock_abi, landlock_errno, pidfd_open, timerfd_monotonic, eventfd, cgroup_v2) =
         platform_probes();
     HostCapabilities {
         target_os: std::env::consts::OS,
@@ -46,6 +47,7 @@ pub(crate) fn probe() -> HostCapabilities {
         landlock_errno,
         pidfd_open,
         timerfd_monotonic,
+        eventfd,
         cgroup_v2,
     }
 }
@@ -68,6 +70,8 @@ impl HostCapabilities {
         push_probe_json(&mut output, self.pidfd_open);
         output.push_str(",\"timerfd_monotonic\":");
         push_probe_json(&mut output, self.timerfd_monotonic);
+        output.push_str(",\"eventfd\":");
+        push_probe_json(&mut output, self.eventfd);
         output.push_str(",\"cgroup_v2\":{\"present\":");
         output.push_str(bool_json(self.cgroup_v2));
         output.push_str("}}}");
@@ -101,6 +105,7 @@ impl HostCapabilities {
         }
         push_probe_human(&mut output, "pidfd-open", self.pidfd_open);
         push_probe_human(&mut output, "timerfd-monotonic", self.timerfd_monotonic);
+        push_probe_human(&mut output, "eventfd", self.eventfd);
         writeln!(
             &mut output,
             "cgroup-v2: {}",
@@ -161,6 +166,7 @@ fn platform_probes() -> (
     Option<i32>,
     CapabilityProbe,
     CapabilityProbe,
+    CapabilityProbe,
     bool,
 ) {
     const LANDLOCK_CREATE_RULESET_VERSION: u32 = 1;
@@ -185,11 +191,15 @@ fn platform_probes() -> (
     let timerfd_result = unsafe { libc::timerfd_create(libc::CLOCK_MONOTONIC, libc::TFD_CLOEXEC) };
     let timerfd_monotonic = fd_probe(timerfd_result as libc::c_long);
 
+    let eventfd_result = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
+    let eventfd = fd_probe(eventfd_result as libc::c_long);
+
     (
         landlock_abi,
         landlock_errno,
         pidfd_open,
         timerfd_monotonic,
+        eventfd,
         Path::new("/sys/fs/cgroup/cgroup.controllers").is_file(),
     )
 }
@@ -200,11 +210,13 @@ fn platform_probes() -> (
     Option<i32>,
     CapabilityProbe,
     CapabilityProbe,
+    CapabilityProbe,
     bool,
 ) {
     (
         None,
         None,
+        CapabilityProbe::unavailable(None),
         CapabilityProbe::unavailable(None),
         CapabilityProbe::unavailable(None),
         false,
@@ -239,6 +251,7 @@ mod tests {
             landlock_errno: None,
             pidfd_open: CapabilityProbe::available(),
             timerfd_monotonic: CapabilityProbe::unavailable(Some(38)),
+            eventfd: CapabilityProbe::available(),
             cgroup_v2: true,
         }
     }
@@ -247,7 +260,7 @@ mod tests {
     fn serializes_capability_snapshot_without_implying_policy_preflight() {
         assert_eq!(
             fixture().to_json(),
-            "{\"ok\":true,\"host\":{\"kind\":\"runtime_capabilities\",\"policy_preflight\":false,\"target_os\":\"linux\",\"target_arch\":\"x86_64\",\"sandbox_target_supported\":true,\"landlock\":{\"abi\":7,\"errno\":null},\"pidfd_open\":{\"available\":true,\"errno\":null},\"timerfd_monotonic\":{\"available\":false,\"errno\":38},\"cgroup_v2\":{\"present\":true}}}"
+            "{\"ok\":true,\"host\":{\"kind\":\"runtime_capabilities\",\"policy_preflight\":false,\"target_os\":\"linux\",\"target_arch\":\"x86_64\",\"sandbox_target_supported\":true,\"landlock\":{\"abi\":7,\"errno\":null},\"pidfd_open\":{\"available\":true,\"errno\":null},\"timerfd_monotonic\":{\"available\":false,\"errno\":38},\"eventfd\":{\"available\":true,\"errno\":null},\"cgroup_v2\":{\"present\":true}}}"
         );
     }
 
@@ -255,7 +268,7 @@ mod tests {
     fn formats_human_capability_snapshot_with_probe_errors() {
         assert_eq!(
             fixture().to_human(),
-            "host-capabilities:\ntarget: linux/x86_64\nsandbox-target-supported: true\nlandlock-abi: 7\npidfd-open: available\ntimerfd-monotonic: unavailable (errno=38)\ncgroup-v2: present\npolicy-preflight: false\n"
+            "host-capabilities:\ntarget: linux/x86_64\nsandbox-target-supported: true\nlandlock-abi: 7\npidfd-open: available\ntimerfd-monotonic: unavailable (errno=38)\neventfd: available\ncgroup-v2: present\npolicy-preflight: false\n"
         );
     }
 }

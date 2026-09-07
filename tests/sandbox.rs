@@ -880,6 +880,33 @@ fn private_procfs_reflects_only_the_sandbox_pid_namespace() {
 }
 
 #[test]
+fn private_procfs_seals_pid1_control_descriptors_during_supervision() {
+    let host_pid = process::id();
+    assert!(
+        host_pid > 2,
+        "host test process must not collide with namespace PID 1/2"
+    );
+    let host_proc_path = format!("/proc/{host_pid}");
+    let cancellation = CancellationToken::new().expect("create procfs control token");
+    let mut isolated = policy(
+        "j",
+        &[host_proc_path.as_str()],
+        &["execveat", "newfstatat", "openat", "close", "exit"],
+    );
+    isolated.procfs_enabled = true;
+    isolated.wall_clock_milliseconds = Some(5000);
+
+    let report = run_report_with_cancel(&isolated, &cancellation)
+        .expect("private procfs control-boundary sandbox run");
+    assert_eq!(report.outcome, ChildOutcome::Exited(0));
+    assert_eq!(report.reaped_descendants, 0);
+    assert!(
+        report.enforcement.private_procfs,
+        "runtime receipt must require both procfs mount and PID1 access hardening"
+    );
+}
+
+#[test]
 fn selected_nonstdio_handle_is_exposed_only_at_declared_destination() {
     let mut pipe = [-1; 2];
     assert_eq!(

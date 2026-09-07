@@ -151,6 +151,7 @@ mod x86_64 {
     const PHASE_OUTPUT_LIMIT_POLL: u32 = 55;
     const PHASE_TIME_OFFSETS: u32 = 56;
     const PHASE_PROCFS_MOUNT: u32 = 57;
+    const PHASE_PROCFS_PID1_HARDEN: u32 = 58;
 
     const SYS_LANDLOCK_CREATE_RULESET: libc::c_long = 444;
     const SYS_LANDLOCK_ADD_RULE: libc::c_long = 445;
@@ -2968,6 +2969,19 @@ mod x86_64 {
         {
             child_fail(launch_error, PHASE_PROCFS_MOUNT, error_exit_syscall);
         }
+
+        // A private procfs intentionally exposes namespace PID 1 metadata. Do
+        // not also expose PID 1's launcher-owned descriptor table as a route
+        // back to cancellation/deadline/pidfd control objects. Setting PID 1
+        // non-dumpable before the direct target is forked makes procfs apply
+        // the kernel's ptrace-access credential gate to /proc/1/fd.
+        if libc::syscall(libc::SYS_prctl, libc::PR_SET_DUMPABLE, 0, 0, 0, 0) == -1 {
+            child_fail(launch_error, PHASE_PROCFS_PID1_HARDEN, error_exit_syscall);
+        }
+
+        // This receipt bit represents the complete private-procfs boundary:
+        // both the PID-namespace proc mount and the PID1 descriptor-access
+        // hardening have succeeded.
         mark_enforcement(launch_error, ENFORCEMENT_PRIVATE_PROCFS);
     }
 
@@ -3424,6 +3438,7 @@ mod x86_64 {
             PHASE_OUTPUT_LIMIT_POLL => "stdout output-limit supervision poll",
             PHASE_TIME_OFFSETS => "time namespace offset installation",
             PHASE_PROCFS_MOUNT => "private procfs mount in PID namespace",
+            PHASE_PROCFS_PID1_HARDEN => "private procfs PID1 descriptor-access hardening",
             _ => "unknown launch phase",
         };
         format!(

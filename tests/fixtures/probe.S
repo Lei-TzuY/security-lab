@@ -25,6 +25,7 @@
 #   m prove Landlock narrows regular-file mutation inside scratch and a writable persistent volume
 #   h prove Landlock narrows directory/symlink/reparent topology mutation
 #   i prove private procfs exposes namespace PID 1/2 while hiding a trusted host PID
+#   j prove private procfs keeps PID1 metadata visible but seals PID1 control descriptors
 #   s prove Landlock allows declared TCP bind/connect ports and denies undeclared ports
 #   a connect selected fd 9 to argv[2] in the abstract UNIX socket namespace
 #   d prove Landlock device ioctl allows /devices/urandom and denies /devices/random
@@ -96,6 +97,8 @@ _start:
     je .landlock_path_topology_mutation
     cmp $105, %al
     je .private_procfs
+    cmp $106, %al
+    je .private_procfs_control_boundary
     cmp $115, %al
     je .landlock_tcp_ports
     cmp $97, %al
@@ -366,6 +369,87 @@ _start:
 .private_procfs_fail:
     add $160, %rsp
     jmp .fail29
+
+.private_procfs_control_boundary:
+    mov 24(%rsp), %r12
+    test %r12, %r12
+    je .fail48
+    sub $160, %rsp
+
+    # Preserve positive PID-namespace evidence while exercising the stronger
+    # control-plane boundary under real deadline/cancellation supervision.
+    mov $262, %eax
+    mov $-100, %edi
+    lea proc_pid1_path(%rip), %rsi
+    mov %rsp, %rdx
+    xor %r10d, %r10d
+    syscall
+    test %rax, %rax
+    js .private_procfs_control_fail
+
+    mov $262, %eax
+    mov $-100, %edi
+    lea proc_pid2_path(%rip), %rsi
+    mov %rsp, %rdx
+    xor %r10d, %r10d
+    syscall
+    test %rax, %rax
+    js .private_procfs_control_fail
+
+    mov $262, %eax
+    mov $-100, %edi
+    mov %r12, %rsi
+    mov %rsp, %rdx
+    xor %r10d, %r10d
+    syscall
+    cmp $-2, %rax
+    jne .private_procfs_control_fail
+
+    # PID1 metadata is deliberately not claimed secret.  status remains a
+    # readable observability surface even though its fd table must be sealed.
+    mov $257, %eax
+    mov $-100, %edi
+    lea proc_pid1_status_path(%rip), %rsi
+    mov $524288, %edx
+    xor %r10d, %r10d
+    syscall
+    test %rax, %rax
+    js .private_procfs_control_fail
+    mov %rax, %r13
+    mov $3, %eax
+    mov %r13, %rdi
+    syscall
+    test %rax, %rax
+    js .private_procfs_control_fail
+
+    # PR_SET_DUMPABLE=0 on launcher-owned PID1 must make the descriptor
+    # directory itself fail the procfs ptrace-access gate with EACCES.  This is
+    # stronger than enumerating entries and hoping individual reopen attempts
+    # fail for object-type-specific reasons.
+    mov $257, %eax
+    mov $-100, %edi
+    lea proc_pid1_fd_path(%rip), %rsi
+    mov $589824, %edx
+    xor %r10d, %r10d
+    syscall
+    cmp $-13, %rax
+    jne .private_procfs_control_unexpected_fd_access
+
+    add $160, %rsp
+    xor %edi, %edi
+    jmp .exit
+
+.private_procfs_control_unexpected_fd_access:
+    test %rax, %rax
+    js .private_procfs_control_fail
+    mov %rax, %r13
+    mov $3, %eax
+    mov %r13, %rdi
+    syscall
+
+.private_procfs_control_fail:
+    add $160, %rsp
+    jmp .fail48
 
 .selected_handle:
     mov 24(%rsp), %rdi
@@ -2312,6 +2396,9 @@ _start:
     jmp .exit
 .fail47:
     mov $47, %edi
+    jmp .exit
+.fail48:
+    mov $48, %edi
 
 .exit:
     mov $60, %eax
@@ -2484,5 +2571,9 @@ proc_pid1_path:
     .asciz "/proc/1"
 proc_pid2_path:
     .asciz "/proc/2"
+proc_pid1_status_path:
+    .asciz "/proc/1/status"
+proc_pid1_fd_path:
+    .asciz "/proc/1/fd"
 
 .section .note.GNU-stack,"",@progbits

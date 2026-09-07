@@ -40,7 +40,7 @@ working_dir = /work
 stdio.stdin = closed
 stdio.stdout = capture
 stdio.stdout_capture_bytes = 1024
-stdio.stdout_total_bytes = 4096
+limit.stdout_total_bytes = 4096
 stdio.stderr = inherit
 handle.9 = 200
 limit.cpu_seconds = 2
@@ -76,7 +76,10 @@ fn manifest_json_is_deterministic_redacted_and_static() {
     assert_eq!(second.status.code(), Some(0));
     assert!(first.stderr.is_empty());
     assert!(second.stderr.is_empty());
-    assert_eq!(first.stdout, second.stdout, "manifest output must be deterministic");
+    assert_eq!(
+        first.stdout, second.stdout,
+        "manifest output must be deterministic"
+    );
 
     let stdout = String::from_utf8(first.stdout).expect("manifest JSON is UTF-8");
     assert!(stdout.starts_with(
@@ -138,9 +141,9 @@ fn manifest_json_rejects_invalid_policy_fail_closed() {
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stderr.is_empty());
     let stdout = String::from_utf8(output.stdout).expect("manifest error JSON is UTF-8");
-    assert!(stdout.starts_with(
-        "{\"ok\":false,\"error\":{\"kind\":\"policy_rejected\",\"message\":"
-    ));
+    assert!(
+        stdout.starts_with("{\"ok\":false,\"error\":{\"kind\":\"policy_rejected\",\"message\":")
+    );
     assert!(stdout.ends_with("}}\n"));
 }
 

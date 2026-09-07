@@ -190,8 +190,7 @@ pub(crate) fn to_json(policy: &SandboxPolicy) -> String {
     write!(&mut output, "{}", policy.limits.address_space_bytes)
         .expect("write to String cannot fail");
     output.push_str(",\"file_size_bytes\":");
-    write!(&mut output, "{}", policy.limits.file_size_bytes)
-        .expect("write to String cannot fail");
+    write!(&mut output, "{}", policy.limits.file_size_bytes).expect("write to String cannot fail");
     output.push_str(",\"open_files\":");
     write!(&mut output, "{}", policy.limits.open_files).expect("write to String cannot fail");
     output.push_str(",\"wall_clock_milliseconds\":");
@@ -259,7 +258,8 @@ pub(crate) fn to_human(policy: &SandboxPolicy) -> String {
     let mut output = String::new();
     writeln!(&mut output, "policy-authority-manifest:").expect("write to String cannot fail");
     writeln!(&mut output, "runtime-preflight: false").expect("write to String cannot fail");
-    writeln!(&mut output, "root: {}", policy.root_dir.display()).expect("write to String cannot fail");
+    writeln!(&mut output, "root: {}", policy.root_dir.display())
+        .expect("write to String cannot fail");
     writeln!(&mut output, "executable: {}", policy.executable.display())
         .expect("write to String cannot fail");
     writeln!(&mut output, "working-dir: {}", policy.working_dir.display())
@@ -387,12 +387,7 @@ fn stdio_mode_name(mode: StdioMode) -> &'static str {
     }
 }
 
-fn push_volume(
-    output: &mut String,
-    source: Option<&Path>,
-    target: Option<&Path>,
-    access: &str,
-) {
+fn push_volume(output: &mut String, source: Option<&Path>, target: Option<&Path>, access: &str) {
     match (source, target) {
         (Some(source), Some(target)) => {
             output.push_str("{\"access\":");

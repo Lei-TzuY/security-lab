@@ -1,6 +1,7 @@
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command};
 
@@ -43,6 +44,29 @@ fn static_only_policy() -> (String, PathBuf) {
     );
     let replacement = format!("filesystem.root = {}", root.display());
     (text.replace(needle, &replacement), root)
+}
+
+fn preflight_policy(label: &str) -> (String, PathBuf) {
+    let root = std::env::temp_dir().join(format!(
+        "security-lab-cli-preflight-root-{}-{label}",
+        process::id()
+    ));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("bin")).expect("create preflight bin directory");
+    fs::create_dir_all(root.join("work")).expect("create preflight work directory");
+    let executable = root.join("bin/probe");
+    fs::write(&executable, b"preflight-only-not-executed\n").expect("write preflight executable");
+    let mut permissions = fs::metadata(&executable)
+        .expect("stat preflight executable")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&executable, permissions).expect("chmod preflight executable");
+
+    let policy = format!(
+        "filesystem.root = {}\nidentity.hostname = preflight\nexecutable = /bin/probe\nworking_dir = /work\nstdio.stdin = closed\nstdio.stdout = capture\nstdio.stdout_capture_bytes = 4096\nstdio.stderr = closed\nlimit.cpu_seconds = 1\nlimit.address_space_bytes = 67108864\nlimit.file_size_bytes = 1048576\nlimit.open_files = 32\nseccomp.allow = execveat,exit\n",
+        root.display()
+    );
+    (policy, root)
 }
 
 fn binary() -> &'static str {
@@ -204,7 +228,8 @@ fn check_json_reports_policy_errors_as_json() {
 
 #[test]
 fn preflight_json_remains_indeterminate_without_mandatory_core_probe() {
-    let (policy, missing_root) = static_only_policy();
+    let (policy, root) =
+        preflight_policy("preflight_json_remains_indeterminate_without_mandatory_core_probe");
     let policy = format!(
         "{policy}\nlandlock.scope_signal = enabled\nlimit.wall_clock_milliseconds = 5000\nlimit.stdout_total_bytes = 8192\n"
     );
@@ -232,15 +257,16 @@ fn preflight_json_remains_indeterminate_without_mandatory_core_probe() {
     assert!(stdout.contains("\"stdout_output_limit\":{\"status\":\"supported\""));
     assert!(stdout.contains("\"eventfd\":{\"available\":true,\"errno\":null}"));
     assert!(stdout.contains("\"time_namespace\":{\"status\":\"not_requested\",\"reason\":null}"));
-    assert!(
-        !missing_root.exists(),
-        "preflight must not materialize runtime root state"
+    assert_eq!(
+        fs::read(root.join("bin/probe")).expect("read preflight executable after probe"),
+        b"preflight-only-not-executed\n"
     );
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
 fn preflight_json_marks_requested_time_namespace_unprobed() {
-    let (policy, missing_root) = static_only_policy();
+    let (policy, root) = preflight_policy("preflight_json_marks_requested_time_namespace_unprobed");
     let policy =
         format!("{policy}\ntime.monotonic_offset_seconds = 1\ntime.boottime_offset_seconds = 2\n");
     let path = write_policy("preflight-time-unprobed", &policy);
@@ -263,15 +289,16 @@ fn preflight_json_marks_requested_time_namespace_unprobed() {
     assert!(stdout.contains(
         "\"time_namespace\":{\"status\":\"unprobed\",\"reason\":\"independent_safe_probe_not_implemented\"}"
     ));
-    assert!(
-        !missing_root.exists(),
-        "indeterminate preflight must not launch the sandbox"
+    assert_eq!(
+        fs::read(root.join("bin/probe")).expect("read time-preflight executable after probe"),
+        b"preflight-only-not-executed\n"
     );
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
 fn preflight_human_report_exposes_partial_scope() {
-    let (policy, missing_root) = static_only_policy();
+    let (policy, root) = preflight_policy("preflight_human_report_exposes_partial_scope");
     let path = write_policy("preflight-human", &policy);
     let output = Command::new(binary())
         .args(["preflight", path.to_str().expect("UTF-8 temp policy path")])
@@ -289,7 +316,11 @@ fn preflight_human_report_exposes_partial_scope() {
         "mandatory-launch-core: unprobed (mandatory_runtime_prerequisites_not_probed)\n"
     ));
     assert!(stdout.contains("time-namespace: not_requested\n"));
-    assert!(!missing_root.exists());
+    assert_eq!(
+        fs::read(root.join("bin/probe")).expect("read human-preflight executable after probe"),
+        b"preflight-only-not-executed\n"
+    );
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]

@@ -20,6 +20,7 @@ jobs:
         run: |
           python3 .github/tmp-28a-generator-fix.py
           python3 .github/tmp-28a-multi-volume.py
+          python3 .github/tmp-28a-post-materialize-fix.py
       - name: Format
         run: cargo fmt --all
       - name: Enable user namespace capability tests
@@ -38,6 +39,7 @@ jobs:
         run: |
           rm .github/tmp-28a-multi-volume.py
           rm .github/tmp-28a-generator-fix.py
+          rm .github/tmp-28a-post-materialize-fix.py
           rm .github/workflows/tmp-28a-multi-volume.yml
           git config user.name LeiZ
           git config user.email 52287354+Lei-TzuY@users.noreply.github.com

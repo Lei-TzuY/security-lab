@@ -1,4 +1,4 @@
-use security_lab::{SandboxPolicy, StdioMode};
+use security_lab::{PersistentVolumeAccess, PersistentVolumePolicy, SandboxPolicy, StdioMode};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
@@ -181,13 +181,9 @@ pub(crate) fn compare(baseline: &SandboxPolicy, candidate: &SandboxPolicy) -> Au
         &mut changes,
     );
 
-    push_change(
-        "filesystem.persistent_volumes",
-        subset_relation(
-            map_is_subset(&baseline.persistent_volumes, &candidate.persistent_volumes),
-            map_is_subset(&candidate.persistent_volumes, &baseline.persistent_volumes),
-            true,
-        ),
+    compare_persistent_volumes(
+        &baseline.persistent_volumes,
+        &candidate.persistent_volumes,
         &mut changes,
     );
 
@@ -486,6 +482,45 @@ fn compare_stdio(
         DeltaClass::Incomparable
     };
     push_change(field, class, changes);
+}
+
+fn compare_persistent_volumes(
+    baseline: &BTreeMap<String, PersistentVolumePolicy>,
+    candidate: &BTreeMap<String, PersistentVolumePolicy>,
+    changes: &mut Vec<Change>,
+) {
+    let mut class = DeltaClass::Unchanged;
+
+    for (name, baseline_volume) in baseline {
+        let relation = match candidate.get(name) {
+            None => DeltaClass::Reduced,
+            Some(candidate_volume) => compare_persistent_volume(baseline_volume, candidate_volume),
+        };
+        class = combine_classes(class, relation);
+    }
+
+    for name in candidate.keys() {
+        if !baseline.contains_key(name) {
+            class = combine_classes(class, DeltaClass::Widened);
+        }
+    }
+
+    push_change("filesystem.persistent_volumes", class, changes);
+}
+
+fn compare_persistent_volume(
+    baseline: &PersistentVolumePolicy,
+    candidate: &PersistentVolumePolicy,
+) -> DeltaClass {
+    if baseline.source != candidate.source || baseline.target != candidate.target {
+        return DeltaClass::Incomparable;
+    }
+
+    match (baseline.access, candidate.access) {
+        (PersistentVolumeAccess::Writable, PersistentVolumeAccess::ReadOnly) => DeltaClass::Reduced,
+        (PersistentVolumeAccess::ReadOnly, PersistentVolumeAccess::Writable) => DeltaClass::Widened,
+        _ => DeltaClass::Unchanged,
+    }
 }
 
 fn compare_selected_handles(

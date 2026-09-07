@@ -55,19 +55,16 @@ jobs:
               gid_t gid = getegid();
               printf("before_unshare_groups=%d uid=%u gid=%u\n", getgroups(0, NULL), (unsigned)uid, (unsigned)gid);
               if (unshare(CLONE_NEWUSER) != 0) { perror("unshare userns"); return 20; }
-
               errno = 0;
               int rc_before = setgroups(0, NULL);
               printf("setgroups_before_gid_map_rc=%d errno=%d (%s)\n", rc_before, errno, strerror(errno));
               if (rc_before != -1 || errno != EPERM) return 21;
-
               char uid_map[64], gid_map[64];
               snprintf(uid_map, sizeof(uid_map), "0 %u 1\n", (unsigned)uid);
               snprintf(gid_map, sizeof(gid_map), "0 %u 1\n", (unsigned)gid);
               write_file("/proc/self/setgroups", "deny\n");
               write_file("/proc/self/uid_map", uid_map);
               write_file("/proc/self/gid_map", gid_map);
-
               errno = 0;
               int rc_after = setgroups(0, NULL);
               printf("setgroups_after_deny_and_gid_map_rc=%d errno=%d (%s)\n", rc_after, errno, strerror(errno));
@@ -78,10 +75,8 @@ jobs:
           EOF
           cc -Wall -Wextra -Werror -O2 /tmp/self_group_probe.c -o /tmp/self_group_probe
           /tmp/self_group_probe
-      - name: Prove parent-assisted helper mapping can clear groups
+      - name: Prove minimal parent-assisted mapping can clear groups
         run: |
-          SUBUID_START=$(awk -F: '$1=="runner" {print $2; exit}' /etc/subuid)
-          SUBGID_START=$(awk -F: '$1=="runner" {print $2; exit}' /etc/subgid)
           cat > /tmp/helper_group_probe.c <<'EOF'
           #define _GNU_SOURCE
           #include <errno.h>
@@ -95,33 +90,26 @@ jobs:
           #include <sys/wait.h>
           #include <unistd.h>
 
-          static int run_helper(const char *helper, pid_t target, const char *inside0,
-                                const char *outside0, const char *inside1,
-                                const char *outside1) {
+          static int run_helper(const char *helper, pid_t target, const char *outside0) {
               pid_t pid = fork();
               if (pid < 0) { perror("fork helper"); exit(30); }
               if (pid == 0) {
                   char target_s[32];
                   snprintf(target_s, sizeof(target_s), "%d", target);
-                  execl(helper, helper, target_s,
-                        inside0, outside0, "1",
-                        inside1, outside1, "1", (char *)NULL);
+                  execl(helper, helper, target_s, "0", outside0, "1", (char *)NULL);
                   perror(helper);
                   _exit(127);
               }
               int status = 0;
               if (waitpid(pid, &status, 0) != pid) { perror("waitpid helper"); exit(31); }
-              if (!WIFEXITED(status)) return 128;
-              return WEXITSTATUS(status);
+              return WIFEXITED(status) ? WEXITSTATUS(status) : 128;
           }
 
-          int main(int argc, char **argv) {
-              if (argc != 3) return 40;
+          int main(void) {
               uid_t uid = geteuid();
               gid_t gid = getegid();
               int ready[2], mapped[2];
               if (pipe(ready) || pipe(mapped)) { perror("pipe"); return 41; }
-
               pid_t child = fork();
               if (child < 0) { perror("fork child"); return 42; }
               if (child == 0) {
@@ -130,47 +118,40 @@ jobs:
                   char one = 'R';
                   if (write(ready[1], &one, 1) != 1) _exit(51);
                   if (read(mapped[0], &one, 1) != 1) _exit(52);
-
                   FILE *f = fopen("/proc/self/setgroups", "re");
                   char state[32] = {0};
                   if (!f || !fgets(state, sizeof(state), f)) _exit(53);
                   if (f) fclose(f);
                   printf("child_setgroups_state=%s", state);
-
                   errno = 0;
                   int rc = setgroups(0, NULL);
-                  printf("child_setgroups_clear_rc=%d errno=%d (%s)\n", rc, errno, strerror(errno));
                   int remaining = getgroups(0, NULL);
-                  printf("child_remaining_groups=%d euid=%u egid=%u\n", remaining,
+                  printf("child_setgroups_clear_rc=%d errno=%d (%s) remaining=%d euid=%u egid=%u\n",
+                         rc, errno, strerror(errno), remaining,
                          (unsigned)geteuid(), (unsigned)getegid());
                   fflush(stdout);
                   if (rc != 0 || remaining != 0 || geteuid() != 0 || getegid() != 0) _exit(54);
                   _exit(0);
               }
-
               close(ready[1]); close(mapped[0]);
               char one;
-              if (read(ready[0], &one, 1) != 1) { perror("parent ready read"); return 60; }
-
+              if (read(ready[0], &one, 1) != 1) return 60;
               char uid_s[32], gid_s[32];
               snprintf(uid_s, sizeof(uid_s), "%u", (unsigned)uid);
               snprintf(gid_s, sizeof(gid_s), "%u", (unsigned)gid);
-              int uid_rc = run_helper("/usr/bin/newuidmap", child, "0", uid_s, "1", argv[1]);
-              int gid_rc = run_helper("/usr/bin/newgidmap", child, "0", gid_s, "1", argv[2]);
-              printf("newuidmap_rc=%d newgidmap_rc=%d child=%d\n", uid_rc, gid_rc, child);
+              int uid_rc = run_helper("/usr/bin/newuidmap", child, uid_s);
+              int gid_rc = run_helper("/usr/bin/newgidmap", child, gid_s);
+              printf("minimal_newuidmap_rc=%d minimal_newgidmap_rc=%d child=%d\n", uid_rc, gid_rc, child);
               fflush(stdout);
               if (uid_rc != 0 || gid_rc != 0) { kill(child, SIGKILL); waitpid(child, NULL, 0); return 61; }
               one = 'M';
-              if (write(mapped[1], &one, 1) != 1) { perror("parent mapped write"); return 62; }
+              if (write(mapped[1], &one, 1) != 1) return 62;
               int status = 0;
-              if (waitpid(child, &status, 0) != child) { perror("waitpid child"); return 63; }
-              if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-                  fprintf(stderr, "child_status=%d\n", status);
-                  return 64;
-              }
-              puts("parent_assisted_group_clear_confirmed");
+              if (waitpid(child, &status, 0) != child) return 63;
+              if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) return 64;
+              puts("minimal_parent_assisted_group_clear_confirmed");
               return 0;
           }
           EOF
           cc -Wall -Wextra -Werror -O2 /tmp/helper_group_probe.c -o /tmp/helper_group_probe
-          /tmp/helper_group_probe "$SUBUID_START" "$SUBGID_START"
+          /tmp/helper_group_probe

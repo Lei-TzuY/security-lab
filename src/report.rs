@@ -68,6 +68,9 @@ pub struct EnforcementReceipt {
     pub readonly_root: bool,
     pub chroot: bool,
     pub fd_sanitization: bool,
+    /// A fresh procfs was mounted by launcher-owned namespace PID 1 after
+    /// entering the sandbox PID namespace and before the direct target fork.
+    pub private_procfs: bool,
     pub rlimits: bool,
     pub capabilities_reduced: bool,
     pub no_new_privs: bool,

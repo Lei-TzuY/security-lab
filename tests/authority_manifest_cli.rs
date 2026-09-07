@@ -33,6 +33,7 @@ fn manifest_policy(root: &Path) -> String {
     format!(
         r#"filesystem.root = {}
 identity.hostname = manifest-test
+filesystem.proc = enabled
 executable = /bin/probe
 arg = super-secret-argument
 env.SECRET_TOKEN = top-secret-value
@@ -88,6 +89,7 @@ fn manifest_json_is_deterministic_redacted_and_static() {
         "{\"ok\":true,\"manifest\":{\"kind\":\"static_authority\",\"runtime_preflight\":false,\"identity\":{\"hostname\":\"manifest-test\""
     ));
     assert!(stdout.contains("\"argument_count\":1,\"environment_keys\":[\"SECRET_TOKEN\"]"));
+    assert!(stdout.contains("\"private_procfs\":true"));
     assert!(stdout.contains("\"selected\":[{\"target_fd\":9,\"source_fd\":200}]"));
     assert!(stdout.contains(
         "\"masked\":[{\"syscall\":\"lseek\",\"argument\":1,\"mask\":\"0x0000000000000001\",\"value\":\"0x0000000000000000\"}]"
@@ -121,6 +123,7 @@ fn manifest_human_summarizes_authority_without_secret_values() {
     let stdout = String::from_utf8(output.stdout).expect("manifest human output is UTF-8");
     assert!(stdout.starts_with("policy-authority-manifest:\nruntime-preflight: false\n"));
     assert!(stdout.contains("arguments: 1\n"));
+    assert!(stdout.contains("private-procfs: enabled\n"));
     assert!(stdout.contains("environment-keys: SECRET_TOKEN\n"));
     assert!(stdout.contains("stdio: stdin=closed stdout=capture stderr=inherit\n"));
     assert!(stdout.contains("selected-handles: 1\n"));

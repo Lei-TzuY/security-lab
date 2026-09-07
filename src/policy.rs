@@ -123,6 +123,9 @@ pub struct SandboxPolicy {
     /// Whether the launcher activates `lo` inside the isolated network namespace.
     /// This does not attach the namespace to any host or external network.
     pub loopback_enabled: bool,
+    /// Whether launcher-owned namespace PID 1 mounts a fresh procfs at `/proc`
+    /// after entering the sandbox PID namespace and before the direct target exists.
+    pub procfs_enabled: bool,
     /// Optional launcher-brokered TCP connection to host 127.0.0.1. The port
     /// and target descriptor must be specified together.
     pub host_loopback_tcp_port: Option<u16>,
@@ -231,6 +234,28 @@ impl SandboxPolicy {
         validate_hostname(&self.hostname)?;
         validate_absolute_path("executable", &self.executable)?;
         validate_absolute_path("working_dir", &self.working_dir)?;
+
+        if self.procfs_enabled {
+            let proc_path = Path::new("/proc");
+            if self.executable.starts_with(proc_path) || self.working_dir.starts_with(proc_path) {
+                return Err(PolicyError::new(
+                    "filesystem.proc must not hide the executable or working_dir",
+                ));
+            }
+            for (path, label) in [
+                (&self.scratch_dir, "filesystem.scratch"),
+                (&self.readonly_volume_target, "volume.readonly_target"),
+                (&self.writable_volume_target, "volume.writable_target"),
+            ] {
+                if let Some(path) = path {
+                    if path.starts_with(proc_path) || proc_path.starts_with(path) {
+                        return Err(PolicyError::new(format!(
+                            "filesystem.proc must not overlap {label}"
+                        )));
+                    }
+                }
+            }
+        }
 
         if self.landlock_read_execute.len() > MAX_LANDLOCK_READ_EXECUTE_PATHS {
             return Err(PolicyError::new(format!(
@@ -1054,6 +1079,7 @@ impl FromStr for SandboxPolicy {
         let mut landlock_scope_abstract_unix_socket = None;
         let mut landlock_scope_signal = None;
         let mut loopback_enabled = None;
+        let mut procfs_enabled = None;
         let mut host_loopback_tcp_port = None;
         let mut host_loopback_tcp_target_fd = None;
         let mut host_ipv4_tcp_address = None;
@@ -1130,6 +1156,12 @@ impl FromStr for SandboxPolicy {
                 )?,
                 "network.loopback" => set_once(
                     &mut loopback_enabled,
+                    parse_enabled_disabled(value, line_no, key)?,
+                    line_no,
+                    key,
+                )?,
+                "filesystem.proc" => set_once(
+                    &mut procfs_enabled,
                     parse_enabled_disabled(value, line_no, key)?,
                     line_no,
                     key,
@@ -1501,6 +1533,7 @@ impl FromStr for SandboxPolicy {
                 .unwrap_or(false),
             landlock_scope_signal: landlock_scope_signal.unwrap_or(false),
             loopback_enabled: loopback_enabled.unwrap_or(false),
+            procfs_enabled: procfs_enabled.unwrap_or(false),
             host_loopback_tcp_port,
             host_loopback_tcp_target_fd,
             host_ipv4_tcp_address,
@@ -1793,6 +1826,7 @@ mod tests {
         assert_eq!(policy.root_dir, PathBuf::from("/"));
         assert_eq!(policy.hostname, "security-lab");
         assert!(!policy.loopback_enabled);
+        assert!(!policy.procfs_enabled);
         assert_eq!(policy.host_loopback_tcp_port, None);
         assert_eq!(policy.host_loopback_tcp_target_fd, None);
         assert_eq!(policy.host_ipv4_tcp_address, None);
@@ -2095,6 +2129,39 @@ mod tests {
 
         let duplicate = format!("{VALID}\nnetwork.loopback = enabled\nnetwork.loopback = disabled");
         assert!(duplicate.parse::<SandboxPolicy>().is_err());
+    }
+
+    #[test]
+    fn parses_private_procfs_mode() {
+        let enabled: SandboxPolicy = format!("{VALID}\nfilesystem.proc = enabled")
+            .parse()
+            .unwrap();
+        assert!(enabled.procfs_enabled);
+
+        let disabled: SandboxPolicy = format!("{VALID}\nfilesystem.proc = disabled")
+            .parse()
+            .unwrap();
+        assert!(!disabled.procfs_enabled);
+    }
+
+    #[test]
+    fn rejects_invalid_duplicate_or_overlapping_private_procfs() {
+        let invalid = format!("{VALID}\nfilesystem.proc = host");
+        assert!(invalid.parse::<SandboxPolicy>().is_err());
+
+        let duplicate = format!("{VALID}\nfilesystem.proc = enabled\nfilesystem.proc = disabled");
+        assert!(duplicate.parse::<SandboxPolicy>().is_err());
+
+        let hides_cwd = VALID.replace("working_dir = /tmp", "working_dir = /proc/self");
+        let hides_cwd = format!("{hides_cwd}\nfilesystem.proc = enabled");
+        assert!(hides_cwd.parse::<SandboxPolicy>().is_err());
+
+        let overlaps_scratch = VALID.replace(
+            "filesystem.scratch = /scratch",
+            "filesystem.scratch = /proc",
+        );
+        let overlaps_scratch = format!("{overlaps_scratch}\nfilesystem.proc = enabled");
+        assert!(overlaps_scratch.parse::<SandboxPolicy>().is_err());
     }
 
     #[test]

@@ -97,6 +97,33 @@ fn added_syscall_is_detected_as_authority_widening() {
 }
 
 #[test]
+fn forbidden_seccomp_mask_is_modeled_as_a_restriction() {
+    let root = unique_absent_root("deny-mask");
+    let baseline_text = base_policy(&root).replace(
+        "seccomp.allow = execveat,exit",
+        "seccomp.allow = execveat,mmap,exit",
+    );
+    let restricted_text = format!(
+        "{baseline_text}seccomp.deny_mask.mmap.2 = 0x6:0x6
+"
+    );
+    let baseline = TempPolicy::new("baseline", &baseline_text);
+    let restricted = TempPolicy::new("restricted", &restricted_text);
+
+    let reduced = run_json(&baseline, &restricted);
+    assert_eq!(reduced.status.code(), Some(0));
+    let stdout = String::from_utf8(reduced.stdout).expect("utf8 output");
+    assert!(stdout.contains(r#""status":"reduced""#));
+    assert!(stdout.contains(r#""field":"seccomp.forbidden_masks","class":"reduced""#));
+
+    let widened = run_json(&restricted, &baseline);
+    assert_eq!(widened.status.code(), Some(5));
+    let stdout = String::from_utf8(widened.stdout).expect("utf8 output");
+    assert!(stdout.contains(r#""status":"widened""#));
+    assert!(stdout.contains(r#""field":"seccomp.forbidden_masks","class":"widened""#));
+}
+
+#[test]
 fn lower_resource_ceiling_is_detected_as_reduction() {
     let root = unique_absent_root("reduce");
     let baseline_text = base_policy(&root);

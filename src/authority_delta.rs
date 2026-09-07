@@ -504,6 +504,7 @@ fn compare_seccomp(baseline: &SandboxPolicy, candidate: &SandboxPolicy, changes:
 
     let mut masked = DeltaClass::Unchanged;
     let mut ranges = DeltaClass::Unchanged;
+    let mut forbidden_masks = DeltaClass::Unchanged;
     for syscall in baseline_allowed.intersection(candidate_allowed) {
         masked = combine_classes(
             masked,
@@ -519,9 +520,17 @@ fn compare_seccomp(baseline: &SandboxPolicy, candidate: &SandboxPolicy, changes:
                 candidate.seccomp.argument_range_rules.get(syscall),
             ),
         );
+        forbidden_masks = combine_classes(
+            forbidden_masks,
+            compare_rule_map(
+                baseline.seccomp.argument_forbidden_mask_rules.get(syscall),
+                candidate.seccomp.argument_forbidden_mask_rules.get(syscall),
+            ),
+        );
     }
     push_change("seccomp.masked_arguments", masked, changes);
     push_change("seccomp.argument_ranges", ranges, changes);
+    push_change("seccomp.forbidden_masks", forbidden_masks, changes);
 }
 
 fn compare_rule_map<V: PartialEq>(

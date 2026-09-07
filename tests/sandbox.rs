@@ -332,6 +332,7 @@ fn policy(mode: &str, extra_args: &[&str], syscalls: &[&str]) -> SandboxPolicy {
             allowed_syscalls: syscall_set(syscalls),
             argument_rules: BTreeMap::new(),
             argument_range_rules: BTreeMap::new(),
+            argument_forbidden_mask_rules: BTreeMap::new(),
         },
     }
 }
@@ -1340,6 +1341,25 @@ fn uts_namespace_uses_policy_hostname_without_changing_host() {
         "sandbox UTS hostname changed host hostname"
     );
     assert_eq!(result.unwrap(), ChildOutcome::Exited(0));
+}
+
+#[test]
+fn seccomp_forbidden_mask_denies_wx_without_blocking_rw_or_rx() {
+    let mut filtered = policy("k", &[], &["execveat", "mmap", "munmap", "exit"]);
+    let mut mmap_rules = BTreeMap::new();
+    mmap_rules.insert(
+        2,
+        SeccompArgRule {
+            mask: 0x6,
+            value: 0x6,
+        },
+    );
+    filtered
+        .seccomp
+        .argument_forbidden_mask_rules
+        .insert("mmap".to_owned(), mmap_rules);
+
+    assert_eq!(run(&filtered).unwrap(), ChildOutcome::Exited(0));
 }
 
 #[test]

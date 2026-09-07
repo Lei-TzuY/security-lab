@@ -53,6 +53,7 @@ limit.open_files = 32
 seccomp.allow = execveat,lseek,read,write,exit
 seccomp.arg.lseek.1 = 0x1:0x0
 seccomp.range.lseek.1 = 4:16
+seccomp.deny_mask.lseek.2 = 0x6:0x6
 "#,
         root.display()
     )
@@ -97,6 +98,9 @@ fn manifest_json_is_deterministic_redacted_and_static() {
     assert!(stdout.contains(
         "\"ranges\":[{\"syscall\":\"lseek\",\"argument\":1,\"minimum\":\"0x0000000000000004\",\"maximum\":\"0x0000000000000010\"}]"
     ));
+    assert!(stdout.contains(
+        "\"deny_mask\":[{\"syscall\":\"lseek\",\"argument\":2,\"mask\":\"0x0000000000000006\",\"value\":\"0x0000000000000006\"}]"
+    ));
     assert!(stdout.contains("\"stdout_capture_bytes\":1024,\"stdout_total_bytes\":4096,\"time_namespace\":{\"monotonic_offset_seconds\":3600,\"boottime_offset_seconds\":7200}"));
     assert!(!stdout.contains("super-secret-argument"));
     assert!(!stdout.contains("top-secret-value"));
@@ -127,7 +131,7 @@ fn manifest_human_summarizes_authority_without_secret_values() {
     assert!(stdout.contains("environment-keys: SECRET_TOKEN\n"));
     assert!(stdout.contains("stdio: stdin=closed stdout=capture stderr=inherit\n"));
     assert!(stdout.contains("selected-handles: 1\n"));
-    assert!(stdout.contains("seccomp: allow=5 masked=1 ranges=1\n"));
+    assert!(stdout.contains("seccomp: allow=5 masked=1 ranges=1 deny-mask=1\n"));
     assert!(stdout
         .contains("time-namespace: monotonic-offset-seconds=3600 boottime-offset-seconds=7200\n"));
     assert!(stdout.contains("stdout-capture-bytes=1024 stdout-total-bytes=4096\n"));

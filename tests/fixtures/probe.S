@@ -9,6 +9,7 @@
 #   A allowed write
 #   B assert 64-bit masked seccomp argument filtering on lseek offset
 #   y assert unsigned 64-bit inclusive seccomp range filtering on lseek offset
+#   k assert a forbidden masked seccomp pattern allows RW/RX mmap and denies RWX
 #   G assert one selected non-stdio handle is remapped without ambient FD leakage
 #   c fork a descendant, publish cancellation readiness on fd 9, then pause
 #   g fork a paused descendant and continuously emit stdout until launcher output budget terminates the tree
@@ -111,6 +112,8 @@ _start:
     je .pidfd_signal_denied
     cmp $121, %al
     je .seccomp_argument_range
+    cmp $107, %al
+    je .seccomp_forbidden_mask
     cmp $70, %al
     je .forbidden
     cmp $69, %al
@@ -201,6 +204,60 @@ _start:
     syscall
     test %rax, %rax
     js .fail3
+    xor %edi, %edi
+    jmp .exit
+
+.seccomp_forbidden_mask:
+    # RW mapping must remain allowed.
+    mov $9, %eax
+    xor %edi, %edi
+    mov $4096, %esi
+    mov $3, %edx
+    mov $0x22, %r10d
+    mov $-1, %r8
+    xor %r9d, %r9d
+    syscall
+    test %rax, %rax
+    js .fail29
+    mov %rax, %r12
+    mov $11, %eax
+    mov %r12, %rdi
+    mov $4096, %esi
+    syscall
+    test %rax, %rax
+    js .fail29
+
+    # RX mapping must remain allowed.
+    mov $9, %eax
+    xor %edi, %edi
+    mov $4096, %esi
+    mov $5, %edx
+    mov $0x22, %r10d
+    mov $-1, %r8
+    xor %r9d, %r9d
+    syscall
+    test %rax, %rax
+    js .fail29
+    mov %rax, %r12
+    mov $11, %eax
+    mov %r12, %rdi
+    mov $4096, %esi
+    syscall
+    test %rax, %rax
+    js .fail29
+
+    # W+X must be denied by the seccomp forbidden-mask rule with exact EPERM.
+    mov $9, %eax
+    xor %edi, %edi
+    mov $4096, %esi
+    mov $7, %edx
+    mov $0x22, %r10d
+    mov $-1, %r8
+    xor %r9d, %r9d
+    syscall
+    cmp $-1, %rax
+    jne .fail29
+
     xor %edi, %edi
     jmp .exit
 

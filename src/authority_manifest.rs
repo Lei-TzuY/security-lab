@@ -264,6 +264,25 @@ pub(crate) fn to_json(policy: &SandboxPolicy) -> String {
             output.push('}');
         }
     }
+    output.push_str("],\"deny_mask\":[");
+    first = true;
+    for (syscall, rules) in &policy.seccomp.argument_forbidden_mask_rules {
+        for (argument, rule) in rules {
+            if !first {
+                output.push(',');
+            }
+            first = false;
+            output.push_str("{\"syscall\":");
+            push_json_string(&mut output, syscall);
+            output.push_str(",\"argument\":");
+            write!(&mut output, "{argument}").expect("write to String cannot fail");
+            output.push_str(",\"mask\":");
+            push_hex_u64(&mut output, rule.mask);
+            output.push_str(",\"value\":");
+            push_hex_u64(&mut output, rule.value);
+            output.push('}');
+        }
+    }
     output.push_str("]}}");
 
     output.push('}');
@@ -367,7 +386,7 @@ pub(crate) fn to_human(policy: &SandboxPolicy) -> String {
     }
     writeln!(
         &mut output,
-        "seccomp: allow={} masked={} ranges={}",
+        "seccomp: allow={} masked={} ranges={} deny-mask={}",
         policy.seccomp.allowed_syscalls.len(),
         policy
             .seccomp
@@ -378,6 +397,12 @@ pub(crate) fn to_human(policy: &SandboxPolicy) -> String {
         policy
             .seccomp
             .argument_range_rules
+            .values()
+            .map(|rules| rules.len())
+            .sum::<usize>(),
+        policy
+            .seccomp
+            .argument_forbidden_mask_rules
             .values()
             .map(|rules| rules.len())
             .sum::<usize>()

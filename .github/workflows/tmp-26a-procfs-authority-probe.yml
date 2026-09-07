@@ -1,0 +1,225 @@
+name: probe procfs control-plane visibility
+
+on:
+  push:
+    branches: [tmp-26a-procfs-authority-probe]
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Enable unprivileged user namespaces for sandbox probe
+        run: |
+          if [ -e /proc/sys/kernel/unprivileged_userns_clone ]; then
+            sudo sysctl -w kernel.unprivileged_userns_clone=1
+          fi
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - name: Compile namespace procfs authority probe
+        run: |
+          cat > /tmp/procfs-authority-probe.c <<'EOF'
+          #define _GNU_SOURCE
+          #include <errno.h>
+          #include <fcntl.h>
+          #include <linux/capability.h>
+          #include <sched.h>
+          #include <signal.h>
+          #include <stdbool.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <sys/eventfd.h>
+          #include <sys/mount.h>
+          #include <sys/prctl.h>
+          #include <sys/stat.h>
+          #include <sys/syscall.h>
+          #include <sys/timerfd.h>
+          #include <sys/types.h>
+          #include <sys/wait.h>
+          #include <unistd.h>
+
+          static void fail(const char *what) {
+              fprintf(stderr, "%s: %s\n", what, strerror(errno));
+              exit(2);
+          }
+
+          static void write_text(const char *path, const char *text) {
+              int fd = open(path, O_WRONLY | O_CLOEXEC);
+              if (fd < 0) fail(path);
+              size_t len = strlen(text);
+              if (write(fd, text, len) != (ssize_t)len) fail("write mapping");
+              close(fd);
+          }
+
+          static void clear_caps(void) {
+              struct __user_cap_header_struct hdr = {
+                  .version = _LINUX_CAPABILITY_VERSION_3,
+                  .pid = 0,
+              };
+              struct __user_cap_data_struct data[2];
+              memset(data, 0, sizeof(data));
+              if (syscall(SYS_capset, &hdr, data) < 0) fail("capset zero");
+              if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) fail("PR_SET_NO_NEW_PRIVS");
+          }
+
+          static void report_open(const char *label, const char *path, int flags) {
+              errno = 0;
+              int fd = open(path, flags | O_CLOEXEC);
+              int saved = errno;
+              printf("OPEN %-20s fd=%d errno=%d(%s)\n", label, fd, saved,
+                     saved ? strerror(saved) : "ok");
+              if (fd >= 0) close(fd);
+          }
+
+          static void report_link(const char *label, const char *path) {
+              char buf[512];
+              errno = 0;
+              ssize_t n = readlink(path, buf, sizeof(buf) - 1);
+              int saved = errno;
+              if (n >= 0) buf[n] = '\0';
+              printf("LINK %-20s n=%zd errno=%d(%s) target=%s\n", label, n, saved,
+                     saved ? strerror(saved) : "ok", n >= 0 ? buf : "-");
+          }
+
+          static int run_probe(bool nondumpable) {
+              uid_t outer_uid = getuid();
+              gid_t outer_gid = getgid();
+              if (unshare(CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWPID) < 0)
+                  fail("unshare user/mount/pid");
+
+              if (access("/proc/self/setgroups", F_OK) == 0)
+                  write_text("/proc/self/setgroups", "deny\n");
+              char map[128];
+              snprintf(map, sizeof(map), "0 %u 1\n", (unsigned)outer_uid);
+              write_text("/proc/self/uid_map", map);
+              snprintf(map, sizeof(map), "0 %u 1\n", (unsigned)outer_gid);
+              write_text("/proc/self/gid_map", map);
+              if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) < 0)
+                  fail("make mounts private");
+
+              char mountpoint[128];
+              snprintf(mountpoint, sizeof(mountpoint), "/tmp/proc-authority-%ld", (long)getpid());
+              if (mkdir(mountpoint, 0700) < 0 && errno != EEXIST) fail("mkdir proc mountpoint");
+
+              pid_t init = fork();
+              if (init < 0) fail("fork pid1");
+              if (init == 0) {
+                  if (getpid() != 1) {
+                      fprintf(stderr, "expected namespace PID1, got %ld\n", (long)getpid());
+                      _exit(3);
+                  }
+                  if (mount("proc", mountpoint, "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL) < 0)
+                      fail("mount private procfs");
+
+                  int efd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+                  if (efd < 0) fail("eventfd");
+                  int tfd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
+                  if (tfd < 0) fail("timerfd");
+                  int pipefd[2];
+                  if (pipe2(pipefd, O_CLOEXEC | O_NONBLOCK) < 0) fail("pipe2");
+                  int regular = open("/etc/hostname", O_RDONLY | O_CLOEXEC);
+                  if (regular < 0) fail("open regular control fixture");
+
+                  if (nondumpable && prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) < 0)
+                      fail("PR_SET_DUMPABLE=0");
+                  int dumpable = prctl(PR_GET_DUMPABLE, 0, 0, 0, 0);
+                  printf("PID1 mode=%s uid=%u gid=%u dumpable=%d fds event=%d timer=%d pipe_r=%d pipe_w=%d regular=%d\n",
+                         nondumpable ? "nondumpable" : "default",
+                         (unsigned)getuid(), (unsigned)getgid(), dumpable,
+                         efd, tfd, pipefd[0], pipefd[1], regular);
+                  fflush(stdout);
+
+                  pid_t target = fork();
+                  if (target < 0) fail("fork pid2");
+                  if (target == 0) {
+                      if (getpid() != 2) {
+                          fprintf(stderr, "expected namespace PID2, got %ld\n", (long)getpid());
+                          _exit(4);
+                      }
+                      clear_caps();
+                      printf("PID2 uid=%u gid=%u dumpable=%d\n", (unsigned)getuid(), (unsigned)getgid(),
+                             prctl(PR_GET_DUMPABLE, 0, 0, 0, 0));
+
+                      int fds[] = {efd, tfd, pipefd[0], pipefd[1], regular};
+                      const char *labels[] = {"eventfd", "timerfd", "pipe-read", "pipe-write", "regular"};
+                      for (size_t i = 0; i < sizeof(fds)/sizeof(fds[0]); ++i) {
+                          char path[256];
+                          snprintf(path, sizeof(path), "%s/1/fd/%d", mountpoint, fds[i]);
+                          report_link(labels[i], path);
+                          report_open(labels[i], path, O_RDONLY);
+                          report_open(labels[i], path, O_RDWR);
+                      }
+
+                      char path[256];
+                      const char *sensitive[] = {"environ", "cmdline", "status", "maps", "mem", "root", "cwd", "fd"};
+                      for (size_t i = 0; i < sizeof(sensitive)/sizeof(sensitive[0]); ++i) {
+                          snprintf(path, sizeof(path), "%s/1/%s", mountpoint, sensitive[i]);
+                          int flags = (!strcmp(sensitive[i], "root") || !strcmp(sensitive[i], "cwd"))
+                              ? (O_PATH | O_DIRECTORY) : (!strcmp(sensitive[i], "fd") ? (O_RDONLY | O_DIRECTORY) : O_RDONLY);
+                          report_open(sensitive[i], path, flags);
+                      }
+
+                      #ifdef SYS_pidfd_open
+                      errno = 0;
+                      int pfd = syscall(SYS_pidfd_open, 1, 0);
+                      int pe = errno;
+                      printf("PIDFD_OPEN pid1 fd=%d errno=%d(%s)\n", pfd, pe, pe ? strerror(pe) : "ok");
+                      #ifdef SYS_pidfd_getfd
+                      if (pfd >= 0) {
+                          errno = 0;
+                          int copied = syscall(SYS_pidfd_getfd, pfd, efd, 0);
+                          int ce = errno;
+                          printf("PIDFD_GETFD eventfd fd=%d errno=%d(%s)\n", copied, ce, ce ? strerror(ce) : "ok");
+                          if (copied >= 0) close(copied);
+                          close(pfd);
+                      }
+                      #endif
+                      #endif
+                      fflush(stdout);
+                      _exit(0);
+                  }
+
+                  int status = 0;
+                  if (waitpid(target, &status, 0) < 0) fail("wait pid2");
+                  umount2(mountpoint, MNT_DETACH);
+                  close(regular);
+                  close(pipefd[0]);
+                  close(pipefd[1]);
+                  close(tfd);
+                  close(efd);
+                  _exit(WIFEXITED(status) ? WEXITSTATUS(status) : 5);
+              }
+
+              int status = 0;
+              if (waitpid(init, &status, 0) < 0) fail("wait pid1");
+              rmdir(mountpoint);
+              return WIFEXITED(status) ? WEXITSTATUS(status) : 6;
+          }
+
+          int main(int argc, char **argv) {
+              bool nondumpable = argc > 1 && strcmp(argv[1], "nondumpable") == 0;
+              return run_probe(nondumpable);
+          }
+          EOF
+          cc -O2 -Wall -Wextra -Werror -o /tmp/procfs-authority-probe /tmp/procfs-authority-probe.c
+      - name: Probe current default PID1 procfs visibility
+        run: /tmp/procfs-authority-probe default
+      - name: Probe non-dumpable PID1 procfs visibility
+        run: /tmp/procfs-authority-probe nondumpable
+      - name: Remove temporary workflow from probe branch
+        if: always()
+        run: |
+          rm .github/workflows/tmp-26a-procfs-authority-probe.yml
+          git config user.name LeiZ
+          git config user.email 52287354+Lei-TzuY@users.noreply.github.com
+          git add -A
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: remove procfs authority probe workflow"
+            git push origin HEAD:tmp-26a-procfs-authority-probe
+          fi

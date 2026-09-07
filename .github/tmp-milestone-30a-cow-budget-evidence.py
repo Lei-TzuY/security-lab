@@ -28,6 +28,12 @@ replace_one(
     ".fail48_cow_stack:\n    add $32, %rsp\n    jmp .fail48\n\n.copy_on_write_root_capacity:\n    sub $4096, %rsp\n    mov $257, %eax\n    mov $-100, %edi\n    lea cow_capacity_path(%rip), %rsi\n    mov $577, %edx\n    mov $384, %r10d\n    syscall\n    test %rax, %rax\n    js .fail48_cow_capacity_stack\n    mov %rax, %r12\n    xor %r13d, %r13d\n\n.copy_on_write_root_capacity_write:\n    mov $1, %eax\n    mov %r12, %rdi\n    mov %rsp, %rsi\n    mov $4096, %edx\n    syscall\n    cmp $-28, %rax\n    je .copy_on_write_root_capacity_full\n    test %rax, %rax\n    jle .fail48_cow_capacity_close\n    add %rax, %r13\n    cmp $65536, %r13\n    ja .fail48_cow_capacity_close\n    jmp .copy_on_write_root_capacity_write\n\n.copy_on_write_root_capacity_full:\n    mov $3, %eax\n    mov %r12, %rdi\n    syscall\n    test %rax, %rax\n    js .fail48_cow_capacity_stack\n    add $4096, %rsp\n    xor %edi, %edi\n    jmp .exit\n\n.fail48_cow_capacity_close:\n    mov $3, %eax\n    mov %r12, %rdi\n    syscall\n.fail48_cow_capacity_stack:\n    add $4096, %rsp\n    jmp .fail48\n\n.forbidden:",
     "raw fixture COW budget oracle",
 )
+replace_one(
+    "tests/fixtures/probe.S",
+    "cow_new_path:\n    .asciz \"/cow-new\"\ncow_lower_original:",
+    "cow_new_path:\n    .asciz \"/cow-new\"\ncow_capacity_path:\n    .asciz \"/cow-capacity\"\ncow_lower_original:",
+    "raw fixture COW budget pathname",
+)
 
 replace_one(
     "tests/sandbox.rs",

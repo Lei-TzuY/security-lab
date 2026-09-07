@@ -1,0 +1,242 @@
+name: probe detached fd-safe overlayfs root
+
+on:
+  push:
+    branches: [tmp-27a-overlayfs-capability-probe]
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Enable unprivileged user namespace capability tests
+        run: |
+          if [ -e /proc/sys/kernel/unprivileged_userns_clone ]; then
+            sudo sysctl -w kernel.unprivileged_userns_clone=1
+          fi
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - name: Build exact mount-API probe
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/security-lab-detached-overlay-probe.c <<'EOF'
+          #define _GNU_SOURCE
+          #include <errno.h>
+          #include <fcntl.h>
+          #include <linux/mount.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <sys/mount.h>
+          #include <sys/stat.h>
+          #include <sys/syscall.h>
+          #include <unistd.h>
+
+          #ifndef AT_EMPTY_PATH
+          #define AT_EMPTY_PATH 0x1000
+          #endif
+          #ifndef AT_RECURSIVE
+          #define AT_RECURSIVE 0x8000
+          #endif
+          #ifndef OPEN_TREE_CLONE
+          #define OPEN_TREE_CLONE 1
+          #endif
+          #ifndef OPEN_TREE_CLOEXEC
+          #define OPEN_TREE_CLOEXEC O_CLOEXEC
+          #endif
+          #ifndef MOVE_MOUNT_F_EMPTY_PATH
+          #define MOVE_MOUNT_F_EMPTY_PATH 0x00000004
+          #endif
+          #ifndef MOVE_MOUNT_T_EMPTY_PATH
+          #define MOVE_MOUNT_T_EMPTY_PATH 0x00000040
+          #endif
+          #ifndef FSOPEN_CLOEXEC
+          #define FSOPEN_CLOEXEC 0x00000001
+          #endif
+          #ifndef FSMOUNT_CLOEXEC
+          #define FSMOUNT_CLOEXEC 0x00000001
+          #endif
+          #ifndef FSCONFIG_SET_STRING
+          #define FSCONFIG_SET_STRING 1
+          #endif
+          #ifndef FSCONFIG_CMD_CREATE
+          #define FSCONFIG_CMD_CREATE 6
+          #endif
+          #ifndef MOUNT_ATTR_RDONLY
+          #define MOUNT_ATTR_RDONLY 0x00000001
+          #endif
+          #ifndef MOUNT_ATTR_NOSUID
+          #define MOUNT_ATTR_NOSUID 0x00000002
+          #endif
+          #ifndef MOUNT_ATTR_NODEV
+          #define MOUNT_ATTR_NODEV 0x00000004
+          #endif
+          #ifndef MOUNT_ATTR_NOEXEC
+          #define MOUNT_ATTR_NOEXEC 0x00000008
+          #endif
+
+          static void die(const char *what) {
+              fprintf(stderr, "%s: errno=%d (%s)\n", what, errno, strerror(errno));
+              exit(1);
+          }
+
+          static void fd_path(char *out, size_t cap, int fd) {
+              int n = snprintf(out, cap, "/proc/self/fd/%d", fd);
+              if (n < 0 || (size_t)n >= cap) exit(90);
+          }
+
+          static void expect_text(int dfd, const char *path, const char *expected) {
+              int fd = openat(dfd, path, O_RDONLY | O_CLOEXEC);
+              if (fd < 0) die(path);
+              char buf[128];
+              ssize_t n = read(fd, buf, sizeof(buf));
+              if (n < 0) die("read");
+              close(fd);
+              size_t want = strlen(expected);
+              if ((size_t)n != want || memcmp(buf, expected, want) != 0) {
+                  fprintf(stderr, "%s content mismatch\n", path);
+                  exit(2);
+              }
+          }
+
+          static int make_detached_tmpfs(void) {
+              int fsfd = syscall(SYS_fsopen, "tmpfs", FSOPEN_CLOEXEC);
+              if (fsfd < 0) die("fsopen tmpfs");
+              if (syscall(SYS_fsconfig, fsfd, FSCONFIG_SET_STRING, "size", "16777216", 0) < 0)
+                  die("fsconfig tmpfs size");
+              if (syscall(SYS_fsconfig, fsfd, FSCONFIG_SET_STRING, "mode", "0700", 0) < 0)
+                  die("fsconfig tmpfs mode");
+              if (syscall(SYS_fsconfig, fsfd, FSCONFIG_CMD_CREATE, NULL, NULL, 0) < 0)
+                  die("fsconfig tmpfs create");
+              int mfd = syscall(SYS_fsmount, fsfd, FSMOUNT_CLOEXEC,
+                  MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV | MOUNT_ATTR_NOEXEC);
+              if (mfd < 0) die("fsmount tmpfs");
+              close(fsfd);
+              return mfd;
+          }
+
+          int main(int argc, char **argv) {
+              if (argc != 3) return 64;
+              const char *lower_pathname = argv[1];
+              const char *merged_pathname = argv[2];
+              if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) < 0)
+                  die("private mount propagation");
+
+              int lower_pin = open(lower_pathname, O_PATH | O_DIRECTORY | O_CLOEXEC);
+              if (lower_pin < 0) die("pin lower");
+              int lower_tree = syscall(SYS_open_tree, lower_pin, ".",
+                  OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC | AT_RECURSIVE);
+              if (lower_tree < 0) die("open_tree lower clone");
+              struct mount_attr ro = { .attr_set = MOUNT_ATTR_RDONLY };
+              if (syscall(SYS_mount_setattr, lower_tree, "", AT_EMPTY_PATH | AT_RECURSIVE,
+                          &ro, sizeof(ro)) < 0)
+                  die("mount_setattr readonly lower");
+
+              int state = make_detached_tmpfs();
+              if (mkdirat(state, "upper", 0700) < 0) die("mkdir upper");
+              if (mkdirat(state, "work", 0700) < 0) die("mkdir work");
+              int upper = openat(state, "upper", O_PATH | O_DIRECTORY | O_CLOEXEC);
+              if (upper < 0) die("open upper");
+              int work = openat(state, "work", O_PATH | O_DIRECTORY | O_CLOEXEC);
+              if (work < 0) die("open work");
+
+              char lower_path[64], upper_path[64], work_path[64];
+              fd_path(lower_path, sizeof(lower_path), lower_tree);
+              fd_path(upper_path, sizeof(upper_path), upper);
+              fd_path(work_path, sizeof(work_path), work);
+
+              int overlay_fs = syscall(SYS_fsopen, "overlay", FSOPEN_CLOEXEC);
+              if (overlay_fs < 0) die("fsopen overlay");
+              if (syscall(SYS_fsconfig, overlay_fs, FSCONFIG_SET_STRING,
+                          "lowerdir", lower_path, 0) < 0)
+                  die("fsconfig overlay lowerdir");
+              if (syscall(SYS_fsconfig, overlay_fs, FSCONFIG_SET_STRING,
+                          "upperdir", upper_path, 0) < 0)
+                  die("fsconfig overlay upperdir");
+              if (syscall(SYS_fsconfig, overlay_fs, FSCONFIG_SET_STRING,
+                          "workdir", work_path, 0) < 0)
+                  die("fsconfig overlay workdir");
+              if (syscall(SYS_fsconfig, overlay_fs, FSCONFIG_CMD_CREATE,
+                          NULL, NULL, 0) < 0)
+                  die("fsconfig overlay create");
+              int overlay = syscall(SYS_fsmount, overlay_fs, FSMOUNT_CLOEXEC, 0);
+              if (overlay < 0) die("fsmount overlay");
+              close(overlay_fs);
+
+              expect_text(overlay, "base", "lower-original\n");
+              expect_text(overlay, "dir/child", "lower-child\n");
+              int fd = openat(overlay, "base", O_WRONLY | O_TRUNC | O_CLOEXEC);
+              if (fd < 0) die("copy-up base");
+              const char replacement[] = "overlay-replaced\n";
+              if (write(fd, replacement, sizeof(replacement)-1) != (ssize_t)(sizeof(replacement)-1))
+                  die("write replacement");
+              close(fd);
+              fd = openat(overlay, "new", O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+              if (fd < 0) die("create new");
+              const char added[] = "overlay-new\n";
+              if (write(fd, added, sizeof(added)-1) != (ssize_t)(sizeof(added)-1))
+                  die("write new");
+              close(fd);
+              if (unlinkat(overlay, "dir/child", 0) < 0) die("whiteout child");
+
+              expect_text(overlay, "base", "overlay-replaced\n");
+              expect_text(overlay, "new", "overlay-new\n");
+              expect_text(lower_tree, "base", "lower-original\n");
+              expect_text(lower_tree, "dir/child", "lower-child\n");
+              expect_text(upper, "base", "overlay-replaced\n");
+              expect_text(upper, "new", "overlay-new\n");
+
+              int target = open(merged_pathname, O_PATH | O_DIRECTORY | O_CLOEXEC);
+              if (target < 0) die("open pinned overlay target");
+              if (syscall(SYS_move_mount, overlay, "", target, "",
+                          MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_EMPTY_PATH) < 0)
+                  die("move_mount overlay to pinned target");
+
+              expect_text(overlay, "base", "overlay-replaced\n");
+              close(target);
+              close(work);
+              close(upper);
+              close(state);
+              close(lower_tree);
+              close(lower_pin);
+              close(overlay);
+              puts("RESULT: detached recursive readonly lower + detached bounded tmpfs upper/work + fsopen/fsconfig/fsmount OverlayFS + move_mount pinned target all work unprivileged.");
+              return 0;
+          }
+          EOF
+          cc -std=c11 -Wall -Wextra -Werror -O2 /tmp/security-lab-detached-overlay-probe.c -o /tmp/security-lab-detached-overlay-probe
+      - name: Exercise exact production mount architecture
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(id -u)" -ne 0
+          base="$(mktemp -d /tmp/security-lab-detached-overlay.XXXXXX)"
+          mkdir -p "$base/lower/dir" "$base/merged"
+          printf 'lower-original\n' > "$base/lower/base"
+          printf 'lower-child\n' > "$base/lower/dir/child"
+          lower_base_hash="$(sha256sum "$base/lower/base" | awk '{print $1}')"
+          lower_child_hash="$(sha256sum "$base/lower/dir/child" | awk '{print $1}')"
+
+          unshare --user --map-root-user --mount -- \
+            /tmp/security-lab-detached-overlay-probe "$base/lower" "$base/merged"
+
+          test "$(sha256sum "$base/lower/base" | awk '{print $1}')" = "$lower_base_hash"
+          test "$(sha256sum "$base/lower/dir/child" | awk '{print $1}')" = "$lower_child_hash"
+          test "$(cat "$base/lower/base")" = "lower-original"
+          test "$(cat "$base/lower/dir/child")" = "lower-child"
+          test ! -e "$base/lower/new"
+          rm -rf "$base"
+      - name: Remove probe workflow
+        if: always()
+        run: |
+          rm .github/workflows/tmp-27a-overlayfs-capability-probe.yml
+          git config user.name LeiZ
+          git config user.email 52287354+Lei-TzuY@users.noreply.github.com
+          git add -A
+          git commit -m "chore: clean detached overlayfs probe" || exit 0
+          git push origin HEAD:tmp-27a-overlayfs-capability-probe

@@ -60,6 +60,7 @@ mod x86_64 {
     const MOVE_MOUNT_T_EMPTY_PATH: libc::c_uint = 0x0000_0040;
     const MOUNT_ATTR_RDONLY: u64 = 0x0000_0001;
     const EXECVEAT_AT_EMPTY_PATH: libc::c_int = 0x1000;
+    const CLONE_NEWTIME: libc::c_int = 0x0000_0080;
 
     const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
     const PR_CAPBSET_DROP: libc::c_int = 24;
@@ -121,6 +122,7 @@ mod x86_64 {
     const PHASE_PROCESS_TREE_USAGE: u32 = 53;
     const PHASE_OUTPUT_LIMIT_PIDFD: u32 = 54;
     const PHASE_OUTPUT_LIMIT_POLL: u32 = 55;
+    const PHASE_TIME_OFFSETS: u32 = 56;
 
     const SYS_LANDLOCK_CREATE_RULESET: libc::c_long = 444;
     const SYS_LANDLOCK_ADD_RULE: libc::c_long = 445;
@@ -736,6 +738,8 @@ mod x86_64 {
         uid_map: Vec<u8>,
         gid_map: Vec<u8>,
         hostname: Vec<u8>,
+        time_monotonic_offset: Option<Vec<u8>>,
+        time_boottime_offset: Option<Vec<u8>>,
         loopback_enabled: bool,
     }
 
@@ -1087,6 +1091,21 @@ mod x86_64 {
             let uid_map = format!("0 {} 1\n", unsafe { libc::geteuid() }).into_bytes();
             let gid_map = format!("0 {} 1\n", unsafe { libc::getegid() }).into_bytes();
             let hostname = policy.hostname.as_bytes().to_vec();
+            let (time_monotonic_offset, time_boottime_offset) = match (
+                policy.time_monotonic_offset_seconds,
+                policy.time_boottime_offset_seconds,
+            ) {
+                (Some(monotonic), Some(boottime)) => (
+                    Some(format!("monotonic {monotonic} 0\n").into_bytes()),
+                    Some(format!("boottime {boottime} 0\n").into_bytes()),
+                ),
+                (None, None) => (None, None),
+                _ => {
+                    return Err(SandboxError::InvalidPolicy(PolicyError::new(
+                        "time.monotonic_offset_seconds and time.boottime_offset_seconds must be specified together",
+                    )));
+                }
+            };
 
             Ok(Self {
                 root_fd,
@@ -1118,6 +1137,8 @@ mod x86_64 {
                 uid_map,
                 gid_map,
                 hostname,
+                time_monotonic_offset,
+                time_boottime_offset,
                 loopback_enabled: policy.loopback_enabled,
             })
         }
@@ -2137,16 +2158,16 @@ mod x86_64 {
             );
         }
 
-        if libc::syscall(
-            libc::SYS_unshare,
-            libc::CLONE_NEWUSER
-                | libc::CLONE_NEWNS
-                | libc::CLONE_NEWPID
-                | libc::CLONE_NEWNET
-                | libc::CLONE_NEWIPC
-                | libc::CLONE_NEWUTS,
-        ) == -1
-        {
+        let mut namespace_flags = libc::CLONE_NEWUSER
+            | libc::CLONE_NEWNS
+            | libc::CLONE_NEWPID
+            | libc::CLONE_NEWNET
+            | libc::CLONE_NEWIPC
+            | libc::CLONE_NEWUTS;
+        if prepared.time_monotonic_offset.is_some() {
+            namespace_flags |= CLONE_NEWTIME;
+        }
+        if libc::syscall(libc::SYS_unshare, namespace_flags) == -1 {
             child_fail(launch_error, PHASE_NAMESPACE, seccomp.error_exit_syscall);
         }
 
@@ -2171,6 +2192,26 @@ mod x86_64 {
             PHASE_GID_MAP,
             seccomp.error_exit_syscall,
         );
+
+        if let (Some(monotonic), Some(boottime)) = (
+            &prepared.time_monotonic_offset,
+            &prepared.time_boottime_offset,
+        ) {
+            write_proc_file_or_fail(
+                b"/proc/self/timens_offsets\0",
+                monotonic,
+                launch_error,
+                PHASE_TIME_OFFSETS,
+                seccomp.error_exit_syscall,
+            );
+            write_proc_file_or_fail(
+                b"/proc/self/timens_offsets\0",
+                boottime,
+                launch_error,
+                PHASE_TIME_OFFSETS,
+                seccomp.error_exit_syscall,
+            );
+        }
 
         if libc::syscall(
             libc::SYS_sethostname,
@@ -3109,6 +3150,7 @@ mod x86_64 {
             PHASE_PROCESS_TREE_USAGE => "process-tree resource usage collection",
             PHASE_OUTPUT_LIMIT_PIDFD => "stdout output-limit pidfd supervision",
             PHASE_OUTPUT_LIMIT_POLL => "stdout output-limit supervision poll",
+            PHASE_TIME_OFFSETS => "time namespace offset installation",
             _ => "unknown launch phase",
         };
         format!(

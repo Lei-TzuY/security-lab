@@ -199,6 +199,20 @@ pub(crate) fn to_json(policy: &SandboxPolicy) -> String {
     push_optional_u64(&mut output, policy.stdout_capture_bytes);
     output.push_str(",\"stdout_total_bytes\":");
     push_optional_u64(&mut output, policy.stdout_total_bytes);
+    output.push_str(",\"time_namespace\":");
+    match (
+        policy.time_monotonic_offset_seconds,
+        policy.time_boottime_offset_seconds,
+    ) {
+        (Some(monotonic), Some(boottime)) => {
+            output.push_str("{\"monotonic_offset_seconds\":");
+            write!(&mut output, "{monotonic}").expect("write to String cannot fail");
+            output.push_str(",\"boottime_offset_seconds\":");
+            write!(&mut output, "{boottime}").expect("write to String cannot fail");
+            output.push('}');
+        }
+        _ => output.push_str("null"),
+    }
     output.push('}');
 
     output.push_str(",\"seccomp\":{\"allow\":[");
@@ -327,6 +341,18 @@ pub(crate) fn to_human(policy: &SandboxPolicy) -> String {
         policy.landlock_scope_abstract_unix_socket
     )
     .expect("write to String cannot fail");
+    match (
+        policy.time_monotonic_offset_seconds,
+        policy.time_boottime_offset_seconds,
+    ) {
+        (Some(monotonic), Some(boottime)) => writeln!(
+            &mut output,
+            "time-namespace: monotonic-offset-seconds={monotonic} boottime-offset-seconds={boottime}"
+        )
+        .expect("write to String cannot fail"),
+        _ => writeln!(&mut output, "time-namespace: none")
+            .expect("write to String cannot fail"),
+    }
     writeln!(
         &mut output,
         "seccomp: allow={} masked={} ranges={}",

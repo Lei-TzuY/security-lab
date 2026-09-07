@@ -199,6 +199,96 @@ fn check_json_reports_policy_errors_as_json() {
 }
 
 #[test]
+fn preflight_json_remains_indeterminate_without_mandatory_core_probe() {
+    let (policy, missing_root) = static_only_policy();
+    let policy = format!(
+        "{policy}\nlandlock.scope_signal = enabled\nlimit.wall_clock_milliseconds = 5000\nlimit.stdout_total_bytes = 8192\n"
+    );
+    let path = write_policy("preflight-known", &policy);
+    let output = Command::new(binary())
+        .args([
+            "preflight-json",
+            path.to_str().expect("UTF-8 temp policy path"),
+        ])
+        .output()
+        .expect("run policy preflight JSON CLI");
+    let _ = fs::remove_file(path);
+
+    assert_eq!(output.status.code(), Some(4));
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).expect("preflight JSON stdout is UTF-8");
+    assert!(stdout.starts_with(
+        "{\"ok\":true,\"preflight\":{\"kind\":\"policy_host_capability_match\",\"policy_preflight\":true,\"launch_attempted\":false,\"launch_preflight_complete\":false,\"status\":\"indeterminate\""
+    ));
+    assert!(stdout.contains(
+        "\"mandatory_launch_core\":{\"status\":\"unprobed\",\"reason\":\"mandatory_runtime_prerequisites_not_probed\"}"
+    ));
+    assert!(stdout.contains("\"landlock\":{\"status\":\"supported\",\"required_abi\":6,"));
+    assert!(stdout.contains("\"deadline\":{\"status\":\"supported\""));
+    assert!(stdout.contains("\"stdout_output_limit\":{\"status\":\"supported\""));
+    assert!(stdout.contains("\"eventfd\":{\"available\":true,\"errno\":null}"));
+    assert!(stdout.contains("\"time_namespace\":{\"status\":\"not_requested\",\"reason\":null}"));
+    assert!(
+        !missing_root.exists(),
+        "preflight must not materialize runtime root state"
+    );
+}
+
+#[test]
+fn preflight_json_marks_requested_time_namespace_unprobed() {
+    let (policy, missing_root) = static_only_policy();
+    let policy =
+        format!("{policy}\ntime.monotonic_offset_seconds = 1\ntime.boottime_offset_seconds = 2\n");
+    let path = write_policy("preflight-time-unprobed", &policy);
+    let output = Command::new(binary())
+        .args([
+            "preflight-json",
+            path.to_str().expect("UTF-8 temp policy path"),
+        ])
+        .output()
+        .expect("run time namespace preflight JSON CLI");
+    let _ = fs::remove_file(path);
+
+    assert_eq!(output.status.code(), Some(4));
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).expect("preflight JSON stdout is UTF-8");
+    assert!(stdout.contains("\"status\":\"indeterminate\""));
+    assert!(stdout.contains(
+        "\"mandatory_launch_core\":{\"status\":\"unprobed\",\"reason\":\"mandatory_runtime_prerequisites_not_probed\"}"
+    ));
+    assert!(stdout.contains(
+        "\"time_namespace\":{\"status\":\"unprobed\",\"reason\":\"independent_safe_probe_not_implemented\"}"
+    ));
+    assert!(
+        !missing_root.exists(),
+        "indeterminate preflight must not launch the sandbox"
+    );
+}
+
+#[test]
+fn preflight_human_report_exposes_partial_scope() {
+    let (policy, missing_root) = static_only_policy();
+    let path = write_policy("preflight-human", &policy);
+    let output = Command::new(binary())
+        .args(["preflight", path.to_str().expect("UTF-8 temp policy path")])
+        .output()
+        .expect("run policy preflight human CLI");
+    let _ = fs::remove_file(path);
+
+    assert_eq!(output.status.code(), Some(4));
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).expect("preflight human stdout is UTF-8");
+    assert!(stdout.starts_with(
+        "policy-host-preflight:\nkind: policy-host-capability-match\npolicy-preflight: true\nlaunch-attempted: false\nlaunch-preflight-complete: false\nstatus: indeterminate\n"
+    ));
+    assert!(stdout.contains(
+        "mandatory-launch-core: unprobed (mandatory_runtime_prerequisites_not_probed)\n"
+    ));
+    assert!(stdout.contains("time-namespace: not_requested\n"));
+    assert!(!missing_root.exists());
+}
+
+#[test]
 fn host_json_reports_runtime_capabilities_without_reading_policy() {
     let output = Command::new(binary())
         .arg("host-json")
@@ -213,6 +303,7 @@ fn host_json_reports_runtime_capabilities_without_reading_policy() {
     ));
     assert!(stdout.contains("\"pidfd_open\":{\"available\":true,\"errno\":null}"));
     assert!(stdout.contains("\"timerfd_monotonic\":{\"available\":true,\"errno\":null}"));
+    assert!(stdout.contains("\"eventfd\":{\"available\":true,\"errno\":null}"));
     assert!(stdout.contains("\"cgroup_v2\":{\"present\":true}"));
     assert!(stdout.ends_with("}}}\n"));
 }
@@ -232,6 +323,7 @@ fn host_human_report_is_explicitly_not_policy_preflight() {
     ));
     assert!(stdout.contains("\npidfd-open: available\n"));
     assert!(stdout.contains("timerfd-monotonic: available\n"));
+    assert!(stdout.contains("eventfd: available\n"));
     assert!(stdout.contains("cgroup-v2: present\n"));
     assert!(stdout.ends_with("policy-preflight: false\n"));
 }

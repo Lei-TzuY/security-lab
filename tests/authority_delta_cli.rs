@@ -69,8 +69,11 @@ fn identical_policy_is_unchanged_and_static() {
     assert!(stdout.contains("\"status\":\"unchanged\""));
     assert!(stdout.contains("\"kernel_effective_state\":false"));
     assert!(stdout.contains("\"filesystem_alias_proof\":false"));
-    assert!(stdout.contains("\"safe_for_unreviewed_update\":true"));
-    assert!(!root.exists(), "static comparison must not materialize the root");
+    assert!(stdout.contains("\"static_non_widening\":true"));
+    assert!(
+        !root.exists(),
+        "static comparison must not materialize the root"
+    );
 }
 
 #[test]
@@ -90,7 +93,7 @@ fn added_syscall_is_detected_as_authority_widening() {
     assert!(stdout.contains("\"status\":\"widened\""));
     assert!(stdout.contains("\"field\":\"seccomp.allow\",\"class\":\"widened\""));
     assert!(stdout.contains("\"widening_detected\":true"));
-    assert!(stdout.contains("\"safe_for_unreviewed_update\":false"));
+    assert!(stdout.contains("\"static_non_widening\":false"));
 }
 
 #[test]
@@ -106,7 +109,7 @@ fn lower_resource_ceiling_is_detected_as_reduction() {
     let stdout = String::from_utf8(output.stdout).expect("utf8 output");
     assert!(stdout.contains("\"status\":\"reduced\""));
     assert!(stdout.contains("\"field\":\"controls.cpu_seconds\",\"class\":\"reduced\""));
-    assert!(stdout.contains("\"safe_for_unreviewed_update\":true"));
+    assert!(stdout.contains("\"static_non_widening\":true"));
 }
 
 #[test]
@@ -157,7 +160,7 @@ fn mixed_widening_and_reduction_is_incomparable() {
     let stdout = String::from_utf8(output.stdout).expect("utf8 output");
     assert!(stdout.contains("\"status\":\"incomparable\""));
     assert!(stdout.contains("\"widening_detected\":true"));
-    assert!(stdout.contains("\"safe_for_unreviewed_update\":false"));
+    assert!(stdout.contains("\"static_non_widening\":false"));
 }
 
 #[test]
@@ -172,7 +175,10 @@ fn invalid_candidate_fails_closed_before_comparison() {
     let stdout = String::from_utf8(output.stdout).expect("utf8 output");
     assert!(stdout.contains("\"ok\":false"));
     assert!(stdout.contains("\"kind\":\"candidate_policy_rejected\""));
-    assert!(!root.exists(), "rejected comparison must not launch the sandbox");
+    assert!(
+        !root.exists(),
+        "rejected comparison must not launch the sandbox"
+    );
 }
 
 fn unique_absent_root(label: &str) -> PathBuf {

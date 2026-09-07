@@ -51,15 +51,14 @@ impl AuthorityDelta {
             "{\"ok\":true,\"authority_delta\":{\"kind\":\"static_policy_authority_delta\",\"kernel_effective_state\":false,\"filesystem_alias_proof\":false,\"status\":\"",
         );
         output.push_str(self.status.as_str());
-        output.push_str("\",\"safe_for_unreviewed_update\":");
-        output.push_str(if matches!(
-            self.status,
-            DeltaClass::Unchanged | DeltaClass::Reduced
-        ) {
-            "true"
-        } else {
-            "false"
-        });
+        output.push_str("\",\"static_non_widening\":");
+        output.push_str(
+            if matches!(self.status, DeltaClass::Unchanged | DeltaClass::Reduced) {
+                "true"
+            } else {
+                "false"
+            },
+        );
         output.push_str(",\"widening_detected\":");
         output.push_str(if widening_detected { "true" } else { "false" });
         output.push_str(",\"changes\":[");
@@ -85,11 +84,8 @@ impl AuthorityDelta {
             .expect("write to String cannot fail");
         writeln!(
             &mut output,
-            "safe-for-unreviewed-update: {}",
-            if matches!(
-                self.status,
-                DeltaClass::Unchanged | DeltaClass::Reduced
-            ) {
+            "static-non-widening: {}",
+            if matches!(self.status, DeltaClass::Unchanged | DeltaClass::Reduced) {
                 "true"
             } else {
                 "false"
@@ -285,8 +281,7 @@ pub(crate) fn compare(baseline: &SandboxPolicy, candidate: &SandboxPolicy) -> Au
         &candidate.selected_handles,
         &mut changes,
     );
-    if baseline.stdio.stdout == StdioMode::Redirect
-        && candidate.stdio.stdout == StdioMode::Redirect
+    if baseline.stdio.stdout == StdioMode::Redirect && candidate.stdio.stdout == StdioMode::Redirect
     {
         compare_exact_incomparable(
             "descriptors.stdout_redirect_path",
@@ -295,9 +290,7 @@ pub(crate) fn compare(baseline: &SandboxPolicy, candidate: &SandboxPolicy) -> Au
             &mut changes,
         );
     }
-    if baseline.stdio.stdout == StdioMode::Capture
-        && candidate.stdio.stdout == StdioMode::Capture
-    {
+    if baseline.stdio.stdout == StdioMode::Capture && candidate.stdio.stdout == StdioMode::Capture {
         if let (Some(base), Some(new)) = (
             baseline.stdout_capture_bytes,
             candidate.stdout_capture_bytes,
@@ -361,10 +354,7 @@ pub(crate) fn compare(baseline: &SandboxPolicy, candidate: &SandboxPolicy) -> Au
 
     push_change(
         "controls.cpu_seconds",
-        classify_allowance(
-            baseline.limits.cpu_seconds,
-            candidate.limits.cpu_seconds,
-        ),
+        classify_allowance(baseline.limits.cpu_seconds, candidate.limits.cpu_seconds),
         &mut changes,
     );
     push_change(
@@ -385,10 +375,7 @@ pub(crate) fn compare(baseline: &SandboxPolicy, candidate: &SandboxPolicy) -> Au
     );
     push_change(
         "controls.open_files",
-        classify_allowance(
-            baseline.limits.open_files,
-            candidate.limits.open_files,
-        ),
+        classify_allowance(baseline.limits.open_files, candidate.limits.open_files),
         &mut changes,
     );
     compare_optional_ceiling(
@@ -438,26 +425,18 @@ pub(crate) fn compare(baseline: &SandboxPolicy, candidate: &SandboxPolicy) -> Au
     AuthorityDelta { status, changes }
 }
 
-fn compare_scratch(
-    baseline: &SandboxPolicy,
-    candidate: &SandboxPolicy,
-    changes: &mut Vec<Change>,
-) {
+fn compare_scratch(baseline: &SandboxPolicy, candidate: &SandboxPolicy, changes: &mut Vec<Change>) {
     match (
         (&baseline.scratch_dir, baseline.scratch_bytes),
         (&candidate.scratch_dir, candidate.scratch_bytes),
     ) {
         ((None, None), (None, None)) => {}
-        ((None, None), (Some(_), Some(_))) => push_change(
-            "filesystem.private_scratch",
-            DeltaClass::Widened,
-            changes,
-        ),
-        ((Some(_), Some(_)), (None, None)) => push_change(
-            "filesystem.private_scratch",
-            DeltaClass::Reduced,
-            changes,
-        ),
+        ((None, None), (Some(_), Some(_))) => {
+            push_change("filesystem.private_scratch", DeltaClass::Widened, changes)
+        }
+        ((Some(_), Some(_)), (None, None)) => {
+            push_change("filesystem.private_scratch", DeltaClass::Reduced, changes)
+        }
         ((Some(base_path), Some(base_bytes)), (Some(new_path), Some(new_bytes))) => {
             if base_path != new_path {
                 push_change(
@@ -510,11 +489,7 @@ fn compare_selected_handles(
     push_change("descriptors.selected_handles", class, changes);
 }
 
-fn compare_seccomp(
-    baseline: &SandboxPolicy,
-    candidate: &SandboxPolicy,
-    changes: &mut Vec<Change>,
-) {
+fn compare_seccomp(baseline: &SandboxPolicy, candidate: &SandboxPolicy, changes: &mut Vec<Change>) {
     let baseline_allowed = &baseline.seccomp.allowed_syscalls;
     let candidate_allowed = &candidate.seccomp.allowed_syscalls;
     push_change(
@@ -738,9 +713,9 @@ fn optional_map_is_subset<V: PartialEq>(
 ) -> bool {
     match baseline {
         None => true,
-        Some(baseline) => baseline.iter().all(|(key, value)| {
-            candidate.and_then(|candidate| candidate.get(key)) == Some(value)
-        }),
+        Some(baseline) => baseline
+            .iter()
+            .all(|(key, value)| candidate.and_then(|candidate| candidate.get(key)) == Some(value)),
     }
 }
 

@@ -74,7 +74,8 @@ mod x86_64 {
     const ENFORCEMENT_NO_NEW_PRIVS: u64 = 1 << 9;
     const ENFORCEMENT_LANDLOCK: u64 = 1 << 10;
     const ENFORCEMENT_SECCOMP: u64 = 1 << 11;
-    const ENFORCEMENT_MANDATORY: u64 = ENFORCEMENT_BASE_NAMESPACES
+    const ENFORCEMENT_KNOWN: u64 = ENFORCEMENT_BASE_NAMESPACES
+        | ENFORCEMENT_TIME_NAMESPACE
         | ENFORCEMENT_HOSTNAME
         | ENFORCEMENT_PRIVATE_MOUNTS
         | ENFORCEMENT_READONLY_ROOT
@@ -83,9 +84,8 @@ mod x86_64 {
         | ENFORCEMENT_RLIMITS
         | ENFORCEMENT_CAPABILITIES
         | ENFORCEMENT_NO_NEW_PRIVS
+        | ENFORCEMENT_LANDLOCK
         | ENFORCEMENT_SECCOMP;
-    const ENFORCEMENT_KNOWN: u64 =
-        ENFORCEMENT_MANDATORY | ENFORCEMENT_TIME_NAMESPACE | ENFORCEMENT_LANDLOCK;
 
     const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
     const PR_CAPBSET_DROP: libc::c_int = 24;
@@ -768,24 +768,83 @@ mod x86_64 {
                 "runtime enforcement receipt published unknown layer bits 0x{unknown:x}"
             )));
         }
-        let missing = ENFORCEMENT_MANDATORY & !bits;
-        if missing != 0 {
-            return Err(SandboxError::SetupFailed(format!(
-                "runtime enforcement receipt is missing mandatory layer bits 0x{missing:x}"
-            )));
+        let observed = |bit| bits & bit != 0;
+        let require_predecessor = |later, earlier, label: &str| {
+            if observed(later) && !observed(earlier) {
+                Err(SandboxError::SetupFailed(format!(
+                    "runtime enforcement receipt published {label} without its required predecessor"
+                )))
+            } else {
+                Ok(())
+            }
+        };
+
+        require_predecessor(
+            ENFORCEMENT_HOSTNAME,
+            ENFORCEMENT_BASE_NAMESPACES,
+            "hostname",
+        )?;
+        require_predecessor(
+            ENFORCEMENT_PRIVATE_MOUNTS,
+            ENFORCEMENT_HOSTNAME,
+            "private mount propagation",
+        )?;
+        require_predecessor(
+            ENFORCEMENT_READONLY_ROOT,
+            ENFORCEMENT_PRIVATE_MOUNTS,
+            "read-only root",
+        )?;
+        require_predecessor(ENFORCEMENT_CHROOT, ENFORCEMENT_READONLY_ROOT, "chroot")?;
+        require_predecessor(
+            ENFORCEMENT_FD_SANITIZATION,
+            ENFORCEMENT_CHROOT,
+            "FD sanitization",
+        )?;
+        require_predecessor(ENFORCEMENT_RLIMITS, ENFORCEMENT_FD_SANITIZATION, "rlimits")?;
+        require_predecessor(
+            ENFORCEMENT_CAPABILITIES,
+            ENFORCEMENT_RLIMITS,
+            "capability reduction",
+        )?;
+        require_predecessor(
+            ENFORCEMENT_NO_NEW_PRIVS,
+            ENFORCEMENT_CAPABILITIES,
+            "no_new_privs",
+        )?;
+        require_predecessor(ENFORCEMENT_LANDLOCK, ENFORCEMENT_NO_NEW_PRIVS, "Landlock")?;
+        require_predecessor(ENFORCEMENT_SECCOMP, ENFORCEMENT_NO_NEW_PRIVS, "seccomp")?;
+
+        let time_namespace_offsets = observed(ENFORCEMENT_TIME_NAMESPACE);
+        if time_namespace_offsets && !time_namespace_requested {
+            return Err(SandboxError::SetupFailed(
+                "runtime enforcement receipt observed unrequested time-namespace offsets"
+                    .to_owned(),
+            ));
+        }
+        // Time offsets are installed before hostname. Reaching hostname with a
+        // requested time namespace but no time bit would be impossible without
+        // corrupted or incomplete receipt publication.
+        if time_namespace_requested && observed(ENFORCEMENT_HOSTNAME) && !time_namespace_offsets {
+            return Err(SandboxError::SetupFailed(
+                "runtime enforcement receipt reached hostname without requested time-namespace offsets"
+                    .to_owned(),
+            ));
         }
 
-        let time_namespace_offsets = bits & ENFORCEMENT_TIME_NAMESPACE != 0;
-        if time_namespace_offsets != time_namespace_requested {
-            return Err(SandboxError::SetupFailed(format!(
-                "runtime enforcement receipt time-namespace mismatch: requested={time_namespace_requested} observed={time_namespace_offsets}"
-            )));
+        let landlock = observed(ENFORCEMENT_LANDLOCK);
+        if landlock && !landlock_requested {
+            return Err(SandboxError::SetupFailed(
+                "runtime enforcement receipt observed unrequested Landlock restriction".to_owned(),
+            ));
         }
-        let landlock = bits & ENFORCEMENT_LANDLOCK != 0;
-        if landlock != landlock_requested {
-            return Err(SandboxError::SetupFailed(format!(
-                "runtime enforcement receipt Landlock mismatch: requested={landlock_requested} observed={landlock}"
-            )));
+        // Landlock restriction runs after no_new_privs and before seccomp. If
+        // seccomp was observed for a Landlock policy, Landlock must have been
+        // positively observed as well.
+        if landlock_requested && observed(ENFORCEMENT_SECCOMP) && !landlock {
+            return Err(SandboxError::SetupFailed(
+                "runtime enforcement receipt reached seccomp without requested Landlock restriction"
+                    .to_owned(),
+            ));
         }
 
         Ok(EnforcementReceipt {
@@ -801,11 +860,6 @@ mod x86_64 {
             no_new_privs: bits & ENFORCEMENT_NO_NEW_PRIVS != 0,
             landlock,
             seccomp: bits & ENFORCEMENT_SECCOMP != 0,
-            // Successful exec cannot mark shared memory because execveat does not
-            // return. This decoder is invoked only after launch_error.phase == 0
-            // and PID1 publishes a complete target lifecycle; failed execveat
-            // writes PHASE_EXECVEAT and never reaches this path.
-            execveat: true,
         })
     }
 
@@ -3382,25 +3436,35 @@ mod x86_64 {
         use super::*;
 
         #[test]
-        fn mandatory_runtime_receipt_is_fail_closed() {
-            let missing_seccomp = ENFORCEMENT_MANDATORY & !ENFORCEMENT_SECCOMP;
-            let error = enforcement_receipt_from_bits(missing_seccomp, false, false)
-                .expect_err("missing mandatory enforcement must fail");
-            assert!(error.to_string().contains("missing mandatory layer bits"));
+        fn impossible_runtime_receipt_progression_is_fail_closed() {
+            let unknown = enforcement_receipt_from_bits(1 << 63, false, false)
+                .expect_err("unknown receipt bits must fail");
+            assert!(unknown.to_string().contains("unknown layer bits"));
+
+            assert!(enforcement_receipt_from_bits(ENFORCEMENT_HOSTNAME, false, false).is_err());
+            assert!(enforcement_receipt_from_bits(
+                ENFORCEMENT_BASE_NAMESPACES | ENFORCEMENT_HOSTNAME,
+                true,
+                false,
+            )
+            .is_err());
+            assert!(enforcement_receipt_from_bits(
+                ENFORCEMENT_BASE_NAMESPACES | ENFORCEMENT_LANDLOCK,
+                false,
+                false,
+            )
+            .is_err());
         }
 
         #[test]
-        fn optional_runtime_receipt_must_match_requested_layers() {
-            let base = ENFORCEMENT_MANDATORY;
-            assert!(enforcement_receipt_from_bits(base, true, false).is_err());
-            assert!(
-                enforcement_receipt_from_bits(base | ENFORCEMENT_TIME_NAMESPACE, false, false)
-                    .is_err()
-            );
-            assert!(enforcement_receipt_from_bits(base, false, true).is_err());
-            assert!(
-                enforcement_receipt_from_bits(base | ENFORCEMENT_LANDLOCK, false, false).is_err()
-            );
+        fn early_control_termination_can_publish_a_valid_partial_receipt() {
+            let receipt = enforcement_receipt_from_bits(ENFORCEMENT_BASE_NAMESPACES, true, true)
+                .expect("early partial receipt should remain observable");
+            assert!(receipt.base_namespaces);
+            assert!(!receipt.time_namespace_offsets);
+            assert!(!receipt.hostname);
+            assert!(!receipt.landlock);
+            assert!(!receipt.seccomp);
         }
     }
 

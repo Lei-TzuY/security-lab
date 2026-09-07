@@ -1340,7 +1340,24 @@ fn allowed_operation_succeeds() {
     assert!(receipt.no_new_privs);
     assert!(!receipt.landlock);
     assert!(receipt.seccomp);
-    assert!(receipt.execveat);
+}
+
+#[test]
+fn pre_cancelled_run_preserves_control_outcome_with_partial_receipt() {
+    let cancellation = CancellationToken::new().expect("create cancellation token");
+    cancellation.cancel().expect("pre-cancel token");
+    let mut cancellable = policy(
+        "Q",
+        &[],
+        &["execveat", "write", "fork", "nanosleep", "pause", "exit"],
+    );
+    cancellable.wall_clock_milliseconds = Some(5000);
+
+    let report = run_report_with_cancel(&cancellable, &cancellation)
+        .expect("pre-cancelled run should remain a valid controlled termination");
+    assert_eq!(report.outcome, ChildOutcome::Cancelled);
+    assert!(report.enforcement.base_namespaces);
+    assert!(report.enforcement.fd_sanitization);
 }
 
 #[test]

@@ -561,7 +561,7 @@ Boundary: 22B is host-observed enforcement, not a precise kernel byte meter. Pip
 
 ### Slice 23A — policy-owned MONOTONIC/BOOTTIME offsets
 
-**Current verified candidate.** Adds one optional Linux time namespace for subsequently created sandbox descendants without changing host clocks or the launcher's own clock view.
+**Status: complete on `main`.** Adds one optional Linux time namespace for subsequently created sandbox descendants without changing host clocks or the launcher's own clock view.
 
 Acceptance evidence is executable:
 
@@ -585,6 +585,26 @@ After 23A integrates, seal this bounded clock-offset model. Do not farm more clo
 **Status: complete on `main`.** `manifest` and `manifest-json` validate policy fail-closed and emit deterministic declared-authority summaries without launching the sandbox or probing kernel support. Argument contents and environment values remain redacted, while authority-bearing filesystem, broker, Landlock, resource, output, seccomp, and time-namespace fields are reviewable.
 
 Boundary: this is static observability, not runtime capability preflight or proof of effective kernel state.
+
+### Slice 24B — conservative policy-specific host preflight
+
+**Current verified candidate.** Adds non-destructive policy/host capability matching without claiming that partial probing proves the full sandbox launch path.
+
+Acceptance evidence is executable:
+
+- `preflight` / `preflight-json` validate the policy first, derive requested Landlock ABI plus deadline/stdout-budget/time-namespace requirements, and compare them with the existing host capability snapshot; `eventfd` is now also probed and surfaced because stdout-total enforcement depends on it;
+- preflight never launches the target, creates sandbox namespaces, materializes the configured root, or mutates runtime filesystem state; machine and human reports explicitly carry `launch_attempted=false` and `launch_preflight_complete=false`;
+- the mandatory launch core is first-class evidence state. The real probe path currently marks it `unprobed` with reason `mandatory_runtime_prerequisites_not_probed`, so green optional probes cannot produce a false-positive `satisfied` verdict;
+- known unavailable represented prerequisites produce `incompatible` with exit status 3; any unprobed mandatory prerequisite produces `indeterminate` with exit status 4. Exit status 0 / `satisfied` is reserved for evaluator state where complete mandatory-core evidence is explicitly present, and is unreachable from the current production probe path;
+- deterministic evaluator regressions prove Linux/x86_64 plus available Landlock/pidfd/timerfd/eventfd still remains indeterminate when the mandatory core is unknown, while an explicitly unavailable mandatory core is incompatible;
+- CLI regressions use a deliberately nonexistent filesystem root and prove `preflight` leaves it absent while reporting the mandatory-core gap, preserving the distinction between static manifest, partial host preflight, and actual `run` evidence;
+- stable rustfmt/Clippy/full tests and the full Rust 1.74 suite are green on the exact implementation head.
+
+Boundary: 24B is a conservative partial preflight, not a dry-run, launch simulator, or complete kernel compatibility oracle. It does not independently establish unprivileged user/mount/PID/network/IPC/UTS/time namespace creation, `openat2`/mount API behavior, descriptor sanitization, final filesystem identity, or target enforcement. Those mechanisms remain authoritative only when the real launch path executes successfully.
+
+### Milestone 24 promotion rule
+
+After 24B integrates, seal the current policy-observability layer. Do not farm output aliases or relabel partial probes as conformance. A later preflight slice must add genuinely safe positive evidence for previously unprobed mandatory mechanisms; otherwise promote to a materially different executable authority/enforcement frontier.
 
 ## Later frontiers
 

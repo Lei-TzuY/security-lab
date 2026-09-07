@@ -24,6 +24,7 @@
 #   r prove Landlock allows declared reads and returns EACCES for an undeclared visible file
 #   m prove Landlock narrows regular-file mutation inside scratch and a writable persistent volume
 #   h prove Landlock narrows directory/symlink/reparent topology mutation
+#   i prove private procfs exposes namespace PID 1/2 while hiding a trusted host PID
 #   s prove Landlock allows declared TCP bind/connect ports and denies undeclared ports
 #   a connect selected fd 9 to argv[2] in the abstract UNIX socket namespace
 #   d prove Landlock device ioctl allows /devices/urandom and denies /devices/random
@@ -93,6 +94,8 @@ _start:
     je .landlock_file_mutation
     cmp $104, %al
     je .landlock_path_topology_mutation
+    cmp $105, %al
+    je .private_procfs
     cmp $115, %al
     je .landlock_tcp_ports
     cmp $97, %al
@@ -322,6 +325,47 @@ _start:
     js .fail29
     xor %edi, %edi
     jmp .exit
+
+.private_procfs:
+    mov 24(%rsp), %r12
+    test %r12, %r12
+    je .fail29
+    sub $160, %rsp
+
+    mov $262, %eax
+    mov $-100, %edi
+    lea proc_pid1_path(%rip), %rsi
+    mov %rsp, %rdx
+    xor %r10d, %r10d
+    syscall
+    test %rax, %rax
+    js .private_procfs_fail
+
+    mov $262, %eax
+    mov $-100, %edi
+    lea proc_pid2_path(%rip), %rsi
+    mov %rsp, %rdx
+    xor %r10d, %r10d
+    syscall
+    test %rax, %rax
+    js .private_procfs_fail
+
+    mov $262, %eax
+    mov $-100, %edi
+    mov %r12, %rsi
+    mov %rsp, %rdx
+    xor %r10d, %r10d
+    syscall
+    cmp $-2, %rax
+    jne .private_procfs_fail
+
+    add $160, %rsp
+    xor %edi, %edi
+    jmp .exit
+
+.private_procfs_fail:
+    add $160, %rsp
+    jmp .fail29
 
 .selected_handle:
     mov 24(%rsp), %rdi
@@ -2434,5 +2478,11 @@ network_buffer:
     .skip 32
 landlock_buffer:
     .skip 32
+
+.section .rodata
+proc_pid1_path:
+    .asciz "/proc/1"
+proc_pid2_path:
+    .asciz "/proc/2"
 
 .section .note.GNU-stack,"",@progbits

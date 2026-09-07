@@ -20,8 +20,8 @@ mod x86_64 {
     };
     use crate::policy::{StdioMode, StdioPolicy};
     use crate::{
-        CancellationToken, CapturedOutput, ChildOutcome, PolicyError, ProcessTreeUsage,
-        ResourceLimits, RunReport, SandboxError, SandboxPolicy,
+        CancellationToken, CapturedOutput, ChildOutcome, EnforcementReceipt, PolicyError,
+        ProcessTreeUsage, ResourceLimits, RunReport, SandboxError, SandboxPolicy,
     };
     use std::ffi::CString;
     use std::io;
@@ -61,6 +61,31 @@ mod x86_64 {
     const MOUNT_ATTR_RDONLY: u64 = 0x0000_0001;
     const EXECVEAT_AT_EMPTY_PATH: libc::c_int = 0x1000;
     const CLONE_NEWTIME: libc::c_int = 0x0000_0080;
+
+    const ENFORCEMENT_BASE_NAMESPACES: u64 = 1 << 0;
+    const ENFORCEMENT_TIME_NAMESPACE: u64 = 1 << 1;
+    const ENFORCEMENT_HOSTNAME: u64 = 1 << 2;
+    const ENFORCEMENT_PRIVATE_MOUNTS: u64 = 1 << 3;
+    const ENFORCEMENT_READONLY_ROOT: u64 = 1 << 4;
+    const ENFORCEMENT_CHROOT: u64 = 1 << 5;
+    const ENFORCEMENT_FD_SANITIZATION: u64 = 1 << 6;
+    const ENFORCEMENT_RLIMITS: u64 = 1 << 7;
+    const ENFORCEMENT_CAPABILITIES: u64 = 1 << 8;
+    const ENFORCEMENT_NO_NEW_PRIVS: u64 = 1 << 9;
+    const ENFORCEMENT_LANDLOCK: u64 = 1 << 10;
+    const ENFORCEMENT_SECCOMP: u64 = 1 << 11;
+    const ENFORCEMENT_KNOWN: u64 = ENFORCEMENT_BASE_NAMESPACES
+        | ENFORCEMENT_TIME_NAMESPACE
+        | ENFORCEMENT_HOSTNAME
+        | ENFORCEMENT_PRIVATE_MOUNTS
+        | ENFORCEMENT_READONLY_ROOT
+        | ENFORCEMENT_CHROOT
+        | ENFORCEMENT_FD_SANITIZATION
+        | ENFORCEMENT_RLIMITS
+        | ENFORCEMENT_CAPABILITIES
+        | ENFORCEMENT_NO_NEW_PRIVS
+        | ENFORCEMENT_LANDLOCK
+        | ENFORCEMENT_SECCOMP;
 
     const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
     const PR_CAPBSET_DROP: libc::c_int = 24;
@@ -685,7 +710,14 @@ mod x86_64 {
 
             let record = mapping.cast::<LaunchErrorRecord>();
             unsafe {
-                ptr::write_volatile(record, LaunchErrorRecord { errno: 0, phase: 0 });
+                ptr::write_volatile(
+                    record,
+                    LaunchErrorRecord {
+                        errno: 0,
+                        phase: 0,
+                        enforcement_bits: 0,
+                    },
+                );
             }
             Ok(Self { record })
         }
@@ -704,6 +736,142 @@ mod x86_64 {
                 );
             }
         }
+    }
+
+    unsafe fn mark_enforcement(launch_error: *mut LaunchErrorRecord, bit: u64) {
+        let current = ptr::read_volatile(ptr::addr_of!((*launch_error).enforcement_bits));
+        ptr::write_volatile(
+            ptr::addr_of_mut!((*launch_error).enforcement_bits),
+            current | bit,
+        );
+    }
+
+    fn policy_requests_landlock(policy: &SandboxPolicy) -> bool {
+        !policy.landlock_read_execute.is_empty()
+            || !policy.landlock_file_mutate.is_empty()
+            || !policy.landlock_path_topology_mutate.is_empty()
+            || !policy.landlock_device_ioctl.is_empty()
+            || !policy.landlock_tcp_bind_ports.is_empty()
+            || !policy.landlock_tcp_connect_ports.is_empty()
+            || policy.landlock_scope_abstract_unix_socket
+            || policy.landlock_scope_signal
+    }
+
+    fn enforcement_receipt_from_bits(
+        bits: u64,
+        time_namespace_requested: bool,
+        landlock_requested: bool,
+    ) -> Result<EnforcementReceipt, SandboxError> {
+        let unknown = bits & !ENFORCEMENT_KNOWN;
+        if unknown != 0 {
+            return Err(SandboxError::SetupFailed(format!(
+                "runtime enforcement receipt published unknown layer bits 0x{unknown:x}"
+            )));
+        }
+        let observed = |bit| bits & bit != 0;
+        let require_predecessor = |later, earlier, label: &str| {
+            if observed(later) && !observed(earlier) {
+                Err(SandboxError::SetupFailed(format!(
+                    "runtime enforcement receipt published {label} without its required predecessor"
+                )))
+            } else {
+                Ok(())
+            }
+        };
+
+        require_predecessor(
+            ENFORCEMENT_HOSTNAME,
+            ENFORCEMENT_BASE_NAMESPACES,
+            "hostname",
+        )?;
+        require_predecessor(
+            ENFORCEMENT_PRIVATE_MOUNTS,
+            ENFORCEMENT_HOSTNAME,
+            "private mount propagation",
+        )?;
+        require_predecessor(
+            ENFORCEMENT_READONLY_ROOT,
+            ENFORCEMENT_PRIVATE_MOUNTS,
+            "read-only root",
+        )?;
+        require_predecessor(ENFORCEMENT_CHROOT, ENFORCEMENT_READONLY_ROOT, "chroot")?;
+        require_predecessor(
+            ENFORCEMENT_FD_SANITIZATION,
+            ENFORCEMENT_CHROOT,
+            "FD sanitization",
+        )?;
+        require_predecessor(ENFORCEMENT_RLIMITS, ENFORCEMENT_FD_SANITIZATION, "rlimits")?;
+        require_predecessor(
+            ENFORCEMENT_CAPABILITIES,
+            ENFORCEMENT_RLIMITS,
+            "capability reduction",
+        )?;
+        require_predecessor(
+            ENFORCEMENT_NO_NEW_PRIVS,
+            ENFORCEMENT_CAPABILITIES,
+            "no_new_privs",
+        )?;
+        require_predecessor(ENFORCEMENT_LANDLOCK, ENFORCEMENT_NO_NEW_PRIVS, "Landlock")?;
+        require_predecessor(ENFORCEMENT_SECCOMP, ENFORCEMENT_NO_NEW_PRIVS, "seccomp")?;
+
+        let time_namespace_offsets = observed(ENFORCEMENT_TIME_NAMESPACE);
+        if time_namespace_offsets && !time_namespace_requested {
+            return Err(SandboxError::SetupFailed(
+                "runtime enforcement receipt observed unrequested time-namespace offsets"
+                    .to_owned(),
+            ));
+        }
+        // Time offsets are installed before hostname. Reaching hostname with a
+        // requested time namespace but no time bit would be impossible without
+        // corrupted or incomplete receipt publication.
+        if time_namespace_requested && observed(ENFORCEMENT_HOSTNAME) && !time_namespace_offsets {
+            return Err(SandboxError::SetupFailed(
+                "runtime enforcement receipt reached hostname without requested time-namespace offsets"
+                    .to_owned(),
+            ));
+        }
+
+        let landlock = observed(ENFORCEMENT_LANDLOCK);
+        if landlock && !landlock_requested {
+            return Err(SandboxError::SetupFailed(
+                "runtime enforcement receipt observed unrequested Landlock restriction".to_owned(),
+            ));
+        }
+        // Landlock restriction runs after no_new_privs and before seccomp. If
+        // seccomp was observed for a Landlock policy, Landlock must have been
+        // positively observed as well.
+        if landlock_requested && observed(ENFORCEMENT_SECCOMP) && !landlock {
+            return Err(SandboxError::SetupFailed(
+                "runtime enforcement receipt reached seccomp without requested Landlock restriction"
+                    .to_owned(),
+            ));
+        }
+
+        Ok(EnforcementReceipt {
+            base_namespaces: bits & ENFORCEMENT_BASE_NAMESPACES != 0,
+            time_namespace_offsets,
+            hostname: bits & ENFORCEMENT_HOSTNAME != 0,
+            private_mount_propagation: bits & ENFORCEMENT_PRIVATE_MOUNTS != 0,
+            readonly_root: bits & ENFORCEMENT_READONLY_ROOT != 0,
+            chroot: bits & ENFORCEMENT_CHROOT != 0,
+            fd_sanitization: bits & ENFORCEMENT_FD_SANITIZATION != 0,
+            rlimits: bits & ENFORCEMENT_RLIMITS != 0,
+            capabilities_reduced: bits & ENFORCEMENT_CAPABILITIES != 0,
+            no_new_privs: bits & ENFORCEMENT_NO_NEW_PRIVS != 0,
+            landlock,
+            seccomp: bits & ENFORCEMENT_SECCOMP != 0,
+        })
+    }
+
+    fn decode_enforcement_receipt(
+        bits: u64,
+        policy: &SandboxPolicy,
+    ) -> Result<EnforcementReceipt, SandboxError> {
+        enforcement_receipt_from_bits(
+            bits,
+            policy.time_monotonic_offset_seconds.is_some(),
+            policy_requests_landlock(policy),
+        )
     }
 
     struct PreparedLandlock {
@@ -1307,6 +1475,7 @@ mod x86_64 {
                 stdout: None,
                 reaped_descendants: 0,
                 process_tree_usage: ProcessTreeUsage::default(),
+                enforcement: EnforcementReceipt::default(),
             });
         }
 
@@ -1316,6 +1485,7 @@ mod x86_64 {
                 "PID namespace lifecycle did not publish target status; bootstrap wait status 0x{bootstrap_status:x}"
             )));
         }
+        let enforcement = decode_enforcement_receipt(launch_error.enforcement_bits, policy)?;
 
         let (stdout, output_limit_observed) = match capture_result {
             Some(result) => {
@@ -1334,6 +1504,7 @@ mod x86_64 {
                 system_cpu_micros: lifecycle_record.system_cpu_micros,
                 max_child_rss_kib: lifecycle_record.max_child_rss_kib,
             },
+            enforcement,
         })
     }
 
@@ -2170,6 +2341,7 @@ mod x86_64 {
         if libc::syscall(libc::SYS_unshare, namespace_flags) == -1 {
             child_fail(launch_error, PHASE_NAMESPACE, seccomp.error_exit_syscall);
         }
+        mark_enforcement(launch_error, ENFORCEMENT_BASE_NAMESPACES);
 
         write_proc_file_or_fail(
             b"/proc/self/setgroups\0",
@@ -2211,6 +2383,7 @@ mod x86_64 {
                 PHASE_TIME_OFFSETS,
                 seccomp.error_exit_syscall,
             );
+            mark_enforcement(launch_error, ENFORCEMENT_TIME_NAMESPACE);
         }
 
         if libc::syscall(
@@ -2221,6 +2394,7 @@ mod x86_64 {
         {
             child_fail(launch_error, PHASE_HOSTNAME, seccomp.error_exit_syscall);
         }
+        mark_enforcement(launch_error, ENFORCEMENT_HOSTNAME);
 
         if prepared.loopback_enabled {
             enable_loopback_or_fail(launch_error, seccomp.error_exit_syscall);
@@ -2241,6 +2415,7 @@ mod x86_64 {
                 seccomp.error_exit_syscall,
             );
         }
+        mark_enforcement(launch_error, ENFORCEMENT_PRIVATE_MOUNTS);
 
         let current_root_how = OpenHow {
             flags: (libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
@@ -2313,6 +2488,7 @@ mod x86_64 {
         {
             child_fail(launch_error, PHASE_ROOT_ATTACH, seccomp.error_exit_syscall);
         }
+        mark_enforcement(launch_error, ENFORCEMENT_READONLY_ROOT);
 
         if libc::syscall(libc::SYS_fchdir, root_tree_fd) == -1 {
             child_fail(launch_error, PHASE_ROOT_FCHDIR, seccomp.error_exit_syscall);
@@ -2381,6 +2557,7 @@ mod x86_64 {
         if libc::syscall(libc::SYS_chroot, b".\0".as_ptr().cast::<libc::c_char>()) == -1 {
             child_fail(launch_error, PHASE_CHROOT, seccomp.error_exit_syscall);
         }
+        mark_enforcement(launch_error, ENFORCEMENT_CHROOT);
         if libc::syscall(libc::SYS_fchdir, cwd_fd) == -1 {
             child_fail(launch_error, PHASE_CWD_FCHDIR, seccomp.error_exit_syscall);
         }
@@ -2394,6 +2571,7 @@ mod x86_64 {
         {
             child_fail(launch_error, PHASE_FD_SANITIZE, seccomp.error_exit_syscall);
         }
+        mark_enforcement(launch_error, ENFORCEMENT_FD_SANITIZATION);
 
         pid_lifecycle::become_pid_namespace_init_or_exit(
             launch_error,
@@ -2473,17 +2651,24 @@ mod x86_64 {
             PHASE_RLIMIT_NOFILE,
             seccomp.error_exit_syscall,
         );
+        mark_enforcement(launch_error, ENFORCEMENT_RLIMITS);
 
         drop_capabilities_or_fail(launch_error, seccomp.error_exit_syscall);
+        mark_enforcement(launch_error, ENFORCEMENT_CAPABILITIES);
 
         if libc::syscall(libc::SYS_prctl, libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == -1 {
             child_fail(launch_error, PHASE_NO_NEW_PRIVS, seccomp.error_exit_syscall);
         }
+        mark_enforcement(launch_error, ENFORCEMENT_NO_NEW_PRIVS);
+        let landlock_active = landlock_ruleset_fd >= 0;
         restrict_landlock_or_fail(
             landlock_ruleset_fd,
             launch_error,
             seccomp.error_exit_syscall,
         );
+        if landlock_active {
+            mark_enforcement(launch_error, ENFORCEMENT_LANDLOCK);
+        }
 
         let program = libc::sock_fprog {
             len: seccomp.filter.len() as u16,
@@ -2500,6 +2685,7 @@ mod x86_64 {
         {
             child_fail(launch_error, PHASE_SECCOMP, seccomp.error_exit_syscall);
         }
+        mark_enforcement(launch_error, ENFORCEMENT_SECCOMP);
 
         libc::syscall(
             libc::SYS_execveat,
@@ -3245,6 +3431,43 @@ mod x86_64 {
             _ => return None,
         })
     }
+    #[cfg(test)]
+    mod enforcement_receipt_tests {
+        use super::*;
+
+        #[test]
+        fn impossible_runtime_receipt_progression_is_fail_closed() {
+            let unknown = enforcement_receipt_from_bits(1 << 63, false, false)
+                .expect_err("unknown receipt bits must fail");
+            assert!(unknown.to_string().contains("unknown layer bits"));
+
+            assert!(enforcement_receipt_from_bits(ENFORCEMENT_HOSTNAME, false, false).is_err());
+            assert!(enforcement_receipt_from_bits(
+                ENFORCEMENT_BASE_NAMESPACES | ENFORCEMENT_HOSTNAME,
+                true,
+                false,
+            )
+            .is_err());
+            assert!(enforcement_receipt_from_bits(
+                ENFORCEMENT_BASE_NAMESPACES | ENFORCEMENT_LANDLOCK,
+                false,
+                false,
+            )
+            .is_err());
+        }
+
+        #[test]
+        fn early_control_termination_can_publish_a_valid_partial_receipt() {
+            let receipt = enforcement_receipt_from_bits(ENFORCEMENT_BASE_NAMESPACES, true, true)
+                .expect("early partial receipt should remain observable");
+            assert!(receipt.base_namespaces);
+            assert!(!receipt.time_namespace_offsets);
+            assert!(!receipt.hostname);
+            assert!(!receipt.landlock);
+            assert!(!receipt.seccomp);
+        }
+    }
+
     #[cfg(test)]
     mod output_outcome_tests {
         use super::*;

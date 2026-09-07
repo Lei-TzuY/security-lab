@@ -51,7 +51,31 @@ pub struct ProcessTreeUsage {
     pub max_child_rss_kib: u64,
 }
 
-/// Detailed result for callers that need launcher-owned captured output or process-tree lifecycle evidence.
+/// Kernel enforcement layers positively observed during this launcher-owned run.
+///
+/// Each field becomes true only after the corresponding kernel operation succeeds.
+/// A false field means that layer was not observed before termination; this can be
+/// expected when launcher-owned cancellation, deadline, or output-budget control
+/// wins while the direct target is still in setup. The receipt intentionally does
+/// not claim successful `execveat`, because a control-plane termination can race
+/// between the final pre-exec setup step and the non-returning exec syscall.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct EnforcementReceipt {
+    pub base_namespaces: bool,
+    pub time_namespace_offsets: bool,
+    pub hostname: bool,
+    pub private_mount_propagation: bool,
+    pub readonly_root: bool,
+    pub chroot: bool,
+    pub fd_sanitization: bool,
+    pub rlimits: bool,
+    pub capabilities_reduced: bool,
+    pub no_new_privs: bool,
+    pub landlock: bool,
+    pub seccomp: bool,
+}
+
+/// Detailed result for callers that need launcher-owned captured output, process-tree lifecycle evidence, or a runtime enforcement receipt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunReport {
     /// Terminal status of the direct target, not of the namespace init.
@@ -62,4 +86,6 @@ pub struct RunReport {
     pub reaped_descendants: u32,
     /// Kernel resource telemetry collected by namespace PID 1 only after the sandbox tree converges.
     pub process_tree_usage: ProcessTreeUsage,
+    /// Runtime receipt for setup enforcement layers positively observed before termination.
+    pub enforcement: EnforcementReceipt,
 }

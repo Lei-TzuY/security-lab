@@ -1,16 +1,4 @@
-from pathlib import Path
-
-
-def replace_one(path: str, old: str, new: str, label: str) -> None:
-    p = Path(path)
-    text = p.read_text()
-    count = text.count(old)
-    if count != 1:
-        raise SystemExit(f"{label}: expected exactly one match, got {count}")
-    p.write_text(text.replace(old, new, 1))
-
-
-probe_module = r'''#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct StagedCapabilityProbe {
     pub(super) available: bool,
     pub(super) errno: Option<i32>,
@@ -511,11 +499,7 @@ unsafe fn write_file(report_fd: libc::c_int, stage: i32, path: &[u8], bytes: &[u
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-unsafe fn probe_rlimit(
-    report_fd: libc::c_int,
-    stage: i32,
-    resource: libc::__rlimit_resource_t,
-) {
+unsafe fn probe_rlimit(report_fd: libc::c_int, stage: i32, resource: libc::__rlimit_resource_t) {
     let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
     if libc::getrlimit(resource, limit.as_mut_ptr()) != 0 {
         fail(report_fd, stage, errno());
@@ -548,7 +532,13 @@ unsafe fn write_report(fd: libc::c_int, report: &ProbeReport) {
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 unsafe fn fail(fd: libc::c_int, stage: i32, error: i32) -> ! {
-    write_report(fd, &ProbeReport { stage, errno: error });
+    write_report(
+        fd,
+        &ProbeReport {
+            stage,
+            errno: error,
+        },
+    );
     libc::_exit(1)
 }
 
@@ -556,133 +546,3 @@ unsafe fn fail(fd: libc::c_int, stage: i32, error: i32) -> ! {
 unsafe fn errno() -> i32 {
     *libc::__errno_location()
 }
-'''
-Path("src/policy_preflight").mkdir(exist_ok=True)
-Path("src/policy_preflight/mandatory_core_probe.rs").write_text(probe_module)
-
-replace_one(
-    "src/policy_preflight.rs",
-    "use crate::host_capabilities::{self, CapabilityProbe, HostCapabilities};\n",
-    "mod mandatory_core_probe;\n\nuse crate::host_capabilities::{self, CapabilityProbe, HostCapabilities};\nuse mandatory_core_probe::StagedCapabilityProbe;\n",
-    "preflight probe module import",
-)
-replace_one(
-    "src/policy_preflight.rs",
-    "pub(crate) struct PolicyPreflight {\n    host: HostCapabilities,\n    requirements: PolicyRequirements,\n    mandatory_launch_core: RequirementStatus,\n}",
-    "pub(crate) struct PolicyPreflight {\n    host: HostCapabilities,\n    requirements: PolicyRequirements,\n    mandatory_launch_core: RequirementStatus,\n    mandatory_namespace_mount_core: Option<StagedCapabilityProbe>,\n}",
-    "preflight staged field",
-)
-replace_one(
-    "src/policy_preflight.rs",
-    "pub(crate) fn probe(policy: &SandboxPolicy) -> PolicyPreflight {\n    evaluate(policy, host_capabilities::probe())\n}",
-    "pub(crate) fn probe(policy: &SandboxPolicy) -> PolicyPreflight {\n    let mut evaluated = evaluate(policy, host_capabilities::probe());\n    evaluated.mandatory_namespace_mount_core = Some(mandatory_core_probe::probe());\n    evaluated\n}",
-    "production staged probe",
-)
-replace_one(
-    "src/policy_preflight.rs",
-    "    PolicyPreflight {\n        host,\n        requirements: PolicyRequirements::from_policy(policy),\n        mandatory_launch_core,\n    }",
-    "    PolicyPreflight {\n        host,\n        requirements: PolicyRequirements::from_policy(policy),\n        mandatory_launch_core,\n        mandatory_namespace_mount_core: None,\n    }",
-    "evaluator staged default",
-)
-replace_one(
-    "src/policy_preflight.rs",
-    '        output.push_str("},\\\"landlock\\\":{\\\"status\\\":\\\"");',
-    '''        output.push('}');
-        if let Some(probe) = self.mandatory_namespace_mount_core {
-            output.push_str(",\\\"mandatory_namespace_mount_core_probe\\\":");
-            push_staged_probe_json(&mut output, probe);
-        }
-        output.push_str(",\\\"landlock\\\":{\\\"status\\\":\\\"");''',
-    "preflight JSON staged probe",
-)
-replace_one(
-    "src/policy_preflight.rs",
-    '''        output.push('\n');
-        output.push_str("landlock: ");''',
-    '''        output.push('\n');
-        if let Some(probe) = self.mandatory_namespace_mount_core {
-            output.push_str("mandatory-namespace-mount-core-probe: ");
-            if probe.available {
-                writeln!(&mut output, "supported (stage={})", probe.stage)
-                    .expect("write to String cannot fail");
-            } else {
-                write!(&mut output, "unsupported (stage={}", probe.stage)
-                    .expect("write to String cannot fail");
-                if let Some(errno) = probe.errno {
-                    write!(&mut output, " errno={errno}").expect("write to String cannot fail");
-                }
-                output.push_str(")\n");
-            }
-        }
-        output.push_str("landlock: ");''',
-    "preflight human staged probe",
-)
-replace_one(
-    "src/policy_preflight.rs",
-    "fn push_probe_json(output: &mut String, probe: CapabilityProbe) {",
-    '''fn push_staged_probe_json(output: &mut String, probe: StagedCapabilityProbe) {
-    output.push_str("{\\\"status\\\":\\\"");
-    output.push_str(if probe.available { "supported" } else { "unsupported" });
-    output.push_str("\\\",\\\"stage\\\":\\\"");
-    output.push_str(probe.stage);
-    output.push_str("\\\",\\\"errno\\\":");
-    push_optional_i32(output, probe.errno);
-    output.push_str(",\\\"isolated_helper\\\":true,\\\"configured_root_touched\\\":false,\\\"target_executed\\\":false}");
-}
-
-fn push_probe_json(output: &mut String, probe: CapabilityProbe) {''',
-    "staged probe serializer",
-)
-
-Path("tests/preflight_core_probe_cli.rs").write_text(r'''#![cfg(all(target_os = "linux", target_arch = "x86_64"))]
-
-use std::fs;
-use std::path::PathBuf;
-use std::process::{self, Command};
-
-fn binary() -> &'static str {
-    env!("CARGO_BIN_EXE_security-lab")
-}
-
-#[test]
-fn preflight_positively_probes_isolated_namespace_mount_core_without_touching_policy_root() {
-    let missing_root = std::env::temp_dir().join(format!(
-        "security-lab-preflight-core-missing-root-{}",
-        process::id()
-    ));
-    let _ = fs::remove_dir_all(&missing_root);
-    let policy_path: PathBuf = std::env::temp_dir().join(format!(
-        "security-lab-preflight-core-policy-{}.conf",
-        process::id()
-    ));
-    let _ = fs::remove_file(&policy_path);
-    let policy = format!(
-        "filesystem.root = {}\nidentity.hostname = preflight-core\nexecutable = /bin/true\nworking_dir = /\nstdio.stdin = closed\nstdio.stdout = closed\nstdio.stderr = closed\nlimit.cpu_seconds = 1\nlimit.address_space_bytes = 67108864\nlimit.file_size_bytes = 1048576\nlimit.open_files = 32\nseccomp.allow = execveat,exit\n",
-        missing_root.display()
-    );
-    fs::write(&policy_path, policy).expect("write preflight policy");
-
-    let output = Command::new(binary())
-        .args([
-            "preflight-json",
-            policy_path.to_str().expect("UTF-8 policy path"),
-        ])
-        .output()
-        .expect("run preflight core probe");
-    let _ = fs::remove_file(&policy_path);
-
-    assert_eq!(output.status.code(), Some(4));
-    assert!(output.stderr.is_empty());
-    let stdout = String::from_utf8(output.stdout).expect("preflight JSON is UTF-8");
-    assert!(stdout.contains(
-        "\"mandatory_launch_core\":{\"status\":\"unprobed\",\"reason\":\"mandatory_runtime_prerequisites_not_probed\"}"
-    ));
-    assert!(stdout.contains(
-        "\"mandatory_namespace_mount_core_probe\":{\"status\":\"supported\",\"stage\":\"complete\",\"errno\":null,\"isolated_helper\":true,\"configured_root_touched\":false,\"target_executed\":false}"
-    ));
-    assert!(
-        !missing_root.exists(),
-        "isolated core probe must not materialize or inspect the configured policy root"
-    );
-}
-''')

@@ -143,19 +143,21 @@ fn seccomp_forbidden_mask_checks_full_64_bit_pattern_without_overblocking() {
 '''
 replace_one("tests/sandbox.rs", old_test, new_test, "cross-word integration test")
 
-# Evidence claims: do not broaden semantics, only close the already-stated 64-bit proof.
-for path in ["README.md", "THREAT_MODEL.md"]:
-    p = Path(path)
-    text = p.read_text()
-    old = "forbidden-mask seccomp parser/validator regressions plus a raw `mmap` oracle"
-    if old not in text:
-        raise SystemExit(f"{path}: forbidden-mask evidence bullet not found")
-    text = text.replace(
-        old,
-        "forbidden-mask seccomp parser/validator regressions plus a cross-word raw `lseek` oracle where one participating low-bit mismatch and one high-word mismatch each remain allowed while the exact two-half masked match returns `EPERM`, together with a raw `mmap` oracle",
-        1,
-    )
-    p.write_text(text)
+# THREAT_MODEL already has a 29A executable-evidence bullet. Strengthen it with
+# the cross-word oracle. README currently summarizes the semantics but has no
+# corresponding evidence bullet, so do not invent a brittle placement there.
+p = Path("THREAT_MODEL.md")
+text = p.read_text()
+old = "forbidden-mask seccomp parser/validator regressions plus a raw `mmap` oracle"
+count = text.count(old)
+if count != 1:
+    raise SystemExit(f"THREAT_MODEL forbidden-mask evidence: expected exactly one match, got {count}")
+text = text.replace(
+    old,
+    "forbidden-mask seccomp parser/validator regressions plus a cross-word raw `lseek` oracle where one participating low-bit mismatch and one high-word mismatch each remain allowed while the exact two-half masked match returns `EPERM`, together with a raw `mmap` oracle",
+    1,
+)
+p.write_text(text)
 
 p = Path("ROADMAP.md")
 text = p.read_text()

@@ -12,6 +12,7 @@
 #   G assert one selected non-stdio handle is remapped without ambient FD leakage
 #   c fork a descendant, publish cancellation readiness on fd 9, then pause
 #   g fork a paused descendant and continuously emit stdout until launcher output budget terminates the tree
+#   f emit CLOCK_MONOTONIC and CLOCK_BOOTTIME timespecs for time-namespace evidence
 #   v read a declared persistent volume, prove it is read-only, and hide its host source path
 #   w write through a declared persistent volume while root and host source paths stay confined
 #   n prove policy-owned loopback supports positive intra-sandbox TCP
@@ -68,6 +69,8 @@ _start:
     je .cancellation_tree
     cmp $103, %al
     je .stdout_output_budget_tree
+    cmp $102, %al
+    je .time_namespace_clocks
     cmp $118, %al
     je .readonly_volume
     cmp $119, %al
@@ -151,6 +154,38 @@ _start:
     cmp $74, %al
     je .uts_identity
     jmp .fail2
+
+.time_namespace_clocks:
+    sub $32, %rsp
+
+    mov $228, %eax
+    mov $1, %edi
+    mov %rsp, %rsi
+    syscall
+    test %rax, %rax
+    js .fail29_time_stack
+
+    mov $228, %eax
+    mov $7, %edi
+    lea 16(%rsp), %rsi
+    syscall
+    test %rax, %rax
+    js .fail29_time_stack
+
+    mov $1, %eax
+    mov $1, %edi
+    mov %rsp, %rsi
+    mov $32, %edx
+    syscall
+    cmp $32, %rax
+    jne .fail29_time_stack
+    add $32, %rsp
+    xor %edi, %edi
+    jmp .exit
+
+.fail29_time_stack:
+    add $32, %rsp
+    jmp .fail29
 
 .allowed:
     mov $1, %eax

@@ -317,6 +317,8 @@ fn policy(mode: &str, extra_args: &[&str], syscalls: &[&str]) -> SandboxPolicy {
         stdout_redirect: None,
         stdout_capture_bytes: None,
         stdout_total_bytes: None,
+        time_monotonic_offset_seconds: None,
+        time_boottime_offset_seconds: None,
         wall_clock_milliseconds: None,
         limits: ResourceLimits {
             cpu_seconds: 2,
@@ -330,6 +332,69 @@ fn policy(mode: &str, extra_args: &[&str], syscalls: &[&str]) -> SandboxPolicy {
             argument_range_rules: BTreeMap::new(),
         },
     }
+}
+
+fn clock_nanos(clock_id: libc::clockid_t) -> i128 {
+    let mut value = unsafe { std::mem::zeroed::<libc::timespec>() };
+    assert_eq!(
+        unsafe { libc::clock_gettime(clock_id, &mut value) },
+        0,
+        "host clock_gettime failed: {}",
+        std::io::Error::last_os_error()
+    );
+    i128::from(value.tv_sec) * 1_000_000_000 + i128::from(value.tv_nsec)
+}
+
+fn captured_timespec_nanos(bytes: &[u8], offset: usize) -> i128 {
+    let seconds = i64::from_ne_bytes(bytes[offset..offset + 8].try_into().unwrap());
+    let nanos = i64::from_ne_bytes(bytes[offset + 8..offset + 16].try_into().unwrap());
+    assert!((0..1_000_000_000).contains(&nanos));
+    i128::from(seconds) * 1_000_000_000 + i128::from(nanos)
+}
+
+#[test]
+fn policy_owned_time_namespace_offsets_descendant_clocks() {
+    const MONOTONIC_OFFSET_SECONDS: u64 = 3600;
+    const BOOTTIME_OFFSET_SECONDS: u64 = 7200;
+    const TOLERANCE_NANOS: i128 = 2_000_000_000;
+
+    let host_monotonic_before = clock_nanos(libc::CLOCK_MONOTONIC);
+    let host_boottime_before = clock_nanos(libc::CLOCK_BOOTTIME);
+
+    let mut timed = policy("f", &[], &["execveat", "clock_gettime", "write", "exit"]);
+    timed.time_monotonic_offset_seconds = Some(MONOTONIC_OFFSET_SECONDS);
+    timed.time_boottime_offset_seconds = Some(BOOTTIME_OFFSET_SECONDS);
+    timed.stdio.stdout = StdioMode::Capture;
+    timed.stdout_capture_bytes = Some(32);
+    timed.wall_clock_milliseconds = Some(5000);
+
+    let report = run_report(&timed).expect("time-namespace sandbox run failed");
+    assert_eq!(report.outcome, ChildOutcome::Exited(0));
+    let captured = report.stdout.expect("time-namespace capture missing");
+    assert!(!captured.truncated);
+    assert_eq!(captured.bytes.len(), 32);
+
+    let host_monotonic_after = clock_nanos(libc::CLOCK_MONOTONIC);
+    let host_boottime_after = clock_nanos(libc::CLOCK_BOOTTIME);
+    let target_monotonic = captured_timespec_nanos(&captured.bytes, 0);
+    let target_boottime = captured_timespec_nanos(&captured.bytes, 16);
+    let monotonic_offset = i128::from(MONOTONIC_OFFSET_SECONDS) * 1_000_000_000;
+    let boottime_offset = i128::from(BOOTTIME_OFFSET_SECONDS) * 1_000_000_000;
+
+    assert!(
+        target_monotonic >= host_monotonic_before + monotonic_offset - TOLERANCE_NANOS
+            && target_monotonic <= host_monotonic_after + monotonic_offset + TOLERANCE_NANOS,
+        "target CLOCK_MONOTONIC did not reflect the configured time namespace offset"
+    );
+    assert!(
+        target_boottime >= host_boottime_before + boottime_offset - TOLERANCE_NANOS
+            && target_boottime <= host_boottime_after + boottime_offset + TOLERANCE_NANOS,
+        "target CLOCK_BOOTTIME did not reflect the configured time namespace offset"
+    );
+    assert!(
+        host_monotonic_after - host_monotonic_before < 30_000_000_000,
+        "host monotonic clock unexpectedly moved with the sandbox time namespace"
+    );
 }
 
 fn assert_random_device_ioctl_available(path: &str) {

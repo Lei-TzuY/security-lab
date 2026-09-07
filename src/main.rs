@@ -1,3 +1,4 @@
+mod authority_manifest;
 mod cli_json;
 mod host_capabilities;
 
@@ -17,14 +18,21 @@ fn main() {
     let run_requested = command.as_deref() == Some(OsStr::new("run"));
     let check_json_requested = command.as_deref() == Some(OsStr::new("check-json"));
     let check_requested = command.as_deref() == Some(OsStr::new("check"));
+    let manifest_json_requested = command.as_deref() == Some(OsStr::new("manifest-json"));
+    let manifest_requested = command.as_deref() == Some(OsStr::new("manifest"));
     let host_json_requested = command.as_deref() == Some(OsStr::new("host-json"));
     let host_requested = command.as_deref() == Some(OsStr::new("host"));
     let host_command = host_json_requested || host_requested;
-    let machine_requested = run_json_requested || check_json_requested || host_json_requested;
+    let machine_requested = run_json_requested
+        || check_json_requested
+        || manifest_json_requested
+        || host_json_requested;
     let recognized_command = run_json_requested
         || run_requested
         || check_json_requested
         || check_requested
+        || manifest_json_requested
+        || manifest_requested
         || host_json_requested
         || host_requested;
     let invalid_shape = if host_command {
@@ -36,7 +44,7 @@ fn main() {
     if !recognized_command || invalid_shape {
         let display_program = program.to_string_lossy();
         let usage = format!(
-            "usage: {display_program} <run|run-json|check|check-json> <policy-file> | {display_program} <host|host-json>"
+            "usage: {display_program} <run|run-json|check|check-json|manifest|manifest-json> <policy-file> | {display_program} <host|host-json>"
         );
         if machine_requested {
             println!("{}", cli_json::error_json("usage", &usage));
@@ -82,6 +90,14 @@ fn main() {
         }
     };
 
+    if manifest_json_requested {
+        println!("{}", authority_manifest::to_json(&policy));
+        process::exit(0);
+    }
+    if manifest_requested {
+        print!("{}", authority_manifest::to_human(&policy));
+        process::exit(0);
+    }
     if check_json_requested {
         println!("{}", cli_json::validation_json());
         process::exit(0);

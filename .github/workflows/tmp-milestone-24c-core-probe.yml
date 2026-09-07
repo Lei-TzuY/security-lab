@@ -16,6 +16,8 @@ jobs:
         with:
           toolchain: stable
           components: rustfmt, clippy
+      - name: Repair construction literal matcher
+        run: python3 .github/tmp-milestone-24c-core-probe-fix.py
       - name: Materialize candidate
         run: python3 .github/tmp-milestone-24c-core-probe.py
       - name: Format
@@ -35,6 +37,7 @@ jobs:
       - name: Remove construction files and commit candidate tree
         run: |
           rm .github/tmp-milestone-24c-core-probe.py
+          rm .github/tmp-milestone-24c-core-probe-fix.py
           rm .github/workflows/tmp-milestone-24c-core-probe.yml
           git config user.name LeiZ
           git config user.email 52287354+Lei-TzuY@users.noreply.github.com

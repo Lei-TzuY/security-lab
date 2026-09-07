@@ -604,7 +604,7 @@ Boundary: 24B is a conservative partial preflight, not a dry-run, launch simulat
 
 ### Slice 24C — isolated mandatory launch-primitive probe
 
-**Current verified candidate.** Adds positive compatibility evidence for a representative mandatory Linux setup core without relabeling that evidence as a complete launch preflight.
+**Status: complete on `main`.** Adds positive compatibility evidence for a representative mandatory Linux setup core without relabeling that evidence as a complete launch preflight.
 
 Acceptance evidence is executable:
 
@@ -617,9 +617,25 @@ Acceptance evidence is executable:
 
 Boundary: 24C is an isolated primitive-compatibility probe, not a launch dry-run or complete kernel compatibility oracle. It does not establish that the configured root exists or is pinnable, prove the exact configured executable/cwd/volume/Landlock/time/procfs path, reproduce the full launcher/PID1 orchestration, prove the production seccomp program for a policy, or prove successful `execveat`. Actual successful runtime execution remains authoritative for those properties.
 
+### Slice 24D — configured filesystem anchor preflight
+
+**Current verified candidate.** Adds a policy-specific read-only prerequisite probe for configured filesystem anchors without converting preflight into a launch dry-run.
+
+Acceptance evidence is executable:
+
+- production `preflight` / `preflight-json` independently probe `filesystem.root`, the sandbox executable and working directory, optional scratch and `/proc` targets, and any declared read-only/writable persistent-volume source and target anchors;
+- host root/volume-source directories use `openat2(O_PATH|O_DIRECTORY|O_CLOEXEC)` with symlink/magic-link traversal forbidden, while sandbox-internal anchors are resolved beneath the opened root with `RESOLVE_BENEATH|RESOLVE_NO_XDEV|RESOLVE_NO_MAGICLINKS|RESOLVE_NO_SYMLINKS`;
+- the executable must additionally `fstat` as a regular file with at least one execute bit, mirroring the corresponding parent-preparation prerequisite without executing it;
+- the configured-filesystem probe creates no namespaces or mounts, writes no configured state, and never executes the target; its machine report explicitly carries `read_only=true`, `namespaces_created=false`, and `target_executed=false`;
+- a deliberately nonexistent root now yields `incompatible` / exit status 3 with `stage=root_open` and `ENOENT`, while the independent 24C isolated helper can still report `supported` and the missing path remains absent;
+- a positive fixture resolves executable/cwd/scratch/proc plus both volume source/target pairs, preserves fixture bytes and empty writable target state, reports the configured-filesystem probe `supported`, but the overall preflight remains `indeterminate` / exit status 4 because `mandatory_launch_core` is still `unprobed`;
+- stable rustfmt/Clippy/full tests and the full Rust 1.74 suite are green on the exact implementation head.
+
+Boundary: 24D is point-in-time read-only path/type/mode prerequisite evidence. It does not pin these descriptors for a later launch, prove cross-time inode identity, inspect the final post-mount Landlock tree, establish time/procfs mount success, reproduce PID1/target orchestration, validate the exact production seccomp program, or prove successful `execveat`.
+
 ### Milestone 24 promotion rule
 
-24A–24B are sealed on `main`; 24C is the current integration candidate. After 24C integrates, do not farm additional syscall aliases or fixture variants around the same isolated-helper mechanism. A later preflight slice is justified only if it safely closes a currently unprobed prerequisite toward a sound complete verdict; otherwise promote to a materially different executable authority/enforcement frontier. Milestone 25A remains a separate evidence class because it records stages positively observed during an actual run.
+24A–24C are sealed on `main`; 24D is the current integration candidate. After 24D integrates, do not farm more path aliases, errno cases, or anchor spellings around the same read-only preflight mechanism. Another preflight slice is justified only if it closes a materially different mandatory prerequisite without turning preflight into a privileged/destructive launch simulation; otherwise promote to a different executable authority/enforcement frontier. Milestone 25A remains a separate evidence class because it records stages positively observed during an actual run.
 
 ## Milestone 25 — runtime enforcement evidence
 

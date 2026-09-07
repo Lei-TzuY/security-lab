@@ -51,7 +51,30 @@ pub struct ProcessTreeUsage {
     pub max_child_rss_kib: u64,
 }
 
-/// Detailed result for callers that need launcher-owned captured output or process-tree lifecycle evidence.
+/// Kernel enforcement layers proven by this successful launcher-owned run.
+///
+/// Fields are published from the actual setup path after the corresponding
+/// kernel operation succeeds. Optional layers are false when they were not
+/// requested. `execveat` is confirmed by the host only after launch error state
+/// is clean and the PID-namespace lifecycle has converged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct EnforcementReceipt {
+    pub base_namespaces: bool,
+    pub time_namespace_offsets: bool,
+    pub hostname: bool,
+    pub private_mount_propagation: bool,
+    pub readonly_root: bool,
+    pub chroot: bool,
+    pub fd_sanitization: bool,
+    pub rlimits: bool,
+    pub capabilities_reduced: bool,
+    pub no_new_privs: bool,
+    pub landlock: bool,
+    pub seccomp: bool,
+    pub execveat: bool,
+}
+
+/// Detailed result for callers that need launcher-owned captured output, process-tree lifecycle evidence, or a runtime enforcement receipt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunReport {
     /// Terminal status of the direct target, not of the namespace init.
@@ -62,4 +85,6 @@ pub struct RunReport {
     pub reaped_descendants: u32,
     /// Kernel resource telemetry collected by namespace PID 1 only after the sandbox tree converges.
     pub process_tree_usage: ProcessTreeUsage,
+    /// Runtime receipt for enforcement layers established by this successful launch.
+    pub enforcement: EnforcementReceipt,
 }

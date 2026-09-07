@@ -121,7 +121,7 @@ fn push_json_string(output: &mut String, value: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use security_lab::{CapturedOutput, ProcessTreeUsage, RunReport};
+    use security_lab::{CapturedOutput, EnforcementReceipt, ProcessTreeUsage, RunReport};
 
     #[test]
     fn serializes_binary_capture_without_loss() {
@@ -137,6 +137,7 @@ mod tests {
                 system_cpu_micros: 22,
                 max_child_rss_kib: 33,
             },
+            enforcement: EnforcementReceipt::default(),
         };
 
         assert_eq!(
@@ -163,6 +164,7 @@ mod tests {
             }),
             reaped_descendants: 1,
             process_tree_usage: ProcessTreeUsage::default(),
+            enforcement: EnforcementReceipt::default(),
         };
         assert!(report_json(&report).contains("\"kind\":\"output_limit_exceeded\""));
     }

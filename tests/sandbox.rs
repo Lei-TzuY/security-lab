@@ -370,6 +370,10 @@ fn policy_owned_time_namespace_offsets_descendant_clocks() {
 
     let report = run_report(&timed).expect("time-namespace sandbox run failed");
     assert_eq!(report.outcome, ChildOutcome::Exited(0));
+    assert!(
+        report.enforcement.time_namespace_offsets,
+        "runtime receipt did not record installed time namespace offsets"
+    );
     let captured = report.stdout.expect("time-namespace capture missing");
     assert!(!captured.truncated);
     assert_eq!(captured.bytes.len(), 32);
@@ -554,7 +558,12 @@ fn landlock_device_ioctl_envelope_binds_rights_at_post_restriction_open() {
     confined.readonly_volume_target = Some(PathBuf::from("/devices"));
     confined.landlock_device_ioctl = vec![PathBuf::from("/devices/urandom")];
 
-    assert_eq!(run(&confined).unwrap(), ChildOutcome::Exited(0));
+    let report = run_report(&confined).expect("Landlock device sandbox failed");
+    assert_eq!(report.outcome, ChildOutcome::Exited(0));
+    assert!(
+        report.enforcement.landlock,
+        "runtime receipt did not record successful Landlock restriction"
+    );
 }
 
 #[test]
@@ -1315,10 +1324,23 @@ fn seccomp_argument_range_checks_unsigned_64_bit_boundaries_and_composes() {
 
 #[test]
 fn allowed_operation_succeeds() {
-    assert_eq!(
-        run(&policy("A", &[], &["execveat", "write", "exit"])).unwrap(),
-        ChildOutcome::Exited(0)
-    );
+    let report = run_report(&policy("A", &[], &["execveat", "write", "exit"]))
+        .expect("allowed operation failed");
+    assert_eq!(report.outcome, ChildOutcome::Exited(0));
+    let receipt = report.enforcement;
+    assert!(receipt.base_namespaces);
+    assert!(!receipt.time_namespace_offsets);
+    assert!(receipt.hostname);
+    assert!(receipt.private_mount_propagation);
+    assert!(receipt.readonly_root);
+    assert!(receipt.chroot);
+    assert!(receipt.fd_sanitization);
+    assert!(receipt.rlimits);
+    assert!(receipt.capabilities_reduced);
+    assert!(receipt.no_new_privs);
+    assert!(!receipt.landlock);
+    assert!(receipt.seccomp);
+    assert!(receipt.execveat);
 }
 
 #[test]

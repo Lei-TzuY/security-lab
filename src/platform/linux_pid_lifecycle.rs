@@ -6,6 +6,7 @@ use std::ptr;
 pub(super) struct LaunchErrorRecord {
     pub(super) errno: i32,
     pub(super) phase: u32,
+    pub(super) enforcement_bits: u64,
 }
 
 #[repr(C)]

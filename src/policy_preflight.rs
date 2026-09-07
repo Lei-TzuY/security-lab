@@ -1,6 +1,8 @@
+mod configured_filesystem_probe;
 mod mandatory_core_probe;
 
 use crate::host_capabilities::{self, CapabilityProbe, HostCapabilities};
+use configured_filesystem_probe::ConfiguredFilesystemProbe;
 use mandatory_core_probe::StagedCapabilityProbe;
 use security_lab::SandboxPolicy;
 use std::fmt::Write as _;
@@ -113,11 +115,13 @@ pub(crate) struct PolicyPreflight {
     host: HostCapabilities,
     requirements: PolicyRequirements,
     mandatory_launch_core: RequirementStatus,
+    configured_filesystem: Option<ConfiguredFilesystemProbe>,
     mandatory_namespace_mount_core: Option<StagedCapabilityProbe>,
 }
 
 pub(crate) fn probe(policy: &SandboxPolicy) -> PolicyPreflight {
     let mut evaluated = evaluate(policy, host_capabilities::probe());
+    evaluated.configured_filesystem = Some(configured_filesystem_probe::probe(policy));
     evaluated.mandatory_namespace_mount_core = Some(mandatory_core_probe::probe());
     evaluated
 }
@@ -139,6 +143,7 @@ fn evaluate_with_core(
         host,
         requirements: PolicyRequirements::from_policy(policy),
         mandatory_launch_core,
+        configured_filesystem: None,
         mandatory_namespace_mount_core: None,
     }
 }
@@ -201,6 +206,7 @@ impl PolicyPreflight {
     fn verdict(&self) -> Verdict {
         if !self.host.sandbox_target_supported
             || self.mandatory_launch_core_status() == RequirementStatus::Unsupported
+            || matches!(self.configured_filesystem, Some(probe) if !probe.available)
             || self.landlock_status() == RequirementStatus::Unsupported
             || self.deadline_status() == RequirementStatus::Unsupported
             || self.output_limit_status() == RequirementStatus::Unsupported
@@ -244,6 +250,10 @@ impl PolicyPreflight {
             output.push_str("null");
         }
         output.push('}');
+        if let Some(probe) = self.configured_filesystem {
+            output.push_str(",\"configured_filesystem_probe\":");
+            push_configured_filesystem_probe_json(&mut output, probe);
+        }
         if let Some(probe) = self.mandatory_namespace_mount_core {
             output.push_str(",\"mandatory_namespace_mount_core_probe\":");
             push_staged_probe_json(&mut output, probe);
@@ -312,6 +322,28 @@ impl PolicyPreflight {
             write!(&mut output, " ({reason})").expect("write to String cannot fail");
         }
         output.push('\n');
+        if let Some(probe) = self.configured_filesystem {
+            output.push_str("configured-filesystem-probe: ");
+            if probe.available {
+                writeln!(
+                    &mut output,
+                    "supported (stage={} read-only=true namespaces-created=false target-executed=false)",
+                    probe.stage
+                )
+                .expect("write to String cannot fail");
+            } else {
+                write!(
+                    &mut output,
+                    "unsupported (stage={} read-only=true namespaces-created=false target-executed=false",
+                    probe.stage
+                )
+                .expect("write to String cannot fail");
+                if let Some(errno) = probe.errno {
+                    write!(&mut output, " errno={errno}").expect("write to String cannot fail");
+                }
+                output.push_str(")\n");
+            }
+        }
         if let Some(probe) = self.mandatory_namespace_mount_core {
             output.push_str("mandatory-namespace-mount-core-probe: ");
             if probe.available {
@@ -382,6 +414,20 @@ fn probe_pair_status(
     } else {
         RequirementStatus::Unsupported
     }
+}
+
+fn push_configured_filesystem_probe_json(output: &mut String, probe: ConfiguredFilesystemProbe) {
+    output.push_str("{\"status\":\"");
+    output.push_str(if probe.available {
+        "supported"
+    } else {
+        "unsupported"
+    });
+    output.push_str("\",\"stage\":\"");
+    output.push_str(probe.stage);
+    output.push_str("\",\"errno\":");
+    push_optional_i32(output, probe.errno);
+    output.push_str(",\"read_only\":true,\"namespaces_created\":false,\"target_executed\":false}");
 }
 
 fn push_staged_probe_json(output: &mut String, probe: StagedCapabilityProbe) {

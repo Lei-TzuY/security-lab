@@ -20,8 +20,9 @@ mod x86_64 {
     };
     use crate::policy::{StdioMode, StdioPolicy};
     use crate::{
-        CancellationToken, CapturedOutput, ChildOutcome, EnforcementReceipt, PolicyError,
-        ProcessTreeUsage, ResourceLimits, RunReport, SandboxError, SandboxPolicy,
+        CancellationToken, CapturedOutput, ChildOutcome, EnforcementReceipt,
+        PersistentVolumeAccess, PolicyError, ProcessTreeUsage, ResourceLimits, RunReport,
+        SandboxError, SandboxPolicy,
     };
     use std::ffi::CString;
     use std::io;
@@ -1224,7 +1225,7 @@ mod x86_64 {
                 })
                 .transpose()?;
 
-            let mut volumes = Vec::with_capacity(2);
+            let mut volumes = Vec::with_capacity(2 + policy.persistent_volumes.len());
             match (
                 &policy.readonly_volume_source,
                 &policy.readonly_volume_target,
@@ -1264,6 +1265,23 @@ mod x86_64 {
                         "volume.writable_source and volume.writable_target must be specified together",
                     )));
                 }
+            }
+
+            for (name, volume) in &policy.persistent_volumes {
+                let access = match volume.access {
+                    PersistentVolumeAccess::ReadOnly => VolumeAccess::ReadOnly,
+                    PersistentVolumeAccess::Writable => VolumeAccess::Writable,
+                };
+                let source_field = format!("volume.mount.{name}.source");
+                volumes.push(prepare_volume(
+                    root_fd.raw(),
+                    &volume.source,
+                    &volume.target,
+                    &source_field,
+                    "named persistent volume source",
+                    "named persistent volume target",
+                    access,
+                )?);
             }
 
             let cwd_relative = sandbox_relative(&policy.working_dir)?;

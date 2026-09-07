@@ -181,6 +181,16 @@ pub(crate) fn compare(baseline: &SandboxPolicy, candidate: &SandboxPolicy) -> Au
         &mut changes,
     );
 
+    push_change(
+        "filesystem.persistent_volumes",
+        subset_relation(
+            map_is_subset(&baseline.persistent_volumes, &candidate.persistent_volumes),
+            map_is_subset(&candidate.persistent_volumes, &baseline.persistent_volumes),
+            true,
+        ),
+        &mut changes,
+    );
+
     compare_positive_bool(
         "network.isolated_loopback_enabled",
         baseline.loopback_enabled,

@@ -1,9 +1,9 @@
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 
 use security_lab::{
-    run, run_report, run_report_with_cancel, CancellationToken, ChildOutcome, ResourceLimits,
-    SandboxError, SandboxPolicy, SeccompArgRangeRule, SeccompArgRule, SeccompPolicy, StdioMode,
-    StdioPolicy,
+    run, run_report, run_report_with_cancel, CancellationToken, ChildOutcome,
+    PersistentVolumeAccess, PersistentVolumePolicy, ResourceLimits, SandboxError, SandboxPolicy,
+    SeccompArgRangeRule, SeccompArgRule, SeccompPolicy, StdioMode, StdioPolicy,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CString;
@@ -188,6 +188,8 @@ fn fixture_root() -> &'static Path {
         std::fs::create_dir_all(root.join("proc")).expect("create sandbox procfs mountpoint");
         std::fs::create_dir_all(root.join("scratch")).expect("create sandbox scratch mountpoint");
         std::fs::create_dir_all(root.join("data")).expect("create sandbox volume mountpoint");
+        std::fs::create_dir_all(root.join("data2"))
+            .expect("create second sandbox volume mountpoint");
         std::fs::create_dir_all(root.join("persist"))
             .expect("create sandbox writable-volume mountpoint");
         std::fs::create_dir_all(root.join("devices"))
@@ -225,6 +227,21 @@ fn readonly_volume_source() -> &'static Path {
             std::fs::create_dir_all(&source).expect("create persistent volume source");
             std::fs::write(source.join("marker"), b"volume-marker\n")
                 .expect("write persistent volume marker");
+            source
+        })
+        .as_path()
+}
+
+fn readonly_volume_source_two() -> &'static Path {
+    static SOURCE: OnceLock<PathBuf> = OnceLock::new();
+    SOURCE
+        .get_or_init(|| {
+            let source =
+                std::env::temp_dir().join(format!("security-lab-volume-two-{}", process::id()));
+            let _ = std::fs::remove_dir_all(&source);
+            std::fs::create_dir_all(&source).expect("create second persistent volume source");
+            std::fs::write(source.join("marker"), b"volume-marker\n")
+                .expect("write second persistent volume marker");
             source
         })
         .as_path()
@@ -308,6 +325,7 @@ fn policy(mode: &str, extra_args: &[&str], syscalls: &[&str]) -> SandboxPolicy {
         readonly_volume_target: None,
         writable_volume_source: None,
         writable_volume_target: None,
+        persistent_volumes: BTreeMap::new(),
         scratch_dir: Some(PathBuf::from("/scratch")),
         scratch_bytes: Some(SCRATCH_BYTES),
         stdio: StdioPolicy {
@@ -904,6 +922,65 @@ fn private_procfs_seals_pid1_control_descriptors_during_supervision() {
     assert!(
         report.enforcement.private_procfs,
         "runtime receipt must require both procfs mount and PID1 access hardening"
+    );
+}
+
+#[test]
+fn named_persistent_volume_graph_mounts_three_mixed_access_volumes() {
+    let first = readonly_volume_source().to_path_buf();
+    let second = readonly_volume_source_two().to_path_buf();
+    let writable = writable_volume_source().to_path_buf();
+    let persisted = writable.join("persisted");
+    let _ = std::fs::remove_file(&persisted);
+    let forbidden = first.join("write-must-fail");
+    let _ = std::fs::remove_file(&forbidden);
+
+    let mut mounted = policy(
+        "z",
+        &[],
+        &["execveat", "openat", "read", "write", "close", "exit"],
+    );
+    mounted.persistent_volumes.insert(
+        "assets-a".to_owned(),
+        PersistentVolumePolicy {
+            source: first.clone(),
+            target: PathBuf::from("/data"),
+            access: PersistentVolumeAccess::ReadOnly,
+        },
+    );
+    mounted.persistent_volumes.insert(
+        "assets-b".to_owned(),
+        PersistentVolumePolicy {
+            source: second.clone(),
+            target: PathBuf::from("/data2"),
+            access: PersistentVolumeAccess::ReadOnly,
+        },
+    );
+    mounted.persistent_volumes.insert(
+        "state".to_owned(),
+        PersistentVolumePolicy {
+            source: writable.clone(),
+            target: PathBuf::from("/persist"),
+            access: PersistentVolumeAccess::Writable,
+        },
+    );
+
+    assert_eq!(run(&mounted).unwrap(), ChildOutcome::Exited(0));
+    assert_eq!(
+        std::fs::read(first.join("marker")).expect("read first named volume marker"),
+        b"volume-marker\n"
+    );
+    assert_eq!(
+        std::fs::read(second.join("marker")).expect("read second named volume marker"),
+        b"volume-marker\n"
+    );
+    assert!(
+        !forbidden.exists(),
+        "named read-only volume accepted a write"
+    );
+    assert_eq!(
+        std::fs::read(&persisted).expect("read named writable volume output"),
+        b"persistent-write\n"
     );
 }
 

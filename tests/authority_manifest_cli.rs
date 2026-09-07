@@ -141,6 +141,26 @@ fn manifest_human_summarizes_authority_without_secret_values() {
 }
 
 #[test]
+fn manifest_json_lists_named_persistent_volumes_deterministically() {
+    let root = root_path("named-volumes");
+    let mut text = manifest_policy(&root);
+    text.push_str(
+        "volume.mount.assets.source = /srv/assets\nvolume.mount.assets.target = /assets\nvolume.mount.assets.access = read-only\nvolume.mount.state.source = /srv/state\nvolume.mount.state.target = /state\nvolume.mount.state.access = writable\n",
+    );
+    let path = write_policy("named-volumes", &text);
+    let output = Command::new(binary())
+        .args(["manifest-json", path.to_str().expect("UTF-8 policy path")])
+        .output()
+        .expect("run named-volume manifest JSON CLI");
+    let _ = fs::remove_file(path);
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8(output.stdout).expect("manifest JSON is UTF-8");
+    assert!(stdout.contains(
+        "\"persistent_volumes\":[{\"name\":\"assets\",\"source\":\"/srv/assets\",\"target\":\"/assets\",\"access\":\"read_only\"},{\"name\":\"state\",\"source\":\"/srv/state\",\"target\":\"/state\",\"access\":\"writable\"}]"
+    ));
+}
+
+#[test]
 fn manifest_json_rejects_invalid_policy_fail_closed() {
     let path = write_policy("invalid", "unknown.field = value\n");
     let output = Command::new(binary())

@@ -74,6 +74,7 @@ mod x86_64 {
     const ENFORCEMENT_NO_NEW_PRIVS: u64 = 1 << 9;
     const ENFORCEMENT_LANDLOCK: u64 = 1 << 10;
     const ENFORCEMENT_SECCOMP: u64 = 1 << 11;
+    const ENFORCEMENT_PRIVATE_PROCFS: u64 = 1 << 12;
     const ENFORCEMENT_KNOWN: u64 = ENFORCEMENT_BASE_NAMESPACES
         | ENFORCEMENT_TIME_NAMESPACE
         | ENFORCEMENT_HOSTNAME
@@ -85,7 +86,8 @@ mod x86_64 {
         | ENFORCEMENT_CAPABILITIES
         | ENFORCEMENT_NO_NEW_PRIVS
         | ENFORCEMENT_LANDLOCK
-        | ENFORCEMENT_SECCOMP;
+        | ENFORCEMENT_SECCOMP
+        | ENFORCEMENT_PRIVATE_PROCFS;
 
     const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
     const PR_CAPBSET_DROP: libc::c_int = 24;
@@ -148,6 +150,8 @@ mod x86_64 {
     const PHASE_OUTPUT_LIMIT_PIDFD: u32 = 54;
     const PHASE_OUTPUT_LIMIT_POLL: u32 = 55;
     const PHASE_TIME_OFFSETS: u32 = 56;
+    const PHASE_PROCFS_MOUNT: u32 = 57;
+    const PHASE_PROCFS_PID1_HARDEN: u32 = 58;
 
     const SYS_LANDLOCK_CREATE_RULESET: libc::c_long = 444;
     const SYS_LANDLOCK_ADD_RULE: libc::c_long = 445;
@@ -757,10 +761,25 @@ mod x86_64 {
             || policy.landlock_scope_signal
     }
 
+    #[cfg(test)]
     fn enforcement_receipt_from_bits(
         bits: u64,
         time_namespace_requested: bool,
         landlock_requested: bool,
+    ) -> Result<EnforcementReceipt, SandboxError> {
+        enforcement_receipt_from_bits_for_policy(
+            bits,
+            time_namespace_requested,
+            landlock_requested,
+            false,
+        )
+    }
+
+    fn enforcement_receipt_from_bits_for_policy(
+        bits: u64,
+        time_namespace_requested: bool,
+        landlock_requested: bool,
+        procfs_requested: bool,
     ) -> Result<EnforcementReceipt, SandboxError> {
         let unknown = bits & !ENFORCEMENT_KNOWN;
         if unknown != 0 {
@@ -800,6 +819,11 @@ mod x86_64 {
             ENFORCEMENT_CHROOT,
             "FD sanitization",
         )?;
+        require_predecessor(
+            ENFORCEMENT_PRIVATE_PROCFS,
+            ENFORCEMENT_FD_SANITIZATION,
+            "private procfs",
+        )?;
         require_predecessor(ENFORCEMENT_RLIMITS, ENFORCEMENT_FD_SANITIZATION, "rlimits")?;
         require_predecessor(
             ENFORCEMENT_CAPABILITIES,
@@ -831,6 +855,19 @@ mod x86_64 {
             ));
         }
 
+        let private_procfs = observed(ENFORCEMENT_PRIVATE_PROCFS);
+        if private_procfs && !procfs_requested {
+            return Err(SandboxError::SetupFailed(
+                "runtime enforcement receipt observed unrequested private procfs".to_owned(),
+            ));
+        }
+        if procfs_requested && observed(ENFORCEMENT_RLIMITS) && !private_procfs {
+            return Err(SandboxError::SetupFailed(
+                "runtime enforcement receipt reached target rlimits without requested private procfs"
+                    .to_owned(),
+            ));
+        }
+
         let landlock = observed(ENFORCEMENT_LANDLOCK);
         if landlock && !landlock_requested {
             return Err(SandboxError::SetupFailed(
@@ -855,6 +892,7 @@ mod x86_64 {
             readonly_root: bits & ENFORCEMENT_READONLY_ROOT != 0,
             chroot: bits & ENFORCEMENT_CHROOT != 0,
             fd_sanitization: bits & ENFORCEMENT_FD_SANITIZATION != 0,
+            private_procfs,
             rlimits: bits & ENFORCEMENT_RLIMITS != 0,
             capabilities_reduced: bits & ENFORCEMENT_CAPABILITIES != 0,
             no_new_privs: bits & ENFORCEMENT_NO_NEW_PRIVS != 0,
@@ -867,10 +905,11 @@ mod x86_64 {
         bits: u64,
         policy: &SandboxPolicy,
     ) -> Result<EnforcementReceipt, SandboxError> {
-        enforcement_receipt_from_bits(
+        enforcement_receipt_from_bits_for_policy(
             bits,
             policy.time_monotonic_offset_seconds.is_some(),
             policy_requests_landlock(policy),
+            policy.procfs_enabled,
         )
     }
 
@@ -909,6 +948,7 @@ mod x86_64 {
         time_monotonic_offset: Option<Vec<u8>>,
         time_boottime_offset: Option<Vec<u8>>,
         loopback_enabled: bool,
+        procfs_enabled: bool,
     }
 
     impl PreparedLaunch {
@@ -917,6 +957,30 @@ mod x86_64 {
             cancellation: Option<&CancellationToken>,
         ) -> Result<Self, SandboxError> {
             let root_fd = open_root(&policy.root_dir)?;
+            if policy.procfs_enabled {
+                let proc_relative = sandbox_relative(Path::new("/proc"))?;
+                let proc_how = OpenHow {
+                    flags: (libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
+                    mode: 0,
+                    resolve: RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS,
+                };
+                let proc_fd = unsafe {
+                    libc::syscall(
+                        libc::SYS_openat2,
+                        root_fd.raw(),
+                        proc_relative.as_ptr(),
+                        &proc_how as *const OpenHow,
+                        std::mem::size_of::<OpenHow>(),
+                    )
+                };
+                if proc_fd == -1 {
+                    return Err(SandboxError::SetupFailed(format!(
+                        "cannot validate private procfs mountpoint beneath filesystem.root: {}",
+                        io::Error::last_os_error()
+                    )));
+                }
+                drop(OwnedFd(proc_fd as RawFd));
+            }
             let root_path =
                 cstring_bytes("filesystem.root", policy.root_dir.as_os_str().as_bytes())?;
             let cwd_check = open_beneath_root(
@@ -1308,6 +1372,7 @@ mod x86_64 {
                 time_monotonic_offset,
                 time_boottime_offset,
                 loopback_enabled: policy.loopback_enabled,
+                procfs_enabled: policy.procfs_enabled,
             })
         }
     }
@@ -2579,6 +2644,9 @@ mod x86_64 {
             PHASE_PID_INIT_WAIT,
             PHASE_FD_SANITIZE,
         );
+        if prepared.procfs_enabled {
+            mount_private_procfs_or_fail(launch_error, seccomp.error_exit_syscall);
+        }
         pid_lifecycle::become_direct_target_or_reap(
             target_lifecycle,
             launch_error,
@@ -2883,6 +2951,38 @@ mod x86_64 {
         if pinned.st_dev != current.st_dev || pinned.st_ino != current.st_ino {
             child_fail_errno(launch_error, phase, libc::ESTALE, error_exit_syscall);
         }
+    }
+
+    unsafe fn mount_private_procfs_or_fail(
+        launch_error: *mut LaunchErrorRecord,
+        error_exit_syscall: libc::c_long,
+    ) {
+        let flags = (libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC) as libc::c_ulong;
+        if libc::syscall(
+            libc::SYS_mount,
+            b"proc\0".as_ptr().cast::<libc::c_char>(),
+            b"/proc\0".as_ptr().cast::<libc::c_char>(),
+            b"proc\0".as_ptr().cast::<libc::c_char>(),
+            flags,
+            ptr::null::<libc::c_void>(),
+        ) == -1
+        {
+            child_fail(launch_error, PHASE_PROCFS_MOUNT, error_exit_syscall);
+        }
+
+        // A private procfs intentionally exposes namespace PID 1 metadata. Do
+        // not also expose PID 1's launcher-owned descriptor table as a route
+        // back to cancellation/deadline/pidfd control objects. Setting PID 1
+        // non-dumpable before the direct target is forked makes procfs apply
+        // the kernel's ptrace-access credential gate to /proc/1/fd.
+        if libc::syscall(libc::SYS_prctl, libc::PR_SET_DUMPABLE, 0, 0, 0, 0) == -1 {
+            child_fail(launch_error, PHASE_PROCFS_PID1_HARDEN, error_exit_syscall);
+        }
+
+        // This receipt bit represents the complete private-procfs boundary:
+        // both the PID-namespace proc mount and the PID1 descriptor-access
+        // hardening have succeeded.
+        mark_enforcement(launch_error, ENFORCEMENT_PRIVATE_PROCFS);
     }
 
     unsafe fn enable_loopback_or_fail(
@@ -3337,6 +3437,8 @@ mod x86_64 {
             PHASE_OUTPUT_LIMIT_PIDFD => "stdout output-limit pidfd supervision",
             PHASE_OUTPUT_LIMIT_POLL => "stdout output-limit supervision poll",
             PHASE_TIME_OFFSETS => "time namespace offset installation",
+            PHASE_PROCFS_MOUNT => "private procfs mount in PID namespace",
+            PHASE_PROCFS_PID1_HARDEN => "private procfs PID1 descriptor-access hardening",
             _ => "unknown launch phase",
         };
         format!(
@@ -3454,6 +3556,53 @@ mod x86_64 {
                 false,
             )
             .is_err());
+        }
+
+        #[test]
+        fn private_procfs_receipt_is_request_bound_and_ordered() {
+            let unrequested = enforcement_receipt_from_bits_for_policy(
+                ENFORCEMENT_BASE_NAMESPACES
+                    | ENFORCEMENT_HOSTNAME
+                    | ENFORCEMENT_PRIVATE_MOUNTS
+                    | ENFORCEMENT_READONLY_ROOT
+                    | ENFORCEMENT_CHROOT
+                    | ENFORCEMENT_FD_SANITIZATION
+                    | ENFORCEMENT_PRIVATE_PROCFS,
+                false,
+                false,
+                false,
+            );
+            assert!(unrequested.is_err());
+
+            let skipped = enforcement_receipt_from_bits_for_policy(
+                ENFORCEMENT_BASE_NAMESPACES
+                    | ENFORCEMENT_HOSTNAME
+                    | ENFORCEMENT_PRIVATE_MOUNTS
+                    | ENFORCEMENT_READONLY_ROOT
+                    | ENFORCEMENT_CHROOT
+                    | ENFORCEMENT_FD_SANITIZATION
+                    | ENFORCEMENT_RLIMITS,
+                false,
+                false,
+                true,
+            );
+            assert!(skipped.is_err());
+
+            let observed = enforcement_receipt_from_bits_for_policy(
+                ENFORCEMENT_BASE_NAMESPACES
+                    | ENFORCEMENT_HOSTNAME
+                    | ENFORCEMENT_PRIVATE_MOUNTS
+                    | ENFORCEMENT_READONLY_ROOT
+                    | ENFORCEMENT_CHROOT
+                    | ENFORCEMENT_FD_SANITIZATION
+                    | ENFORCEMENT_PRIVATE_PROCFS
+                    | ENFORCEMENT_RLIMITS,
+                false,
+                false,
+                true,
+            )
+            .expect("requested procfs progression should decode");
+            assert!(observed.private_procfs);
         }
 
         #[test]

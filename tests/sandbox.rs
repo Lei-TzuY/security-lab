@@ -185,6 +185,7 @@ fn fixture_root() -> &'static Path {
         let root = std::env::temp_dir().join(format!("security-lab-root-{}", process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("work")).expect("create sandbox work directory");
+        std::fs::create_dir_all(root.join("proc")).expect("create sandbox procfs mountpoint");
         std::fs::create_dir_all(root.join("scratch")).expect("create sandbox scratch mountpoint");
         std::fs::create_dir_all(root.join("data")).expect("create sandbox volume mountpoint");
         std::fs::create_dir_all(root.join("persist"))
@@ -288,6 +289,7 @@ fn policy(mode: &str, extra_args: &[&str], syscalls: &[&str]) -> SandboxPolicy {
         landlock_scope_abstract_unix_socket: false,
         landlock_scope_signal: false,
         loopback_enabled: false,
+        procfs_enabled: false,
         host_loopback_tcp_port: None,
         host_loopback_tcp_target_fd: None,
         host_ipv4_tcp_address: None,
@@ -836,6 +838,72 @@ fn persistent_volume_source_cannot_overlap_sandbox_root() {
         }
         other => panic!("unexpected read-only root-overlap result: {other}"),
     }
+}
+
+#[test]
+fn private_procfs_reflects_only_the_sandbox_pid_namespace() {
+    let proc_mountpoint = fixture_root().join("proc");
+    assert_eq!(
+        std::fs::read_dir(&proc_mountpoint)
+            .expect("read empty procfs mountpoint before run")
+            .count(),
+        0,
+        "fixture proc mountpoint must begin empty"
+    );
+
+    let host_pid = process::id();
+    assert!(
+        host_pid > 2,
+        "host test process must not collide with namespace PID 1/2"
+    );
+    let host_proc_path = format!("/proc/{host_pid}");
+    let mut isolated = policy(
+        "i",
+        &[host_proc_path.as_str()],
+        &["execveat", "newfstatat", "exit"],
+    );
+    isolated.procfs_enabled = true;
+
+    let report = run_report(&isolated).expect("private procfs sandbox run");
+    assert_eq!(report.outcome, ChildOutcome::Exited(0));
+    assert!(
+        report.enforcement.private_procfs,
+        "runtime receipt must positively observe the PID1 procfs mount"
+    );
+    assert_eq!(
+        std::fs::read_dir(&proc_mountpoint)
+            .expect("read procfs mountpoint after run")
+            .count(),
+        0,
+        "private procfs mount must disappear with the sandbox mount namespace"
+    );
+}
+
+#[test]
+fn private_procfs_seals_pid1_control_descriptors_during_supervision() {
+    let host_pid = process::id();
+    assert!(
+        host_pid > 2,
+        "host test process must not collide with namespace PID 1/2"
+    );
+    let host_proc_path = format!("/proc/{host_pid}");
+    let cancellation = CancellationToken::new().expect("create procfs control token");
+    let mut isolated = policy(
+        "j",
+        &[host_proc_path.as_str()],
+        &["execveat", "newfstatat", "openat", "close", "exit"],
+    );
+    isolated.procfs_enabled = true;
+    isolated.wall_clock_milliseconds = Some(5000);
+
+    let report = run_report_with_cancel(&isolated, &cancellation)
+        .expect("private procfs control-boundary sandbox run");
+    assert_eq!(report.outcome, ChildOutcome::Exited(0));
+    assert_eq!(report.reaped_descendants, 0);
+    assert!(
+        report.enforcement.private_procfs,
+        "runtime receipt must require both procfs mount and PID1 access hardening"
+    );
 }
 
 #[test]

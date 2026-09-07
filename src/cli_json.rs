@@ -48,6 +48,8 @@ pub(crate) fn report_json(report: &RunReport) -> String {
     push_bool(&mut output, report.enforcement.chroot);
     output.push_str(",\"fd_sanitization\":");
     push_bool(&mut output, report.enforcement.fd_sanitization);
+    output.push_str(",\"private_procfs\":");
+    push_bool(&mut output, report.enforcement.private_procfs);
     output.push_str(",\"rlimits\":");
     push_bool(&mut output, report.enforcement.rlimits);
     output.push_str(",\"capabilities_reduced\":");
@@ -170,7 +172,7 @@ mod tests {
 
         assert_eq!(
             report_json(&report),
-            "{\"ok\":true,\"outcome\":{\"kind\":\"exited\",\"code\":7},\"stdout\":{\"encoding\":\"hex\",\"data\":\"0022ff\",\"truncated\":true},\"reaped_descendants\":3,\"process_tree_usage\":{\"user_cpu_micros\":11,\"system_cpu_micros\":22,\"max_child_rss_kib\":33},\"enforcement\":{\"base_namespaces\":false,\"time_namespace_offsets\":false,\"hostname\":false,\"private_mount_propagation\":false,\"readonly_root\":false,\"chroot\":false,\"fd_sanitization\":false,\"rlimits\":false,\"capabilities_reduced\":false,\"no_new_privs\":false,\"landlock\":false,\"seccomp\":false}}"
+            "{\"ok\":true,\"outcome\":{\"kind\":\"exited\",\"code\":7},\"stdout\":{\"encoding\":\"hex\",\"data\":\"0022ff\",\"truncated\":true},\"reaped_descendants\":3,\"process_tree_usage\":{\"user_cpu_micros\":11,\"system_cpu_micros\":22,\"max_child_rss_kib\":33},\"enforcement\":{\"base_namespaces\":false,\"time_namespace_offsets\":false,\"hostname\":false,\"private_mount_propagation\":false,\"readonly_root\":false,\"chroot\":false,\"fd_sanitization\":false,\"private_procfs\":false,\"rlimits\":false,\"capabilities_reduced\":false,\"no_new_privs\":false,\"landlock\":false,\"seccomp\":false}}"
         );
     }
 

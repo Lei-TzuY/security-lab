@@ -52,6 +52,7 @@ struct PolicyRequirements {
     deadline: bool,
     stdout_output_limit: bool,
     time_namespace: bool,
+    private_procfs: bool,
 }
 
 impl PolicyRequirements {
@@ -93,6 +94,7 @@ impl PolicyRequirements {
             stdout_output_limit: policy.stdout_total_bytes.is_some(),
             time_namespace: policy.time_monotonic_offset_seconds.is_some()
                 && policy.time_boottime_offset_seconds.is_some(),
+            private_procfs: policy.procfs_enabled,
         }
     }
 }
@@ -169,6 +171,14 @@ impl PolicyPreflight {
         }
     }
 
+    fn private_procfs_status(&self) -> RequirementStatus {
+        if self.requirements.private_procfs {
+            RequirementStatus::Unprobed
+        } else {
+            RequirementStatus::NotRequested
+        }
+    }
+
     fn mandatory_launch_core_status(&self) -> RequirementStatus {
         self.mandatory_launch_core
     }
@@ -191,6 +201,7 @@ impl PolicyPreflight {
             Verdict::Incompatible
         } else if self.mandatory_launch_core_status() == RequirementStatus::Unprobed
             || self.time_namespace_status() == RequirementStatus::Unprobed
+            || self.private_procfs_status() == RequirementStatus::Unprobed
         {
             Verdict::Indeterminate
         } else {
@@ -250,6 +261,14 @@ impl PolicyPreflight {
         output.push_str("\",\"reason\":");
         if self.requirements.time_namespace {
             output.push_str("\"independent_safe_probe_not_implemented\"");
+        } else {
+            output.push_str("null");
+        }
+        output.push_str("},\"private_procfs\":{\"status\":\"");
+        output.push_str(self.private_procfs_status().as_str());
+        output.push_str("\",\"reason\":");
+        if self.requirements.private_procfs {
+            output.push_str("\"pid_namespace_procfs_mount_requires_real_launch\"");
         } else {
             output.push_str("null");
         }
@@ -313,6 +332,12 @@ impl PolicyPreflight {
         output.push_str(self.time_namespace_status().as_str());
         if self.requirements.time_namespace {
             output.push_str(" (independent-safe-probe-not-implemented)");
+        }
+        output.push('\n');
+        output.push_str("private-procfs: ");
+        output.push_str(self.private_procfs_status().as_str());
+        if self.requirements.private_procfs {
+            output.push_str(" (pid-namespace-procfs-mount-requires-real-launch)");
         }
         output.push('\n');
         output
@@ -435,6 +460,20 @@ seccomp.allow = execveat,exit
     }
 
     #[test]
+    fn private_procfs_remains_unprobed_without_real_namespace_mount() {
+        let policy = policy("filesystem.proc = enabled");
+        let evaluated = evaluate_with_core(&policy, host(None), RequirementStatus::Supported);
+        assert_eq!(
+            evaluated.private_procfs_status(),
+            RequirementStatus::Unprobed
+        );
+        assert_eq!(evaluated.verdict(), Verdict::Indeterminate);
+        assert!(evaluated
+            .to_json()
+            .contains("\"private_procfs\":{\"status\":\"unprobed\""));
+    }
+
+    #[test]
     fn derives_highest_requested_landlock_abi_and_supervision_requirements() {
         let policy = policy(
             "landlock.scope_signal = enabled\nlimit.wall_clock_milliseconds = 1000\nlimit.stdout_total_bytes = 8192",
@@ -446,6 +485,7 @@ seccomp.allow = execveat,exit
                 deadline: true,
                 stdout_output_limit: true,
                 time_namespace: false,
+                private_procfs: false,
             }
         );
     }
@@ -459,7 +499,7 @@ seccomp.allow = execveat,exit
         assert_eq!(report.exit_code(), 0);
         assert_eq!(
             report.to_json(),
-            "{\"ok\":true,\"preflight\":{\"kind\":\"policy_host_capability_match\",\"policy_preflight\":true,\"launch_attempted\":false,\"launch_preflight_complete\":false,\"status\":\"satisfied\",\"sandbox_target\":{\"status\":\"supported\",\"target_os\":\"linux\",\"target_arch\":\"x86_64\"},\"mandatory_launch_core\":{\"status\":\"supported\",\"reason\":null},\"landlock\":{\"status\":\"supported\",\"required_abi\":6,\"observed_abi\":7,\"errno\":null},\"deadline\":{\"status\":\"supported\",\"pidfd_open\":{\"available\":true,\"errno\":null},\"timerfd_monotonic\":{\"available\":true,\"errno\":null}},\"stdout_output_limit\":{\"status\":\"supported\",\"pidfd_open\":{\"available\":true,\"errno\":null},\"eventfd\":{\"available\":true,\"errno\":null}},\"time_namespace\":{\"status\":\"not_requested\",\"reason\":null}}}"
+            "{\"ok\":true,\"preflight\":{\"kind\":\"policy_host_capability_match\",\"policy_preflight\":true,\"launch_attempted\":false,\"launch_preflight_complete\":false,\"status\":\"satisfied\",\"sandbox_target\":{\"status\":\"supported\",\"target_os\":\"linux\",\"target_arch\":\"x86_64\"},\"mandatory_launch_core\":{\"status\":\"supported\",\"reason\":null},\"landlock\":{\"status\":\"supported\",\"required_abi\":6,\"observed_abi\":7,\"errno\":null},\"deadline\":{\"status\":\"supported\",\"pidfd_open\":{\"available\":true,\"errno\":null},\"timerfd_monotonic\":{\"available\":true,\"errno\":null}},\"stdout_output_limit\":{\"status\":\"supported\",\"pidfd_open\":{\"available\":true,\"errno\":null},\"eventfd\":{\"available\":true,\"errno\":null}},\"time_namespace\":{\"status\":\"not_requested\",\"reason\":null},\"private_procfs\":{\"status\":\"not_requested\",\"reason\":null}}}"
         );
     }
 

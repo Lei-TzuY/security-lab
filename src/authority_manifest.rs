@@ -22,6 +22,8 @@ pub(crate) fn to_json(policy: &SandboxPolicy) -> String {
 
     output.push_str(",\"host_filesystem\":{\"root\":");
     push_path(&mut output, &policy.root_dir);
+    output.push_str(",\"private_procfs\":");
+    push_bool(&mut output, policy.procfs_enabled);
     output.push_str(",\"scratch\":");
     match (&policy.scratch_dir, policy.scratch_bytes) {
         (Some(path), Some(bytes)) => {
@@ -274,6 +276,16 @@ pub(crate) fn to_human(policy: &SandboxPolicy) -> String {
     writeln!(&mut output, "runtime-preflight: false").expect("write to String cannot fail");
     writeln!(&mut output, "root: {}", policy.root_dir.display())
         .expect("write to String cannot fail");
+    writeln!(
+        &mut output,
+        "private-procfs: {}",
+        if policy.procfs_enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    )
+    .expect("write to String cannot fail");
     writeln!(&mut output, "executable: {}", policy.executable.display())
         .expect("write to String cannot fail");
     writeln!(&mut output, "working-dir: {}", policy.working_dir.display())

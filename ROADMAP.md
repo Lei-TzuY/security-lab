@@ -610,7 +610,7 @@ Boundary: 24B is a conservative partial preflight, not a dry-run, launch simulat
 
 ### Slice 25A — post-attempt enforcement receipt
 
-**Current verified candidate.** Adds structured positive evidence for launcher-owned setup stages that actually completed during a sandbox invocation.
+**Status: complete on `main`.** Adds structured positive evidence for launcher-owned setup stages that actually completed during a sandbox invocation.
 
 Acceptance evidence is executable:
 
@@ -627,6 +627,27 @@ Boundary: 25A is positive setup-stage telemetry, not a cryptographic attestation
 ### Milestone 25 promotion rule
 
 After 25A integrates, seal this receipt schema at the current stage granularity. Do not farm aliases, duplicate per-syscall bits, or relabel the receipt as attestation/conformance. Promote to a materially different executable authority/enforcement frontier unless a new receipt field corresponds to a genuinely new kernel boundary.
+
+## Milestone 26 — PID namespace observability surface
+
+### Slice 26A — private procfs with PID1 control-descriptor closure
+
+**Current verified candidate.** Adds an optional procfs view backed by the sandbox PID namespace while preserving launcher-owned PID 1 control authority.
+
+Acceptance evidence is executable:
+
+- policy accepts `filesystem.proc = enabled|disabled`, defaults to disabled, requires an existing `/proc` directory beneath the selected root, and rejects overlap with executable/working directory, private scratch, or persistent-volume targets;
+- after the process becomes namespace PID 1 and before the direct target is forked, PID 1 mounts a fresh procfs at `/proc` with `MS_NOSUID|MS_NODEV|MS_NOEXEC`;
+- PID 1 immediately sets `PR_SET_DUMPABLE=0`; failure is a distinct fail-closed launch phase, and the `private_procfs` enforcement-receipt bit is published only after both the procfs mount and PID1 descriptor-access hardening succeed;
+- the original raw oracle proves `/proc/1` and `/proc/2` exist while a trusted host PID path is `ENOENT`, and the host-side mountpoint returns to its empty fixture state after the private mount namespace exits;
+- a separate control-plane raw oracle runs with an unsignalled `CancellationToken` plus a five-second deadline, preserves `/proc/1/status` readability, and requires exact `EACCES` when opening `/proc/1/fd`; natural `Exited(0)` still wins, proving the hardening composes with real cancellation/deadline supervision instead of disabling that lifecycle path;
+- all prior sandbox/tooling regressions remain active; stable rustfmt/Clippy/full tests and the full Rust 1.74 suite are green on the exact candidate.
+
+Boundary: 26A is PID-namespace proc observability with explicit closure of PID1's proc descriptor-table route. It does not claim that PID1 cmdline/status metadata is secret, hide the existence of PID1, implement arbitrary procfs mount options, provide a per-process visibility policy, or prevent a sufficiently privileged external host process from observing the sandbox.
+
+### Milestone 26 promotion rule
+
+After 26A integrates, seal the private-procfs/PID-visibility slice. Do not farm proc mount-option aliases or additional metadata files. Promote to a materially different executable authority/enforcement frontier; delegated cgroup accounting and supplementary-group isolation remain blocked until their prerequisites change.
 
 ## Later frontiers
 

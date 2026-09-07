@@ -1905,6 +1905,16 @@ mod x86_64 {
                     );
                 }
             }
+            if let Some(rules) = policy.seccomp.argument_forbidden_mask_rules.get(name) {
+                for (argument_index, rule) in rules {
+                    append_seccomp_argument_forbidden_mask_checks(
+                        &mut checks,
+                        *argument_index,
+                        rule.mask,
+                        rule.value,
+                    );
+                }
+            }
             checks.push(stmt(BPF_RET_K, SECCOMP_RET_ALLOW));
             if checks.len() > u8::MAX as usize {
                 return Err(SandboxError::InvalidPolicy(PolicyError::new(format!(
@@ -1959,6 +1969,53 @@ mod x86_64 {
         }
         filter.push(jump(BPF_JMP_JEQ_K, value, 1, 0));
         filter.push(stmt(BPF_RET_K, SECCOMP_RET_ERRNO | (libc::EPERM as u32)));
+    }
+
+    fn append_seccomp_argument_forbidden_mask_checks(
+        filter: &mut Vec<libc::sock_filter>,
+        argument_index: u8,
+        mask: u64,
+        value: u64,
+    ) {
+        let argument_offset = SECCOMP_DATA_ARGS_OFFSET + u32::from(argument_index) * 8;
+        let low_mask = mask as u32;
+        let low_value = value as u32;
+        let high_mask = (mask >> 32) as u32;
+        let high_value = (value >> 32) as u32;
+
+        match (low_mask != 0, high_mask != 0) {
+            (true, true) => {
+                filter.push(stmt(BPF_LD_W_ABS, argument_offset));
+                if low_mask != u32::MAX {
+                    filter.push(stmt(BPF_ALU_AND_K, low_mask));
+                }
+                let high_block_len = if high_mask == u32::MAX { 3 } else { 4 };
+                filter.push(jump(BPF_JMP_JEQ_K, low_value, 0, high_block_len));
+                filter.push(stmt(BPF_LD_W_ABS, argument_offset + 4));
+                if high_mask != u32::MAX {
+                    filter.push(stmt(BPF_ALU_AND_K, high_mask));
+                }
+                filter.push(jump(BPF_JMP_JEQ_K, high_value, 0, 1));
+                filter.push(stmt(BPF_RET_K, SECCOMP_RET_ERRNO | (libc::EPERM as u32)));
+            }
+            (true, false) => {
+                filter.push(stmt(BPF_LD_W_ABS, argument_offset));
+                if low_mask != u32::MAX {
+                    filter.push(stmt(BPF_ALU_AND_K, low_mask));
+                }
+                filter.push(jump(BPF_JMP_JEQ_K, low_value, 0, 1));
+                filter.push(stmt(BPF_RET_K, SECCOMP_RET_ERRNO | (libc::EPERM as u32)));
+            }
+            (false, true) => {
+                filter.push(stmt(BPF_LD_W_ABS, argument_offset + 4));
+                if high_mask != u32::MAX {
+                    filter.push(stmt(BPF_ALU_AND_K, high_mask));
+                }
+                filter.push(jump(BPF_JMP_JEQ_K, high_value, 0, 1));
+                filter.push(stmt(BPF_RET_K, SECCOMP_RET_ERRNO | (libc::EPERM as u32)));
+            }
+            (false, false) => unreachable!("zero forbidden mask rejected by policy validation"),
+        }
     }
 
     fn append_seccomp_argument_range_checks(

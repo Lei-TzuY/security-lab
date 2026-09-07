@@ -1,0 +1,78 @@
+name: probe supplementary group mapping
+
+on:
+  push:
+    branches: [tmp-supplementary-groups-probe]
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Inspect helper mapping environment
+        run: |
+          set -eux
+          id
+          id -G
+          grep '^CapEff:' /proc/self/status
+          command -v newgidmap || true
+          command -v newuidmap || true
+          grep -E '^(runner|1001):' /etc/subgid || true
+          grep -E '^(runner|1001):' /etc/subuid || true
+      - name: Probe setgroups/gid_map ordering
+        run: |
+          cat > /tmp/group_probe.c <<'EOF'
+          #define _GNU_SOURCE
+          #include <errno.h>
+          #include <fcntl.h>
+          #include <sched.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <sys/types.h>
+          #include <unistd.h>
+
+          static void write_file(const char *path, const char *data) {
+              int fd = open(path, O_WRONLY | O_CLOEXEC);
+              if (fd < 0) { perror(path); exit(10); }
+              size_t len = strlen(data);
+              if (write(fd, data, len) != (ssize_t)len) { perror("write"); exit(11); }
+              close(fd);
+          }
+
+          int main(void) {
+              uid_t uid = geteuid();
+              gid_t gid = getegid();
+              int n = getgroups(0, NULL);
+              printf("before_unshare_groups=%d uid=%u gid=%u\n", n, (unsigned)uid, (unsigned)gid);
+              if (unshare(CLONE_NEWUSER) != 0) { perror("unshare userns"); return 20; }
+
+              errno = 0;
+              int rc_before = setgroups(0, NULL);
+              printf("setgroups_before_gid_map_rc=%d errno=%d (%s)\n", rc_before, errno, strerror(errno));
+              if (rc_before != -1 || errno != EPERM) return 21;
+
+              char uid_map[64], gid_map[64];
+              snprintf(uid_map, sizeof(uid_map), "0 %u 1\n", (unsigned)uid);
+              snprintf(gid_map, sizeof(gid_map), "0 %u 1\n", (unsigned)gid);
+              write_file("/proc/self/setgroups", "deny\n");
+              write_file("/proc/self/uid_map", uid_map);
+              write_file("/proc/self/gid_map", gid_map);
+
+              errno = 0;
+              int rc_after = setgroups(0, NULL);
+              printf("setgroups_after_deny_and_gid_map_rc=%d errno=%d (%s)\n", rc_after, errno, strerror(errno));
+              if (rc_after != -1 || errno != EPERM) return 22;
+
+              printf("supplementary_group_clear_blocker_confirmed\n");
+              return 0;
+          }
+          EOF
+          cc -Wall -Wextra -Werror -O2 /tmp/group_probe.c -o /tmp/group_probe
+          if [ -e /proc/sys/kernel/unprivileged_userns_clone ]; then
+            sudo sysctl -w kernel.unprivileged_userns_clone=1
+          fi
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          /tmp/group_probe

@@ -27,6 +27,8 @@
 #   h prove Landlock narrows directory/symlink/reparent topology mutation
 #   i prove private procfs exposes namespace PID 1/2 while hiding a trusted host PID
 #   j prove private procfs keeps PID1 metadata visible but seals PID1 control descriptors
+#   z mutate an ephemeral copy-on-write root and verify merged-state behavior
+#   l fill an ephemeral copy-on-write root until the declared byte budget returns ENOSPC
 #   s prove Landlock allows declared TCP bind/connect ports and denies undeclared ports
 #   a connect selected fd 9 to argv[2] in the abstract UNIX socket namespace
 #   d prove Landlock device ioctl allows /devices/urandom and denies /devices/random
@@ -100,6 +102,10 @@ _start:
     je .private_procfs
     cmp $106, %al
     je .private_procfs_control_boundary
+    cmp $122, %al
+    je .copy_on_write_root
+    cmp $108, %al
+    je .copy_on_write_root_capacity
     cmp $115, %al
     je .landlock_tcp_ports
     cmp $97, %al
@@ -1755,6 +1761,175 @@ _start:
     mov %eax, %edi
     jmp .exit
 
+.copy_on_write_root:
+    sub $32, %rsp
+    mov $257, %eax
+    mov $-100, %edi
+    lea cow_base_path(%rip), %rsi
+    xor %edx, %edx
+    xor %r10d, %r10d
+    syscall
+    test %rax, %rax
+    js .fail48_cow_stack
+    mov %rax, %r12
+    xor %eax, %eax
+    mov %r12, %rdi
+    mov %rsp, %rsi
+    mov $15, %edx
+    syscall
+    cmp $15, %rax
+    jne .fail48_cow_stack
+    mov $3, %eax
+    mov %r12, %rdi
+    syscall
+    test %rax, %rax
+    js .fail48_cow_stack
+    lea cow_lower_original(%rip), %rsi
+    mov %rsp, %rdi
+    mov $15, %ecx
+    repe cmpsb
+    jne .fail48_cow_stack
+
+    mov $257, %eax
+    mov $-100, %edi
+    lea cow_base_path(%rip), %rsi
+    mov $513, %edx
+    xor %r10d, %r10d
+    syscall
+    test %rax, %rax
+    js .fail48_cow_stack
+    mov %rax, %r12
+    mov $1, %eax
+    mov %r12, %rdi
+    lea cow_replacement(%rip), %rsi
+    mov $cow_replacement_len, %edx
+    syscall
+    cmp $cow_replacement_len, %rax
+    jne .fail48_cow_stack
+    mov $3, %eax
+    mov %r12, %rdi
+    syscall
+    test %rax, %rax
+    js .fail48_cow_stack
+
+    mov $257, %eax
+    mov $-100, %edi
+    lea cow_new_path(%rip), %rsi
+    mov $193, %edx
+    mov $384, %r10d
+    syscall
+    test %rax, %rax
+    js .fail48_cow_stack
+    mov %rax, %r12
+    mov $1, %eax
+    mov %r12, %rdi
+    lea cow_new_message(%rip), %rsi
+    mov $cow_new_message_len, %edx
+    syscall
+    cmp $cow_new_message_len, %rax
+    jne .fail48_cow_stack
+    mov $3, %eax
+    mov %r12, %rdi
+    syscall
+    test %rax, %rax
+    js .fail48_cow_stack
+
+    mov $87, %eax
+    lea cow_child_path(%rip), %rdi
+    syscall
+    test %rax, %rax
+    js .fail48_cow_stack
+
+    mov $257, %eax
+    mov $-100, %edi
+    lea cow_base_path(%rip), %rsi
+    xor %edx, %edx
+    xor %r10d, %r10d
+    syscall
+    test %rax, %rax
+    js .fail48_cow_stack
+    mov %rax, %r12
+    xor %eax, %eax
+    mov %r12, %rdi
+    mov %rsp, %rsi
+    mov $cow_replacement_len, %edx
+    syscall
+    cmp $cow_replacement_len, %rax
+    jne .fail48_cow_stack
+    mov $3, %eax
+    mov %r12, %rdi
+    syscall
+    test %rax, %rax
+    js .fail48_cow_stack
+    lea cow_replacement(%rip), %rsi
+    mov %rsp, %rdi
+    mov $cow_replacement_len, %ecx
+    repe cmpsb
+    jne .fail48_cow_stack
+
+    mov $257, %eax
+    mov $-100, %edi
+    lea cow_child_path(%rip), %rsi
+    xor %edx, %edx
+    xor %r10d, %r10d
+    syscall
+    cmp $-2, %rax
+    jne .fail48_cow_stack
+
+    add $32, %rsp
+    xor %edi, %edi
+    jmp .exit
+
+.fail48_cow_stack:
+    add $32, %rsp
+    jmp .fail48
+
+.copy_on_write_root_capacity:
+    sub $4096, %rsp
+    mov $257, %eax
+    mov $-100, %edi
+    lea cow_capacity_path(%rip), %rsi
+    mov $577, %edx
+    mov $384, %r10d
+    syscall
+    test %rax, %rax
+    js .fail48_cow_capacity_stack
+    mov %rax, %r12
+    xor %r13d, %r13d
+
+.copy_on_write_root_capacity_write:
+    mov $1, %eax
+    mov %r12, %rdi
+    mov %rsp, %rsi
+    mov $4096, %edx
+    syscall
+    cmp $-28, %rax
+    je .copy_on_write_root_capacity_full
+    test %rax, %rax
+    jle .fail48_cow_capacity_close
+    add %rax, %r13
+    cmp $65536, %r13
+    ja .fail48_cow_capacity_close
+    jmp .copy_on_write_root_capacity_write
+
+.copy_on_write_root_capacity_full:
+    mov $3, %eax
+    mov %r12, %rdi
+    syscall
+    test %rax, %rax
+    js .fail48_cow_capacity_stack
+    add $4096, %rsp
+    xor %edi, %edi
+    jmp .exit
+
+.fail48_cow_capacity_close:
+    mov $3, %eax
+    mov %r12, %rdi
+    syscall
+.fail48_cow_capacity_stack:
+    add $4096, %rsp
+    jmp .fail48
+
 .forbidden:
     mov $39, %eax
     syscall
@@ -2548,6 +2723,22 @@ writable_volume_output:
 writable_volume_message:
     .ascii "persistent-write\n"
 .set writable_volume_message_len, . - writable_volume_message
+cow_base_path:
+    .asciz "/cow-base"
+cow_child_path:
+    .asciz "/cow-dir/child"
+cow_new_path:
+    .asciz "/cow-new"
+cow_capacity_path:
+    .asciz "/cow-capacity"
+cow_lower_original:
+    .ascii "lower-original\n"
+cow_replacement:
+    .ascii "cow-replaced\n"
+.set cow_replacement_len, . - cow_replacement
+cow_new_message:
+    .ascii "cow-new\n"
+.set cow_new_message_len, . - cow_new_message
 loopback_message:
     .ascii "loopback-ok"
 .set loopback_message_len, . - loopback_message

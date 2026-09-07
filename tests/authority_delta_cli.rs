@@ -124,6 +124,36 @@ fn forbidden_seccomp_mask_is_modeled_as_a_restriction() {
 }
 
 #[test]
+fn copy_on_write_root_is_modeled_as_ephemeral_write_authority() {
+    let root = unique_absent_root("cow-root");
+    let baseline_text = base_policy(&root);
+    let cow_text = format!("{baseline_text}filesystem.cow_root_bytes = 16777216\n");
+    let baseline = TempPolicy::new("baseline", &baseline_text);
+    let cow = TempPolicy::new("cow", &cow_text);
+
+    let widened = run_json(&baseline, &cow);
+    assert_eq!(widened.status.code(), Some(5));
+    let stdout = String::from_utf8(widened.stdout).expect("utf8 output");
+    assert!(stdout.contains("\"status\":\"widened\""));
+    assert!(stdout.contains("\"field\":\"filesystem.copy_on_write_root\",\"class\":\"widened\""));
+
+    let reduced = run_json(&cow, &baseline);
+    assert_eq!(reduced.status.code(), Some(0));
+    let stdout = String::from_utf8(reduced.stdout).expect("utf8 output");
+    assert!(stdout.contains("\"status\":\"reduced\""));
+    assert!(stdout.contains("\"field\":\"filesystem.copy_on_write_root\",\"class\":\"reduced\""));
+
+    let larger_text = format!("{baseline_text}filesystem.cow_root_bytes = 33554432\n");
+    let larger = TempPolicy::new("larger", &larger_text);
+    let enlarged = run_json(&cow, &larger);
+    assert_eq!(enlarged.status.code(), Some(5));
+    let stdout = String::from_utf8(enlarged.stdout).expect("utf8 output");
+    assert!(
+        stdout.contains("\"field\":\"filesystem.copy_on_write_root_bytes\",\"class\":\"widened\"")
+    );
+}
+
+#[test]
 fn lower_resource_ceiling_is_detected_as_reduction() {
     let root = unique_absent_root("reduce");
     let baseline_text = base_policy(&root);

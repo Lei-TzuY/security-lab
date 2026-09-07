@@ -24,6 +24,8 @@ const MIN_SELECTED_TARGET_FD: u32 = 3;
 const MAX_SELECTED_TARGET_FD: u32 = 63;
 const MIN_SCRATCH_BYTES: u64 = 4096;
 const MAX_SCRATCH_BYTES: u64 = 1024 * 1024 * 1024;
+const MIN_COW_ROOT_BYTES: u64 = 4096;
+const MAX_COW_ROOT_BYTES: u64 = 1024 * 1024 * 1024;
 const MIN_CAPTURE_BYTES: u64 = 1;
 const MAX_CAPTURE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_STDOUT_TOTAL_BYTES: u64 = 1024 * 1024 * 1024;
@@ -92,6 +94,9 @@ pub struct SeccompPolicy {
 pub struct SandboxPolicy {
     /// Host path pinned as the sandbox filesystem root before fork.
     pub root_dir: PathBuf,
+    /// Optional byte ceiling for a private tmpfs upper/work backing an
+    /// ephemeral OverlayFS copy-on-write view of `root_dir`.
+    pub cow_root_bytes: Option<u64>,
     /// Launcher-owned hostname installed inside the sandbox UTS namespace.
     pub hostname: String,
     /// Absolute path interpreted inside `root_dir`.
@@ -238,6 +243,14 @@ impl SandboxPolicy {
         validate_hostname(&self.hostname)?;
         validate_absolute_path("executable", &self.executable)?;
         validate_absolute_path("working_dir", &self.working_dir)?;
+
+        if let Some(bytes) = self.cow_root_bytes {
+            if !(MIN_COW_ROOT_BYTES..=MAX_COW_ROOT_BYTES).contains(&bytes) {
+                return Err(PolicyError::new(format!(
+                    "filesystem.cow_root_bytes must be between {MIN_COW_ROOT_BYTES} and {MAX_COW_ROOT_BYTES}"
+                )));
+            }
+        }
 
         if self.procfs_enabled {
             let proc_path = Path::new("/proc");
@@ -1109,6 +1122,7 @@ impl FromStr for SandboxPolicy {
 
     fn from_str(input: &str) -> Result<Self, Self::Err> {
         let mut root_dir = None;
+        let mut cow_root_bytes = None;
         let mut hostname = None;
         let mut executable = None;
         let mut args = Vec::new();
@@ -1183,6 +1197,12 @@ impl FromStr for SandboxPolicy {
 
             match key {
                 "filesystem.root" => set_once(&mut root_dir, value.to_owned(), line_no, key)?,
+                "filesystem.cow_root_bytes" => set_once(
+                    &mut cow_root_bytes,
+                    parse_u64(value, line_no, key)?,
+                    line_no,
+                    key,
+                )?,
                 "identity.hostname" => set_once(&mut hostname, value.to_owned(), line_no, key)?,
                 "landlock.tcp_bind_port" => {
                     landlock_tcp_bind_ports.push(parse_tcp_port(value, line_no, key)?)
@@ -1595,6 +1615,7 @@ impl FromStr for SandboxPolicy {
 
         let policy = Self {
             root_dir: PathBuf::from(required(root_dir, "filesystem.root")?),
+            cow_root_bytes,
             hostname: required(hostname, "identity.hostname")?,
             executable: PathBuf::from(required(executable, "executable")?),
             args,
@@ -1914,6 +1935,7 @@ mod tests {
     fn parses_complete_policy() {
         let policy: SandboxPolicy = VALID.parse().unwrap();
         assert_eq!(policy.root_dir, PathBuf::from("/"));
+        assert_eq!(policy.cow_root_bytes, None);
         assert_eq!(policy.hostname, "security-lab");
         assert!(!policy.loopback_enabled);
         assert!(!policy.procfs_enabled);
@@ -2514,6 +2536,30 @@ mod tests {
         assert!(error
             .to_string()
             .contains("collides with the brokered host-IPv4 TCP connection target"));
+    }
+
+    #[test]
+    fn parses_bounded_copy_on_write_root() {
+        let policy: SandboxPolicy = format!("{VALID}\nfilesystem.cow_root_bytes = 16777216")
+            .parse()
+            .unwrap();
+        assert_eq!(policy.cow_root_bytes, Some(16 * 1024 * 1024));
+
+        let too_small = format!(
+            "{VALID}\nfilesystem.cow_root_bytes = {}",
+            MIN_COW_ROOT_BYTES - 1
+        );
+        assert!(too_small.parse::<SandboxPolicy>().is_err());
+
+        let too_large = format!(
+            "{VALID}\nfilesystem.cow_root_bytes = {}",
+            MAX_COW_ROOT_BYTES + 1
+        );
+        assert!(too_large.parse::<SandboxPolicy>().is_err());
+
+        let duplicate =
+            format!("{VALID}\nfilesystem.cow_root_bytes = 4096\nfilesystem.cow_root_bytes = 8192");
+        assert!(duplicate.parse::<SandboxPolicy>().is_err());
     }
 
     #[test]

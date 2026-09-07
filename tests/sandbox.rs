@@ -196,6 +196,11 @@ fn fixture_root() -> &'static Path {
             .expect("create Landlock allowed directory");
         std::fs::create_dir_all(root.join("landlock-denied"))
             .expect("create Landlock denied directory");
+        std::fs::create_dir_all(root.join("cow-dir")).expect("create COW root fixture directory");
+        std::fs::write(root.join("cow-base"), b"lower-original\n")
+            .expect("write COW lower base fixture");
+        std::fs::write(root.join("cow-dir/child"), b"lower-child\n")
+            .expect("write COW lower child fixture");
         std::fs::write(root.join("landlock-allowed/marker"), b"landlock-allowed\n")
             .expect("write Landlock allowed marker");
         std::fs::write(root.join("landlock-denied/secret"), b"landlock-secret\n")
@@ -275,6 +280,7 @@ fn policy(mode: &str, extra_args: &[&str], syscalls: &[&str]) -> SandboxPolicy {
     args.extend(extra_args.iter().map(|arg| (*arg).to_owned()));
     SandboxPolicy {
         root_dir: fixture_root().to_path_buf(),
+        cow_root_bytes: None,
         hostname: "security-lab".to_owned(),
         executable: PathBuf::from("/probe"),
         args,
@@ -335,6 +341,86 @@ fn policy(mode: &str, extra_args: &[&str], syscalls: &[&str]) -> SandboxPolicy {
             argument_forbidden_mask_rules: BTreeMap::new(),
         },
     }
+}
+
+#[test]
+fn raw_fixture_dispatch_modes_are_unique() {
+    let source = include_str!("fixtures/probe.S");
+    let dispatch = source
+        .split_once("_start:\n")
+        .expect("raw fixture has _start")
+        .1
+        .split_once("\n.allowed:")
+        .expect("raw fixture dispatch precedes .allowed")
+        .0;
+    let mut modes = BTreeSet::new();
+    for line in dispatch.lines() {
+        let line = line.trim();
+        let Some(value) = line
+            .strip_prefix("cmp $")
+            .and_then(|rest| rest.strip_suffix(", %al"))
+        else {
+            continue;
+        };
+        let value: u16 = value
+            .parse()
+            .expect("fixture dispatch uses decimal byte values");
+        assert!(
+            modes.insert(value),
+            "duplicate raw fixture dispatch mode byte {value}"
+        );
+    }
+    assert!(
+        modes.len() >= 40,
+        "unexpectedly small raw fixture dispatch table"
+    );
+}
+
+#[test]
+fn copy_on_write_root_is_ephemeral_and_preserves_host_lower() {
+    let root = fixture_root();
+    let base = root.join("cow-base");
+    let child = root.join("cow-dir/child");
+    let created = root.join("cow-new");
+    let _ = std::fs::remove_file(&created);
+    assert_eq!(std::fs::read(&base).unwrap(), b"lower-original\n");
+    assert_eq!(std::fs::read(&child).unwrap(), b"lower-child\n");
+
+    for _ in 0..2 {
+        let mut cow = policy(
+            "z",
+            &[],
+            &[
+                "execveat", "openat", "read", "write", "close", "unlink", "exit",
+            ],
+        );
+        cow.cow_root_bytes = Some(SCRATCH_BYTES);
+        let report = run_report(&cow).expect("copy-on-write root sandbox failed");
+        assert_eq!(report.outcome, ChildOutcome::Exited(0));
+        assert!(report.enforcement.copy_on_write_root);
+        assert!(!report.enforcement.readonly_root);
+        assert_eq!(std::fs::read(&base).unwrap(), b"lower-original\n");
+        assert_eq!(std::fs::read(&child).unwrap(), b"lower-child\n");
+        assert!(!created.exists());
+    }
+}
+
+#[test]
+fn copy_on_write_root_byte_budget_is_kernel_enforced() {
+    const COW_BUDGET_BYTES: u64 = 64 * 1024;
+    let created = fixture_root().join("cow-capacity");
+    let _ = std::fs::remove_file(&created);
+
+    let mut cow = policy("l", &[], &["execveat", "openat", "write", "close", "exit"]);
+    cow.cow_root_bytes = Some(COW_BUDGET_BYTES);
+    let report = run_report(&cow).expect("copy-on-write root budget sandbox failed");
+    assert_eq!(report.outcome, ChildOutcome::Exited(0));
+    assert!(report.enforcement.copy_on_write_root);
+    assert!(!report.enforcement.readonly_root);
+    assert!(
+        !created.exists(),
+        "COW budget oracle persisted its upper-layer file into the host lower tree"
+    );
 }
 
 fn clock_nanos(clock_id: libc::clockid_t) -> i128 {
@@ -751,6 +837,38 @@ fn landlock_file_mutation_requires_existing_writable_surface() {
         }
         other => panic!("unexpected Landlock mutation policy result: {other}"),
     }
+}
+
+#[test]
+fn copy_on_write_root_preserves_readonly_persistent_volume_semantics() {
+    let source = readonly_volume_source().to_path_buf();
+    let forbidden_write = source.join("write-must-fail");
+    let _ = std::fs::remove_file(&forbidden_write);
+    let marker_before = std::fs::read(source.join("marker")).expect("read host volume marker");
+    let source_argument = source.to_string_lossy().into_owned();
+
+    let mut mounted = policy(
+        "v",
+        &[source_argument.as_str()],
+        &["execveat", "openat", "read", "close", "exit"],
+    );
+    mounted.cow_root_bytes = Some(16 * 1024 * 1024);
+    mounted.readonly_volume_source = Some(source.clone());
+    mounted.readonly_volume_target = Some(PathBuf::from("/data"));
+
+    let report = run_report(&mounted).expect("COW root plus read-only volume run failed");
+    assert_eq!(report.outcome, ChildOutcome::Exited(0));
+    assert!(report.enforcement.copy_on_write_root);
+    assert!(!report.enforcement.readonly_root);
+    assert_eq!(
+        std::fs::read(source.join("marker")).expect("read host volume marker after COW run"),
+        marker_before,
+        "COW root changed a declared read-only persistent-volume marker"
+    );
+    assert!(
+        !forbidden_write.exists(),
+        "COW root widened a declared read-only persistent volume"
+    );
 }
 
 #[test]

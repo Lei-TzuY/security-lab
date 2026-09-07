@@ -114,7 +114,7 @@ fn run_json_emits_deterministic_machine_report() {
     }
     assert_eq!(
         enforcement,
-        "{\"base_namespaces\":true,\"time_namespace_offsets\":false,\"hostname\":true,\"private_mount_propagation\":true,\"readonly_root\":true,\"chroot\":true,\"fd_sanitization\":true,\"private_procfs\":false,\"rlimits\":true,\"capabilities_reduced\":true,\"no_new_privs\":true,\"landlock\":false,\"seccomp\":true}}\n"
+        "{\"base_namespaces\":true,\"time_namespace_offsets\":false,\"hostname\":true,\"private_mount_propagation\":true,\"readonly_root\":true,\"copy_on_write_root\":false,\"chroot\":true,\"fd_sanitization\":true,\"private_procfs\":false,\"rlimits\":true,\"capabilities_reduced\":true,\"no_new_privs\":true,\"landlock\":false,\"seccomp\":true}}\n"
     );
 }
 

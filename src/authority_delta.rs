@@ -155,6 +155,7 @@ pub(crate) fn compare(baseline: &SandboxPolicy, candidate: &SandboxPolicy) -> Au
         &candidate.procfs_enabled,
         &mut changes,
     );
+    compare_copy_on_write_root(baseline, candidate, &mut changes);
     compare_scratch(baseline, candidate, &mut changes);
     compare_optional_capability(
         "filesystem.read_only_volume",
@@ -423,6 +424,31 @@ pub(crate) fn compare(baseline: &SandboxPolicy, candidate: &SandboxPolicy) -> Au
     };
 
     AuthorityDelta { status, changes }
+}
+
+fn compare_copy_on_write_root(
+    baseline: &SandboxPolicy,
+    candidate: &SandboxPolicy,
+    changes: &mut Vec<Change>,
+) {
+    match (baseline.cow_root_bytes, candidate.cow_root_bytes) {
+        (None, None) => {}
+        (None, Some(_)) => push_change(
+            "filesystem.copy_on_write_root",
+            DeltaClass::Widened,
+            changes,
+        ),
+        (Some(_), None) => push_change(
+            "filesystem.copy_on_write_root",
+            DeltaClass::Reduced,
+            changes,
+        ),
+        (Some(base), Some(new)) => push_change(
+            "filesystem.copy_on_write_root_bytes",
+            classify_allowance(base, new),
+            changes,
+        ),
+    }
 }
 
 fn compare_scratch(baseline: &SandboxPolicy, candidate: &SandboxPolicy, changes: &mut Vec<Change>) {

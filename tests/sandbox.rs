@@ -110,6 +110,51 @@ fn unix_stream_client() -> TestFd {
     TestFd(client)
 }
 
+#[repr(C, align(8))]
+struct OneFdControl([u8; 24]);
+
+fn send_one_fd(socket_fd: RawFd, source_fd: RawFd) {
+    let mut payload = *b"F";
+    let mut iovec = libc::iovec {
+        iov_base: payload.as_mut_ptr().cast::<libc::c_void>(),
+        iov_len: payload.len(),
+    };
+    let mut control = OneFdControl([0; 24]);
+    let header = control.0.as_mut_ptr().cast::<libc::cmsghdr>();
+    unsafe {
+        (*header).cmsg_len = std::mem::size_of::<libc::cmsghdr>() + std::mem::size_of::<RawFd>();
+        (*header).cmsg_level = libc::SOL_SOCKET;
+        (*header).cmsg_type = libc::SCM_RIGHTS;
+        control
+            .0
+            .as_mut_ptr()
+            .add(std::mem::size_of::<libc::cmsghdr>())
+            .cast::<RawFd>()
+            .write(source_fd);
+    }
+
+    let mut message = unsafe { std::mem::zeroed::<libc::msghdr>() };
+    message.msg_iov = &mut iovec;
+    message.msg_iovlen = 1;
+    message.msg_control = control.0.as_mut_ptr().cast::<libc::c_void>();
+    message.msg_controllen = control.0.len();
+
+    loop {
+        let sent = unsafe { libc::sendmsg(socket_fd, &message, 0) };
+        if sent == 1 {
+            return;
+        }
+        if sent == -1 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            panic!("SCM_RIGHTS sendmsg failed: {error}");
+        }
+        panic!("SCM_RIGHTS sendmsg wrote unexpected payload length {sent}");
+    }
+}
+
 fn write_all_fd(fd: RawFd, buffer: &[u8]) {
     let mut offset = 0usize;
     while offset < buffer.len() {
@@ -1223,6 +1268,56 @@ fn stdout_total_budget_owns_process_tree_teardown() {
     let captured = report.stdout.expect("capture result missing");
     assert_eq!(captured.bytes.len(), 1024);
     assert!(captured.truncated);
+}
+
+#[test]
+fn brokered_host_unix_stream_transfers_one_post_launch_fd_via_scm_rights() {
+    let socket_path = std::env::temp_dir().join(format!(
+        "security-lab-runtime-rights-{}.sock",
+        process::id()
+    ));
+    let marker_path = std::env::temp_dir().join(format!(
+        "security-lab-runtime-rights-marker-{}",
+        process::id()
+    ));
+    let _ = std::fs::remove_file(&socket_path);
+    let _ = std::fs::remove_file(&marker_path);
+    std::fs::write(&marker_path, b"runtime-fd-handoff-ok\n")
+        .expect("seed runtime descriptor handoff marker");
+
+    let listener = UnixListener::bind(&socket_path).expect("bind runtime SCM_RIGHTS endpoint");
+    let marker_for_server = marker_path.clone();
+    let server = thread::spawn(move || {
+        let (stream, _) = listener
+            .accept()
+            .expect("accept runtime SCM_RIGHTS broker connection");
+        let mut ready = [0u8; 1];
+        read_exact_fd(stream.as_raw_fd(), &mut ready);
+        assert_eq!(&ready, b"R", "target must execute before the FD is sent");
+        let marker =
+            std::fs::File::open(marker_for_server).expect("open runtime descriptor handoff marker");
+        send_one_fd(stream.as_raw_fd(), marker.as_raw_fd());
+    });
+
+    let marker_argument = marker_path.to_string_lossy().into_owned();
+    let mut brokered = policy(
+        "0",
+        &[marker_argument.as_str()],
+        &[
+            "execveat", "write", "recvmsg", "read", "close", "openat", "exit",
+        ],
+    );
+    brokered.host_unix_stream_path = Some(socket_path.clone());
+    brokered.host_unix_stream_target_fd = Some(10);
+    brokered.host_unix_stream_peer_uid = Some(unsafe { libc::geteuid() });
+    brokered.host_unix_stream_peer_gid = Some(unsafe { libc::getegid() });
+    brokered.wall_clock_milliseconds = Some(2000);
+
+    let result = run(&brokered);
+    server.join().expect("runtime SCM_RIGHTS server failed");
+    let _ = std::fs::remove_file(&socket_path);
+    let _ = std::fs::remove_file(&marker_path);
+    assert_eq!(result.unwrap(), ChildOutcome::Exited(0));
 }
 
 #[test]

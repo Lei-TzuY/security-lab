@@ -26,6 +26,8 @@ pub(crate) fn to_json(policy: &SandboxPolicy) -> String {
     push_bool(&mut output, policy.procfs_enabled);
     output.push_str(",\"copy_on_write_root_bytes\":");
     push_optional_u64(&mut output, policy.cow_root_bytes);
+    output.push_str(",\"copy_on_write_diff_bytes\":");
+    push_optional_u64(&mut output, policy.cow_diff_bytes);
     output.push_str(",\"scratch\":");
     match (&policy.scratch_dir, policy.scratch_bytes) {
         (Some(path), Some(bytes)) => {
@@ -301,6 +303,12 @@ pub(crate) fn to_human(policy: &SandboxPolicy) -> String {
         &mut output,
         "copy-on-write-root-bytes: {}",
         display_optional_u64(policy.cow_root_bytes)
+    )
+    .expect("write to String cannot fail");
+    writeln!(
+        &mut output,
+        "copy-on-write-diff-bytes: {}",
+        display_optional_u64(policy.cow_diff_bytes)
     )
     .expect("write to String cannot fail");
     writeln!(

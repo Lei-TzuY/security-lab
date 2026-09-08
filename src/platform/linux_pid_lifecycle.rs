@@ -1,3 +1,4 @@
+use super::cow_diff::{self, CowDiffState};
 use std::io;
 use std::ptr;
 
@@ -134,6 +135,7 @@ pub(super) struct TargetSupervisionPhases {
     pub(super) output_limit_pidfd: u32,
     pub(super) output_limit_poll: u32,
     pub(super) usage: u32,
+    pub(super) cow_diff_export: u32,
 }
 
 /// Called by the launcher-owned namespace init (PID 1). Fork the direct target.
@@ -142,20 +144,30 @@ pub(super) struct TargetSupervisionPhases {
 /// optionally enforces a monotonic wall-clock deadline, kills and reaps every
 /// remaining descendant, publishes the target lifecycle, and exits without
 /// ever inheriting the target seccomp policy.
+pub(super) struct CowDiffControl {
+    pub(super) upper_fd: libc::c_int,
+    pub(super) state: *mut CowDiffState,
+}
+
 pub(super) unsafe fn become_direct_target_or_reap(
     lifecycle: *mut TargetLifecycleRecord,
     launch_error: *mut LaunchErrorRecord,
     wall_clock_milliseconds: u64,
     cancellation_fd: libc::c_int,
     output_limit_fd: libc::c_int,
+    cow_diff: CowDiffControl,
     phases: TargetSupervisionPhases,
 ) {
+    let CowDiffControl {
+        upper_fd: cow_upper_fd,
+        state: cow_diff_state,
+    } = cow_diff;
     let pid = libc::syscall(libc::SYS_fork);
     if pid == -1 {
         fail(launch_error, phases.fork);
     }
     if pid == 0 {
-        for control_fd in [cancellation_fd, output_limit_fd] {
+        for control_fd in [cancellation_fd, output_limit_fd, cow_upper_fd] {
             if control_fd >= 3 && libc::close(control_fd) == -1 {
                 fail(launch_error, phases.close);
             }
@@ -164,7 +176,7 @@ pub(super) unsafe fn become_direct_target_or_reap(
     }
     let pid = pid as libc::pid_t;
 
-    if let Err(errno) = close_nonstdio_except(cancellation_fd, output_limit_fd) {
+    if let Err(errno) = close_nonstdio_except(cancellation_fd, output_limit_fd, cow_upper_fd) {
         libc::syscall(libc::SYS_kill, pid, libc::SIGKILL);
         let _ = wait_specific(pid);
         let _ = kill_and_reap_remaining(launch_error, phases.kill, phases.reap);
@@ -185,6 +197,17 @@ pub(super) unsafe fn become_direct_target_or_reap(
         Ok(usage) => usage,
         Err(errno) => fail_errno(launch_error, phases.usage, errno),
     };
+    if !cow_diff_state.is_null() {
+        if cow_upper_fd < 3 {
+            fail_errno(launch_error, phases.cow_diff_export, libc::EINVAL);
+        }
+        if let Err(errno) = cow_diff::export_upper(cow_upper_fd, cow_diff_state) {
+            fail_errno(launch_error, phases.cow_diff_export, errno);
+        }
+    }
+    if cow_upper_fd >= 3 && libc::close(cow_upper_fd) == -1 {
+        fail(launch_error, phases.close);
+    }
 
     ptr::write_volatile(ptr::addr_of_mut!((*lifecycle).status), direct_status);
     ptr::write_volatile(
@@ -430,8 +453,12 @@ fn timeval_to_micros(value: libc::timeval) -> u64 {
         .saturating_add(micros.min(999_999))
 }
 
-unsafe fn close_nonstdio_except(keep_a: libc::c_int, keep_b: libc::c_int) -> Result<(), i32> {
-    let mut keep = [keep_a, keep_b];
+unsafe fn close_nonstdio_except(
+    keep_a: libc::c_int,
+    keep_b: libc::c_int,
+    keep_c: libc::c_int,
+) -> Result<(), i32> {
+    let mut keep = [keep_a, keep_b, keep_c];
     keep.sort_unstable();
     let mut cursor = 3u64;
     let mut previous = -1;

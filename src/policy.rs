@@ -26,6 +26,8 @@ const MIN_SCRATCH_BYTES: u64 = 4096;
 const MAX_SCRATCH_BYTES: u64 = 1024 * 1024 * 1024;
 const MIN_COW_ROOT_BYTES: u64 = 4096;
 const MAX_COW_ROOT_BYTES: u64 = 1024 * 1024 * 1024;
+const MIN_COW_DIFF_BYTES: u64 = 64;
+const MAX_COW_DIFF_BYTES: u64 = 16 * 1024 * 1024;
 const MIN_CAPTURE_BYTES: u64 = 1;
 const MAX_CAPTURE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_STDOUT_TOTAL_BYTES: u64 = 1024 * 1024 * 1024;
@@ -97,6 +99,9 @@ pub struct SandboxPolicy {
     /// Optional byte ceiling for a private tmpfs upper/work backing an
     /// ephemeral OverlayFS copy-on-write view of `root_dir`.
     pub cow_root_bytes: Option<u64>,
+    /// Optional complete post-run export ceiling for the private COW upper tree.
+    /// Valid only when `cow_root_bytes` is also configured.
+    pub cow_diff_bytes: Option<u64>,
     /// Launcher-owned hostname installed inside the sandbox UTS namespace.
     pub hostname: String,
     /// Absolute path interpreted inside `root_dir`.
@@ -248,6 +253,18 @@ impl SandboxPolicy {
             if !(MIN_COW_ROOT_BYTES..=MAX_COW_ROOT_BYTES).contains(&bytes) {
                 return Err(PolicyError::new(format!(
                     "filesystem.cow_root_bytes must be between {MIN_COW_ROOT_BYTES} and {MAX_COW_ROOT_BYTES}"
+                )));
+            }
+        }
+        if let Some(bytes) = self.cow_diff_bytes {
+            if self.cow_root_bytes.is_none() {
+                return Err(PolicyError::new(
+                    "filesystem.cow_diff_bytes requires filesystem.cow_root_bytes",
+                ));
+            }
+            if !(MIN_COW_DIFF_BYTES..=MAX_COW_DIFF_BYTES).contains(&bytes) {
+                return Err(PolicyError::new(format!(
+                    "filesystem.cow_diff_bytes must be between {MIN_COW_DIFF_BYTES} and {MAX_COW_DIFF_BYTES}"
                 )));
             }
         }
@@ -1123,6 +1140,7 @@ impl FromStr for SandboxPolicy {
     fn from_str(input: &str) -> Result<Self, Self::Err> {
         let mut root_dir = None;
         let mut cow_root_bytes = None;
+        let mut cow_diff_bytes = None;
         let mut hostname = None;
         let mut executable = None;
         let mut args = Vec::new();
@@ -1199,6 +1217,12 @@ impl FromStr for SandboxPolicy {
                 "filesystem.root" => set_once(&mut root_dir, value.to_owned(), line_no, key)?,
                 "filesystem.cow_root_bytes" => set_once(
                     &mut cow_root_bytes,
+                    parse_u64(value, line_no, key)?,
+                    line_no,
+                    key,
+                )?,
+                "filesystem.cow_diff_bytes" => set_once(
+                    &mut cow_diff_bytes,
                     parse_u64(value, line_no, key)?,
                     line_no,
                     key,
@@ -1616,6 +1640,7 @@ impl FromStr for SandboxPolicy {
         let policy = Self {
             root_dir: PathBuf::from(required(root_dir, "filesystem.root")?),
             cow_root_bytes,
+            cow_diff_bytes,
             hostname: required(hostname, "identity.hostname")?,
             executable: PathBuf::from(required(executable, "executable")?),
             args,
@@ -1936,6 +1961,7 @@ mod tests {
         let policy: SandboxPolicy = VALID.parse().unwrap();
         assert_eq!(policy.root_dir, PathBuf::from("/"));
         assert_eq!(policy.cow_root_bytes, None);
+        assert_eq!(policy.cow_diff_bytes, None);
         assert_eq!(policy.hostname, "security-lab");
         assert!(!policy.loopback_enabled);
         assert!(!policy.procfs_enabled);
@@ -2560,6 +2586,25 @@ mod tests {
         let duplicate =
             format!("{VALID}\nfilesystem.cow_root_bytes = 4096\nfilesystem.cow_root_bytes = 8192");
         assert!(duplicate.parse::<SandboxPolicy>().is_err());
+    }
+
+    #[test]
+    fn parses_bounded_copy_on_write_diff_export() {
+        let policy: SandboxPolicy = format!(
+            "{VALID}\nfilesystem.cow_root_bytes = 16777216\nfilesystem.cow_diff_bytes = 4096"
+        )
+        .parse()
+        .unwrap();
+        assert_eq!(policy.cow_diff_bytes, Some(4096));
+
+        let without_cow = format!("{VALID}\nfilesystem.cow_diff_bytes = 4096");
+        assert!(without_cow.parse::<SandboxPolicy>().is_err());
+
+        let too_small = format!(
+            "{VALID}\nfilesystem.cow_root_bytes = 16777216\nfilesystem.cow_diff_bytes = {}",
+            MIN_COW_DIFF_BYTES - 1
+        );
+        assert!(too_small.parse::<SandboxPolicy>().is_err());
     }
 
     #[test]

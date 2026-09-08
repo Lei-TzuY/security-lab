@@ -1,4 +1,8 @@
 use crate::snapshot_identity::{SnapshotIdentity, SnapshotIdentityError};
+use crate::snapshot_signature::{
+    verify_snapshot_identity_ed25519, SnapshotEd25519Error, SNAPSHOT_ED25519_PUBLIC_KEY_BYTES,
+    SNAPSHOT_ED25519_SIGNATURE_BYTES,
+};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::error::Error;
@@ -52,6 +56,7 @@ pub enum SnapshotArchiveError {
         attempted: u64,
     },
     Identity(SnapshotIdentityError),
+    Signature(SnapshotEd25519Error),
     UnsupportedPlatform(String),
     Io {
         phase: &'static str,
@@ -76,6 +81,12 @@ impl fmt::Display for SnapshotArchiveError {
                 "snapshot archive {resource} budget exceeded: limit={limit} attempted={attempted}"
             ),
             Self::Identity(source) => write!(f, "snapshot archive identity failed: {source}"),
+            Self::Signature(source) => {
+                write!(
+                    f,
+                    "snapshot archive signature verification failed: {source}"
+                )
+            }
             Self::UnsupportedPlatform(message) => {
                 write!(f, "unsupported snapshot archive platform: {message}")
             }
@@ -94,6 +105,7 @@ impl Error for SnapshotArchiveError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Identity(source) => Some(source),
+            Self::Signature(source) => Some(source),
             Self::Io { source, .. } => Some(source),
             _ => None,
         }
@@ -103,6 +115,12 @@ impl Error for SnapshotArchiveError {
 impl From<SnapshotIdentityError> for SnapshotArchiveError {
     fn from(value: SnapshotIdentityError) -> Self {
         Self::Identity(value)
+    }
+}
+
+impl From<SnapshotEd25519Error> for SnapshotArchiveError {
+    fn from(value: SnapshotEd25519Error) -> Self {
+        Self::Signature(value)
     }
 }
 
@@ -155,6 +173,39 @@ pub fn materialize_snapshot_archive_atomic(
 ) -> Result<SnapshotArchiveMaterializeReport, SnapshotArchiveError> {
     validate_limits(limits)?;
     let parsed = parse_archive(archive, limits)?;
+    #[cfg(target_os = "linux")]
+    {
+        linux::materialize(archive, destination, parsed, limits)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (archive, destination, parsed, limits);
+        Err(SnapshotArchiveError::UnsupportedPlatform(
+            "atomic snapshot materialization requires Linux renameat2 and fd-relative filesystem operations"
+                .to_owned(),
+        ))
+    }
+}
+
+/// Validate a canonical archive, strictly verify its Milestone 37A Ed25519
+/// signature under the exact caller-supplied public key, and only then permit
+/// destination inspection or staging-tree creation.
+///
+/// The signature covers the canonical Milestone 33A identity derived directly
+/// from the frozen archive records. A verification failure therefore cannot
+/// publish or stage an unauthenticated tree. Publication retains the same
+/// failure-atomic, non-fsync durability boundary as
+/// `materialize_snapshot_archive_atomic`.
+pub fn materialize_snapshot_archive_ed25519_atomic(
+    archive: &[u8],
+    destination: &Path,
+    public_key: &[u8; SNAPSHOT_ED25519_PUBLIC_KEY_BYTES],
+    expected_signature: &[u8; SNAPSHOT_ED25519_SIGNATURE_BYTES],
+    limits: SnapshotArchiveLimits,
+) -> Result<SnapshotArchiveMaterializeReport, SnapshotArchiveError> {
+    validate_limits(limits)?;
+    let parsed = parse_archive(archive, limits)?;
+    verify_snapshot_identity_ed25519(parsed.identity, public_key, expected_signature)?;
     #[cfg(target_os = "linux")]
     {
         linux::materialize(archive, destination, parsed, limits)

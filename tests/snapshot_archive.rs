@@ -1,8 +1,9 @@
 #![cfg(target_os = "linux")]
 
 use security_lab::{
-    materialize_snapshot_archive_atomic, serialize_snapshot_archive, snapshot_archive_identity,
-    snapshot_sha256, SnapshotArchiveError, SnapshotArchiveLimits, SnapshotIdentityLimits,
+    materialize_snapshot_archive_atomic, materialize_snapshot_archive_ed25519_atomic,
+    serialize_snapshot_archive, sign_snapshot_ed25519, snapshot_archive_identity, snapshot_sha256,
+    SnapshotArchiveError, SnapshotArchiveLimits, SnapshotEd25519Error, SnapshotIdentityLimits,
 };
 use std::fs;
 use std::os::unix::fs::{symlink, PermissionsExt};
@@ -273,5 +274,98 @@ fn symlink_parent_archive_is_rejected_before_materialization() {
         SnapshotArchiveError::InvalidInput(_)
     ));
     assert!(!destination.exists());
+    assert!(!has_staging_residue(temp.path()));
+}
+
+#[test]
+fn ed25519_verified_archive_publication_survives_live_source_mutation() {
+    let temp = TempTree::new();
+    let source = temp.path().join("source");
+    let destination = temp.path().join("verified-materialized");
+    fs::create_dir(&source).expect("create source");
+    populate(&source);
+
+    let archive = serialize_snapshot_archive(&source, archive_limits()).expect("serialize source");
+    let seed = [0x5a; 32];
+    let evidence =
+        sign_snapshot_ed25519(&source, &seed, identity_limits()).expect("sign source identity");
+    assert_eq!(evidence.snapshot, archive.identity);
+
+    fs::write(source.join("alpha"), b"live-source-changed-after-signing\n")
+        .expect("mutate live source after archive signing");
+    assert_ne!(
+        snapshot_sha256(&source, identity_limits()).expect("hash mutated source"),
+        archive.identity
+    );
+
+    let report = materialize_snapshot_archive_ed25519_atomic(
+        &archive.bytes,
+        &destination,
+        &evidence.public_key,
+        &evidence.signature,
+        archive_limits(),
+    )
+    .expect("verify frozen archive and publish");
+    assert_eq!(report.identity, archive.identity);
+    assert_eq!(
+        snapshot_sha256(&destination, identity_limits()).expect("hash verified publication"),
+        archive.identity
+    );
+    assert_eq!(
+        fs::read(destination.join("alpha")).expect("read captured alpha"),
+        b"captured-alpha\n"
+    );
+    assert!(!has_staging_residue(temp.path()));
+}
+
+#[test]
+fn ed25519_archive_verification_fails_before_publication_side_effects() {
+    let temp = TempTree::new();
+    let source = temp.path().join("source");
+    fs::create_dir(&source).expect("create source");
+    populate(&source);
+
+    let archive = serialize_snapshot_archive(&source, archive_limits()).expect("serialize source");
+    let evidence = sign_snapshot_ed25519(&source, &[0x61; 32], identity_limits())
+        .expect("sign source identity");
+    let wrong = sign_snapshot_ed25519(&source, &[0x62; 32], identity_limits())
+        .expect("derive wrong verifying key");
+
+    let missing_parent_destination = temp.path().join("missing-parent/out");
+    let wrong_key_error = materialize_snapshot_archive_ed25519_atomic(
+        &archive.bytes,
+        &missing_parent_destination,
+        &wrong.public_key,
+        &evidence.signature,
+        archive_limits(),
+    )
+    .expect_err("wrong key must fail before destination inspection");
+    assert!(matches!(
+        wrong_key_error,
+        SnapshotArchiveError::Signature(SnapshotEd25519Error::VerificationFailed)
+    ));
+    assert!(!temp.path().join("missing-parent").exists());
+
+    let mut tampered = archive.bytes.clone();
+    let needle = b"captured-alpha\n";
+    let offset = tampered
+        .windows(needle.len())
+        .position(|window| window == needle)
+        .expect("archive contains captured alpha payload");
+    tampered[offset] ^= 0x01;
+    let tampered_destination = temp.path().join("tampered-must-not-publish");
+    let tampered_error = materialize_snapshot_archive_ed25519_atomic(
+        &tampered,
+        &tampered_destination,
+        &evidence.public_key,
+        &evidence.signature,
+        archive_limits(),
+    )
+    .expect_err("parse-valid content tamper must fail signature verification");
+    assert!(matches!(
+        tampered_error,
+        SnapshotArchiveError::Signature(SnapshotEd25519Error::VerificationFailed)
+    ));
+    assert!(!tampered_destination.exists());
     assert!(!has_staging_residue(temp.path()));
 }

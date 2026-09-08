@@ -41,7 +41,7 @@ tests = "tests/cow_diff_apply.rs"
 replace_one(
     tests,
     """use std::fs;\nuse std::os::unix::ffi::OsStrExt;\n""",
-    """use std::ffi::CString;\nuse std::fs;\nuse std::os::unix::ffi::{OsStrExt, OsStringExt};\n""",
+    """use std::ffi::CString;\nuse std::fs;\nuse std::os::unix::ffi::OsStrExt;\n""",
     "test imports",
 )
 replace_one(

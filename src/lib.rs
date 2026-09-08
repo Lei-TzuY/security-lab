@@ -6,6 +6,7 @@
 mod cancellation;
 mod cow_diff_apply;
 mod platform;
+mod snapshot_identity;
 pub mod policy;
 pub mod report;
 
@@ -23,6 +24,9 @@ pub use policy::{
 pub use report::{
     CapturedOutput, ChildOutcome, CowDiff, CowDiffEntry, EnforcementReceipt, ProcessTreeUsage,
     RunReport,
+};
+pub use snapshot_identity::{
+    snapshot_sha256, SnapshotIdentity, SnapshotIdentityError, SnapshotIdentityLimits,
 };
 
 #[derive(Debug)]

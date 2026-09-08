@@ -9,6 +9,7 @@ mod platform;
 pub mod policy;
 pub mod report;
 mod runtime_fd_broker;
+mod snapshot_archive;
 mod snapshot_auth;
 mod snapshot_identity;
 mod snapshot_signature;
@@ -31,6 +32,11 @@ pub use report::{
 };
 pub use runtime_fd_broker::{
     PreparedReadOnlyRegularFile, RuntimeFdBroker, RuntimeFdBrokerError, RuntimeFdSession,
+};
+pub use snapshot_archive::{
+    materialize_snapshot_archive_atomic, materialize_snapshot_archive_ed25519_atomic,
+    serialize_snapshot_archive, snapshot_archive_identity, SnapshotArchive, SnapshotArchiveError,
+    SnapshotArchiveLimits, SnapshotArchiveMaterializeReport,
 };
 pub use snapshot_auth::{
     snapshot_hmac_sha256, verify_snapshot_hmac_sha256, SnapshotHmac, SnapshotHmacError,

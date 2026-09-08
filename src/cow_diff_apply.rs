@@ -29,7 +29,8 @@ pub struct CowDiffApplyReport {
 /// Evidence returned when replay was gated by an expected canonical base identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CowDiffApplyBoundReport {
-    /// Canonical identity observed immediately before replay setup began.
+    /// Canonical identity revalidated from the materialized base copy immediately
+    /// before diff replay begins.
     pub base_identity: SnapshotIdentity,
     /// Existing bounded/failure-atomic replay accounting.
     pub replay: CowDiffApplyReport,
@@ -135,13 +136,16 @@ pub fn apply_cow_diff_atomic(
 }
 
 /// Replay `diff` only when the current canonical identity of `base` matches
-/// `expected_base`. The identity check is completed before destination inspection
-/// or replay staging begins. A mismatch therefore cannot publish or stage a tree.
+/// `expected_base` both before replay setup and again after the base has been
+/// materialized into the private staging tree. The first gate preserves the 34A
+/// fail-fast ordering: a stale expected identity is rejected before destination
+/// inspection or staging creation. The second gate binds replay to the exact
+/// materialized input tree, so a base mutation after the first scan cannot be
+/// replayed under the earlier identity.
 ///
-/// This is an optimistic trusted-base precondition, not hostile-writer locking:
-/// callers must not infer protection against a concurrent mutation after the
-/// identity scan and before/during replay. The SHA-256 identity is also not an
-/// authenticity or provenance statement.
+/// This does not make the source tree a hostile-writer snapshot while it is being
+/// copied: the materialized tree must itself hash to `expected_base` before replay.
+/// The SHA-256 identity is also not an authenticity or provenance statement.
 pub fn apply_cow_diff_atomic_with_expected_base(
     base: &Path,
     destination: &Path,
@@ -151,20 +155,38 @@ pub fn apply_cow_diff_atomic_with_expected_base(
     replay_limits: CowDiffApplyLimits,
 ) -> Result<CowDiffApplyBoundReport, CowDiffApplyError> {
     validate_limits(replay_limits)?;
-    let actual = snapshot_sha256(base, identity_limits)
+    let initial = snapshot_sha256(base, identity_limits)
         .map_err(|source| CowDiffApplyError::BaseIdentity { source })?;
-    if actual.sha256 != expected_base.sha256 {
+    if initial.sha256 != expected_base.sha256 {
         return Err(CowDiffApplyError::BaseIdentityMismatch {
             expected: expected_base,
-            actual,
+            actual: initial,
         });
     }
 
-    let replay = apply_cow_diff_atomic(base, destination, diff, replay_limits)?;
-    Ok(CowDiffApplyBoundReport {
-        base_identity: actual,
-        replay,
-    })
+    #[cfg(target_os = "linux")]
+    {
+        let (replay, materialized) = linux::apply_with_verified_base(
+            base,
+            destination,
+            diff,
+            expected_base,
+            identity_limits,
+            replay_limits,
+        )?;
+        Ok(CowDiffApplyBoundReport {
+            base_identity: materialized,
+            replay,
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (destination, diff, expected_base, identity_limits);
+        Err(CowDiffApplyError::UnsupportedPlatform(
+            "atomic replay requires Linux renameat2 and fd-relative filesystem operations"
+                .to_owned(),
+        ))
+    }
 }
 
 fn validate_limits(limits: CowDiffApplyLimits) -> Result<(), CowDiffApplyError> {
@@ -304,6 +326,37 @@ mod linux {
         diff: &CowDiff,
         limits: CowDiffApplyLimits,
     ) -> Result<CowDiffApplyReport, CowDiffApplyError> {
+        let (report, materialized) = apply_inner(base, destination, diff, limits, None)?;
+        debug_assert!(materialized.is_none());
+        Ok(report)
+    }
+
+    pub(super) fn apply_with_verified_base(
+        base: &Path,
+        destination: &Path,
+        diff: &CowDiff,
+        expected_base: SnapshotIdentity,
+        identity_limits: SnapshotIdentityLimits,
+        limits: CowDiffApplyLimits,
+    ) -> Result<(CowDiffApplyReport, SnapshotIdentity), CowDiffApplyError> {
+        let (report, materialized) = apply_inner(
+            base,
+            destination,
+            diff,
+            limits,
+            Some((expected_base, identity_limits)),
+        )?;
+        let materialized = materialized.expect("verified replay must return staging identity");
+        Ok((report, materialized))
+    }
+
+    fn apply_inner(
+        base: &Path,
+        destination: &Path,
+        diff: &CowDiff,
+        limits: CowDiffApplyLimits,
+        expected_materialized: Option<(SnapshotIdentity, SnapshotIdentityLimits)>,
+    ) -> Result<(CowDiffApplyReport, Option<SnapshotIdentity>), CowDiffApplyError> {
         if !base.is_absolute() || !destination.is_absolute() {
             return Err(CowDiffApplyError::InvalidInput(
                 "base and destination must be absolute host paths".to_owned(),
@@ -362,6 +415,29 @@ mod linux {
                 &[],
                 0,
             )?;
+
+            let materialized_identity =
+                if let Some((expected, identity_limits)) = expected_materialized {
+                    // The copy phase intentionally keeps directories launcher-writable.
+                    // Restore the canonical base modes before hashing so the second
+                    // identity gate observes the same object model as Snapshot 33A.
+                    restore_directory_modes(staging_fd.raw(), &directory_modes)?;
+                    let staging_path =
+                        canonical_parent.join(OsString::from_vec(staging_name.as_bytes().to_vec()));
+                    let actual = snapshot_sha256(&staging_path, identity_limits)
+                        .map_err(|source| CowDiffApplyError::BaseIdentity { source })?;
+                    if actual.sha256 != expected.sha256 {
+                        return Err(CowDiffApplyError::BaseIdentityMismatch { expected, actual });
+                    }
+                    // Replay mutates this private tree. Re-enable owner write/search
+                    // authority without changing the canonical modes retained in the
+                    // directory-mode map; final modes are restored after replay.
+                    make_directories_writable(staging_fd.raw(), &directory_modes)?;
+                    Some(actual)
+                } else {
+                    None
+                };
+
             apply_entries(
                 staging_fd.raw(),
                 diff,
@@ -374,7 +450,7 @@ mod linux {
                 staging_name.as_c_str(),
                 destination_name.as_c_str(),
             )?;
-            Ok(budget.report())
+            Ok((budget.report(), materialized_identity))
         })();
 
         if let Err(primary) = replay_result {
@@ -920,6 +996,29 @@ mod linux {
         Ok(())
     }
 
+    fn make_directories_writable(
+        root_fd: RawFd,
+        directory_modes: &BTreeMap<Vec<u8>, u32>,
+    ) -> Result<(), CowDiffApplyError> {
+        let mut modes: Vec<_> = directory_modes.iter().collect();
+        modes.sort_by(|(left, _), (right, _)| {
+            path_depth(left)
+                .cmp(&path_depth(right))
+                .then_with(|| left.cmp(right))
+        });
+        for (relative, mode) in modes {
+            let directory = open_relative_directory(root_fd, relative)?;
+            let writable = *mode | 0o700;
+            if unsafe { libc::fchmod(directory.raw(), writable as libc::mode_t) } == -1 {
+                return Err(io_error(
+                    "prepare verified staging directory for replay",
+                    io::Error::last_os_error(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn restore_directory_modes(
         root_fd: RawFd,
         directory_modes: &BTreeMap<Vec<u8>, u32>,
@@ -1194,5 +1293,108 @@ mod linux {
 
     fn io_error(phase: &'static str, source: io::Error) -> CowDiffApplyError {
         CowDiffApplyError::Io { phase, source }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod verified_staging_tests {
+    use super::*;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    struct TempTree(PathBuf);
+
+    impl TempTree {
+        fn new() -> Self {
+            let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let root = std::env::temp_dir().join(format!(
+                "security-lab-verified-staging-{}-{id}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&root);
+            fs::create_dir(&root).expect("create verified-staging test root");
+            Self(root)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempTree {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn identity_limits() -> SnapshotIdentityLimits {
+        SnapshotIdentityLimits {
+            max_bytes: 1024 * 1024,
+            max_nodes: 1024,
+        }
+    }
+
+    fn replay_limits() -> CowDiffApplyLimits {
+        CowDiffApplyLimits {
+            max_bytes: 1024 * 1024,
+            max_nodes: 1024,
+        }
+    }
+
+    #[test]
+    fn materialized_identity_gate_rejects_base_change_after_initial_gate() {
+        let tree = TempTree::new();
+        let base = tree.path().join("base");
+        let destination = tree.path().join("snapshot");
+        fs::create_dir(&base).expect("create base");
+        fs::write(base.join("value"), b"expected\n").expect("write expected base");
+        let expected = snapshot_sha256(&base, identity_limits()).expect("hash expected base");
+
+        // This private entry point models the exact state immediately after the
+        // public 34A early gate has succeeded. A mutation here must be detected
+        // by the new materialized-staging gate before diff replay/publication.
+        fs::write(base.join("value"), b"mutated-after-first-gate\n")
+            .expect("mutate base after simulated first gate");
+        let mutated = snapshot_sha256(&base, identity_limits()).expect("hash mutated base");
+        assert_ne!(mutated.sha256, expected.sha256);
+
+        let empty = CowDiff {
+            entries: Vec::new(),
+            encoded_bytes: 6,
+        };
+        let error = linux::apply_with_verified_base(
+            &base,
+            &destination,
+            &empty,
+            expected,
+            identity_limits(),
+            replay_limits(),
+        )
+        .expect_err("materialized staging identity must reject post-gate base mutation");
+
+        match error {
+            CowDiffApplyError::BaseIdentityMismatch {
+                expected: observed_expected,
+                actual,
+            } => {
+                assert_eq!(observed_expected, expected);
+                assert_eq!(actual, mutated);
+            }
+            other => panic!("unexpected verified-staging failure: {other}"),
+        }
+        assert!(!destination.exists());
+        let residue = fs::read_dir(tree.path())
+            .expect("read verified-staging parent")
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .as_encoded_bytes()
+                    .starts_with(b".security-lab-cow-apply-")
+            });
+        assert!(!residue, "verified-staging mismatch left replay residue");
     }
 }

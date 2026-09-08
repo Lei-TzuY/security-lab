@@ -3,6 +3,7 @@
 use security_lab::{
     apply_cow_diff_atomic, CowDiff, CowDiffApplyError, CowDiffApplyLimits, CowDiffEntry,
 };
+use std::ffi::CString;
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{symlink, PermissionsExt};
@@ -222,6 +223,38 @@ fn symlink_parent_escape_fails_closed_without_publication() {
         .expect_err("symlink parent must fail closed");
     assert!(matches!(error, CowDiffApplyError::Io { .. }));
     assert!(!outside.join("owned").exists());
+    assert!(!destination.exists());
+    assert!(staging_entries(tree.path()).is_empty());
+}
+
+#[test]
+fn node_budget_is_enforced_during_base_directory_enumeration() {
+    let tree = TempTree::new();
+    let base = tree.path().join("base");
+    let destination = tree.path().join("snapshot");
+    fs::create_dir(&base).expect("create base");
+    fs::write(base.join("regular"), b"x").expect("write regular base child");
+
+    let fifo = base.join("fifo");
+    let fifo_c = CString::new(fifo.as_os_str().as_bytes()).expect("fifo path has no NUL");
+    assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+
+    let changes = diff(Vec::new());
+    let tight = CowDiffApplyLimits {
+        max_bytes: 1024 * 1024,
+        max_nodes: 2,
+    };
+    let error = apply_cow_diff_atomic(&base, &destination, &changes, tight)
+        .expect_err("base enumeration must stop at the global node budget");
+
+    assert!(matches!(
+        error,
+        CowDiffApplyError::BudgetExceeded {
+            resource: "node",
+            limit: 2,
+            attempted: 3,
+        }
+    ));
     assert!(!destination.exists());
     assert!(staging_entries(tree.path()).is_empty());
 }

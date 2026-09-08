@@ -16,6 +16,23 @@ jobs:
         with:
           toolchain: stable
           components: rustfmt, clippy
+      - name: Align generator with exact 30A root return
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('.github/tmp-milestone-31a-cow-diff.py')
+          text = p.read_text()
+          old = '            close_setup_fd(current_root_fd);\\n            mark_enforcement(launch_error, ENFORCEMENT_READONLY_ROOT);\\n            return lower_tree_fd;\\n'
+          current = '            mark_enforcement(launch_error, ENFORCEMENT_READONLY_ROOT);\\n            return lower_tree_fd;\\n'
+          if text.count(old) != 1:
+              raise SystemExit(f'old readonly anchor count={text.count(old)}')
+          text = text.replace(old, current, 1)
+          old_new = '            close_setup_fd(current_root_fd);\\n            mark_enforcement(launch_error, ENFORCEMENT_READONLY_ROOT);\\n            return (lower_tree_fd, -1);\\n'
+          current_new = '            mark_enforcement(launch_error, ENFORCEMENT_READONLY_ROOT);\\n            return (lower_tree_fd, -1);\\n'
+          if text.count(old_new) != 1:
+              raise SystemExit(f'new readonly anchor count={text.count(old_new)}')
+          p.write_text(text.replace(old_new, current_new, 1))
+          PY
       - name: Materialize candidate
         run: python3 .github/tmp-milestone-31a-cow-diff.py
       - name: Format

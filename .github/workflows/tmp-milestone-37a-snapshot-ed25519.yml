@@ -18,8 +18,10 @@ jobs:
           components: rustfmt, clippy
       - name: Materialize candidate
         run: python3 .github/tmp-milestone-37a-snapshot-ed25519.py
-      - name: Resolve lockfile
-        run: cargo check --all-targets --all-features
+      - name: Resolve MSRV-compatible lockfile
+        run: |
+          cargo check --all-targets --all-features
+          cargo update -p base64ct --precise 1.6.0
       - name: Format
         run: cargo fmt --all
       - name: Enable user namespace capability tests

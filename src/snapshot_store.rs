@@ -26,8 +26,12 @@ pub enum SnapshotStoreError {
     InvalidInput(String),
     Archive(SnapshotArchiveError),
     Signature(SnapshotEd25519Error),
-    ObjectNotFound { identity: SnapshotIdentity },
-    ObjectConflict { identity: SnapshotIdentity },
+    ObjectNotFound {
+        identity: SnapshotIdentity,
+    },
+    ObjectConflict {
+        identity: SnapshotIdentity,
+    },
     UnsupportedPlatform(String),
     Io {
         phase: &'static str,
@@ -342,9 +346,11 @@ mod linux {
                 },
             ));
         }
-        let size = usize::try_from(size).map_err(|_| SnapshotStoreError::InvalidInput(
-            "stored object is too large for this process address space".to_owned(),
-        ))?;
+        let size = usize::try_from(size).map_err(|_| {
+            SnapshotStoreError::InvalidInput(
+                "stored object is too large for this process address space".to_owned(),
+            )
+        })?;
         let mut archive = vec![0u8; size];
         read_exact(object.raw(), &mut archive, identity)?;
         let mut extra = [0u8; 1];
@@ -356,9 +362,8 @@ mod linux {
     }
 
     fn open_store_root(store_root: &Path) -> Result<OwnedFd, SnapshotStoreError> {
-        let path = CString::new(store_root.as_os_str().as_bytes()).map_err(|_| {
-            SnapshotStoreError::InvalidInput("store_root contains NUL".to_owned())
-        })?;
+        let path = CString::new(store_root.as_os_str().as_bytes())
+            .map_err(|_| SnapshotStoreError::InvalidInput("store_root contains NUL".to_owned()))?;
         let fd = unsafe {
             libc::open(
                 path.as_ptr(),
@@ -567,13 +572,8 @@ mod linux {
 
     fn retry_read(fd: RawFd, buffer: &mut [u8]) -> Result<usize, SnapshotStoreError> {
         loop {
-            let read = unsafe {
-                libc::read(
-                    fd,
-                    buffer.as_mut_ptr().cast::<libc::c_void>(),
-                    buffer.len(),
-                )
-            };
+            let read =
+                unsafe { libc::read(fd, buffer.as_mut_ptr().cast::<libc::c_void>(), buffer.len()) };
             if read >= 0 {
                 return Ok(read as usize);
             }

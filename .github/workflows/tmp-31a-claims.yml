@@ -22,13 +22,28 @@ jobs:
           from pathlib import Path
           p = Path("README.md")
           text = p.read_text()
-          actual = "The tmpfs backing mount is `nosuid,nodev,noexec`; this is not a claim that the merged root is globally `noexec`."
-          expected = "The COW backing tmpfs is `nosuid,nodev,noexec`, but the merged root is not claimed globally `noexec`."
-          if text.count(actual) != 1:
-              raise SystemExit(f"README actual COW backing sentence: expected one match, got {text.count(actual)}")
-          p.write_text(text.replace(actual, expected, 1))
+          actual_sentence = "The tmpfs backing mount is `nosuid,nodev,noexec`; this is not a claim that the merged root is globally `noexec`."
+          expected_sentence = "The COW backing tmpfs is `nosuid,nodev,noexec`, but the merged root is not claimed globally `noexec`."
+          if text.count(actual_sentence) != 1:
+              raise SystemExit(f"README actual COW backing sentence: expected one match, got {text.count(actual_sentence)}")
+          text = text.replace(actual_sentence, expected_sentence, 1)
+          cow_state = "- Copy-on-write root state is bounded to 4 KiB–1 GiB by policy, lives in a private tmpfs upper/work layer, and disappears with the sandbox mount namespace. Declared read-only persistent volumes are attached after final-root construction and remain read-only even when COW root is enabled; writable persistent volumes remain the separate explicit persistence authority."
+          marker = "- **COW root evidence boundary:** the runtime receipt publishes exactly one of `readonly_root` or `copy_on_write_root` according to the requested final-root mode, and the receipt-completeness gate rejects the wrong or simultaneous mode. Static preflight leaves COW support `unprobed`; only a real run can produce positive enforcement evidence."
+          if text.count(cow_state) != 1:
+              raise SystemExit(f"README COW state invariant: expected one match, got {text.count(cow_state)}")
+          text = text.replace(cow_state, cow_state + "\n" + marker, 1)
+          p.write_text(text)
           PY
           python3 .github/tmp-31a-claims.py
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("README.md")
+          text = p.read_text()
+          marker = "- **COW root evidence boundary:** the runtime receipt publishes exactly one of `readonly_root` or `copy_on_write_root` according to the requested final-root mode, and the receipt-completeness gate rejects the wrong or simultaneous mode. Static preflight leaves COW support `unprobed`; only a real run can produce positive enforcement evidence.\n"
+          if text.count(marker) != 1:
+              raise SystemExit(f"README temporary COW evidence marker: expected one match, got {text.count(marker)}")
+          p.write_text(text.replace(marker, "", 1))
+          PY
       - name: Enable user namespace capability tests
         run: |
           if [ -e /proc/sys/kernel/unprivileged_userns_clone ]; then

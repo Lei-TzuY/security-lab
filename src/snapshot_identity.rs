@@ -122,6 +122,9 @@ fn validate_limits(limits: SnapshotIdentityLimits) -> Result<(), SnapshotIdentit
 }
 
 #[cfg(target_os = "linux")]
+pub(crate) use linux::CanonicalHasher;
+
+#[cfg(target_os = "linux")]
 mod linux {
     use super::*;
     use std::ffi::CString;
@@ -151,7 +154,7 @@ mod linux {
         }
     }
 
-    struct CanonicalHasher {
+    pub(crate) struct CanonicalHasher {
         hasher: Sha256,
         limits: SnapshotIdentityLimits,
         encoded_bytes: u64,
@@ -159,7 +162,7 @@ mod linux {
     }
 
     impl CanonicalHasher {
-        fn new(limits: SnapshotIdentityLimits) -> Result<Self, SnapshotIdentityError> {
+        pub(crate) fn new(limits: SnapshotIdentityLimits) -> Result<Self, SnapshotIdentityError> {
             let mut value = Self {
                 hasher: Sha256::new(),
                 limits,
@@ -170,7 +173,7 @@ mod linux {
             Ok(value)
         }
 
-        fn consume_node(&mut self) -> Result<(), SnapshotIdentityError> {
+        pub(crate) fn consume_node(&mut self) -> Result<(), SnapshotIdentityError> {
             let attempted = self.nodes.checked_add(1).ok_or_else(|| {
                 SnapshotIdentityError::InvalidInput("node accounting overflow".to_owned())
             })?;
@@ -185,7 +188,7 @@ mod linux {
             Ok(())
         }
 
-        fn update(&mut self, bytes: &[u8]) -> Result<(), SnapshotIdentityError> {
+        pub(crate) fn update(&mut self, bytes: &[u8]) -> Result<(), SnapshotIdentityError> {
             let attempted = self
                 .encoded_bytes
                 .checked_add(bytes.len() as u64)
@@ -213,7 +216,7 @@ mod linux {
             self.update(path)
         }
 
-        fn record_directory(
+        pub(crate) fn record_directory(
             &mut self,
             path: &[u8],
             mode: u32,
@@ -222,7 +225,7 @@ mod linux {
             self.update(&mode.to_le_bytes())
         }
 
-        fn begin_file(
+        pub(crate) fn begin_file(
             &mut self,
             path: &[u8],
             mode: u32,
@@ -233,7 +236,7 @@ mod linux {
             self.update(&length.to_le_bytes())
         }
 
-        fn record_symlink(
+        pub(crate) fn record_symlink(
             &mut self,
             path: &[u8],
             target: &[u8],
@@ -246,7 +249,7 @@ mod linux {
             self.update(target)
         }
 
-        fn finish(self) -> SnapshotIdentity {
+        pub(crate) fn finish(self) -> SnapshotIdentity {
             let digest = self.hasher.finalize();
             let mut sha256 = [0u8; 32];
             sha256.copy_from_slice(&digest);

@@ -21,6 +21,7 @@
 #   p write through a brokered host-loopback TCP fd while direct host reachability stays isolated
 #   e write one brokered host-IPv4 UDP datagram while fresh target UDP stays isolated
 #   b exchange bytes over a brokered host pathname AF_UNIX stream; direct host path stays hidden
+#   0 receive one post-launch SCM_RIGHTS fd over that broker and prove its host pathname stays hidden
 #   q accept one connection through a launcher-brokered host-loopback TCP listening fd
 #   r prove Landlock allows declared reads and returns EACCES for an undeclared visible file
 #   m prove Landlock narrows regular-file mutation inside scratch and a writable persistent volume
@@ -90,6 +91,8 @@ _start:
     je .brokered_host_udp
     cmp $98, %al
     je .brokered_host_unix
+    cmp $48, %al
+    je .brokered_host_unix_scm_rights
     cmp $113, %al
     je .brokered_host_loopback_ingress
     cmp $114, %al
@@ -1093,6 +1096,129 @@ _start:
     mov %r13, %rdi
     syscall
     jmp .fail45
+
+.brokered_host_unix_scm_rights:
+    # argv[2] is the original trusted host pathname for the transferred file.
+    # Preserve it across the stack frame so we can prove chroot keeps it hidden.
+    mov 24(%rsp), %r13
+    test %r13, %r13
+    je .fail29
+    sub $160, %rsp
+    mov $-1, %r12
+
+    # Publish a one-byte readiness handshake from executed target code. The host
+    # peer waits for this byte before sendmsg(SCM_RIGHTS), making the capability
+    # transfer observably post-launch rather than preloaded in the socket buffer.
+    movb $82, 143(%rsp)
+    mov $1, %eax
+    mov $10, %edi
+    lea 143(%rsp), %rsi
+    mov $1, %edx
+    syscall
+    cmp $1, %rax
+    jne .brokered_host_unix_scm_rights_fail
+
+    # Build one iovec plus a 24-byte ancillary buffer for exactly one descriptor.
+    # Linux x86_64 msghdr layout is 56 bytes; cmsghdr is 16 bytes and one int
+    # produces CMSG_LEN=20 / CMSG_SPACE=24.
+    xor %eax, %eax
+    mov %rax, 0(%rsp)
+    mov %rax, 8(%rsp)
+    lea 64(%rsp), %rax
+    mov %rax, 16(%rsp)
+    movq $1, 24(%rsp)
+    lea 80(%rsp), %rax
+    mov %rax, 32(%rsp)
+    movq $24, 40(%rsp)
+    movq $0, 48(%rsp)
+
+    lea 144(%rsp), %rax
+    mov %rax, 64(%rsp)
+    movq $1, 72(%rsp)
+    movq $0, 80(%rsp)
+    movq $0, 88(%rsp)
+    movq $0, 96(%rsp)
+
+    # MSG_CMSG_CLOEXEC ensures the received capability cannot survive a later
+    # exec unless the target deliberately clears FD_CLOEXEC.
+    mov $47, %eax
+    mov $10, %edi
+    mov %rsp, %rsi
+    mov $0x40000000, %edx
+    syscall
+    cmp $1, %rax
+    jne .brokered_host_unix_scm_rights_fail
+    cmpb $70, 144(%rsp)
+    jne .brokered_host_unix_scm_rights_fail
+    testl $8, 48(%rsp)
+    jne .brokered_host_unix_scm_rights_fail
+    cmpq $20, 80(%rsp)
+    jne .brokered_host_unix_scm_rights_fail
+    cmpl $1, 88(%rsp)
+    jne .brokered_host_unix_scm_rights_fail
+    cmpl $1, 92(%rsp)
+    jne .brokered_host_unix_scm_rights_fail
+    mov 96(%rsp), %r12d
+    test %r12d, %r12d
+    js .brokered_host_unix_scm_rights_fail
+
+    # The handed-off descriptor must carry the exact file object capability.
+    mov $0, %eax
+    mov %r12d, %edi
+    lea 112(%rsp), %rsi
+    mov $runtime_fd_handoff_marker_len, %edx
+    syscall
+    cmp $runtime_fd_handoff_marker_len, %rax
+    jne .brokered_host_unix_scm_rights_fail
+    lea 112(%rsp), %rsi
+    lea runtime_fd_handoff_marker(%rip), %rdi
+    mov $runtime_fd_handoff_marker_len, %ecx
+    repe cmpsb
+    jne .brokered_host_unix_scm_rights_fail
+
+    mov $3, %eax
+    mov %r12d, %edi
+    syscall
+    test %rax, %rax
+    js .brokered_host_unix_scm_rights_fail
+    mov $-1, %r12
+
+    # The descriptor grant must not make the original host pathname reachable.
+    mov $257, %eax
+    mov $-100, %edi
+    mov %r13, %rsi
+    xor %edx, %edx
+    xor %r10d, %r10d
+    syscall
+    cmp $-2, %rax
+    je .brokered_host_unix_scm_rights_close_broker
+    test %rax, %rax
+    js .brokered_host_unix_scm_rights_fail
+    mov %rax, %r14
+    mov $3, %eax
+    mov %r14, %rdi
+    syscall
+    jmp .brokered_host_unix_scm_rights_fail
+
+.brokered_host_unix_scm_rights_close_broker:
+    mov $3, %eax
+    mov $10, %edi
+    syscall
+    test %rax, %rax
+    js .brokered_host_unix_scm_rights_fail
+    add $160, %rsp
+    xor %edi, %edi
+    jmp .exit
+
+.brokered_host_unix_scm_rights_fail:
+    test %r12d, %r12d
+    js .brokered_host_unix_scm_rights_fail_restore
+    mov $3, %eax
+    mov %r12d, %edi
+    syscall
+.brokered_host_unix_scm_rights_fail_restore:
+    add $160, %rsp
+    jmp .fail29
 
 .brokered_host_unix:
     mov $1, %eax
@@ -2789,6 +2915,9 @@ brokered_host_udp_message:
 brokered_host_unix_message:
     .ascii "brokered-host-unix-ok"
 .set brokered_host_unix_message_len, . - brokered_host_unix_message
+runtime_fd_handoff_marker:
+    .ascii "runtime-fd-handoff-ok\n"
+.set runtime_fd_handoff_marker_len, . - runtime_fd_handoff_marker
 brokered_host_unix_reply:
     .ascii "host-unix-reply"
 .set brokered_host_unix_reply_len, . - brokered_host_unix_reply

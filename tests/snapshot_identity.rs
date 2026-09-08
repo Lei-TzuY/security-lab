@@ -150,6 +150,36 @@ fn unsupported_node_and_budget_overflow_fail_closed() {
     }
 }
 
+#[test]
+fn node_budget_is_enforced_during_directory_enumeration() {
+    let tree = TempTree::new();
+    let root = tree.path().join("snapshot");
+    fs::create_dir(&root).expect("create snapshot");
+    fs::write(root.join("regular"), b"x").expect("write regular child");
+
+    let fifo = root.join("fifo");
+    let fifo_c = CString::new(fifo.as_os_str().as_bytes()).expect("fifo path has no NUL");
+    assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+
+    let error = snapshot_sha256(
+        &root,
+        SnapshotIdentityLimits {
+            max_bytes: 1024 * 1024,
+            max_nodes: 2,
+        },
+    )
+    .expect_err("directory enumeration must stop at the global node budget");
+
+    assert!(matches!(
+        error,
+        SnapshotIdentityError::BudgetExceeded {
+            resource: "node",
+            limit: 2,
+            attempted: 3,
+        }
+    ));
+}
+
 fn encoded_bytes(entries: &[CowDiffEntry]) -> u64 {
     let mut total = 6u64;
     for entry in entries {

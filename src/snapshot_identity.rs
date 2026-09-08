@@ -218,7 +218,6 @@ mod linux {
             path: &[u8],
             mode: u32,
         ) -> Result<(), SnapshotIdentityError> {
-            self.consume_node()?;
             self.record_prefix(b'D', path)?;
             self.update(&mode.to_le_bytes())
         }
@@ -229,7 +228,6 @@ mod linux {
             mode: u32,
             length: u64,
         ) -> Result<(), SnapshotIdentityError> {
-            self.consume_node()?;
             self.record_prefix(b'F', path)?;
             self.update(&mode.to_le_bytes())?;
             self.update(&length.to_le_bytes())
@@ -243,7 +241,6 @@ mod linux {
             let target_len = u32::try_from(target.len()).map_err(|_| {
                 SnapshotIdentityError::InvalidInput("symlink target length overflow".to_owned())
             })?;
-            self.consume_node()?;
             self.record_prefix(b'L', path)?;
             self.update(&target_len.to_le_bytes())?;
             self.update(target)
@@ -281,6 +278,7 @@ mod linux {
         }
 
         let mut identity = CanonicalHasher::new(limits)?;
+        identity.consume_node()?;
         identity.record_directory(b"/", root_stat.st_mode & 0o7777)?;
         hash_directory(root_fd.raw(), &[], 0, &mut identity)?;
         Ok(identity.finish())
@@ -297,7 +295,7 @@ mod linux {
                 "snapshot exceeds the 64-level identity depth ceiling".to_owned(),
             ));
         }
-        for name in read_directory_names(directory_fd)? {
+        for name in read_directory_names(directory_fd, identity)? {
             let child_relative = join_relative(relative, &name)?;
             let absolute_path = absolute_snapshot_path(&child_relative);
             let name_c = CString::new(name).expect("directory entry has no embedded NUL");
@@ -514,7 +512,10 @@ mod linux {
         Ok(stat)
     }
 
-    fn read_directory_names(directory_fd: RawFd) -> Result<Vec<Vec<u8>>, SnapshotIdentityError> {
+    fn read_directory_names(
+        directory_fd: RawFd,
+        identity: &mut CanonicalHasher,
+    ) -> Result<Vec<Vec<u8>>, SnapshotIdentityError> {
         if unsafe { libc::lseek(directory_fd, 0, libc::SEEK_SET) } == -1 {
             return Err(io_error(
                 "rewind snapshot directory enumeration",
@@ -571,6 +572,11 @@ mod linux {
                     })?;
                 let name = &name_region[..name_len];
                 if name != b"." && name != b".." {
+                    // Reserve the node budget before retaining the entry name.
+                    // This bounds directory-enumeration memory/work globally,
+                    // including ancestor name vectors that remain live while
+                    // recursion processes a child directory.
+                    identity.consume_node()?;
                     names.push(name.to_vec());
                 }
                 offset += reclen;

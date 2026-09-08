@@ -175,7 +175,7 @@ send_helper = r'''#[repr(C, align(8))]
 struct OneFdControl([u8; 24]);
 
 fn send_one_fd(socket_fd: RawFd, source_fd: RawFd) {
-    let mut payload = [b'F'];
+    let mut payload = *b"F";
     let mut iovec = libc::iovec {
         iov_base: payload.as_mut_ptr().cast::<libc::c_void>(),
         iov_len: payload.len(),

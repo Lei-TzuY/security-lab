@@ -23,4 +23,12 @@ text = text.replace(
     "        let materialize_result: Result<(), SnapshotArchiveError> = (|| {\n",
     1,
 )
+for old_mode, new_mode in [
+    ("(root_stat.st_mode & 0o7777) as u32", "root_stat.st_mode & 0o7777"),
+    ("(current.st_mode & 0o7777) as u32", "current.st_mode & 0o7777"),
+    ("(stat.st_mode & 0o7777) as u32", "stat.st_mode & 0o7777"),
+]:
+    if old_mode not in text:
+        raise SystemExit(f"mode cast not found: {old_mode}")
+    text = text.replace(old_mode, new_mode, 1)
 path.write_text(text)

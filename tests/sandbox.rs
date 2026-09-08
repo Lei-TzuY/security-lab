@@ -1,9 +1,9 @@
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 
 use security_lab::{
-    run, run_report, run_report_with_cancel, CancellationToken, ChildOutcome, ResourceLimits,
-    SandboxError, SandboxPolicy, SeccompArgRangeRule, SeccompArgRule, SeccompPolicy, StdioMode,
-    StdioPolicy,
+    run, run_report, run_report_with_cancel, CancellationToken, ChildOutcome, CowDiffEntry,
+    ResourceLimits, SandboxError, SandboxPolicy, SeccompArgRangeRule, SeccompArgRule,
+    SeccompPolicy, StdioMode, StdioPolicy,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CString;
@@ -199,6 +199,13 @@ fn fixture_root() -> &'static Path {
         std::fs::create_dir_all(root.join("cow-dir")).expect("create COW root fixture directory");
         std::fs::write(root.join("cow-base"), b"lower-original\n")
             .expect("write COW lower base fixture");
+        std::fs::write(root.join("cow-meta"), b"lower-metadata\n")
+            .expect("write COW lower metadata fixture");
+        std::fs::set_permissions(
+            root.join("cow-meta"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .expect("set COW lower metadata fixture mode");
         std::fs::write(root.join("cow-dir/child"), b"lower-child\n")
             .expect("write COW lower child fixture");
         std::fs::write(root.join("landlock-allowed/marker"), b"landlock-allowed\n")
@@ -281,6 +288,7 @@ fn policy(mode: &str, extra_args: &[&str], syscalls: &[&str]) -> SandboxPolicy {
     SandboxPolicy {
         root_dir: fixture_root().to_path_buf(),
         cow_root_bytes: None,
+        cow_diff_bytes: None,
         hostname: "security-lab".to_owned(),
         executable: PathBuf::from("/probe"),
         args,
@@ -380,10 +388,22 @@ fn raw_fixture_dispatch_modes_are_unique() {
 fn copy_on_write_root_is_ephemeral_and_preserves_host_lower() {
     let root = fixture_root();
     let base = root.join("cow-base");
+    let metadata_only = root.join("cow-meta");
     let child = root.join("cow-dir/child");
     let created = root.join("cow-new");
+    let redirected = root.join("cow-renamed");
     let _ = std::fs::remove_file(&created);
+    let _ = std::fs::remove_dir_all(&redirected);
     assert_eq!(std::fs::read(&base).unwrap(), b"lower-original\n");
+    assert_eq!(std::fs::read(&metadata_only).unwrap(), b"lower-metadata\n");
+    assert_eq!(
+        std::fs::metadata(&metadata_only)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o644
+    );
     assert_eq!(std::fs::read(&child).unwrap(), b"lower-child\n");
 
     for _ in 0..2 {
@@ -391,17 +411,50 @@ fn copy_on_write_root_is_ephemeral_and_preserves_host_lower() {
             "z",
             &[],
             &[
-                "execveat", "openat", "read", "write", "close", "unlink", "exit",
+                "execveat", "openat", "read", "write", "close", "fchmod", "rename", "unlink",
+                "exit",
             ],
         );
         cow.cow_root_bytes = Some(SCRATCH_BYTES);
+        cow.cow_diff_bytes = Some(4096);
         let report = run_report(&cow).expect("copy-on-write root sandbox failed");
         assert_eq!(report.outcome, ChildOutcome::Exited(0));
         assert!(report.enforcement.copy_on_write_root);
         assert!(!report.enforcement.readonly_root);
+        let diff = report.cow_diff.expect("requested COW diff export");
+        assert!(diff.entries.iter().any(|entry| matches!(
+            entry,
+            CowDiffEntry::UpsertFile { path, bytes, .. }
+                if path == b"/cow-base" && bytes == b"cow-replaced\n"
+        )));
+        assert!(diff.entries.iter().any(|entry| matches!(
+            entry,
+            CowDiffEntry::UpsertFile { path, mode, bytes }
+                if path == b"/cow-new" && *mode == 0o600 && bytes == b"cow-new\n"
+        )));
+        assert!(diff.entries.iter().any(|entry| matches!(
+            entry,
+            CowDiffEntry::UpsertFile { path, mode, bytes }
+                if path == b"/cow-meta" && *mode == 0o640 && bytes == b"lower-metadata\n"
+        )));
+        assert!(diff.entries.iter().any(|entry| matches!(
+            entry,
+            CowDiffEntry::Remove { path } if path == b"/cow-dir/child"
+        )));
+        assert!(diff.encoded_bytes <= 4096);
         assert_eq!(std::fs::read(&base).unwrap(), b"lower-original\n");
+        assert_eq!(std::fs::read(&metadata_only).unwrap(), b"lower-metadata\n");
+        assert_eq!(
+            std::fs::metadata(&metadata_only)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o644
+        );
         assert_eq!(std::fs::read(&child).unwrap(), b"lower-child\n");
         assert!(!created.exists());
+        assert!(!redirected.exists());
     }
 }
 
@@ -869,6 +922,25 @@ fn copy_on_write_root_preserves_readonly_persistent_volume_semantics() {
         !forbidden_write.exists(),
         "COW root widened a declared read-only persistent volume"
     );
+}
+
+#[test]
+fn copy_on_write_diff_export_fails_closed_when_budget_is_too_small() {
+    let mut cow = policy(
+        "z",
+        &[],
+        &[
+            "execveat", "openat", "read", "write", "close", "fchmod", "rename", "unlink", "exit",
+        ],
+    );
+    cow.cow_root_bytes = Some(SCRATCH_BYTES);
+    cow.cow_diff_bytes = Some(64);
+    match run_report(&cow).expect_err("undersized COW diff budget must fail closed") {
+        SandboxError::SetupFailed(message) => {
+            assert!(message.contains("bounded copy-on-write diff export"));
+        }
+        other => panic!("unexpected COW diff overflow result: {other}"),
+    }
 }
 
 #[test]

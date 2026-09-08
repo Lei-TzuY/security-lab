@@ -38,6 +38,43 @@ pub struct CapturedOutput {
     pub truncated: bool,
 }
 
+/// One deterministic copy-on-write root change exported after launcher-owned tree teardown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CowDiffEntry {
+    /// Create or replace a regular file with exact content and Unix permission
+    /// bits (`st_mode & 0o7777`). Ownership, timestamps, and xattrs are not exported.
+    UpsertFile {
+        path: Vec<u8>,
+        mode: u32,
+        bytes: Vec<u8>,
+    },
+    /// Ensure a directory exists with the exported Unix permission bits.
+    EnsureDirectory {
+        path: Vec<u8>,
+        mode: u32,
+    },
+    Symlink {
+        path: Vec<u8>,
+        target: Vec<u8>,
+    },
+    Remove {
+        path: Vec<u8>,
+    },
+    OpaqueDirectory {
+        path: Vec<u8>,
+    },
+}
+
+/// Complete bounded content/topology/permission-mode change-set for the
+/// supported ephemeral COW object classes. Ownership, timestamps, and xattrs
+/// are intentionally outside this replay contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CowDiff {
+    pub entries: Vec<CowDiffEntry>,
+    /// Bytes consumed by the canonical internal change-set encoding.
+    pub encoded_bytes: u64,
+}
+
 /// Kernel resource usage attributed to the terminated/waited-for sandbox process tree.
 ///
 /// CPU fields are cumulative `RUSAGE_CHILDREN` values observed by launcher-owned
@@ -88,6 +125,8 @@ pub struct RunReport {
     pub outcome: ChildOutcome,
     /// Present exactly when stdout was configured as `capture`.
     pub stdout: Option<CapturedOutput>,
+    /// Present exactly when `filesystem.cow_diff_bytes` requested the bounded COW content/topology/permission-mode export.
+    pub cow_diff: Option<CowDiff>,
     /// Additional orphaned descendants reaped by the launcher-owned PID 1 after the direct target terminated.
     pub reaped_descendants: u32,
     /// Kernel resource telemetry collected by namespace PID 1 only after the sandbox tree converges.

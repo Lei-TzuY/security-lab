@@ -739,7 +739,7 @@ After 29A integrates, do not farm inverse-equality aliases, extra masks, W^X-spe
 
 ### Slice 30A — bounded copy-on-write root
 
-**Current verified candidate.** Adds one materially different filesystem authority mode: policy may explicitly widen the default recursively read-only root into bounded, private, ephemeral target-side mutation without granting host-lower write-through authority.
+**Status: complete on `main`.** Adds one materially different filesystem authority mode: policy may explicitly widen the default recursively read-only root into bounded, private, ephemeral target-side mutation without granting host-lower write-through authority.
 
 Acceptance evidence is executable:
 
@@ -757,7 +757,30 @@ Boundary: 30A is ephemeral root mutation only. It does not provide persistence, 
 
 ### Milestone 30 promotion rule
 
-After 30A integrates, do not farm byte-ceiling variants, extra upper/work directory names, or repeated mutation path oracles. A later filesystem slice must add materially different executable semantics such as a real bounded export/snapshot/diff lifecycle with integrity evidence; otherwise promote to another independent authority/enforcement frontier.
+30A is sealed on `main`; do not farm byte-ceiling variants, extra upper/work directory names, or repeated mutation path oracles. Promotion requires materially different executable semantics.
+
+## Milestone 31 — bounded ephemeral filesystem change export
+
+### Slice 31A — bounded post-run COW diff
+
+**Current verified candidate.** Adds a launcher-owned, bounded change-export capability for the existing ephemeral COW root without turning the private upper layer into persistent host state.
+
+Acceptance evidence is executable:
+
+- `filesystem.cow_diff_bytes` is optional, valid only with `filesystem.cow_root_bytes`, and fail-closed bounded; an undersized export budget returns a setup failure rather than a truncated successful `CowDiff`;
+- namespace PID 1 retains the private upper-tree descriptor outside target authority and exports only after the direct target has terminated and remaining descendants have been killed/reaped, so the walk observes converged post-run COW state;
+- COW mount construction explicitly fixes `metacopy=off` and `redirect_dir=nofollow` instead of inheriting host OverlayFS defaults, keeping supported upper records self-contained for the exporter rather than relying on omitted metacopy/redirect xattrs;
+- the raw COW oracle replaces an existing file, creates `/cow-new` with mode `0600`, chmods an unchanged lower file to `0640`, requires exact `EXDEV` for lower/merged directory rename, removes an existing child, and leaves the trusted host lower tree content/mode/topology unchanged across independent runs; the public `RunReport` regression requires exact replaced/created bytes, the metadata-only file's original bytes plus exported `0640` mode, the exact new-file `0600` mode, and the removal record;
+- supported canonical records cover regular-file upserts, directory existence/mode, symlink targets, whiteout removals, and opaque-directory topology; regular files and directories preserve Unix permission bits as `st_mode & 0o7777`;
+- `run-json` exposes the same file/directory permission modes numerically, with a deterministic unit regression proving `0600`/`0750` serialization rather than asking a consumer to guess creator umask;
+- unsupported upper-layer object kinds fail closed with `EOPNOTSUPP`, and the canonical encoding budget includes the exported mode metadata;
+- stable rustfmt/Clippy/full tests and the full Rust 1.74 suite are green on the exact implementation head.
+
+Boundary: 31A is a bounded content/topology/permission-mode export for supported upper-layer object classes under the explicitly pinned `metacopy=off` / `redirect_dir=nofollow` COW semantics. It does not preserve UID/GID ownership, timestamps, other xattrs/ACLs, hard-link identity, device/FIFO/socket nodes, or filesystem aliases; it does not supply a replay/commit executor, transaction/atomicity/durability semantics, persistent image lifecycle, or cryptographic snapshot integrity.
+
+### Milestone 31 promotion rule
+
+After 31A integrates, do not farm more record tags or metadata fields unless they close a demonstrated replay/integrity boundary. Promote to a materially different capability such as a verified replay/apply lifecycle with confinement and failure atomicity, stronger snapshot identity/integrity evidence, or another independent authority/enforcement frontier.
 
 ## Later frontiers
 

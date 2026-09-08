@@ -6,9 +6,9 @@
 mod cancellation;
 mod cow_diff_apply;
 mod platform;
-mod snapshot_identity;
 pub mod policy;
 pub mod report;
+mod snapshot_identity;
 
 use std::error::Error;
 use std::fmt;

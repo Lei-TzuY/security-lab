@@ -235,9 +235,13 @@ fn replayed_snapshot_identity_matches_independent_expected_tree() {
 
     let base_after = snapshot_sha256(&base, identity_limits()).expect("hash base after replay");
     let replayed = snapshot_sha256(&destination, identity_limits()).expect("hash replayed tree");
-    let expected_identity = snapshot_sha256(&expected, identity_limits()).expect("hash expected tree");
+    let expected_identity =
+        snapshot_sha256(&expected, identity_limits()).expect("hash expected tree");
 
-    assert_eq!(base_before, base_after, "replay mutated trusted base identity");
+    assert_eq!(
+        base_before, base_after,
+        "replay mutated trusted base identity"
+    );
     assert_ne!(base_before.sha256, replayed.sha256);
     assert_eq!(replayed, expected_identity);
 }

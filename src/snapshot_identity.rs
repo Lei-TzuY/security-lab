@@ -281,7 +281,7 @@ mod linux {
         }
 
         let mut identity = CanonicalHasher::new(limits)?;
-        identity.record_directory(b"/", (root_stat.st_mode & 0o7777) as u32)?;
+        identity.record_directory(b"/", root_stat.st_mode & 0o7777)?;
         hash_directory(root_fd.raw(), &[], 0, &mut identity)?;
         Ok(identity.finish())
     }
@@ -311,27 +311,14 @@ mod linux {
                             "snapshot directory changed type during identity scan".to_owned(),
                         ));
                     }
-                    identity.record_directory(
-                        &absolute_path,
-                        (current.st_mode & 0o7777) as u32,
-                    )?;
+                    identity.record_directory(&absolute_path, current.st_mode & 0o7777)?;
                     hash_directory(child.raw(), &child_relative, depth + 1, identity)?;
                 }
                 libc::S_IFREG => {
-                    hash_regular_file(
-                        directory_fd,
-                        name_c.as_c_str(),
-                        &absolute_path,
-                        identity,
-                    )?;
+                    hash_regular_file(directory_fd, name_c.as_c_str(), &absolute_path, identity)?;
                 }
                 libc::S_IFLNK => {
-                    hash_symlink(
-                        directory_fd,
-                        name_c.as_c_str(),
-                        &absolute_path,
-                        identity,
-                    )?;
+                    hash_symlink(directory_fd, name_c.as_c_str(), &absolute_path, identity)?;
                 }
                 _ => {
                     return Err(SnapshotIdentityError::InvalidInput(format!(
@@ -372,7 +359,7 @@ mod linux {
             ));
         }
         let length = stat.st_size as u64;
-        identity.begin_file(path, (stat.st_mode & 0o7777) as u32, length)?;
+        identity.begin_file(path, stat.st_mode & 0o7777, length)?;
 
         let mut remaining = length;
         let mut buffer = [0u8; 8192];
@@ -464,10 +451,7 @@ mod linux {
         identity.record_symlink(path, &target[..count])
     }
 
-    fn open_directory_path(
-        path: &Path,
-        phase: &'static str,
-    ) -> Result<Fd, SnapshotIdentityError> {
+    fn open_directory_path(path: &Path, phase: &'static str) -> Result<Fd, SnapshotIdentityError> {
         let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
             SnapshotIdentityError::InvalidInput(format!("{phase} path contains an embedded NUL"))
         })?;
@@ -525,10 +509,7 @@ mod linux {
             )
         } == -1
         {
-            return Err(io_error(
-                "stat snapshot entry",
-                io::Error::last_os_error(),
-            ));
+            return Err(io_error("stat snapshot entry", io::Error::last_os_error()));
         }
         Ok(stat)
     }

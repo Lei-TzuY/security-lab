@@ -151,6 +151,14 @@ Milestone 40A treats the store root as trusted host-local state. A put validates
 
 Milestone 40B adds a narrower lifecycle guarantee: `store_snapshot_archive_ed25519_durable` acknowledges success only after the authenticated/no-replace 40A result has been reopened and checked as the expected regular read-only object and `fsync` has succeeded on that object, the containing `objects/` directory, and the store root. The denial regression uses a real seccomp `EPERM` response for `fsync` to prove the barrier is attempted and failure is surfaced. If publication reached the final 40A rename but no durable acknowledgement was returned, an exact retry is safe: 40A byte-for-byte deduplication identifies the same object and 40B reruns all durability barriers. The claim is limited to the Linux/local-filesystem `fsync` contract and does not imply a journal, transactional multi-object commit, stale temporary-object scavenging, storage-device power-loss testing, remote replication, or resistance to a privileged hostile store writer.
 
+## Snapshot trust-policy semantics
+
+Milestone 41A introduces a bounded explicit authorization snapshot above the existing strict Ed25519 cryptographic verifier. Each exact public key receives a domain-separated SHA-256 key ID and an `Active` or `Revoked` state. A policy contains 1–64 validly encoded Ed25519 public keys, a non-zero caller-supplied generation, and a deterministic identity over the generation plus the complete sorted key/state records. The rotation API requires the next generation to increase, carries existing keys forward, can revoke known keys, can add new active keys, and refuses reactivation of a key already revoked in that policy lineage.
+
+Trusted store/materialization wrappers perform signer lookup first. `UnknownSigner` and `RevokedSigner` therefore terminate before store-root inspection. An active signer still passes through the existing `verify_strict` Ed25519 path before authenticated object publication/materialization, so policy membership never substitutes for possession of a valid signature. Successful reports bind the operation to the exact policy identity and signer key ID used for the decision.
+
+The trust policy is itself caller-provided in-memory state. Its deterministic generation/hash is provenance for the policy snapshot used by one operation, **not** proof that the snapshot is newest or independently authentic. There is no persistent monotonic generation store, anti-rollback state, certificate chain, key custody, validity clock, secure distribution, hardware root, or compromise-recovery channel. Supplying an older policy snapshot intentionally recovers that snapshot's older authorization decisions.
+
 ## Explicit non-goals and limitations
 
 This sandbox is **not** a production multi-tenant container boundary. Milestone 30A does not turn OverlayFS into a persistence or snapshot subsystem: target-side COW changes disappear with the mount namespace, and there is no export/commit operation, transaction/atomicity/durability guarantee, immutable or cryptographic snapshot, alias-proof subtree identity, or guarantee for special/network filesystems beyond the tested Linux behavior.
@@ -192,6 +200,7 @@ Therefore the project does not claim `pids.max` enforcement from root/sudo-only 
 - Supplying a `CancellationToken` to a cancellable run and signalling it intentionally authorizes launcher PID 1 to terminate the direct target and descendants when cancellation wins the documented race. The token is one-way and remains cancelled after it is signalled.
 - Root device/inode revalidation is not a subtree integrity proof.
 - A caller using expected-base replay is trusted to obtain and retain the expected digest from independently trusted state. The digest itself is not provenance/authentication. The live source tree is not frozen or serialized while materialization runs, but replay proceeds only when the completed private staging input itself reproduces the expected canonical identity.
+- A caller using Milestone 41A trusted snapshot APIs is trusted to choose the `SnapshotTrustPolicy` snapshot. The reported generation/hash identifies that exact snapshot but does not make it fresh, persistent, or rollback-resistant; deliberately supplying an older policy restores its older decisions.
 
 ## Test strategy and evidence
 

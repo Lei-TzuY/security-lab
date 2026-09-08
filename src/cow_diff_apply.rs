@@ -1,3 +1,6 @@
+use crate::snapshot_identity::{
+    snapshot_sha256, SnapshotIdentity, SnapshotIdentityError, SnapshotIdentityLimits,
+};
 use crate::{CowDiff, CowDiffEntry};
 use std::error::Error;
 use std::fmt;
@@ -23,6 +26,15 @@ pub struct CowDiffApplyReport {
     pub accounted_nodes: u64,
 }
 
+/// Evidence returned when replay was gated by an expected canonical base identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CowDiffApplyBoundReport {
+    /// Canonical identity observed immediately before replay setup began.
+    pub base_identity: SnapshotIdentity,
+    /// Existing bounded/failure-atomic replay accounting.
+    pub replay: CowDiffApplyReport,
+}
+
 #[derive(Debug)]
 pub enum CowDiffApplyError {
     InvalidInput(String),
@@ -30,6 +42,13 @@ pub enum CowDiffApplyError {
         resource: &'static str,
         limit: u64,
         attempted: u64,
+    },
+    BaseIdentity {
+        source: SnapshotIdentityError,
+    },
+    BaseIdentityMismatch {
+        expected: SnapshotIdentity,
+        actual: SnapshotIdentity,
     },
     UnsupportedPlatform(String),
     Io {
@@ -54,6 +73,15 @@ impl fmt::Display for CowDiffApplyError {
                 f,
                 "COW diff apply {resource} budget exceeded: limit={limit} attempted={attempted}"
             ),
+            Self::BaseIdentity { source } => {
+                write!(f, "COW diff apply base identity check failed: {source}")
+            }
+            Self::BaseIdentityMismatch { expected, actual } => write!(
+                f,
+                "COW diff apply base identity mismatch: expected_sha256={} actual_sha256={}",
+                expected.sha256_hex(),
+                actual.sha256_hex()
+            ),
             Self::UnsupportedPlatform(message) => {
                 write!(f, "unsupported COW diff apply platform: {message}")
             }
@@ -71,6 +99,7 @@ impl fmt::Display for CowDiffApplyError {
 impl Error for CowDiffApplyError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::BaseIdentity { source } => Some(source),
             Self::Io { source, .. } => Some(source),
             _ => None,
         }
@@ -103,6 +132,39 @@ pub fn apply_cow_diff_atomic(
                 .to_owned(),
         ))
     }
+}
+
+/// Replay `diff` only when the current canonical identity of `base` matches
+/// `expected_base`. The identity check is completed before destination inspection
+/// or replay staging begins. A mismatch therefore cannot publish or stage a tree.
+///
+/// This is an optimistic trusted-base precondition, not hostile-writer locking:
+/// callers must not infer protection against a concurrent mutation after the
+/// identity scan and before/during replay. The SHA-256 identity is also not an
+/// authenticity or provenance statement.
+pub fn apply_cow_diff_atomic_with_expected_base(
+    base: &Path,
+    destination: &Path,
+    diff: &CowDiff,
+    expected_base: SnapshotIdentity,
+    identity_limits: SnapshotIdentityLimits,
+    replay_limits: CowDiffApplyLimits,
+) -> Result<CowDiffApplyBoundReport, CowDiffApplyError> {
+    validate_limits(replay_limits)?;
+    let actual = snapshot_sha256(base, identity_limits)
+        .map_err(|source| CowDiffApplyError::BaseIdentity { source })?;
+    if actual.sha256 != expected_base.sha256 {
+        return Err(CowDiffApplyError::BaseIdentityMismatch {
+            expected: expected_base,
+            actual,
+        });
+    }
+
+    let replay = apply_cow_diff_atomic(base, destination, diff, replay_limits)?;
+    Ok(CowDiffApplyBoundReport {
+        base_identity: actual,
+        replay,
+    })
 }
 
 fn validate_limits(limits: CowDiffApplyLimits) -> Result<(), CowDiffApplyError> {

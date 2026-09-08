@@ -199,6 +199,13 @@ fn fixture_root() -> &'static Path {
         std::fs::create_dir_all(root.join("cow-dir")).expect("create COW root fixture directory");
         std::fs::write(root.join("cow-base"), b"lower-original\n")
             .expect("write COW lower base fixture");
+        std::fs::write(root.join("cow-meta"), b"lower-metadata\n")
+            .expect("write COW lower metadata fixture");
+        std::fs::set_permissions(
+            root.join("cow-meta"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .expect("set COW lower metadata fixture mode");
         std::fs::write(root.join("cow-dir/child"), b"lower-child\n")
             .expect("write COW lower child fixture");
         std::fs::write(root.join("landlock-allowed/marker"), b"landlock-allowed\n")
@@ -381,10 +388,22 @@ fn raw_fixture_dispatch_modes_are_unique() {
 fn copy_on_write_root_is_ephemeral_and_preserves_host_lower() {
     let root = fixture_root();
     let base = root.join("cow-base");
+    let metadata_only = root.join("cow-meta");
     let child = root.join("cow-dir/child");
     let created = root.join("cow-new");
+    let redirected = root.join("cow-renamed");
     let _ = std::fs::remove_file(&created);
+    let _ = std::fs::remove_dir_all(&redirected);
     assert_eq!(std::fs::read(&base).unwrap(), b"lower-original\n");
+    assert_eq!(std::fs::read(&metadata_only).unwrap(), b"lower-metadata\n");
+    assert_eq!(
+        std::fs::metadata(&metadata_only)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o644
+    );
     assert_eq!(std::fs::read(&child).unwrap(), b"lower-child\n");
 
     for _ in 0..2 {
@@ -392,7 +411,8 @@ fn copy_on_write_root_is_ephemeral_and_preserves_host_lower() {
             "z",
             &[],
             &[
-                "execveat", "openat", "read", "write", "close", "unlink", "exit",
+                "execveat", "openat", "read", "write", "close", "fchmod", "rename", "unlink",
+                "exit",
             ],
         );
         cow.cow_root_bytes = Some(SCRATCH_BYTES);
@@ -414,12 +434,27 @@ fn copy_on_write_root_is_ephemeral_and_preserves_host_lower() {
         )));
         assert!(diff.entries.iter().any(|entry| matches!(
             entry,
+            CowDiffEntry::UpsertFile { path, mode, bytes }
+                if path == b"/cow-meta" && *mode == 0o640 && bytes == b"lower-metadata\n"
+        )));
+        assert!(diff.entries.iter().any(|entry| matches!(
+            entry,
             CowDiffEntry::Remove { path } if path == b"/cow-dir/child"
         )));
         assert!(diff.encoded_bytes <= 4096);
         assert_eq!(std::fs::read(&base).unwrap(), b"lower-original\n");
+        assert_eq!(std::fs::read(&metadata_only).unwrap(), b"lower-metadata\n");
+        assert_eq!(
+            std::fs::metadata(&metadata_only)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o644
+        );
         assert_eq!(std::fs::read(&child).unwrap(), b"lower-child\n");
         assert!(!created.exists());
+        assert!(!redirected.exists());
     }
 }
 
@@ -895,7 +930,7 @@ fn copy_on_write_diff_export_fails_closed_when_budget_is_too_small() {
         "z",
         &[],
         &[
-            "execveat", "openat", "read", "write", "close", "unlink", "exit",
+            "execveat", "openat", "read", "write", "close", "fchmod", "rename", "unlink", "exit",
         ],
     );
     cow.cow_root_bytes = Some(SCRATCH_BYTES);

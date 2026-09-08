@@ -125,10 +125,7 @@ pub struct SnapshotTrustPolicy {
 }
 
 impl SnapshotTrustPolicy {
-    pub fn new(
-        generation: u64,
-        keys: Vec<SnapshotTrustKey>,
-    ) -> Result<Self, SnapshotTrustError> {
+    pub fn new(generation: u64, keys: Vec<SnapshotTrustKey>) -> Result<Self, SnapshotTrustError> {
         if generation == 0 {
             return Err(SnapshotTrustError::InvalidGeneration);
         }
@@ -152,9 +149,7 @@ impl SnapshotTrustPolicy {
         records.sort_by_key(|record| record.id);
         for pair in records.windows(2) {
             if pair[0].id == pair[1].id {
-                return Err(SnapshotTrustError::DuplicateKey {
-                    key_id: pair[0].id,
-                });
+                return Err(SnapshotTrustError::DuplicateKey { key_id: pair[0].id });
             }
         }
 
@@ -215,7 +210,9 @@ impl SnapshotTrustPolicy {
             let id = SnapshotTrustKeyId::from_public_key(&public_key);
             if let Some(existing) = self.find_record(id) {
                 return Err(match existing.key.state {
-                    SnapshotTrustKeyState::Active => SnapshotTrustError::DuplicateKey { key_id: id },
+                    SnapshotTrustKeyState::Active => {
+                        SnapshotTrustError::DuplicateKey { key_id: id }
+                    }
                     SnapshotTrustKeyState::Revoked => {
                         SnapshotTrustError::RevokedKeyReactivation { key_id: id }
                     }
@@ -298,13 +295,19 @@ impl fmt::Display for SnapshotTrustError {
                 "snapshot trust policy key count {attempted} exceeds limit {limit}"
             ),
             Self::InvalidPublicKey { key_id } => {
-                write!(f, "snapshot trust key {key_id} is not a valid Ed25519 public key")
+                write!(
+                    f,
+                    "snapshot trust key {key_id} is not a valid Ed25519 public key"
+                )
             }
             Self::DuplicateKey { key_id } => {
                 write!(f, "snapshot trust policy contains duplicate key {key_id}")
             }
             Self::UnknownRevocation { key_id } => {
-                write!(f, "snapshot trust rotation cannot revoke unknown key {key_id}")
+                write!(
+                    f,
+                    "snapshot trust rotation cannot revoke unknown key {key_id}"
+                )
             }
             Self::RevokedKeyReactivation { key_id } => write!(
                 f,
@@ -430,7 +433,9 @@ mod tests {
     use ed25519_dalek::SigningKey;
 
     fn public(seed: u8) -> [u8; SNAPSHOT_ED25519_PUBLIC_KEY_BYTES] {
-        SigningKey::from_bytes(&[seed; 32]).verifying_key().to_bytes()
+        SigningKey::from_bytes(&[seed; 32])
+            .verifying_key()
+            .to_bytes()
     }
 
     #[test]
@@ -472,7 +477,10 @@ mod tests {
         let b_id = SnapshotTrustKeyId::from_public_key(&b);
         let first = SnapshotTrustPolicy::new(1, vec![SnapshotTrustKey::active(a)]).unwrap();
         let rotated = first.rotate(2, vec![b], &[a_id]).unwrap();
-        assert_eq!(rotated.key_state(a_id), Some(SnapshotTrustKeyState::Revoked));
+        assert_eq!(
+            rotated.key_state(a_id),
+            Some(SnapshotTrustKeyState::Revoked)
+        );
         assert_eq!(rotated.key_state(b_id), Some(SnapshotTrustKeyState::Active));
         assert!(matches!(
             rotated.resolve_active(a_id),

@@ -68,10 +68,10 @@ fn rotation_revokes_old_signer_before_store_access_and_accepts_new_signer() {
     fs::create_dir(&store).expect("create store root");
 
     let archive = serialize_snapshot_archive(&source, archive_limits()).expect("serialize archive");
-    let old = sign_snapshot_ed25519(&source, &[0x51; 32], identity_limits())
-        .expect("sign with old key");
-    let new = sign_snapshot_ed25519(&source, &[0x52; 32], identity_limits())
-        .expect("sign with new key");
+    let old =
+        sign_snapshot_ed25519(&source, &[0x51; 32], identity_limits()).expect("sign with old key");
+    let new =
+        sign_snapshot_ed25519(&source, &[0x52; 32], identity_limits()).expect("sign with new key");
     assert_eq!(old.snapshot, archive.identity);
     assert_eq!(new.snapshot, archive.identity);
 
@@ -127,8 +127,8 @@ fn rotation_revokes_old_signer_before_store_access_and_accepts_new_signer() {
         "revoked signer must not create or inspect a missing store root"
     );
 
-    let unknown = sign_snapshot_ed25519(&source, &[0x53; 32], identity_limits())
-        .expect("derive unknown key");
+    let unknown =
+        sign_snapshot_ed25519(&source, &[0x53; 32], identity_limits()).expect("derive unknown key");
     let unknown_id = SnapshotTrustKeyId::from_public_key(&unknown.public_key);
     match store_snapshot_archive_trusted_ed25519_durable(
         &missing_store,
@@ -187,15 +187,12 @@ fn active_signer_still_requires_valid_signature() {
     let source = create_source(workspace.path());
     let store = workspace.path().join("store");
     fs::create_dir(&store).expect("create store root");
-    let evidence = sign_snapshot_ed25519(&source, &[0x61; 32], identity_limits())
-        .expect("sign snapshot");
+    let evidence =
+        sign_snapshot_ed25519(&source, &[0x61; 32], identity_limits()).expect("sign snapshot");
     let archive = serialize_snapshot_archive(&source, archive_limits()).expect("serialize archive");
     let signer = SnapshotTrustKeyId::from_public_key(&evidence.public_key);
-    let policy = SnapshotTrustPolicy::new(
-        9,
-        vec![SnapshotTrustKey::active(evidence.public_key)],
-    )
-    .expect("build trust policy");
+    let policy = SnapshotTrustPolicy::new(9, vec![SnapshotTrustKey::active(evidence.public_key)])
+        .expect("build trust policy");
     let mut corrupted = evidence.signature;
     corrupted[7] ^= 0x80;
 

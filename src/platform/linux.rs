@@ -3897,6 +3897,7 @@ mod x86_64 {
             "accept" => libc::SYS_accept,
             "bind" => libc::SYS_bind,
             "listen" => libc::SYS_listen,
+            "recvmsg" => libc::SYS_recvmsg,
             "msgget" => libc::SYS_msgget,
             "pread64" => libc::SYS_pread64,
             "access" => libc::SYS_access,

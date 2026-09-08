@@ -960,7 +960,7 @@ Boundary: 39A proves signature validity under the exact supplied public key for 
 
 ### Slice 40A — immutable identity-addressed frozen archive objects
 
-**Current verified candidate.** Adds a bounded host-local object lifecycle for already-authenticated frozen archives rather than another signature or publication wrapper.
+**Status: complete on `main`.** Adds a bounded host-local object lifecycle for already-authenticated frozen archives rather than another signature or publication wrapper.
 
 Acceptance evidence is executable:
 
@@ -972,11 +972,26 @@ Acceptance evidence is executable:
 - deterministic integration evidence proves first insert plus dedup, materialization of frozen bytes after the live source changes, wrong-key failure before a deliberately missing store root is inspected, and rejection of a same-size parse-valid stored-object tamper with no destination publication;
 - rustfmt, Clippy with `-D warnings`, the full stable suite, and the full Rust 1.74 suite are green on the exact implementation head.
 
-Boundary: 40A is a trusted host-local bounded object store. Mode `0444` is an API immutability convention, not protection from a privileged writer controlling the store root. It does not provide `fsync` crash durability/recovery, trust-store or key provenance/rotation/revocation, garbage collection/indexing, version retention, remote/distributed CAS, replication, or hostile concurrent store-writer protection.
+Boundary: 40A is a trusted host-local bounded object store. Mode `0444` is an API immutability convention, not protection from a privileged writer controlling the store root. 40A by itself does not provide success-return `fsync` durability, trust-store or key provenance/rotation/revocation, garbage collection/indexing, version retention, remote/distributed CAS, replication, or hostile concurrent store-writer protection.
+
+### Slice 40B — success-return durable content-addressed publication
+
+**Current verified candidate.** Adds a real durability barrier to the authenticated 40A object lifecycle rather than another content-address or tamper variant.
+
+Acceptance evidence is executable:
+
+- `store_snapshot_archive_ed25519_durable` first executes the existing bounded archive validation, strict Ed25519 verification, no-replace publication, and exact-object dedup path; no unauthenticated archive gains a durability shortcut;
+- after the 40A result, Linux code reopens the exact identity-addressed object beneath the store, checks that it is a regular read-only file with the expected archive length, then requires `fsync` success in order on the object, the `objects/` directory, and the store root before returning success;
+- a normal new insertion crosses those barriers and remains materializable through the existing identity re-derivation plus Ed25519 verification path;
+- a child test process installs a narrow seccomp filter that returns `EPERM` only for `fsync`; the durable API observes that real syscall failure at the object barrier and fails rather than silently acknowledging durability;
+- after that deliberately ambiguous state, where the 40A rename may already have published the exact object but 40B returned no durable acknowledgement, retrying the same authenticated archive converges through byte-for-byte deduplication with `inserted = false`, reruns all durability barriers, and remains materializable;
+- rustfmt, Clippy with `-D warnings`, the complete stable suite, and the complete Rust 1.74 suite are green on the exact implementation head.
+
+Boundary: 40B claims only success-return durability under the local Linux kernel/filesystem `fsync` contract. It does not claim a physical power-loss experiment, storage-device cache behavior beyond that contract, a write-ahead journal, transactional multi-object commit, stale temporary-object recovery/scavenging, garbage collection, remote replication, trust/key lifecycle, or protection from a privileged hostile writer controlling the store root.
 
 ### Milestone 40 promotion rule
 
-After 40A integrates, do not farm object filename encodings, extra dedup aliases, or repeated tamper vectors. Promote to a materially stronger lifecycle boundary such as crash-durable publication/recovery or independently specified trust/key lifecycle semantics.
+After 40B integrates, the bounded host-local publication/durability path is sealed at this scope. Do not farm extra `fsync` orderings, filenames, or repeated failure aliases. Promote to an independently specified trust/key lifecycle boundary (key identity/provenance plus rotation or revocation semantics) or another materially different storage lifecycle capability with executable evidence.
 
 ## Independent host-local IPC frontier — post-launch object transfer
 

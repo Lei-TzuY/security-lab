@@ -555,8 +555,7 @@ mod linux {
                 "base snapshot exceeds the 64-level replay depth ceiling".to_owned(),
             ));
         }
-        for name in read_directory_names(source_fd)? {
-            budget.consume_base_node()?;
+        for name in read_directory_names_bounded(source_fd, Some(budget))? {
             let name_c = CString::new(name.clone()).expect("directory entry has no embedded NUL");
             let child_relative = join_relative(relative, &name);
             let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
@@ -988,14 +987,17 @@ mod linux {
     }
 
     fn clear_directory(directory_fd: RawFd) -> Result<(), CowDiffApplyError> {
-        for name in read_directory_names(directory_fd)? {
+        for name in read_directory_names_bounded(directory_fd, None)? {
             let name = CString::new(name).expect("directory entry has no embedded NUL");
             remove_any(directory_fd, name.as_c_str())?;
         }
         Ok(())
     }
 
-    fn read_directory_names(directory_fd: RawFd) -> Result<Vec<Vec<u8>>, CowDiffApplyError> {
+    fn read_directory_names_bounded(
+        directory_fd: RawFd,
+        mut base_budget: Option<&mut Budget>,
+    ) -> Result<Vec<Vec<u8>>, CowDiffApplyError> {
         if unsafe { libc::lseek(directory_fd, 0, libc::SEEK_SET) } == -1 {
             return Err(io_error(
                 "rewind directory enumeration",
@@ -1050,6 +1052,12 @@ mod linux {
                     })?;
                 let name = &name_region[..name_len];
                 if name != b"." && name != b".." {
+                    if let Some(budget) = &mut base_budget {
+                        // Reserve the base-tree node before retaining its name.
+                        // This makes max_nodes bound directory-enumeration
+                        // buffering instead of applying only after collection.
+                        budget.consume_base_node()?;
+                    }
                     names.push(name.to_vec());
                 }
                 offset += reclen;

@@ -8,6 +8,7 @@ mod cow_diff_apply;
 mod platform;
 pub mod policy;
 pub mod report;
+mod snapshot_auth;
 mod snapshot_identity;
 
 use std::error::Error;
@@ -25,6 +26,10 @@ pub use policy::{
 pub use report::{
     CapturedOutput, ChildOutcome, CowDiff, CowDiffEntry, EnforcementReceipt, ProcessTreeUsage,
     RunReport,
+};
+pub use snapshot_auth::{
+    snapshot_hmac_sha256, verify_snapshot_hmac_sha256, SnapshotHmac, SnapshotHmacError,
+    SNAPSHOT_HMAC_KEY_BYTES,
 };
 pub use snapshot_identity::{
     snapshot_sha256, SnapshotIdentity, SnapshotIdentityError, SnapshotIdentityLimits,

@@ -853,7 +853,7 @@ Boundary: 34A is an optimistic precondition for a trusted/stable base. It does n
 
 ### Slice 35A — verified materialized base
 
-**Current verified candidate.** Binds expected-base replay to the exact supported metadata and bytes materialized into the private staging tree before diff application, rather than trusting only the earlier live-source scan.
+**Status: complete on `main`.** Binds expected-base replay to the exact supported metadata and bytes materialized into the private staging tree before diff application, rather than trusting only the earlier live-source scan.
 
 Acceptance evidence is executable:
 
@@ -870,6 +870,27 @@ Boundary: 35A closes the 34A identity-check-to-replay **mis-binding for the inpu
 ### Milestone 35 promotion rule
 
 After 35A integrates, do not farm second-hash placements or identity API aliases. A stronger COW-lifecycle phase must add independently evidenced authenticity/provenance, a real frozen/serialized source snapshot, or separately specified durability/versioned publication. A separate architectural promotion may instead move to launcher-owned dynamic host-local IPC mediation; target-side self-inspection must not be relabeled as broker enforcement.
+
+## Milestone 36 — keyed canonical snapshot authentication
+
+### Slice 36A — HMAC-SHA256 snapshot authentication
+
+**Current verified candidate.** Adds a symmetric authentication property over the existing bounded canonical snapshot identity rather than another digest placement or replay gate.
+
+Acceptance evidence is executable:
+
+- `snapshot_hmac_sha256(root, key, limits)` and `verify_snapshot_hmac_sha256(root, key, expected_tag, limits)` require an exact 32-byte caller-supplied key and reuse the bounded 33A canonical snapshot scan;
+- the tag is HMAC-SHA256 using pinned `hmac` 0.12.1 and `sha2` 0.10.9, over the versioned domain `security-lab-snapshot-hmac-sha256-v1\0` plus canonical SHA-256, `encoded_bytes` little-endian `u64`, and `nodes` little-endian `u64`;
+- verification uses the HMAC implementation's constant-time tag comparison path and reports `AuthenticationFailed` without exposing a computed replacement tag;
+- the existing 33A reference tree with key bytes `00..1f` produces fixed tag `70dfbe6a9ccdc1cc21b278c0ee249bbf651bd3db802d759ea2902698c4d64743`; the unchanged tree verifies, while content mutation and a distinct 32-byte key fail authentication;
+- identity byte/node budget exhaustion remains a distinct fail-closed `SnapshotIdentityError` path before tag comparison;
+- stable rustfmt/Clippy/full tests and the full Rust 1.74 suite are green on the exact implementation head.
+
+Boundary: 36A is symmetric key-possession authentication for the existing canonical identity model. It is not a digital signature, public-key provenance, attestation, certificate/key-distribution system, key-generation/storage/rotation mechanism, or guarantee of caller key entropy. It does not freeze the live source tree, extend the identity metadata model, or add durability/crash recovery.
+
+### Milestone 36 promotion rule
+
+After 36A integrates, do not farm tag encodings, key-length aliases, MAC algorithm names, or extra verification wrappers. A stronger authentication/provenance phase must add independently evidenced public-key identity/signature semantics or a real trusted key lifecycle; otherwise promote to a frozen/serialized source snapshot, durability/versioned publication, or launcher-owned dynamic host-local IPC mediation.
 
 ## Independent host-local IPC frontier — post-launch object transfer
 

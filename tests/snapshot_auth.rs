@@ -88,13 +88,8 @@ fn snapshot_hmac_matches_fixed_vector_and_verifies() {
         "70dfbe6a9ccdc1cc21b278c0ee249bbf651bd3db802d759ea2902698c4d64743"
     );
 
-    let verified = verify_snapshot_hmac_sha256(
-        &root,
-        &key,
-        &authenticated.tag,
-        identity_limits(),
-    )
-    .expect("verify matching snapshot HMAC");
+    let verified = verify_snapshot_hmac_sha256(&root, &key, &authenticated.tag, identity_limits())
+        .expect("verify matching snapshot HMAC");
     assert_eq!(verified, authenticated.snapshot);
 }
 
@@ -114,13 +109,8 @@ fn mutation_and_wrong_key_fail_authentication() {
 
     fs::write(root.join("alpha"), b"hello\n").expect("restore authenticated content");
     let wrong_key = [0xa5u8; SNAPSHOT_HMAC_KEY_BYTES];
-    let error = verify_snapshot_hmac_sha256(
-        &root,
-        &wrong_key,
-        &baseline.tag,
-        identity_limits(),
-    )
-    .expect_err("wrong key must not authenticate snapshot");
+    let error = verify_snapshot_hmac_sha256(&root, &wrong_key, &baseline.tag, identity_limits())
+        .expect_err("wrong key must not authenticate snapshot");
     assert!(matches!(error, SnapshotHmacError::AuthenticationFailed));
 }
 

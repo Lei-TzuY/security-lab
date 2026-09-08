@@ -1,4 +1,6 @@
-use crate::snapshot_identity::{snapshot_sha256, SnapshotIdentity, SnapshotIdentityError, SnapshotIdentityLimits};
+use crate::snapshot_identity::{
+    snapshot_sha256, SnapshotIdentity, SnapshotIdentityError, SnapshotIdentityLimits,
+};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::error::Error;
@@ -100,10 +102,7 @@ fn tag_identity(key: &[u8; SNAPSHOT_HMAC_KEY_BYTES], snapshot: SnapshotIdentity)
     tag
 }
 
-fn mac_for_identity(
-    key: &[u8; SNAPSHOT_HMAC_KEY_BYTES],
-    snapshot: SnapshotIdentity,
-) -> HmacSha256 {
+fn mac_for_identity(key: &[u8; SNAPSHOT_HMAC_KEY_BYTES], snapshot: SnapshotIdentity) -> HmacSha256 {
     let mut mac = HmacSha256::new_from_slice(key)
         .expect("HMAC-SHA256 accepts the fixed 32-byte snapshot key length");
     mac.update(SNAPSHOT_HMAC_DOMAIN);

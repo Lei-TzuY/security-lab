@@ -1,0 +1,80 @@
+from pathlib import Path
+
+
+def replace_one(path: str, old: str, new: str, label: str) -> None:
+    p = Path(path)
+    text = p.read_text()
+    count = text.count(old)
+    if count != 1:
+        raise SystemExit(f"{label}: expected exactly one match, got {count}")
+    p.write_text(text.replace(old, new, 1))
+
+
+# README: seal bare identity as 33A and describe only the verified 34A precondition gate.
+replace_one(
+    "README.md",
+    "The current Milestone 33A verified candidate adds **bounded canonical SHA-256 snapshot identity** for the supported regular-file/directory/symlink tree model, committing to sorted raw path bytes, object type, Unix permission modes, file bytes, and symlink targets under explicit byte/node work ceilings.",
+    "Milestone 33A added **bounded canonical SHA-256 snapshot identity** for the supported regular-file/directory/symlink tree model. The current Milestone 34A verified candidate adds **expected-base identity binding for atomic COW replay**: the checked replay API recomputes the canonical base identity before destination/staging setup and fails closed on a digest mismatch.",
+    "README milestone summary",
+)
+replace_one(
+    "README.md",
+    "A successful replay restores supported Unix permission modes and publishes the completed staging tree with one Linux `renameat2(RENAME_NOREPLACE)`. The destination must not already exist; there is no overwrite fallback. This gives failure atomicity for **new-snapshot publication before the rename boundary**, not durability or crash consistency. The API does not `fsync` the tree, does not preserve UID/GID, timestamps, xattrs/ACLs, hard-link identity, or special nodes, does not protect against a hostile concurrent writer mutating the trusted base/destination parent during replay, and does not claim that symlink objects intentionally preserved in the resulting snapshot are confinement-safe if a later consumer follows them.",
+    "A successful replay restores supported Unix permission modes and publishes the completed staging tree with one Linux `renameat2(RENAME_NOREPLACE)`. The destination must not already exist; there is no overwrite fallback. This gives failure atomicity for **new-snapshot publication before the rename boundary**, not durability or crash consistency. The API does not `fsync` the tree, does not preserve UID/GID, timestamps, xattrs/ACLs, hard-link identity, or special nodes, does not protect against a hostile concurrent writer mutating the trusted base/destination parent during replay, and does not claim that symlink objects intentionally preserved in the resulting snapshot are confinement-safe if a later consumer follows them.\n\nMilestone 34A adds `apply_cow_diff_atomic_with_expected_base(base, destination, diff, expected_base, identity_limits, replay_limits)`. It first computes the existing 33A canonical identity of `base`; identity-scan failure is surfaced separately, and a digest mismatch returns `BaseIdentityMismatch` **before destination-parent inspection or staging creation**. A match continues through the unchanged 32A atomic replay path and returns `CowDiffApplyBoundReport` containing both the identity actually checked and the normal replay accounting. The existing `apply_cow_diff_atomic` API remains available with its original unbound semantics.",
+    "README checked replay",
+)
+replace_one(
+    "README.md",
+    "This digest is **identity evidence, not authenticity or provenance**. It does not sign or key the hash, does not bind 32A replay to an expected base automatically, does not preserve or commit to UID/GID, timestamps, xattrs/ACLs, hard-link identity, or unsupported special nodes, and is not a point-in-time snapshot against hostile concurrent host writers. Durability/crash semantics remain outside this API.",
+    "This digest is **identity evidence, not authenticity or provenance**. Milestone 34A can consume an explicitly supplied expected identity as an optimistic replay precondition, but neither the bare digest nor the checked replay signs, keys, authenticates, or attests that value. The identity model still omits UID/GID, timestamps, xattrs/ACLs, hard-link identity, and unsupported special nodes. The checked replay does not freeze or serialize the trusted base between the identity scan and replay, so hostile concurrent host mutation can still race that interval; durability/crash semantics also remain outside these APIs.",
+    "README identity boundary",
+)
+
+# ROADMAP: seal 33A and promote the executable expected-base binding as 34A.
+replace_one(
+    "ROADMAP.md",
+    "**Current verified candidate.** Adds deterministic cryptographic content identity for the exact regular-file/directory/symlink tree model already preserved by the 31A/32A lifecycle, without claiming authenticity or a broader metadata snapshot.",
+    "**Status: complete on `main`.** Adds deterministic cryptographic content identity for the exact regular-file/directory/symlink tree model already preserved by the 31A/32A lifecycle, without claiming authenticity or a broader metadata snapshot.",
+    "ROADMAP 33A status",
+)
+replace_one(
+    "ROADMAP.md",
+    "### Milestone 33 promotion rule\n\nAfter 33A integrates, seal hash-algorithm/vector variants. A materially stronger next COW-lifecycle slice is to bind replay to an explicitly expected base identity and fail before publication on mismatch, or to add independently evidenced authenticity/provenance; neither should be inferred from a bare digest.\n",
+    "### Milestone 33 promotion rule\n\n33A is sealed on `main`; do not farm hash-algorithm names, vector variants, or metadata aliases that repeat the same identity model. The next COW-lifecycle capability must consume identity as a real executable precondition or add independently evidenced provenance/authenticity.\n\n## Milestone 34 — replay precondition binding\n\n### Slice 34A — expected-base identity gate\n\n**Current verified candidate.** Binds the 32A new-snapshot replay path to one explicitly supplied 33A canonical base identity without changing the legacy unbound replay API.\n\nAcceptance evidence is executable:\n\n- `apply_cow_diff_atomic_with_expected_base(base, destination, diff, expected_base, identity_limits, replay_limits)` requires one explicit expected `SnapshotIdentity` plus independent bounded identity/replay work ceilings;\n- replay limits validate first, then the current canonical SHA-256 of `base` is computed with the 33A traversal before any destination-parent inspection or replay staging creation; identity-scan failures remain explicit base-identity check failures;\n- a digest mismatch returns distinct `BaseIdentityMismatch { expected, actual }` and does not enter the 32A replay path;\n- the deterministic mismatch regression captures a valid base identity, mutates the base, and deliberately chooses a destination beneath a nonexistent parent. `BaseIdentityMismatch` must win instead of destination-parent lookup, while the parent/destination stay absent and no `.security-lab-cow-apply-*` staging entry appears;\n- a matching expected identity continues through the existing failure-atomic replay, returns the exact checked base identity plus normal replay accounting, publishes the expected changed snapshot, and leaves the trusted base unchanged;\n- the original `apply_cow_diff_atomic` remains available with unchanged unbound semantics; stable rustfmt/Clippy/full tests and the full Rust 1.74 suite are green on the exact implementation candidate.\n\nBoundary: 34A is an optimistic precondition for a trusted/stable base. It does not freeze, lock, or snapshot the base between identity calculation and replay, so it does not close a hostile concurrent-writer race. It is not a signature, MAC, provenance/authenticity statement, attestation, durability/crash-recovery mechanism, or overwrite transaction.\n\n### Milestone 34 promotion rule\n\nAfter 34A integrates, seal expected-digest API aliases and mismatch variants. A materially stronger COW-lifecycle slice must close the identity-check-to-replay race with an executable frozen/immutable snapshot mechanism, add independently evidenced authenticity/provenance, or introduce separately specified durability/versioned-publication semantics; none may be inferred from 34A.\n",
+    "ROADMAP 34A section",
+)
+
+# Threat model: state the checked replay property and keep its trust/concurrency boundary explicit.
+replace_one(
+    "THREAT_MODEL.md",
+    "The current Milestone 33A verified candidate adds a separate bounded canonical SHA-256 identity calculation for supported snapshot trees; it is deterministic content/topology/mode identity evidence, not authenticity or provenance.",
+    "Milestone 33A added a separate bounded canonical SHA-256 identity calculation for supported snapshot trees. The current Milestone 34A verified candidate binds one replay API to an explicitly expected base identity and rejects a digest mismatch before replay destination/staging setup; this remains identity/precondition evidence rather than authenticity, provenance, or attestation.",
+    "threat purpose 34A",
+)
+replace_one(
+    "THREAT_MODEL.md",
+    "- **Atomic host-side COW replay:** `apply_cow_diff_atomic` validates canonical diff structure and exact encoded-byte accounting before mutation, copies a trusted base directory into a private sibling staging tree, refuses unsupported base node kinds, and resolves replay parents fd-by-fd with `O_NOFOLLOW`. Explicit byte/node ceilings fail closed. Supported file/directory/symlink/remove/opaque-directory records are applied only inside staging; directory modes are restored after topology changes. Success publishes a previously absent destination with one `renameat2(RENAME_NOREPLACE)` and no non-atomic fallback. Any pre-publication replay failure leaves the base unchanged and the destination absent; staging cleanup failure is surfaced explicitly. This is new-snapshot publication atomicity only: it does not provide fsync-backed durability/crash recovery, overwrite transactions, protection from hostile concurrent host mutation, automatic binding to an expected cryptographic base/destination identity, omitted metadata preservation, or confinement guarantees for a later consumer that follows symlink objects preserved in the snapshot.\n",
+    "- **Atomic host-side COW replay:** `apply_cow_diff_atomic` validates canonical diff structure and exact encoded-byte accounting before mutation, copies a trusted base directory into a private sibling staging tree, refuses unsupported base node kinds, and resolves replay parents fd-by-fd with `O_NOFOLLOW`. Explicit byte/node ceilings fail closed. Supported file/directory/symlink/remove/opaque-directory records are applied only inside staging; directory modes are restored after topology changes. Success publishes a previously absent destination with one `renameat2(RENAME_NOREPLACE)` and no non-atomic fallback. Any pre-publication replay failure leaves the base unchanged and the destination absent; staging cleanup failure is surfaced explicitly. This is new-snapshot publication atomicity only: it does not provide fsync-backed durability/crash recovery, overwrite transactions, protection from hostile concurrent host mutation, omitted metadata preservation, or confinement guarantees for a later consumer that follows symlink objects preserved in the snapshot.\n- **Expected-base replay gate:** `apply_cow_diff_atomic_with_expected_base` computes the existing 33A canonical identity before destination-parent inspection or staging creation and requires the digest to match one caller-supplied `SnapshotIdentity`. Identity-scan failure is explicit; mismatch returns `BaseIdentityMismatch { expected, actual }` without entering replay setup. A match returns the identity actually checked plus the unchanged 32A replay report. The legacy unbound replay API remains intentionally available.\n",
+    "threat expected-base property",
+)
+replace_one(
+    "THREAT_MODEL.md",
+    "- Root device/inode revalidation is not a subtree integrity proof.\n",
+    "- Root device/inode revalidation is not a subtree integrity proof.\n- A caller using expected-base replay is trusted to obtain and retain the expected digest from independently trusted state. The digest itself is not provenance/authentication, and the base is not frozen between the identity scan and replay; hostile concurrent host mutation can still race that interval.\n",
+    "threat expected identity trust",
+)
+
+# Add deterministic evidence next to the existing COW lifecycle evidence section if present.
+p = Path("THREAT_MODEL.md")
+text = p.read_text()
+needle = "- COW replay regressions prove supported diff application into a new snapshot, base preservation, symlink-parent escape rejection, byte/node budget failure, and absence of staging residue after failure;\n"
+if needle in text:
+    text = text.replace(
+        needle,
+        needle + "- expected-base replay regressions prove a matching digest returns checked identity plus replay accounting, while a base mutated after identity capture returns `BaseIdentityMismatch` before even a deliberately invalid destination parent is inspected and leaves no destination/staging state;\n",
+        1,
+    )
+else:
+    # Keep construction strict: we need an existing COW evidence anchor rather than appending out of context.
+    raise SystemExit("threat COW replay evidence anchor not found")
+p.write_text(text)

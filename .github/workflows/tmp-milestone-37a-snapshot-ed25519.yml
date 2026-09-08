@@ -22,6 +22,7 @@ jobs:
         run: |
           cargo check --all-targets --all-features
           cargo update -p base64ct --precise 1.6.0
+          cargo update -p zeroize --precise 1.8.1
       - name: Format
         run: cargo fmt --all
       - name: Enable user namespace capability tests

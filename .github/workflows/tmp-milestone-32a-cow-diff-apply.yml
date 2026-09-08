@@ -17,7 +17,9 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
       - name: Materialize candidate
-        run: python3 .github/tmp-milestone-32a-cow-diff-apply.py
+        run: |
+          python3 .github/tmp-milestone-32a-cow-diff-apply.py
+          sed -i '/use std::os::unix::fs::PermissionsExt;/d' src/cow_diff_apply.rs
       - name: Format
         run: cargo fmt --all
       - name: Enable user namespace capability tests

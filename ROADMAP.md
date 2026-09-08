@@ -809,7 +809,7 @@ Boundary: 32A provides failure-atomic publication of a **new** snapshot up to th
 
 ### Slice 33A — bounded SHA-256 identity for supported snapshot trees
 
-**Current verified candidate.** Adds deterministic cryptographic content identity for the exact regular-file/directory/symlink tree model already preserved by the 31A/32A lifecycle, without claiming authenticity or a broader metadata snapshot.
+**Status: complete on `main`.** Adds deterministic cryptographic content identity for the exact regular-file/directory/symlink tree model already preserved by the 31A/32A lifecycle, without claiming authenticity or a broader metadata snapshot.
 
 Acceptance evidence is executable:
 
@@ -825,7 +825,28 @@ Boundary: 33A is canonical SHA-256 identity evidence for the supported tree mode
 
 ### Milestone 33 promotion rule
 
-After 33A integrates, seal hash-algorithm/vector variants. A materially stronger next COW-lifecycle slice is to bind replay to an explicitly expected base identity and fail before publication on mismatch, or to add independently evidenced authenticity/provenance; neither should be inferred from a bare digest.
+33A is sealed on `main`; do not farm hash-algorithm names, vector variants, or metadata aliases that repeat the same identity model. The next COW-lifecycle capability must consume identity as a real executable precondition or add independently evidenced provenance/authenticity.
+
+## Milestone 34 — replay precondition binding
+
+### Slice 34A — expected-base identity gate
+
+**Current verified candidate.** Binds the 32A new-snapshot replay path to one explicitly supplied 33A canonical base identity without changing the legacy unbound replay API.
+
+Acceptance evidence is executable:
+
+- `apply_cow_diff_atomic_with_expected_base(base, destination, diff, expected_base, identity_limits, replay_limits)` requires one explicit expected `SnapshotIdentity` plus independent bounded identity/replay work ceilings;
+- replay limits validate first, then the current canonical SHA-256 of `base` is computed with the 33A traversal before any destination-parent inspection or replay staging creation; identity-scan failures remain explicit base-identity check failures;
+- a digest mismatch returns distinct `BaseIdentityMismatch { expected, actual }` and does not enter the 32A replay path;
+- the deterministic mismatch regression captures a valid base identity, mutates the base, and deliberately chooses a destination beneath a nonexistent parent. `BaseIdentityMismatch` must win instead of destination-parent lookup, while the parent/destination stay absent and no `.security-lab-cow-apply-*` staging entry appears;
+- a matching expected identity continues through the existing failure-atomic replay, returns the exact checked base identity plus normal replay accounting, publishes the expected changed snapshot, and leaves the trusted base unchanged;
+- the original `apply_cow_diff_atomic` remains available with unchanged unbound semantics; stable rustfmt/Clippy/full tests and the full Rust 1.74 suite are green on the exact implementation candidate.
+
+Boundary: 34A is an optimistic precondition for a trusted/stable base. It does not freeze, lock, or snapshot the base between identity calculation and replay, so it does not close a hostile concurrent-writer race. It is not a signature, MAC, provenance/authenticity statement, attestation, durability/crash-recovery mechanism, or overwrite transaction.
+
+### Milestone 34 promotion rule
+
+After 34A integrates, seal expected-digest API aliases and mismatch variants. A materially stronger COW-lifecycle slice must close the identity-check-to-replay race with an executable frozen/immutable snapshot mechanism, add independently evidenced authenticity/provenance, or introduce separately specified durability/versioned-publication semantics; none may be inferred from 34A.
 
 ## Later frontiers
 

@@ -875,7 +875,7 @@ After 35A integrates, do not farm second-hash placements or identity API aliases
 
 ### Slice 36A — HMAC-SHA256 snapshot authentication
 
-**Current verified candidate.** Adds a symmetric authentication property over the existing bounded canonical snapshot identity rather than another digest placement or replay gate.
+**Status: complete on `main`.** Adds a symmetric authentication property over the existing bounded canonical snapshot identity rather than another digest placement or replay gate.
 
 Acceptance evidence is executable:
 
@@ -891,6 +891,26 @@ Boundary: 36A is symmetric key-possession authentication for the existing canoni
 ### Milestone 36 promotion rule
 
 After 36A integrates, do not farm tag encodings, key-length aliases, MAC algorithm names, or extra verification wrappers. A stronger authentication/provenance phase must add independently evidenced public-key identity/signature semantics or a real trusted key lifecycle; otherwise promote to a frozen/serialized source snapshot, durability/versioned publication, or launcher-owned dynamic host-local IPC mediation.
+
+## Milestone 37 — public-key canonical snapshot signatures
+
+### Slice 37A — Ed25519 snapshot signature evidence
+
+**Current verified candidate.** Adds a materially different public-key authenticity primitive over the existing bounded canonical snapshot identity rather than another shared-secret MAC wrapper.
+
+Acceptance evidence is executable:
+
+- `sign_snapshot_ed25519` accepts an exact 32-byte caller-supplied Ed25519 signing seed, computes the existing bounded canonical snapshot identity, signs a versioned/domain-separated message containing the identity digest plus encoded-byte/node accounting, and returns the identity, exact 32-byte public key, and exact 64-byte signature;
+- `verify_snapshot_ed25519` recomputes the bounded identity and performs strict Ed25519 verification under the exact caller-supplied public key; malformed public-key decoding, identity-scan failure, and signature verification failure remain distinct fail-closed results;
+- an unchanged tree verifies, while content mutation, a different public key, and one-bit signature corruption each fail;
+- an independent RFC 8032 test-vector oracle requires the published test-vector public key/signature bytes for the empty message and strictly verifies them, so the cryptographic backend is not validated only against self-generated outputs;
+- stable rustfmt/Clippy/full tests and the full Rust 1.74 suite are green on the exact implementation head, with MSRV-compatible transitive versions pinned in `Cargo.lock`.
+
+Boundary: 37A is public-key signature evidence for the existing canonical identity. It does not generate, store, rotate, distribute, authorize, or attest keys; it does not provide certificates, a trust store, signature chains, remote/hardware attestation, a frozen/serialized live-source snapshot, or durability/versioned publication.
+
+### Milestone 37 promotion rule
+
+After 37A integrates, do not farm signature encodings, Ed25519 wrapper aliases, alternate fixed test seeds, or additional self-sign/verify vectors. A stronger provenance phase must add real trusted key lifecycle or signer-authorization semantics; otherwise promote to the still-open frozen/serialized source-snapshot or durability/versioned-publication frontier.
 
 ## Independent host-local IPC frontier — post-launch object transfer
 

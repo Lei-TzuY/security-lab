@@ -8,6 +8,7 @@ mod cow_diff_apply;
 mod platform;
 pub mod policy;
 pub mod report;
+mod snapshot_archive;
 mod snapshot_auth;
 mod snapshot_identity;
 mod snapshot_signature;
@@ -27,6 +28,10 @@ pub use policy::{
 pub use report::{
     CapturedOutput, ChildOutcome, CowDiff, CowDiffEntry, EnforcementReceipt, ProcessTreeUsage,
     RunReport,
+};
+pub use snapshot_archive::{
+    materialize_snapshot_archive_atomic, serialize_snapshot_archive, snapshot_archive_identity,
+    SnapshotArchive, SnapshotArchiveError, SnapshotArchiveLimits, SnapshotArchiveMaterializeReport,
 };
 pub use snapshot_auth::{
     snapshot_hmac_sha256, verify_snapshot_hmac_sha256, SnapshotHmac, SnapshotHmacError,

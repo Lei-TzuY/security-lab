@@ -1,6 +1,4 @@
-from pathlib import Path
-
-MODULE = r'''use crate::{CowDiff, CowDiffEntry};
+use crate::{CowDiff, CowDiffEntry};
 use std::error::Error;
 use std::fmt;
 use std::path::Path;
@@ -59,7 +57,9 @@ impl fmt::Display for CowDiffApplyError {
             Self::UnsupportedPlatform(message) => {
                 write!(f, "unsupported COW diff apply platform: {message}")
             }
-            Self::Io { phase, source } => write!(f, "COW diff apply failed during {phase}: {source}"),
+            Self::Io { phase, source } => {
+                write!(f, "COW diff apply failed during {phase}: {source}")
+            }
             Self::CleanupFailed { primary, cleanup } => write!(
                 f,
                 "COW diff apply failed ({primary}) and staging cleanup also failed ({cleanup})"
@@ -99,7 +99,8 @@ pub fn apply_cow_diff_atomic(
     {
         let _ = (base, destination, diff);
         Err(CowDiffApplyError::UnsupportedPlatform(
-            "atomic replay requires Linux renameat2 and fd-relative filesystem operations".to_owned(),
+            "atomic replay requires Linux renameat2 and fd-relative filesystem operations"
+                .to_owned(),
         ))
     }
 }
@@ -127,7 +128,6 @@ mod linux {
     use std::fs;
     use std::io;
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
-    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::io::RawFd;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -195,14 +195,12 @@ mod linux {
         }
 
         fn consume_base_bytes(&mut self, amount: u64) -> Result<(), CowDiffApplyError> {
-            let copied = self
-                .copied_base_bytes
-                .checked_add(amount)
-                .ok_or_else(|| CowDiffApplyError::InvalidInput("byte accounting overflow".to_owned()))?;
-            let attempted = self
-                .diff_bytes
-                .checked_add(copied)
-                .ok_or_else(|| CowDiffApplyError::InvalidInput("byte accounting overflow".to_owned()))?;
+            let copied = self.copied_base_bytes.checked_add(amount).ok_or_else(|| {
+                CowDiffApplyError::InvalidInput("byte accounting overflow".to_owned())
+            })?;
+            let attempted = self.diff_bytes.checked_add(copied).ok_or_else(|| {
+                CowDiffApplyError::InvalidInput("byte accounting overflow".to_owned())
+            })?;
             if attempted > self.limits.max_bytes {
                 return Err(CowDiffApplyError::BudgetExceeded {
                     resource: "byte",
@@ -252,7 +250,8 @@ mod linux {
         let validated_paths = validate_diff(diff)?;
         let mut budget = Budget::new(limits, diff.encoded_bytes, diff.entries.len() as u64)?;
 
-        let canonical_base = fs::canonicalize(base).map_err(|source| io_error("canonicalize base", source))?;
+        let canonical_base =
+            fs::canonicalize(base).map_err(|source| io_error("canonicalize base", source))?;
         let destination_parent = destination.parent().ok_or_else(|| {
             CowDiffApplyError::InvalidInput("destination must have a parent directory".to_owned())
         })?;
@@ -260,16 +259,18 @@ mod linux {
             .map_err(|source| io_error("canonicalize destination parent", source))?;
         if canonical_parent.starts_with(&canonical_base) {
             return Err(CowDiffApplyError::InvalidInput(
-                "destination parent must not be the base directory or a descendant of it".to_owned(),
+                "destination parent must not be the base directory or a descendant of it"
+                    .to_owned(),
             ));
         }
         let destination_name = destination.file_name().ok_or_else(|| {
-            CowDiffApplyError::InvalidInput("destination must name one snapshot directory".to_owned())
+            CowDiffApplyError::InvalidInput(
+                "destination must name one snapshot directory".to_owned(),
+            )
         })?;
         let destination_name = checked_component(destination_name.as_bytes(), "destination name")?;
-        let published_path = canonical_parent.join(OsString::from_vec(
-            destination_name.as_bytes().to_vec(),
-        ));
+        let published_path =
+            canonical_parent.join(OsString::from_vec(destination_name.as_bytes().to_vec()));
         match fs::symlink_metadata(&published_path) {
             Ok(_) => {
                 return Err(CowDiffApplyError::InvalidInput(
@@ -332,7 +333,8 @@ mod linux {
         let mut previous: Option<(Vec<u8>, u8)> = None;
         for entry in &diff.entries {
             let path = entry_path(entry);
-            let relative = validate_diff_path(path, matches!(entry, CowDiffEntry::OpaqueDirectory { .. }))?;
+            let relative =
+                validate_diff_path(path, matches!(entry, CowDiffEntry::OpaqueDirectory { .. }))?;
             let rank = entry_rank(entry);
             if let Some((previous_path, previous_rank)) = &previous {
                 match relative.cmp(previous_path) {
@@ -490,7 +492,10 @@ mod linux {
     fn duplicate_fd(fd: RawFd) -> Result<Fd, CowDiffApplyError> {
         let duplicated = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
         if duplicated == -1 {
-            return Err(io_error("duplicate directory descriptor", io::Error::last_os_error()));
+            return Err(io_error(
+                "duplicate directory descriptor",
+                io::Error::last_os_error(),
+            ));
         }
         Ok(Fd(duplicated))
     }
@@ -498,10 +503,9 @@ mod linux {
     fn create_staging(parent_fd: RawFd) -> Result<(CString, Fd), CowDiffApplyError> {
         for _ in 0..64 {
             let counter = STAGING_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let name = CString::new(format!(
-                ".security-lab-cow-apply-{}-{counter}",
-                unsafe { libc::getpid() }
-            ))
+            let name = CString::new(format!(".security-lab-cow-apply-{}-{counter}", unsafe {
+                libc::getpid()
+            }))
             .expect("generated staging name contains no NUL");
             let created = unsafe { libc::mkdirat(parent_fd, name.as_ptr(), 0o700) };
             if created == -1 {
@@ -565,7 +569,10 @@ mod linux {
                 )
             } == -1
             {
-                return Err(io_error("stat base snapshot entry", io::Error::last_os_error()));
+                return Err(io_error(
+                    "stat base snapshot entry",
+                    io::Error::last_os_error(),
+                ));
             }
             match stat.st_mode & libc::S_IFMT {
                 libc::S_IFDIR => {
@@ -575,7 +582,11 @@ mod linux {
                             io::Error::last_os_error(),
                         ));
                     }
-                    let source_child = open_child_directory(source_fd, name_c.as_c_str(), "open base child directory")?;
+                    let source_child = open_child_directory(
+                        source_fd,
+                        name_c.as_c_str(),
+                        "open base child directory",
+                    )?;
                     let destination_child = open_child_directory(
                         destination_fd,
                         name_c.as_c_str(),
@@ -647,23 +658,25 @@ mod linux {
             )
         };
         if source_fd == -1 {
-            return Err(io_error("open base regular file", io::Error::last_os_error()));
+            return Err(io_error(
+                "open base regular file",
+                io::Error::last_os_error(),
+            ));
         }
         let source_fd = Fd(source_fd);
         let destination_fd = unsafe {
             libc::openat(
                 destination_parent,
                 name.as_ptr(),
-                libc::O_WRONLY
-                    | libc::O_CREAT
-                    | libc::O_EXCL
-                    | libc::O_CLOEXEC
-                    | libc::O_NOFOLLOW,
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
                 0o600,
             )
         };
         if destination_fd == -1 {
-            return Err(io_error("create copied regular file", io::Error::last_os_error()));
+            return Err(io_error(
+                "create copied regular file",
+                io::Error::last_os_error(),
+            ));
         }
         let destination_fd = Fd(destination_fd);
         let mut buffer = [0u8; 8192];
@@ -689,7 +702,10 @@ mod linux {
             write_all(destination_fd.raw(), &buffer[..count as usize])?;
         }
         if unsafe { libc::fchmod(destination_fd.raw(), mode as libc::mode_t) } == -1 {
-            return Err(io_error("restore copied file mode", io::Error::last_os_error()));
+            return Err(io_error(
+                "restore copied file mode",
+                io::Error::last_os_error(),
+            ));
         }
         Ok(())
     }
@@ -763,12 +779,18 @@ mod linux {
                         )
                     };
                     if fd == -1 {
-                        return Err(io_error("create replayed regular file", io::Error::last_os_error()));
+                        return Err(io_error(
+                            "create replayed regular file",
+                            io::Error::last_os_error(),
+                        ));
                     }
                     let fd = Fd(fd);
                     write_all(fd.raw(), bytes)?;
                     if unsafe { libc::fchmod(fd.raw(), *mode as libc::mode_t) } == -1 {
-                        return Err(io_error("apply replayed file mode", io::Error::last_os_error()));
+                        return Err(io_error(
+                            "apply replayed file mode",
+                            io::Error::last_os_error(),
+                        ));
                     }
                 }
                 CowDiffEntry::Symlink { target, .. } => {
@@ -778,10 +800,17 @@ mod linux {
                     remove_any(parent_fd.raw(), leaf.as_c_str())?;
                     remove_mode_subtree(directory_modes, relative);
                     let target = CString::new(target.as_slice()).map_err(|_| {
-                        CowDiffApplyError::InvalidInput("diff symlink target contains NUL".to_owned())
+                        CowDiffApplyError::InvalidInput(
+                            "diff symlink target contains NUL".to_owned(),
+                        )
                     })?;
-                    if unsafe { libc::symlinkat(target.as_ptr(), parent_fd.raw(), leaf.as_ptr()) } == -1 {
-                        return Err(io_error("create replayed symlink", io::Error::last_os_error()));
+                    if unsafe { libc::symlinkat(target.as_ptr(), parent_fd.raw(), leaf.as_ptr()) }
+                        == -1
+                    {
+                        return Err(io_error(
+                            "create replayed symlink",
+                            io::Error::last_os_error(),
+                        ));
                     }
                 }
                 CowDiffEntry::Remove { .. } => {
@@ -811,12 +840,18 @@ mod linux {
                 remove_any(parent_fd.raw(), leaf.as_c_str())?;
                 remove_mode_subtree(directory_modes, relative);
                 if unsafe { libc::mkdirat(parent_fd.raw(), leaf.as_ptr(), 0o700) } == -1 {
-                    return Err(io_error("create replayed directory", io::Error::last_os_error()));
+                    return Err(io_error(
+                        "create replayed directory",
+                        io::Error::last_os_error(),
+                    ));
                 }
             }
             None => {
                 if unsafe { libc::mkdirat(parent_fd.raw(), leaf.as_ptr(), 0o700) } == -1 {
-                    return Err(io_error("create replayed directory", io::Error::last_os_error()));
+                    return Err(io_error(
+                        "create replayed directory",
+                        io::Error::last_os_error(),
+                    ));
                 }
             }
         }
@@ -837,7 +872,10 @@ mod linux {
         for (relative, mode) in modes {
             let directory = open_relative_directory(root_fd, relative)?;
             if unsafe { libc::fchmod(directory.raw(), *mode as libc::mode_t) } == -1 {
-                return Err(io_error("restore replayed directory mode", io::Error::last_os_error()));
+                return Err(io_error(
+                    "restore replayed directory mode",
+                    io::Error::last_os_error(),
+                ));
             }
         }
         Ok(())
@@ -863,8 +901,7 @@ mod linux {
         if prefix.is_empty() {
             return true;
         }
-        path == prefix
-            || (path.starts_with(prefix) && path.get(prefix.len()) == Some(&b'/'))
+        path == prefix || (path.starts_with(prefix) && path.get(prefix.len()) == Some(&b'/'))
     }
 
     fn split_parent_leaf(relative: &[u8]) -> Result<(&[u8], &[u8]), CowDiffApplyError> {
@@ -894,7 +931,10 @@ mod linux {
                 )
             };
             if next == -1 {
-                return Err(io_error("resolve replay parent without symlinks", io::Error::last_os_error()));
+                return Err(io_error(
+                    "resolve replay parent without symlinks",
+                    io::Error::last_os_error(),
+                ));
             }
             current = Fd(next);
         }
@@ -929,13 +969,20 @@ mod linux {
             return Ok(());
         };
         if mode & libc::S_IFMT == libc::S_IFDIR {
-            let directory = open_child_directory(parent_fd, name, "open directory for replay removal")?;
+            let directory =
+                open_child_directory(parent_fd, name, "open directory for replay removal")?;
             clear_directory(directory.raw())?;
             if unsafe { libc::unlinkat(parent_fd, name.as_ptr(), libc::AT_REMOVEDIR) } == -1 {
-                return Err(io_error("remove replayed directory", io::Error::last_os_error()));
+                return Err(io_error(
+                    "remove replayed directory",
+                    io::Error::last_os_error(),
+                ));
             }
         } else if unsafe { libc::unlinkat(parent_fd, name.as_ptr(), 0) } == -1 {
-            return Err(io_error("remove replayed non-directory", io::Error::last_os_error()));
+            return Err(io_error(
+                "remove replayed non-directory",
+                io::Error::last_os_error(),
+            ));
         }
         Ok(())
     }
@@ -950,7 +997,10 @@ mod linux {
 
     fn read_directory_names(directory_fd: RawFd) -> Result<Vec<Vec<u8>>, CowDiffApplyError> {
         if unsafe { libc::lseek(directory_fd, 0, libc::SEEK_SET) } == -1 {
-            return Err(io_error("rewind directory enumeration", io::Error::last_os_error()));
+            return Err(io_error(
+                "rewind directory enumeration",
+                io::Error::last_os_error(),
+            ));
         }
         let mut names = Vec::new();
         let mut buffer = [0u8; DIRENT_BUFFER_BYTES];
@@ -982,18 +1032,22 @@ mod linux {
                     ));
                 }
                 let record = unsafe { buffer.as_ptr().add(offset) };
-                let reclen = unsafe { u16::from_ne_bytes([*record.add(16), *record.add(17)]) as usize };
+                let reclen =
+                    unsafe { u16::from_ne_bytes([*record.add(16), *record.add(17)]) as usize };
                 if reclen < 20 || offset + reclen > count {
                     return Err(CowDiffApplyError::InvalidInput(
                         "directory enumeration returned an invalid record length".to_owned(),
                     ));
                 }
                 let name_region = &buffer[offset + 19..offset + reclen];
-                let name_len = name_region.iter().position(|byte| *byte == 0).ok_or_else(|| {
-                    CowDiffApplyError::InvalidInput(
-                        "directory enumeration returned an unterminated name".to_owned(),
-                    )
-                })?;
+                let name_len = name_region
+                    .iter()
+                    .position(|byte| *byte == 0)
+                    .ok_or_else(|| {
+                        CowDiffApplyError::InvalidInput(
+                            "directory enumeration returned an unterminated name".to_owned(),
+                        )
+                    })?;
                 let name = &name_region[..name_len];
                 if name != b"." && name != b".." {
                     names.push(name.to_vec());
@@ -1006,7 +1060,8 @@ mod linux {
     }
 
     fn join_relative(parent: &[u8], name: &[u8]) -> Vec<u8> {
-        let mut result = Vec::with_capacity(parent.len() + usize::from(!parent.is_empty()) + name.len());
+        let mut result =
+            Vec::with_capacity(parent.len() + usize::from(!parent.is_empty()) + name.len());
         result.extend_from_slice(parent);
         if !parent.is_empty() {
             result.push(b'/');
@@ -1017,13 +1072,8 @@ mod linux {
 
     fn write_all(fd: RawFd, mut bytes: &[u8]) -> Result<(), CowDiffApplyError> {
         while !bytes.is_empty() {
-            let written = unsafe {
-                libc::write(
-                    fd,
-                    bytes.as_ptr().cast::<libc::c_void>(),
-                    bytes.len(),
-                )
-            };
+            let written =
+                unsafe { libc::write(fd, bytes.as_ptr().cast::<libc::c_void>(), bytes.len()) };
             if written == -1 {
                 let error = io::Error::last_os_error();
                 if error.raw_os_error() == Some(libc::EINTR) {
@@ -1076,267 +1126,3 @@ mod linux {
         CowDiffApplyError::Io { phase, source }
     }
 }
-'''
-
-TEST = r'''#![cfg(target_os = "linux")]
-
-use security_lab::{
-    apply_cow_diff_atomic, CowDiff, CowDiffApplyError, CowDiffApplyLimits, CowDiffEntry,
-};
-use std::fs;
-use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{symlink, PermissionsExt};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-
-static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-struct TempTree(PathBuf);
-
-impl TempTree {
-    fn new() -> Self {
-        let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
-            "security-lab-cow-diff-apply-{}-{id}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir(&root).expect("create test root");
-        Self(root)
-    }
-
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TempTree {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
-fn encoded_bytes(entries: &[CowDiffEntry]) -> u64 {
-    let mut total = 6u64;
-    for entry in entries {
-        let (path, payload) = match entry {
-            CowDiffEntry::UpsertFile { path, bytes, .. } => (path, 4 + bytes.len() as u64),
-            CowDiffEntry::EnsureDirectory { path, .. } => (path, 4),
-            CowDiffEntry::Symlink { path, target } => (path, target.len() as u64),
-            CowDiffEntry::Remove { path } | CowDiffEntry::OpaqueDirectory { path } => (path, 0),
-        };
-        total += 11 + (path.len() - 1) as u64 + payload;
-    }
-    total
-}
-
-fn diff(entries: Vec<CowDiffEntry>) -> CowDiff {
-    let encoded_bytes = encoded_bytes(&entries);
-    CowDiff {
-        entries,
-        encoded_bytes,
-    }
-}
-
-fn limits() -> CowDiffApplyLimits {
-    CowDiffApplyLimits {
-        max_bytes: 1024 * 1024,
-        max_nodes: 1024,
-    }
-}
-
-fn staging_entries(parent: &Path) -> Vec<PathBuf> {
-    let mut entries = Vec::new();
-    for entry in fs::read_dir(parent).expect("read parent") {
-        let path = entry.expect("parent entry").path();
-        if path
-            .file_name()
-            .expect("entry name")
-            .as_bytes()
-            .starts_with(b".security-lab-cow-apply-")
-        {
-            entries.push(path);
-        }
-    }
-    entries
-}
-
-#[test]
-fn atomically_replays_supported_diff_without_mutating_base() {
-    let tree = TempTree::new();
-    let base = tree.path().join("base");
-    let destination = tree.path().join("snapshot");
-    fs::create_dir(&base).expect("create base");
-    fs::write(base.join("existing"), b"old\n").expect("write existing");
-    fs::write(base.join("remove-me"), b"remove\n").expect("write removable");
-    fs::create_dir(base.join("opaque")).expect("create opaque base dir");
-    fs::write(base.join("opaque/old-child"), b"old-child\n").expect("write opaque child");
-    fs::create_dir(base.join("keep-dir")).expect("create keep dir");
-    fs::write(base.join("keep-dir/value"), b"keep\n").expect("write keep value");
-    symlink("existing", base.join("base-link")).expect("create base symlink");
-    fs::set_permissions(&base, fs::Permissions::from_mode(0o751)).expect("set base mode");
-    fs::set_permissions(base.join("keep-dir"), fs::Permissions::from_mode(0o750))
-        .expect("set keep-dir mode");
-
-    let changes = diff(vec![
-        CowDiffEntry::UpsertFile {
-            path: b"/existing".to_vec(),
-            mode: 0o640,
-            bytes: b"replaced\n".to_vec(),
-        },
-        CowDiffEntry::EnsureDirectory {
-            path: b"/newdir".to_vec(),
-            mode: 0o750,
-        },
-        CowDiffEntry::UpsertFile {
-            path: b"/newdir/file".to_vec(),
-            mode: 0o600,
-            bytes: b"new-file\n".to_vec(),
-        },
-        CowDiffEntry::EnsureDirectory {
-            path: b"/opaque".to_vec(),
-            mode: 0o700,
-        },
-        CowDiffEntry::OpaqueDirectory {
-            path: b"/opaque".to_vec(),
-        },
-        CowDiffEntry::Remove {
-            path: b"/remove-me".to_vec(),
-        },
-        CowDiffEntry::Symlink {
-            path: b"/symlink-new".to_vec(),
-            target: b"newdir/file".to_vec(),
-        },
-    ]);
-
-    let report = apply_cow_diff_atomic(&base, &destination, &changes, limits())
-        .expect("atomic replay succeeds");
-
-    assert_eq!(report.diff_encoded_bytes, changes.encoded_bytes);
-    assert!(report.copied_base_bytes >= b"old\nremove\nold-child\nkeep\nexisting".len() as u64);
-    assert!(report.accounted_nodes >= changes.entries.len() as u64 + 1);
-    assert_eq!(fs::read(destination.join("existing")).unwrap(), b"replaced\n");
-    assert_eq!(
-        fs::metadata(destination.join("existing"))
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o7777,
-        0o640
-    );
-    assert_eq!(fs::read(destination.join("newdir/file")).unwrap(), b"new-file\n");
-    assert_eq!(
-        fs::metadata(destination.join("newdir/file"))
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o7777,
-        0o600
-    );
-    assert_eq!(
-        fs::metadata(destination.join("newdir"))
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o7777,
-        0o750
-    );
-    assert!(!destination.join("opaque/old-child").exists());
-    assert!(!destination.join("remove-me").exists());
-    assert_eq!(
-        fs::read_link(destination.join("symlink-new"))
-            .unwrap()
-            .as_os_str()
-            .as_bytes(),
-        b"newdir/file"
-    );
-    assert_eq!(fs::read(destination.join("keep-dir/value")).unwrap(), b"keep\n");
-    assert_eq!(
-        fs::metadata(destination.join("keep-dir"))
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o7777,
-        0o750
-    );
-    assert_eq!(
-        fs::metadata(&destination).unwrap().permissions().mode() & 0o7777,
-        0o751
-    );
-
-    assert_eq!(fs::read(base.join("existing")).unwrap(), b"old\n");
-    assert_eq!(fs::read(base.join("remove-me")).unwrap(), b"remove\n");
-    assert_eq!(fs::read(base.join("opaque/old-child")).unwrap(), b"old-child\n");
-    assert!(staging_entries(tree.path()).is_empty());
-}
-
-#[test]
-fn symlink_parent_escape_fails_closed_without_publication() {
-    let tree = TempTree::new();
-    let base = tree.path().join("base");
-    let outside = tree.path().join("outside");
-    let destination = tree.path().join("snapshot");
-    fs::create_dir(&base).expect("create base");
-    fs::create_dir(&outside).expect("create outside");
-    symlink(&outside, base.join("escape")).expect("create escaping symlink");
-
-    let changes = diff(vec![CowDiffEntry::UpsertFile {
-        path: b"/escape/owned".to_vec(),
-        mode: 0o600,
-        bytes: b"must-not-escape\n".to_vec(),
-    }]);
-
-    let error = apply_cow_diff_atomic(&base, &destination, &changes, limits())
-        .expect_err("symlink parent must fail closed");
-    assert!(matches!(error, CowDiffApplyError::Io { .. }));
-    assert!(!outside.join("owned").exists());
-    assert!(!destination.exists());
-    assert!(staging_entries(tree.path()).is_empty());
-}
-
-#[test]
-fn byte_budget_failure_is_atomic_and_cleans_staging() {
-    let tree = TempTree::new();
-    let base = tree.path().join("base");
-    let destination = tree.path().join("snapshot");
-    fs::create_dir(&base).expect("create base");
-    let payload = vec![b'x'; 8192];
-    fs::write(base.join("large"), &payload).expect("write large base file");
-
-    let changes = diff(vec![CowDiffEntry::Remove {
-        path: b"/missing".to_vec(),
-    }]);
-    let tight = CowDiffApplyLimits {
-        max_bytes: changes.encoded_bytes + 4096,
-        max_nodes: 100,
-    };
-    let error = apply_cow_diff_atomic(&base, &destination, &changes, tight)
-        .expect_err("copy budget must fail before publication");
-    assert!(matches!(
-        error,
-        CowDiffApplyError::BudgetExceeded {
-            resource: "byte",
-            ..
-        }
-    ));
-    assert_eq!(fs::read(base.join("large")).unwrap(), payload);
-    assert!(!destination.exists());
-    assert!(staging_entries(tree.path()).is_empty());
-}
-'''
-
-Path("src/cow_diff_apply.rs").write_text(MODULE)
-Path("tests/cow_diff_apply.rs").write_text(TEST)
-
-lib = Path("src/lib.rs")
-text = lib.read_text()
-needle = "mod cancellation;\nmod platform;"
-replacement = "mod cancellation;\nmod cow_diff_apply;\nmod platform;"
-if text.count(needle) != 1:
-    raise SystemExit("lib module insertion point changed")
-text = text.replace(needle, replacement, 1)
-needle = "pub use cancellation::CancellationToken;\n"
-replacement = "pub use cancellation::CancellationToken;\npub use cow_diff_apply::{\n    apply_cow_diff_atomic, CowDiffApplyError, CowDiffApplyLimits, CowDiffApplyReport,\n};\n"
-if text.count(needle) != 1:
-    raise SystemExit("lib export insertion point changed")
-lib.write_text(text.replace(needle, replacement, 1))

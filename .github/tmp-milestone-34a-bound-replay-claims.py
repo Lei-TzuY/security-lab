@@ -63,18 +63,15 @@ replace_one(
     "- Root device/inode revalidation is not a subtree integrity proof.\n- A caller using expected-base replay is trusted to obtain and retain the expected digest from independently trusted state. The digest itself is not provenance/authentication, and the base is not frozen between the identity scan and replay; hostile concurrent host mutation can still race that interval.\n",
     "threat expected identity trust",
 )
-
-# Add deterministic evidence next to the existing COW lifecycle evidence section if present.
-p = Path("THREAT_MODEL.md")
-text = p.read_text()
-needle = "- COW replay regressions prove supported diff application into a new snapshot, base preservation, symlink-parent escape rejection, byte/node budget failure, and absence of staging residue after failure;\n"
-if needle in text:
-    text = text.replace(
-        needle,
-        needle + "- expected-base replay regressions prove a matching digest returns checked identity plus replay accounting, while a base mutated after identity capture returns `BaseIdentityMismatch` before even a deliberately invalid destination parent is inspected and leaves no destination/staging state;\n",
-        1,
-    )
-else:
-    # Keep construction strict: we need an existing COW evidence anchor rather than appending out of context.
-    raise SystemExit("threat COW replay evidence anchor not found")
-p.write_text(text)
+replace_one(
+    "THREAT_MODEL.md",
+    "- writable-volume parser/validator regressions plus a raw mount oracle that writes exact `persistent-write\\n` bytes at `/persist/persisted`, still requires `EROFS` outside the writable mount, requires `ENOENT` for the original host source pathname after chroot, and is followed by host-side proof that the exact bytes persisted only in the declared source;\n",
+    "- writable-volume parser/validator regressions plus a raw mount oracle that writes exact `persistent-write\\n` bytes at `/persist/persisted`, still requires `EROFS` outside the writable mount, requires `ENOENT` for the original host source pathname after chroot, and is followed by host-side proof that the exact bytes persisted only in the declared source;\n- the COW snapshot lifecycle has executable evidence from bounded upper-tree export through failure-atomic new-snapshot replay and canonical SHA-256 identity; replay budget/path failures leave no published snapshot, and equivalent supported trees reproduce the same fixed canonical digest while modeled mutations change it;\n- expected-base replay regressions prove a matching digest returns checked identity plus replay accounting, while a base mutated after identity capture returns `BaseIdentityMismatch` before even a deliberately invalid destination parent is inspected and leaves no destination/staging state;\n",
+    "threat 34A test evidence",
+)
+replace_one(
+    "THREAT_MODEL.md",
+    "Milestones through 27D are integrated on `main`, including the complete 24A–24E static/preflight evidence sequence; complete launch preflight intentionally remains indeterminate because the mandatory launch core is still unprobed as a whole. The current Milestone 29A candidate adds a materially different negative seccomp predicate rather than farming range endpoint aliases. Milestone 4A cgroup-v2 aggregate process accounting remains blocked by missing unprivileged delegation; supplementary-group isolation also remains blocked on a viable mapping architecture. Future promotion must target a materially different executable authority/enforcement frontier or safely close a genuinely unprobed prerequisite without overstating evidence.",
+    "Milestones through 33A are integrated on `main`, including bounded COW root mutation, post-run diff export, failure-atomic host-side replay, and canonical snapshot identity. The current Milestone 34A verified candidate consumes that identity as an explicit replay precondition and fails before replay setup on mismatch without claiming concurrency locking or authenticity. Milestone 4A cgroup-v2 aggregate process accounting remains blocked by missing unprivileged delegation; supplementary-group isolation also remains blocked on a viable mapping architecture. Future promotion must target a materially stronger executable COW lifecycle property or another independent authority/enforcement frontier without overstating evidence.",
+    "threat phase promotion 34A",
+)

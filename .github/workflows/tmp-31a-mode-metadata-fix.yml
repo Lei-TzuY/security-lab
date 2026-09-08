@@ -17,7 +17,18 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
       - name: Materialize permission metadata fix
-        run: python3 .github/tmp-31a-mode-metadata-fix.py
+        run: |
+          python3 .github/tmp-31a-mode-metadata-fix.py
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("src/platform/linux_cow_diff.rs")
+          text = p.read_text()
+          old = "        | CowDiffEntry::EnsureDirectory { path }\n"
+          new = "        | CowDiffEntry::EnsureDirectory { path, .. }\n"
+          if text.count(old) != 1:
+              raise SystemExit(f"entry_path EnsureDirectory pattern: expected one match, got {text.count(old)}")
+          p.write_text(text.replace(old, new, 1))
+          PY
       - name: Enable user namespace capability tests
         run: |
           if [ -e /proc/sys/kernel/unprivileged_userns_clone ]; then

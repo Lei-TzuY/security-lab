@@ -1,37 +1,4 @@
-from pathlib import Path
-
-
-def replace_one(path: str, old: str, new: str, label: str) -> None:
-    p = Path(path)
-    text = p.read_text()
-    count = text.count(old)
-    if count != 1:
-        raise SystemExit(f"{label}: expected exactly one match, got {count}")
-    p.write_text(text.replace(old, new, 1))
-
-
-replace_one(
-    "Cargo.toml",
-    '[dependencies]\nhmac = "=0.12.1"\n',
-    '[dependencies]\ned25519-dalek = "=2.1.1"\nhmac = "=0.12.1"\n',
-    "Cargo dependency insertion",
-)
-
-replace_one(
-    "src/lib.rs",
-    "mod snapshot_auth;\nmod snapshot_identity;\n",
-    "mod snapshot_auth;\nmod snapshot_identity;\nmod snapshot_signature;\n",
-    "snapshot signature module",
-)
-
-replace_one(
-    "src/lib.rs",
-    "pub use snapshot_identity::{\n    snapshot_sha256, SnapshotIdentity, SnapshotIdentityError, SnapshotIdentityLimits,\n};\n",
-    "pub use snapshot_identity::{\n    snapshot_sha256, SnapshotIdentity, SnapshotIdentityError, SnapshotIdentityLimits,\n};\npub use snapshot_signature::{\n    sign_snapshot_ed25519, verify_snapshot_ed25519, SnapshotEd25519Error,\n    SnapshotEd25519Signature, SNAPSHOT_ED25519_PUBLIC_KEY_BYTES,\n    SNAPSHOT_ED25519_SIGNATURE_BYTES, SNAPSHOT_ED25519_SIGNING_KEY_BYTES,\n};\n",
-    "snapshot signature exports",
-)
-
-Path("src/snapshot_signature.rs").write_text(r'''use crate::snapshot_identity::{
+use crate::snapshot_identity::{
     snapshot_sha256, SnapshotIdentity, SnapshotIdentityError, SnapshotIdentityLimits,
 };
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
@@ -260,12 +227,10 @@ mod tests {
 
     #[test]
     fn ed25519_backend_matches_rfc8032_test_vector_one() {
-        let seed = decode_hex::<32>(
-            "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
-        );
-        let expected_public = decode_hex::<32>(
-            "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
-        );
+        let seed =
+            decode_hex::<32>("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60");
+        let expected_public =
+            decode_hex::<32>("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a");
         let expected_signature = decode_hex::<64>(
             "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e06522490155\
              5fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b",
@@ -281,7 +246,10 @@ mod tests {
     }
 
     fn decode_hex<const N: usize>(text: &str) -> [u8; N] {
-        let compact: Vec<u8> = text.bytes().filter(|byte| !byte.is_ascii_whitespace()).collect();
+        let compact: Vec<u8> = text
+            .bytes()
+            .filter(|byte| !byte.is_ascii_whitespace())
+            .collect();
         assert_eq!(compact.len(), N * 2);
         let mut out = [0u8; N];
         for (index, slot) in out.iter_mut().enumerate() {
@@ -299,4 +267,3 @@ mod tests {
         }
     }
 }
-''')

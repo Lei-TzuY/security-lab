@@ -15,4 +15,12 @@ old = '''        names.sort_by(|left, right| {
 if old not in text:
     raise SystemExit("cleanup sort block not found")
 text = text.replace(old, "        names.sort();\n", 1)
+old_result = "        let materialize_result = (|| {\n"
+if old_result not in text:
+    raise SystemExit("materialize result binding not found")
+text = text.replace(
+    old_result,
+    "        let materialize_result: Result<(), SnapshotArchiveError> = (|| {\n",
+    1,
+)
 path.write_text(text)

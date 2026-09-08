@@ -8,6 +8,7 @@ mod cow_diff_apply;
 mod platform;
 pub mod policy;
 pub mod report;
+mod runtime_fd_broker;
 mod snapshot_auth;
 mod snapshot_identity;
 
@@ -26,6 +27,9 @@ pub use policy::{
 pub use report::{
     CapturedOutput, ChildOutcome, CowDiff, CowDiffEntry, EnforcementReceipt, ProcessTreeUsage,
     RunReport,
+};
+pub use runtime_fd_broker::{
+    PreparedReadOnlyRegularFile, RuntimeFdBroker, RuntimeFdBrokerError, RuntimeFdSession,
 };
 pub use snapshot_auth::{
     snapshot_hmac_sha256, verify_snapshot_hmac_sha256, SnapshotHmac, SnapshotHmacError,

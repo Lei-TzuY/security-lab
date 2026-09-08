@@ -48,36 +48,12 @@ jobs:
               1,
           )
           replacements = [
-              (
-                  '    let result = walk_directory(root_fd, state, &mut path, 0);\n    let close_result = libc::close(root_fd);\n    if let Err(errno) = result {\n        return Err(errno);\n    }\n',
-                  '    let result = walk_directory(root_fd, state, &mut path, 0, 0);\n    let close_result = libc::close(root_fd);\n    result?;\n',
-                  'root walk result',
-              ),
-              (
-                  '    path: &mut [u8; PATH_BYTES_MAX],\n    path_len: usize,\n) -> Result<(), i32> {\n    let mut buffer = [0u8; DIRENT_BUFFER_BYTES];\n',
-                  '    path: &mut [u8; PATH_BYTES_MAX],\n    path_len: usize,\n    depth: usize,\n) -> Result<(), i32> {\n    if depth > MAX_EXPORT_DEPTH {\n        return Err(libc::ELOOP);\n    }\n    let mut buffer = [0u8; DIRENT_BUFFER_BYTES];\n',
-                  'walk signature',
-              ),
-              (
-                  '                export_entry(directory_fd, name_ptr, state, path, next_len)?;\n',
-                  '                export_entry(directory_fd, name_ptr, state, path, next_len, depth)?;\n',
-                  'export entry call',
-              ),
-              (
-                  '    path: &mut [u8; PATH_BYTES_MAX],\n    path_len: usize,\n) -> Result<(), i32> {\n    let mut stat = std::mem::zeroed::<libc::stat>();\n',
-                  '    path: &mut [u8; PATH_BYTES_MAX],\n    path_len: usize,\n    depth: usize,\n) -> Result<(), i32> {\n    let mut stat = std::mem::zeroed::<libc::stat>();\n',
-                  'export entry signature',
-              ),
-              (
-                  '        let result = walk_directory(fd, state, path, path_len);\n        let close_result = libc::close(fd);\n        if let Err(errno) = result {\n            return Err(errno);\n        }\n',
-                  '        let result = walk_directory(fd, state, path, path_len, depth + 1);\n        let close_result = libc::close(fd);\n        result?;\n',
-                  'recursive walk result',
-              ),
-              (
-                  '        let result = append_file(state, &path[..path_len], fd, stat.st_size as usize);\n        let close_result = libc::close(fd);\n        if let Err(errno) = result {\n            return Err(errno);\n        }\n',
-                  '        let result = append_file(state, &path[..path_len], fd, stat.st_size as usize);\n        let close_result = libc::close(fd);\n        result?;\n',
-                  'file result',
-              ),
+              ('    let result = walk_directory(root_fd, state, &mut path, 0);\n    let close_result = libc::close(root_fd);\n    if let Err(errno) = result {\n        return Err(errno);\n    }\n', '    let result = walk_directory(root_fd, state, &mut path, 0, 0);\n    let close_result = libc::close(root_fd);\n    result?;\n', 'root walk result'),
+              ('    path: &mut [u8; PATH_BYTES_MAX],\n    path_len: usize,\n) -> Result<(), i32> {\n    let mut buffer = [0u8; DIRENT_BUFFER_BYTES];\n', '    path: &mut [u8; PATH_BYTES_MAX],\n    path_len: usize,\n    depth: usize,\n) -> Result<(), i32> {\n    if depth > MAX_EXPORT_DEPTH {\n        return Err(libc::ELOOP);\n    }\n    let mut buffer = [0u8; DIRENT_BUFFER_BYTES];\n', 'walk signature'),
+              ('                export_entry(directory_fd, name_ptr, state, path, next_len)?;\n', '                export_entry(directory_fd, name_ptr, state, path, next_len, depth)?;\n', 'export entry call'),
+              ('    path: &mut [u8; PATH_BYTES_MAX],\n    path_len: usize,\n) -> Result<(), i32> {\n    let mut stat = std::mem::zeroed::<libc::stat>();\n', '    path: &mut [u8; PATH_BYTES_MAX],\n    path_len: usize,\n    depth: usize,\n) -> Result<(), i32> {\n    let mut stat = std::mem::zeroed::<libc::stat>();\n', 'export entry signature'),
+              ('        let result = walk_directory(fd, state, path, path_len);\n        let close_result = libc::close(fd);\n        if let Err(errno) = result {\n            return Err(errno);\n        }\n', '        let result = walk_directory(fd, state, path, path_len, depth + 1);\n        let close_result = libc::close(fd);\n        result?;\n', 'recursive walk result'),
+              ('        let result = append_file(state, &path[..path_len], fd, stat.st_size as usize);\n        let close_result = libc::close(fd);\n        if let Err(errno) = result {\n            return Err(errno);\n        }\n', '        let result = append_file(state, &path[..path_len], fd, stat.st_size as usize);\n        let close_result = libc::close(fd);\n        result?;\n', 'file result'),
           ]
           for old, new, label in replacements:
               if text.count(old) != 1:
@@ -110,6 +86,18 @@ jobs:
           if text.count(old) != 1:
               raise SystemExit(f'lifecycle call anchor count={text.count(old)}')
           linux.write_text(text.replace(old, new, 1))
+          PY
+      - name: Update deterministic run-json contract
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('tests/cli.rs')
+          text = p.read_text()
+          old = '\\"truncated\\\":false},\\\"reaped_descendants\\\":0,\\\"process_tree_usage\\\":{\\\"user_cpu_micros\\\":'
+          new = '\\"truncated\\\":false},\\\"cow_diff\\\":null,\\\"reaped_descendants\\\":0,\\\"process_tree_usage\\\":{\\\"user_cpu_micros\\\":'
+          if text.count(old) != 1:
+              raise SystemExit(f'run-json contract anchor count={text.count(old)}')
+          p.write_text(text.replace(old, new, 1))
           PY
       - name: Format
         run: cargo fmt --all

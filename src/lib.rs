@@ -14,6 +14,7 @@ mod snapshot_identity;
 mod snapshot_signature;
 mod snapshot_store;
 mod snapshot_store_durable;
+mod snapshot_trust;
 
 use std::error::Error;
 use std::fmt;
@@ -53,6 +54,13 @@ pub use snapshot_store::{
     store_snapshot_archive_ed25519_atomic, SnapshotStoreError, SnapshotStorePutReport,
 };
 pub use snapshot_store_durable::store_snapshot_archive_ed25519_durable;
+pub use snapshot_trust::{
+    materialize_snapshot_store_object_trusted_ed25519_atomic,
+    store_snapshot_archive_trusted_ed25519_durable, SnapshotTrustDecision, SnapshotTrustError,
+    SnapshotTrustKey, SnapshotTrustKeyId, SnapshotTrustKeyState, SnapshotTrustPolicy,
+    SnapshotTrustPolicyIdentity, SnapshotTrustedMaterializeReport, SnapshotTrustedStorePutReport,
+    SNAPSHOT_TRUST_MAX_KEYS,
+};
 
 #[derive(Debug)]
 pub enum SandboxError {

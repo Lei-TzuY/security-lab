@@ -1,8 +1,6 @@
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 
-use security_lab::{
-    run, ChildOutcome, RuntimeFdBroker, RuntimeFdBrokerError, SandboxPolicy,
-};
+use security_lab::{run, ChildOutcome, RuntimeFdBroker, RuntimeFdBrokerError, SandboxPolicy};
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -18,10 +16,7 @@ static NEXT_PATH: AtomicU64 = AtomicU64::new(1);
 
 fn unique_path(label: &str) -> PathBuf {
     let sequence = NEXT_PATH.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!(
-        "security-lab-{label}-{}-{sequence}",
-        process::id()
-    ))
+    std::env::temp_dir().join(format!("security-lab-{label}-{}-{sequence}", process::id()))
 }
 
 struct TestFd(RawFd);
@@ -56,7 +51,8 @@ fn receive_one_fd(stream: &UnixStream) -> TestFd {
     message.msg_control = control.0.as_mut_ptr().cast::<libc::c_void>();
     message.msg_controllen = control.0.len();
 
-    let received = unsafe { libc::recvmsg(stream.as_raw_fd(), &mut message, libc::MSG_CMSG_CLOEXEC) };
+    let received =
+        unsafe { libc::recvmsg(stream.as_raw_fd(), &mut message, libc::MSG_CMSG_CLOEXEC) };
     assert_eq!(
         received,
         1,
@@ -66,7 +62,8 @@ fn receive_one_fd(stream: &UnixStream) -> TestFd {
     assert_eq!(&payload, b"F");
     assert_eq!(message.msg_flags & libc::MSG_CTRUNC, 0);
     assert!(
-        message.msg_controllen >= std::mem::size_of::<libc::cmsghdr>() + std::mem::size_of::<RawFd>()
+        message.msg_controllen
+            >= std::mem::size_of::<libc::cmsghdr>() + std::mem::size_of::<RawFd>()
     );
 
     let header = control.0.as_ptr().cast::<libc::cmsghdr>();
@@ -160,7 +157,10 @@ fn broker_attenuates_rw_regular_file_to_readonly_independent_description() {
         },
         -1
     );
-    assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::EBADF)
+    );
     assert_eq!(
         read_exact_fd(received.raw(), b"broker-rights-marker\n".len()),
         b"broker-rights-marker\n"
@@ -198,7 +198,10 @@ fn broker_attenuates_rw_regular_file_to_readonly_independent_description() {
     drop(session);
     drop(client);
     drop(broker);
-    assert!(!socket_path.exists(), "broker drop must remove its own socket inode");
+    assert!(
+        !socket_path.exists(),
+        "broker drop must remove its own socket inode"
+    );
     std::fs::remove_file(&file_path).expect("remove broker source");
     std::fs::remove_dir(&directory_path).expect("remove broker source directory");
 }
@@ -312,7 +315,10 @@ fn broker_configuration_is_fail_closed_and_non_overwriting() {
         broker.configure_policy(&mut policy, 10),
         Err(RuntimeFdBrokerError::InvalidConfiguration(_))
     ));
-    assert_eq!(policy, before, "failed broker configuration must not partially mutate policy");
+    assert_eq!(
+        policy, before,
+        "failed broker configuration must not partially mutate policy"
+    );
 
     drop(broker);
     std::fs::remove_dir_all(&root).expect("remove broker policy root");

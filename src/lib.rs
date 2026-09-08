@@ -4,6 +4,7 @@
 //! platform layer which either applies every requested boundary or fails.
 
 mod cancellation;
+mod cow_diff_apply;
 mod platform;
 pub mod policy;
 pub mod report;
@@ -12,6 +13,9 @@ use std::error::Error;
 use std::fmt;
 
 pub use cancellation::CancellationToken;
+pub use cow_diff_apply::{
+    apply_cow_diff_atomic, CowDiffApplyError, CowDiffApplyLimits, CowDiffApplyReport,
+};
 pub use policy::{
     PolicyError, ResourceLimits, SandboxPolicy, SeccompArgRangeRule, SeccompArgRule, SeccompPolicy,
     StdioMode, StdioPolicy,

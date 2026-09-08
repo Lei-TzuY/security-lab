@@ -763,7 +763,7 @@ Boundary: 30A is ephemeral root mutation only. It does not provide persistence, 
 
 ### Slice 31A — bounded post-run COW diff
 
-**Current verified candidate.** Adds a launcher-owned, bounded change-export capability for the existing ephemeral COW root without turning the private upper layer into persistent host state.
+**Status: complete on `main`.** Adds a launcher-owned, bounded change-export capability for the existing ephemeral COW root without turning the private upper layer into persistent host state.
 
 Acceptance evidence is executable:
 
@@ -780,7 +780,30 @@ Boundary: 31A is a bounded content/topology/permission-mode export for supported
 
 ### Milestone 31 promotion rule
 
-After 31A integrates, do not farm more record tags or metadata fields unless they close a demonstrated replay/integrity boundary. Promote to a materially different capability such as a verified replay/apply lifecycle with confinement and failure atomicity, stronger snapshot identity/integrity evidence, or another independent authority/enforcement frontier.
+31A is sealed on `main`; do not farm more record tags or metadata fields unless they close a demonstrated replay/integrity boundary. Promotion is now a materially different COW lifecycle capability.
+
+## Milestone 32 — COW diff replay lifecycle
+
+### Slice 32A — atomic new-snapshot replay
+
+**Current verified candidate.** Adds a bounded host-side apply path for the canonical 31A diff without mutating the trusted base directory in place.
+
+Acceptance evidence is executable:
+
+- `apply_cow_diff_atomic(base, destination, diff, limits)` accepts only absolute trusted host paths, requires a previously absent destination, validates canonical diff path/order/record shape plus exact `encoded_bytes`, and rejects malformed/root-replacement inputs before staging mutation;
+- replay work is fail-closed bounded by explicit `CowDiffApplyLimits`: canonical diff plus copied regular-file/symlink bytes consume the byte budget, while base nodes plus diff records consume the node budget;
+- the launcher-side helper copies supported base regular files/directories/symlinks into a private sibling staging directory and rejects unsupported node kinds instead of silently dropping them;
+- every diff parent is resolved fd-by-fd with `O_DIRECTORY|O_NOFOLLOW`; a copied symlink used as a parent therefore fails rather than redirecting a replay write outside staging;
+- replay implements regular-file upsert with bytes/mode, directory ensure/mode, symlink replacement, recursive removal, and opaque-directory clearing; supported directory modes are restored after topology mutation;
+- success publishes the completed tree with one Linux `renameat2(RENAME_NOREPLACE)` and no fallback to a non-atomic overwrite path;
+- deterministic tests prove a mixed replay preserves the base while producing exact replacement/new-file bytes, modes, removals, opaque-directory semantics and symlink target; a symlink-parent escape attempt fails with no outside mutation or destination publication; and a byte-budget failure leaves the base unchanged, destination absent, and staging cleaned;
+- stable rustfmt/Clippy/full tests and the full Rust 1.74 suite are green on the exact implementation candidate.
+
+Boundary: 32A provides failure-atomic publication of a **new** snapshot up to the final rename boundary. It does not overwrite an existing destination, fsync data/metadata, provide crash-recovery or durability guarantees, preserve UID/GID/timestamps/xattrs/ACLs/hard links/special nodes, prove cryptographic identity of the base/diff, defend against hostile concurrent host writers, or claim that preserved symlink objects are confinement-safe for later consumers that choose to follow them.
+
+### Milestone 32 promotion rule
+
+After 32A integrates, seal basic replay/apply semantics rather than farming path aliases, extra failure codes, or duplicate record variants. Promote to stronger snapshot identity/integrity evidence or another independent executable authority/enforcement frontier; any durability or overwrite-transaction phase requires its own fsync/crash semantics and deterministic evidence.
 
 ## Later frontiers
 

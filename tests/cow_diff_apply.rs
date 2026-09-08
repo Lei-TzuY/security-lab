@@ -1,7 +1,8 @@
 #![cfg(target_os = "linux")]
 
 use security_lab::{
-    apply_cow_diff_atomic, CowDiff, CowDiffApplyError, CowDiffApplyLimits, CowDiffEntry,
+    apply_cow_diff_atomic, apply_cow_diff_atomic_with_expected_base, snapshot_sha256, CowDiff,
+    CowDiffApplyError, CowDiffApplyLimits, CowDiffEntry, SnapshotIdentityLimits,
 };
 use std::ffi::CString;
 use std::fs;
@@ -61,6 +62,13 @@ fn diff(entries: Vec<CowDiffEntry>) -> CowDiff {
 
 fn limits() -> CowDiffApplyLimits {
     CowDiffApplyLimits {
+        max_bytes: 1024 * 1024,
+        max_nodes: 1024,
+    }
+}
+
+fn identity_limits() -> SnapshotIdentityLimits {
+    SnapshotIdentityLimits {
         max_bytes: 1024 * 1024,
         max_nodes: 1024,
     }
@@ -285,6 +293,85 @@ fn byte_budget_failure_is_atomic_and_cleans_staging() {
         }
     ));
     assert_eq!(fs::read(base.join("large")).unwrap(), payload);
+    assert!(!destination.exists());
+    assert!(staging_entries(tree.path()).is_empty());
+}
+
+#[test]
+fn expected_base_identity_allows_matching_atomic_replay() {
+    let tree = TempTree::new();
+    let base = tree.path().join("base");
+    let destination = tree.path().join("snapshot");
+    fs::create_dir(&base).expect("create base");
+    fs::write(base.join("value"), b"before\n").expect("write base value");
+
+    let expected = snapshot_sha256(&base, identity_limits()).expect("hash expected base");
+    let changes = diff(vec![CowDiffEntry::UpsertFile {
+        path: b"/value".to_vec(),
+        mode: 0o600,
+        bytes: b"after\n".to_vec(),
+    }]);
+
+    let report = apply_cow_diff_atomic_with_expected_base(
+        &base,
+        &destination,
+        &changes,
+        expected,
+        identity_limits(),
+        limits(),
+    )
+    .expect("matching expected base identity permits replay");
+
+    assert_eq!(report.base_identity, expected);
+    assert_eq!(report.replay.diff_encoded_bytes, changes.encoded_bytes);
+    assert_eq!(fs::read(destination.join("value")).unwrap(), b"after\n");
+    assert_eq!(fs::read(base.join("value")).unwrap(), b"before\n");
+    assert!(staging_entries(tree.path()).is_empty());
+}
+
+#[test]
+fn base_identity_mismatch_fails_before_destination_or_staging_setup() {
+    let tree = TempTree::new();
+    let base = tree.path().join("base");
+    fs::create_dir(&base).expect("create base");
+    fs::write(base.join("value"), b"expected\n").expect("write expected base value");
+    let expected = snapshot_sha256(&base, identity_limits()).expect("hash expected base");
+
+    fs::write(base.join("value"), b"mutated\n").expect("mutate base after identity capture");
+    let actual = snapshot_sha256(&base, identity_limits()).expect("hash mutated base");
+    assert_ne!(actual.sha256, expected.sha256);
+
+    // The parent deliberately does not exist. If replay setup runs before the
+    // identity gate, destination-parent canonicalization would win instead.
+    let missing_parent = tree.path().join("missing-parent");
+    let destination = missing_parent.join("snapshot");
+    let changes = diff(vec![CowDiffEntry::UpsertFile {
+        path: b"/new".to_vec(),
+        mode: 0o600,
+        bytes: b"must-not-publish\n".to_vec(),
+    }]);
+
+    let error = apply_cow_diff_atomic_with_expected_base(
+        &base,
+        &destination,
+        &changes,
+        expected,
+        identity_limits(),
+        limits(),
+    )
+    .expect_err("mismatched base identity must fail closed before replay setup");
+
+    match error {
+        CowDiffApplyError::BaseIdentityMismatch {
+            expected: observed_expected,
+            actual: observed_actual,
+        } => {
+            assert_eq!(observed_expected, expected);
+            assert_eq!(observed_actual, actual);
+        }
+        other => panic!("unexpected expected-base failure: {other}"),
+    }
+    assert!(!missing_parent.exists());
     assert!(!destination.exists());
     assert!(staging_entries(tree.path()).is_empty());
 }

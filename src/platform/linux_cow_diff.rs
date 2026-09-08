@@ -104,11 +104,22 @@ impl SharedCowDiff {
             path.extend_from_slice(&bytes[offset..end_path]);
             let payload = &bytes[end_path..end_payload];
             let entry = match tag {
-                TAG_FILE => CowDiffEntry::UpsertFile {
-                    path,
-                    bytes: payload.to_vec(),
-                },
-                TAG_DIRECTORY if payload.is_empty() => CowDiffEntry::EnsureDirectory { path },
+                TAG_FILE if payload.len() >= 4 => {
+                    let mode = u32::from_le_bytes(
+                        payload[..4].try_into().expect("fixed file mode length"),
+                    );
+                    CowDiffEntry::UpsertFile {
+                        path,
+                        mode,
+                        bytes: payload[4..].to_vec(),
+                    }
+                }
+                TAG_DIRECTORY if payload.len() == 4 => {
+                    let mode = u32::from_le_bytes(
+                        payload.try_into().expect("fixed directory mode length"),
+                    );
+                    CowDiffEntry::EnsureDirectory { path, mode }
+                }
                 TAG_SYMLINK => CowDiffEntry::Symlink {
                     path,
                     target: payload.to_vec(),
@@ -149,7 +160,7 @@ impl Drop for SharedCowDiff {
 fn entry_path(entry: &CowDiffEntry) -> &[u8] {
     match entry {
         CowDiffEntry::UpsertFile { path, .. }
-        | CowDiffEntry::EnsureDirectory { path }
+        | CowDiffEntry::EnsureDirectory { path, .. }
         | CowDiffEntry::Symlink { path, .. }
         | CowDiffEntry::Remove { path }
         | CowDiffEntry::OpaqueDirectory { path } => path,
@@ -304,7 +315,9 @@ unsafe fn export_entry(
             return Err(*libc::__errno_location());
         }
         let fd = fd as libc::c_int;
-        append_record(state, TAG_DIRECTORY, &path[..path_len], &[])?;
+        let mode = (stat.st_mode & 0o7777) as u32;
+        let mode_bytes = mode.to_le_bytes();
+        append_record(state, TAG_DIRECTORY, &path[..path_len], &mode_bytes)?;
         if is_opaque_directory(fd)? {
             append_record(state, TAG_OPAQUE_DIRECTORY, &path[..path_len], &[])?;
         }
@@ -339,7 +352,8 @@ unsafe fn export_entry(
             let _ = libc::close(fd);
             return Err(libc::EIO);
         }
-        let result = append_file(state, &path[..path_len], fd, stat.st_size as usize);
+        let mode = (stat.st_mode & 0o7777) as u32;
+        let result = append_file(state, &path[..path_len], fd, mode, stat.st_size as usize);
         let close_result = libc::close(fd);
         result?;
         if close_result == -1 {
@@ -376,15 +390,20 @@ unsafe fn append_file(
     state: *mut CowDiffState,
     path: &[u8],
     fd: libc::c_int,
+    mode: u32,
     length: usize,
 ) -> Result<(), i32> {
-    let payload = reserve_record(state, TAG_FILE, path, length)?;
+    let payload_len = 4usize.checked_add(length).ok_or(libc::EFBIG)?;
+    let payload = reserve_record(state, TAG_FILE, path, payload_len)?;
+    let mode_bytes = mode.to_le_bytes();
+    ptr::copy_nonoverlapping(mode_bytes.as_ptr(), payload, mode_bytes.len());
+    let data = payload.add(mode_bytes.len());
     let mut offset = 0usize;
     while offset < length {
         let read = libc::syscall(
             libc::SYS_pread64,
             fd,
-            payload.add(offset).cast::<libc::c_void>(),
+            data.add(offset).cast::<libc::c_void>(),
             length - offset,
             offset as libc::off_t,
         );
@@ -400,7 +419,7 @@ unsafe fn append_file(
         }
         offset += read as usize;
     }
-    commit_record(state, RECORD_HEADER_BYTES + path.len() + length);
+    commit_record(state, RECORD_HEADER_BYTES + path.len() + payload_len);
     Ok(())
 }
 

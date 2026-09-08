@@ -404,13 +404,13 @@ fn copy_on_write_root_is_ephemeral_and_preserves_host_lower() {
         let diff = report.cow_diff.expect("requested COW diff export");
         assert!(diff.entries.iter().any(|entry| matches!(
             entry,
-            CowDiffEntry::UpsertFile { path, bytes }
+            CowDiffEntry::UpsertFile { path, bytes, .. }
                 if path == b"/cow-base" && bytes == b"cow-replaced\n"
         )));
         assert!(diff.entries.iter().any(|entry| matches!(
             entry,
-            CowDiffEntry::UpsertFile { path, bytes }
-                if path == b"/cow-new" && bytes == b"cow-new\n"
+            CowDiffEntry::UpsertFile { path, mode, bytes }
+                if path == b"/cow-new" && *mode == 0o600 && bytes == b"cow-new\n"
         )));
         assert!(diff.entries.iter().any(|entry| matches!(
             entry,

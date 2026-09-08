@@ -116,7 +116,7 @@ pub(crate) fn outcome_exit_code(outcome: ChildOutcome) -> i32 {
 fn push_cow_diff_entry(output: &mut String, entry: &CowDiffEntry) {
     let (kind, path) = match entry {
         CowDiffEntry::UpsertFile { path, .. } => ("upsert_file", path),
-        CowDiffEntry::EnsureDirectory { path } => ("ensure_directory", path),
+        CowDiffEntry::EnsureDirectory { path, .. } => ("ensure_directory", path),
         CowDiffEntry::Symlink { path, .. } => ("symlink", path),
         CowDiffEntry::Remove { path } => ("remove", path),
         CowDiffEntry::OpaqueDirectory { path } => ("opaque_directory", path),
@@ -127,10 +127,16 @@ fn push_cow_diff_entry(output: &mut String, entry: &CowDiffEntry) {
     push_hex(output, path);
     output.push('\"');
     match entry {
-        CowDiffEntry::UpsertFile { bytes, .. } => {
+        CowDiffEntry::UpsertFile { mode, bytes, .. } => {
+            output.push_str(",\"mode\":");
+            write!(output, "{mode}").expect("write to String cannot fail");
             output.push_str(",\"data_encoding\":\"hex\",\"data\":\"");
             push_hex(output, bytes);
             output.push('\"');
+        }
+        CowDiffEntry::EnsureDirectory { mode, .. } => {
+            output.push_str(",\"mode\":");
+            write!(output, "{mode}").expect("write to String cannot fail");
         }
         CowDiffEntry::Symlink { target, .. } => {
             output.push_str(",\"target_encoding\":\"hex\",\"target\":\"");
@@ -198,7 +204,7 @@ fn push_json_string(output: &mut String, value: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use security_lab::{CapturedOutput, EnforcementReceipt, ProcessTreeUsage, RunReport};
+    use security_lab::{CapturedOutput, CowDiff, EnforcementReceipt, ProcessTreeUsage, RunReport};
 
     #[test]
     fn serializes_binary_capture_without_loss() {
@@ -222,6 +228,34 @@ mod tests {
             report_json(&report),
             "{\"ok\":true,\"outcome\":{\"kind\":\"exited\",\"code\":7},\"stdout\":{\"encoding\":\"hex\",\"data\":\"0022ff\",\"truncated\":true},\"cow_diff\":null,\"reaped_descendants\":3,\"process_tree_usage\":{\"user_cpu_micros\":11,\"system_cpu_micros\":22,\"max_child_rss_kib\":33},\"enforcement\":{\"base_namespaces\":false,\"time_namespace_offsets\":false,\"hostname\":false,\"private_mount_propagation\":false,\"readonly_root\":false,\"copy_on_write_root\":false,\"chroot\":false,\"fd_sanitization\":false,\"private_procfs\":false,\"rlimits\":false,\"capabilities_reduced\":false,\"no_new_privs\":false,\"landlock\":false,\"seccomp\":false}}"
         );
+    }
+
+    #[test]
+    fn serializes_cow_diff_permission_modes() {
+        let report = RunReport {
+            outcome: ChildOutcome::Exited(0),
+            stdout: None,
+            cow_diff: Some(CowDiff {
+                entries: vec![
+                    CowDiffEntry::EnsureDirectory {
+                        path: b"/state".to_vec(),
+                        mode: 0o750,
+                    },
+                    CowDiffEntry::UpsertFile {
+                        path: b"/state/item".to_vec(),
+                        mode: 0o600,
+                        bytes: b"ok".to_vec(),
+                    },
+                ],
+                encoded_bytes: 64,
+            }),
+            reaped_descendants: 0,
+            process_tree_usage: ProcessTreeUsage::default(),
+            enforcement: EnforcementReceipt::default(),
+        };
+        let json = report_json(&report);
+        assert!(json.contains("\"kind\":\"ensure_directory\",\"path_encoding\":\"hex\",\"path\":\"2f7374617465\",\"mode\":488"));
+        assert!(json.contains("\"kind\":\"upsert_file\",\"path_encoding\":\"hex\",\"path\":\"2f73746174652f6974656d\",\"mode\":384,\"data_encoding\":\"hex\",\"data\":\"6f6b\""));
     }
 
     #[test]

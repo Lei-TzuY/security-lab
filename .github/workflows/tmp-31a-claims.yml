@@ -17,7 +17,18 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
       - name: Materialize claims
-        run: python3 .github/tmp-31a-claims.py
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("README.md")
+          text = p.read_text()
+          actual = "The tmpfs backing mount is `nosuid,nodev,noexec`; this is not a claim that the merged root is globally `noexec`."
+          expected = "The COW backing tmpfs is `nosuid,nodev,noexec`, but the merged root is not claimed globally `noexec`."
+          if text.count(actual) != 1:
+              raise SystemExit(f"README actual COW backing sentence: expected one match, got {text.count(actual)}")
+          p.write_text(text.replace(actual, expected, 1))
+          PY
+          python3 .github/tmp-31a-claims.py
       - name: Enable user namespace capability tests
         run: |
           if [ -e /proc/sys/kernel/unprivileged_userns_clone ]; then

@@ -1,13 +1,11 @@
 #![cfg(target_os = "linux")]
 
 use security_lab::{
-    initialize_snapshot_trust_state, load_snapshot_trust_state_identity,
-    materialize_snapshot_store_object_persisted_trust_ed25519_atomic,
-    rotate_snapshot_trust_state, serialize_snapshot_archive, sign_snapshot_ed25519,
-    snapshot_trust_state_path, store_snapshot_archive_persisted_trust_ed25519_durable,
-    SnapshotArchiveLimits, SnapshotIdentityLimits, SnapshotTrustError, SnapshotTrustKey,
-    SnapshotTrustKeyId, SnapshotTrustKeyState, SnapshotTrustPolicy, SnapshotTrustStateError,
-    SnapshotTrustStateKey,
+    initialize_snapshot_trust_state, load_snapshot_trust_state_identity, rotate_snapshot_trust_state,
+    serialize_snapshot_archive, sign_snapshot_ed25519, snapshot_trust_state_path,
+    PersistedSnapshotTrust, SnapshotArchiveLimits, SnapshotIdentityLimits, SnapshotTrustError,
+    SnapshotTrustKey, SnapshotTrustKeyId, SnapshotTrustKeyState, SnapshotTrustPolicy,
+    SnapshotTrustStateError, SnapshotTrustStateKey,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -98,17 +96,18 @@ fn persisted_rotation_rejects_stale_policy_before_store_io_and_accepts_successor
         generation_one.identity()
     );
 
-    let first = store_snapshot_archive_persisted_trust_ed25519_durable(
-        &state_root,
-        &state_key,
-        &store,
-        &archive.bytes,
-        &generation_one,
-        old_id,
-        &old.signature,
-        archive_limits(),
-    )
-    .expect("generation-one signer is authorized by persisted state");
+    let generation_one_trust =
+        PersistedSnapshotTrust::new(&state_root, &state_key, &generation_one);
+    assert_eq!(generation_one_trust.policy_identity(), generation_one.identity());
+    let first = generation_one_trust
+        .store_archive_ed25519_durable(
+            &store,
+            &archive.bytes,
+            old_id,
+            &old.signature,
+            archive_limits(),
+        )
+        .expect("generation-one signer is authorized by persisted state");
     assert!(first.store.inserted);
     assert_eq!(first.store.identity, archive.identity);
     assert_eq!(first.trust.policy, generation_one.identity());
@@ -147,17 +146,15 @@ fn persisted_rotation_rejects_stale_policy_before_store_io_and_accepts_successor
     assert_eq!(retry.identity(), generation_two.identity());
 
     let missing_store = workspace.path().join("missing-store");
-    match store_snapshot_archive_persisted_trust_ed25519_durable(
-        &state_root,
-        &state_key,
-        &missing_store,
-        &archive.bytes,
-        &generation_one,
-        old_id,
-        &old.signature,
-        archive_limits(),
-    )
-    .expect_err("stale policy must fail before snapshot store access")
+    match generation_one_trust
+        .store_archive_ed25519_durable(
+            &missing_store,
+            &archive.bytes,
+            old_id,
+            &old.signature,
+            archive_limits(),
+        )
+        .expect_err("stale policy must fail before snapshot store access")
     {
         SnapshotTrustStateError::StalePolicy {
             persisted,
@@ -173,17 +170,17 @@ fn persisted_rotation_rejects_stale_policy_before_store_io_and_accepts_successor
         "stale policy must not create or inspect a missing snapshot store"
     );
 
-    match store_snapshot_archive_persisted_trust_ed25519_durable(
-        &state_root,
-        &state_key,
-        &missing_store,
-        &archive.bytes,
-        &generation_two,
-        old_id,
-        &old.signature,
-        archive_limits(),
-    )
-    .expect_err("persisted successor must still reject its revoked signer")
+    let generation_two_trust =
+        PersistedSnapshotTrust::new(&state_root, &state_key, &generation_two);
+    match generation_two_trust
+        .store_archive_ed25519_durable(
+            &missing_store,
+            &archive.bytes,
+            old_id,
+            &old.signature,
+            archive_limits(),
+        )
+        .expect_err("persisted successor must still reject its revoked signer")
     {
         SnapshotTrustStateError::Trust(SnapshotTrustError::RevokedSigner { key_id }) => {
             assert_eq!(key_id, old_id)
@@ -195,34 +192,30 @@ fn persisted_rotation_rejects_stale_policy_before_store_io_and_accepts_successor
         "revoked signer must fail before snapshot store access"
     );
 
-    let deduplicated = store_snapshot_archive_persisted_trust_ed25519_durable(
-        &state_root,
-        &state_key,
-        &store,
-        &archive.bytes,
-        &generation_two,
-        new_id,
-        &new.signature,
-        archive_limits(),
-    )
-    .expect("persisted successor authorizes the new signer");
+    let deduplicated = generation_two_trust
+        .store_archive_ed25519_durable(
+            &store,
+            &archive.bytes,
+            new_id,
+            &new.signature,
+            archive_limits(),
+        )
+        .expect("persisted successor authorizes the new signer");
     assert!(!deduplicated.store.inserted);
     assert_eq!(deduplicated.trust.policy, generation_two.identity());
     assert_eq!(deduplicated.trust.signer, new_id);
 
     let destination = workspace.path().join("restored");
-    let restored = materialize_snapshot_store_object_persisted_trust_ed25519_atomic(
-        &state_root,
-        &state_key,
-        &store,
-        archive.identity,
-        &destination,
-        &generation_two,
-        new_id,
-        &new.signature,
-        archive_limits(),
-    )
-    .expect("materialize through persisted successor trust state");
+    let restored = generation_two_trust
+        .materialize_store_object_ed25519_atomic(
+            &store,
+            archive.identity,
+            &destination,
+            new_id,
+            &new.signature,
+            archive_limits(),
+        )
+        .expect("materialize through persisted successor trust state");
     assert_eq!(restored.materialization.identity, archive.identity);
     assert_eq!(restored.trust.policy, generation_two.identity());
     assert_eq!(
@@ -287,17 +280,16 @@ fn authenticated_state_rejects_wrong_key_and_tampering_before_store_io() {
     fs::write(&state_path, bytes).expect("tamper trust state fixture");
 
     let missing_store = workspace.path().join("missing-store");
-    match store_snapshot_archive_persisted_trust_ed25519_durable(
-        &state_root,
-        &state_key,
-        &missing_store,
-        &archive.bytes,
-        &policy,
-        signer,
-        &evidence.signature,
-        archive_limits(),
-    )
-    .expect_err("tampered state must fail before snapshot store access")
+    let persisted = PersistedSnapshotTrust::new(&state_root, &state_key, &policy);
+    match persisted
+        .store_archive_ed25519_durable(
+            &missing_store,
+            &archive.bytes,
+            signer,
+            &evidence.signature,
+            archive_limits(),
+        )
+        .expect_err("tampered state must fail before snapshot store access")
     {
         SnapshotTrustStateError::AuthenticationFailed => {}
         other => panic!("unexpected tampered-state result: {other}"),

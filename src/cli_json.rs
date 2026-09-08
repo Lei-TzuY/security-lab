@@ -1,4 +1,4 @@
-use security_lab::{ChildOutcome, RunReport, SandboxError};
+use security_lab::{ChildOutcome, CowDiffEntry, RunReport, SandboxError};
 use std::fmt::Write as _;
 
 pub(crate) fn report_json(report: &RunReport) -> String {
@@ -12,6 +12,22 @@ pub(crate) fn report_json(report: &RunReport) -> String {
             output.push_str("\",\"truncated\":");
             output.push_str(if captured.truncated { "true" } else { "false" });
             output.push('}');
+        }
+        None => output.push_str("null"),
+    }
+    output.push_str(",\"cow_diff\":");
+    match &report.cow_diff {
+        Some(diff) => {
+            output.push_str("{\"encoded_bytes\":");
+            write!(&mut output, "{}", diff.encoded_bytes).expect("write to String cannot fail");
+            output.push_str(",\"entries\":[");
+            for (index, entry) in diff.entries.iter().enumerate() {
+                if index != 0 {
+                    output.push(',');
+                }
+                push_cow_diff_entry(&mut output, entry);
+            }
+            output.push_str("]}");
         }
         None => output.push_str("null"),
     }
@@ -97,6 +113,35 @@ pub(crate) fn outcome_exit_code(outcome: ChildOutcome) -> i32 {
     }
 }
 
+fn push_cow_diff_entry(output: &mut String, entry: &CowDiffEntry) {
+    let (kind, path) = match entry {
+        CowDiffEntry::UpsertFile { path, .. } => ("upsert_file", path),
+        CowDiffEntry::EnsureDirectory { path } => ("ensure_directory", path),
+        CowDiffEntry::Symlink { path, .. } => ("symlink", path),
+        CowDiffEntry::Remove { path } => ("remove", path),
+        CowDiffEntry::OpaqueDirectory { path } => ("opaque_directory", path),
+    };
+    output.push_str("{\"kind\":");
+    push_json_string(output, kind);
+    output.push_str(",\"path_encoding\":\"hex\",\"path\":\"");
+    push_hex(output, path);
+    output.push('\"');
+    match entry {
+        CowDiffEntry::UpsertFile { bytes, .. } => {
+            output.push_str(",\"data_encoding\":\"hex\",\"data\":\"");
+            push_hex(output, bytes);
+            output.push('\"');
+        }
+        CowDiffEntry::Symlink { target, .. } => {
+            output.push_str(",\"target_encoding\":\"hex\",\"target\":\"");
+            push_hex(output, target);
+            output.push('\"');
+        }
+        _ => {}
+    }
+    output.push('}');
+}
+
 fn push_bool(output: &mut String, value: bool) {
     output.push_str(if value { "true" } else { "false" });
 }
@@ -163,6 +208,7 @@ mod tests {
                 bytes: vec![0x00, 0x22, 0xff],
                 truncated: true,
             }),
+            cow_diff: None,
             reaped_descendants: 3,
             process_tree_usage: ProcessTreeUsage {
                 user_cpu_micros: 11,
@@ -174,7 +220,7 @@ mod tests {
 
         assert_eq!(
             report_json(&report),
-            "{\"ok\":true,\"outcome\":{\"kind\":\"exited\",\"code\":7},\"stdout\":{\"encoding\":\"hex\",\"data\":\"0022ff\",\"truncated\":true},\"reaped_descendants\":3,\"process_tree_usage\":{\"user_cpu_micros\":11,\"system_cpu_micros\":22,\"max_child_rss_kib\":33},\"enforcement\":{\"base_namespaces\":false,\"time_namespace_offsets\":false,\"hostname\":false,\"private_mount_propagation\":false,\"readonly_root\":false,\"copy_on_write_root\":false,\"chroot\":false,\"fd_sanitization\":false,\"private_procfs\":false,\"rlimits\":false,\"capabilities_reduced\":false,\"no_new_privs\":false,\"landlock\":false,\"seccomp\":false}}"
+            "{\"ok\":true,\"outcome\":{\"kind\":\"exited\",\"code\":7},\"stdout\":{\"encoding\":\"hex\",\"data\":\"0022ff\",\"truncated\":true},\"cow_diff\":null,\"reaped_descendants\":3,\"process_tree_usage\":{\"user_cpu_micros\":11,\"system_cpu_micros\":22,\"max_child_rss_kib\":33},\"enforcement\":{\"base_namespaces\":false,\"time_namespace_offsets\":false,\"hostname\":false,\"private_mount_propagation\":false,\"readonly_root\":false,\"copy_on_write_root\":false,\"chroot\":false,\"fd_sanitization\":false,\"private_procfs\":false,\"rlimits\":false,\"capabilities_reduced\":false,\"no_new_privs\":false,\"landlock\":false,\"seccomp\":false}}"
         );
     }
 
@@ -194,6 +240,7 @@ mod tests {
                 bytes: b"prefix".to_vec(),
                 truncated: true,
             }),
+            cow_diff: None,
             reaped_descendants: 1,
             process_tree_usage: ProcessTreeUsage::default(),
             enforcement: EnforcementReceipt::default(),

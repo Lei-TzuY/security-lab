@@ -156,6 +156,7 @@ pub(crate) fn compare(baseline: &SandboxPolicy, candidate: &SandboxPolicy) -> Au
         &mut changes,
     );
     compare_copy_on_write_root(baseline, candidate, &mut changes);
+    compare_copy_on_write_diff(baseline, candidate, &mut changes);
     compare_scratch(baseline, candidate, &mut changes);
     compare_optional_capability(
         "filesystem.read_only_volume",
@@ -445,6 +446,31 @@ fn compare_copy_on_write_root(
         ),
         (Some(base), Some(new)) => push_change(
             "filesystem.copy_on_write_root_bytes",
+            classify_allowance(base, new),
+            changes,
+        ),
+    }
+}
+
+fn compare_copy_on_write_diff(
+    baseline: &SandboxPolicy,
+    candidate: &SandboxPolicy,
+    changes: &mut Vec<Change>,
+) {
+    match (baseline.cow_diff_bytes, candidate.cow_diff_bytes) {
+        (None, None) => {}
+        (None, Some(_)) => push_change(
+            "filesystem.copy_on_write_diff_export",
+            DeltaClass::Widened,
+            changes,
+        ),
+        (Some(_), None) => push_change(
+            "filesystem.copy_on_write_diff_export",
+            DeltaClass::Reduced,
+            changes,
+        ),
+        (Some(base), Some(new)) => push_change(
+            "filesystem.copy_on_write_diff_bytes",
             classify_allowance(base, new),
             changes,
         ),

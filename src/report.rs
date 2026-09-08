@@ -38,6 +38,24 @@ pub struct CapturedOutput {
     pub truncated: bool,
 }
 
+/// One deterministic copy-on-write root change exported after launcher-owned tree teardown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CowDiffEntry {
+    UpsertFile { path: Vec<u8>, bytes: Vec<u8> },
+    EnsureDirectory { path: Vec<u8> },
+    Symlink { path: Vec<u8>, target: Vec<u8> },
+    Remove { path: Vec<u8> },
+    OpaqueDirectory { path: Vec<u8> },
+}
+
+/// Complete bounded change-set for an ephemeral copy-on-write root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CowDiff {
+    pub entries: Vec<CowDiffEntry>,
+    /// Bytes consumed by the canonical internal change-set encoding.
+    pub encoded_bytes: u64,
+}
+
 /// Kernel resource usage attributed to the terminated/waited-for sandbox process tree.
 ///
 /// CPU fields are cumulative `RUSAGE_CHILDREN` values observed by launcher-owned
@@ -88,6 +106,8 @@ pub struct RunReport {
     pub outcome: ChildOutcome,
     /// Present exactly when stdout was configured as `capture`.
     pub stdout: Option<CapturedOutput>,
+    /// Present exactly when `filesystem.cow_diff_bytes` requested a complete bounded COW export.
+    pub cow_diff: Option<CowDiff>,
     /// Additional orphaned descendants reaped by the launcher-owned PID 1 after the direct target terminated.
     pub reaped_descendants: u32,
     /// Kernel resource telemetry collected by namespace PID 1 only after the sandbox tree converges.

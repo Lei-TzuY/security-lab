@@ -9,13 +9,17 @@ pub(crate) fn run_report(
 }
 
 #[cfg(target_arch = "x86_64")]
+#[path = "linux_cow_diff.rs"]
+mod cow_diff;
+#[cfg(target_arch = "x86_64")]
 #[path = "linux_pid_lifecycle.rs"]
 mod pid_lifecycle;
 
 #[cfg(target_arch = "x86_64")]
 mod x86_64 {
+    use super::cow_diff::{CowDiffState, SharedCowDiff};
     use super::pid_lifecycle::{
-        self, LaunchErrorRecord, SharedTargetLifecycle, TargetLifecycleRecord,
+        self, CowDiffControl, LaunchErrorRecord, SharedTargetLifecycle, TargetLifecycleRecord,
         TargetSupervisionPhases,
     };
     use crate::policy::{StdioMode, StdioPolicy};
@@ -167,6 +171,7 @@ mod x86_64 {
     const PHASE_COW_OVERLAY_CREATE: u32 = 62;
     const PHASE_COW_OVERLAY_MOUNT: u32 = 63;
     const PHASE_COW_ROOT_ATTACH: u32 = 64;
+    const PHASE_COW_DIFF_EXPORT: u32 = 65;
 
     const SYS_LANDLOCK_CREATE_RULESET: libc::c_long = 444;
     const SYS_LANDLOCK_ADD_RULE: libc::c_long = 445;
@@ -983,6 +988,7 @@ mod x86_64 {
         root_fd: OwnedFd,
         root_path: CString,
         cow_root_size: Option<CString>,
+        cow_diff_requested: bool,
         executable_fd: OwnedFd,
         selected_handles: Vec<PreparedSelectedHandle>,
         selected_storage_floor: RawFd,
@@ -1405,6 +1411,7 @@ mod x86_64 {
                 root_fd,
                 root_path,
                 cow_root_size,
+                cow_diff_requested: policy.cow_diff_bytes.is_some(),
                 executable_fd,
                 selected_handles,
                 selected_storage_floor,
@@ -1452,6 +1459,7 @@ mod x86_64 {
         capture_read_fd: RawFd,
         capture_write_fd: RawFd,
         output_limit_fd: RawFd,
+        cow_diff_state: *mut CowDiffState,
         wall_clock_milliseconds: u64,
     }
 
@@ -1527,6 +1535,15 @@ mod x86_64 {
                 "cannot allocate shared target lifecycle state: {err}"
             ))
         })?;
+        let cow_diff = policy
+            .cow_diff_bytes
+            .map(SharedCowDiff::new)
+            .transpose()
+            .map_err(|err| {
+                SandboxError::SetupFailed(format!(
+                    "cannot allocate bounded copy-on-write diff state: {err}"
+                ))
+            })?;
         let output_limit_event = policy
             .stdout_total_bytes
             .map(|_| create_output_limit_eventfd())
@@ -1551,6 +1568,9 @@ mod x86_64 {
             capture_read_fd,
             capture_write_fd,
             output_limit_fd,
+            cow_diff_state: cow_diff
+                .as_ref()
+                .map_or(ptr::null_mut(), SharedCowDiff::raw),
             wall_clock_milliseconds: policy.wall_clock_milliseconds.unwrap_or(0),
         };
 
@@ -1601,6 +1621,7 @@ mod x86_64 {
             return decode_launch_error(launch_error).map(|outcome| RunReport {
                 outcome,
                 stdout: None,
+                cow_diff: None,
                 reaped_descendants: 0,
                 process_tree_usage: ProcessTreeUsage::default(),
                 enforcement: EnforcementReceipt::default(),
@@ -1623,9 +1644,11 @@ mod x86_64 {
             None => (None, false),
         };
         let outcome = resolve_lifecycle_outcome(&lifecycle_record, output_limit_observed)?;
+        let cow_diff = cow_diff.as_ref().map(SharedCowDiff::snapshot).transpose()?;
         Ok(RunReport {
             outcome,
             stdout,
+            cow_diff,
             reaped_descendants: lifecycle_record.reaped_descendants,
             process_tree_usage: ProcessTreeUsage {
                 user_cpu_micros: lifecycle_record.user_cpu_micros,
@@ -2551,7 +2574,7 @@ mod x86_64 {
         current_root_fd: RawFd,
         launch_error: *mut LaunchErrorRecord,
         error_exit_syscall: libc::c_long,
-    ) -> RawFd {
+    ) -> (RawFd, RawFd) {
         let lower_tree_fd = libc::syscall(
             libc::SYS_open_tree,
             current_root_fd,
@@ -2594,7 +2617,7 @@ mod x86_64 {
                 child_fail(launch_error, PHASE_ROOT_ATTACH, error_exit_syscall);
             }
             mark_enforcement(launch_error, ENFORCEMENT_READONLY_ROOT);
-            return lower_tree_fd;
+            return (lower_tree_fd, -1);
         };
 
         let state_fsfd = libc::syscall(
@@ -2757,11 +2780,16 @@ mod x86_64 {
         }
 
         close_setup_fd(work_fd);
-        close_setup_fd(upper_fd);
+        let retained_upper_fd = if prepared.cow_diff_requested {
+            upper_fd
+        } else {
+            close_setup_fd(upper_fd);
+            -1
+        };
         close_setup_fd(state_mount_fd);
         close_setup_fd(lower_tree_fd);
         mark_enforcement(launch_error, ENFORCEMENT_COW_ROOT);
-        overlay_fd
+        (overlay_fd, retained_upper_fd)
     }
 
     unsafe fn child_exec(
@@ -2777,6 +2805,7 @@ mod x86_64 {
             capture_read_fd,
             capture_write_fd,
             output_limit_fd,
+            cow_diff_state,
             wall_clock_milliseconds,
         } = control;
         if capture_read_fd >= FIRST_NON_STDIO_FD as RawFd && libc::close(capture_read_fd) == -1 {
@@ -2902,7 +2931,7 @@ mod x86_64 {
             seccomp.error_exit_syscall,
         );
 
-        let root_tree_fd = construct_final_root_or_fail(
+        let (root_tree_fd, cow_upper_fd) = construct_final_root_or_fail(
             prepared,
             current_root_fd,
             launch_error,
@@ -3007,6 +3036,10 @@ mod x86_64 {
             wall_clock_milliseconds,
             prepared.cancellation_fd.as_ref().map_or(-1, |fd| fd.raw()),
             output_limit_fd,
+            CowDiffControl {
+                upper_fd: cow_upper_fd,
+                state: cow_diff_state,
+            },
             TargetSupervisionPhases {
                 fork: PHASE_TARGET_FORK,
                 kill: PHASE_PROCESS_TREE_KILL,
@@ -3021,6 +3054,7 @@ mod x86_64 {
                 output_limit_pidfd: PHASE_OUTPUT_LIMIT_PIDFD,
                 output_limit_poll: PHASE_OUTPUT_LIMIT_POLL,
                 usage: PHASE_PROCESS_TREE_USAGE,
+                cow_diff_export: PHASE_COW_DIFF_EXPORT,
             },
         );
 
@@ -3805,6 +3839,7 @@ mod x86_64 {
             PHASE_COW_OVERLAY_CREATE => "copy-on-write root OverlayFS creation",
             PHASE_COW_OVERLAY_MOUNT => "copy-on-write root OverlayFS mount",
             PHASE_COW_ROOT_ATTACH => "copy-on-write final root attachment",
+            PHASE_COW_DIFF_EXPORT => "bounded copy-on-write diff export",
             _ => "unknown launch phase",
         };
         format!(

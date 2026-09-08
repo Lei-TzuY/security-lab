@@ -1,264 +1,12 @@
-from pathlib import Path
-
-
-def replace_one(path: str, old: str, new: str, label: str) -> None:
-    p = Path(path)
-    text = p.read_text()
-    count = text.count(old)
-    if count != 1:
-        raise SystemExit(f"{label}: expected exactly one match, got {count}")
-    p.write_text(text.replace(old, new, 1))
-
-
-replace_one(
-    "src/snapshot_trust_state.rs",
-    "use crate::snapshot_archive::{SnapshotArchiveLimits, SnapshotArchiveMaterializeReport};",
-    "use crate::snapshot_archive::SnapshotArchiveLimits;",
-    "remove unused archive report import",
-)
-
-replace_one(
-    "src/snapshot_trust_state.rs",
-    '''#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SnapshotTrustStateReceipt {
-    pub policy: SnapshotTrustPolicyIdentity,
-}
-''',
-    '''#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SnapshotTrustStateReceipt {
-    pub policy: SnapshotTrustPolicyIdentity,
-}
-
-/// One persisted trust-state authority reused by state-backed snapshot operations.
-///
-/// The context binds the host-owned authenticated state location/key to the exact
-/// caller-supplied trust-policy snapshot. Each operation still reopens, locks,
-/// authenticates, and compares persisted state before touching snapshot storage.
-pub struct SnapshotTrustStateContext<'a> {
-    state_root: &'a Path,
-    state_key: &'a SnapshotTrustStateKey,
-    policy: &'a SnapshotTrustPolicy,
-}
-
-impl<'a> SnapshotTrustStateContext<'a> {
-    pub fn new(
-        state_root: &'a Path,
-        state_key: &'a SnapshotTrustStateKey,
-        policy: &'a SnapshotTrustPolicy,
-    ) -> Self {
-        Self {
-            state_root,
-            state_key,
-            policy,
-        }
-    }
-}
-''',
-    "insert persisted trust context",
-)
-
-replace_one(
-    "src/snapshot_trust_state.rs",
-    '''pub fn store_snapshot_archive_persisted_trust_ed25519_durable(
-    state_root: &Path,
-    state_key: &SnapshotTrustStateKey,
-    store_root: &Path,
-    archive: &[u8],
-    policy: &SnapshotTrustPolicy,
-    signer: SnapshotTrustKeyId,
-    expected_signature: &[u8; SNAPSHOT_ED25519_SIGNATURE_BYTES],
-    limits: SnapshotArchiveLimits,
-) -> Result<SnapshotTrustedStorePutReport, SnapshotTrustStateError> {
-    #[cfg(target_os = "linux")]
-    {
-        let _guard = linux::lock_shared_and_validate(state_root, state_key, policy.identity())?;
-        Ok(store_snapshot_archive_trusted_ed25519_durable(
-            store_root,
-            archive,
-            policy,
-            signer,
-            expected_signature,
-            limits,
-        )?)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (
-            state_root,
-            state_key,
-            store_root,
-            archive,
-            policy,
-            signer,
-            expected_signature,
-            limits,
-        );
-        Err(SnapshotTrustStateError::UnsupportedPlatform(
-            "persisted snapshot trust operations currently require Linux flock and authenticated fd-relative state access"
-                .to_owned(),
-        ))
-    }
-}
-''',
-    '''pub fn store_snapshot_archive_persisted_trust_ed25519_durable(
-    context: &SnapshotTrustStateContext<'_>,
-    store_root: &Path,
-    archive: &[u8],
-    signer: SnapshotTrustKeyId,
-    expected_signature: &[u8; SNAPSHOT_ED25519_SIGNATURE_BYTES],
-    limits: SnapshotArchiveLimits,
-) -> Result<SnapshotTrustedStorePutReport, SnapshotTrustStateError> {
-    #[cfg(target_os = "linux")]
-    {
-        let _guard = linux::lock_shared_and_validate(
-            context.state_root,
-            context.state_key,
-            context.policy.identity(),
-        )?;
-        Ok(store_snapshot_archive_trusted_ed25519_durable(
-            store_root,
-            archive,
-            context.policy,
-            signer,
-            expected_signature,
-            limits,
-        )?)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (
-            context,
-            store_root,
-            archive,
-            signer,
-            expected_signature,
-            limits,
-        );
-        Err(SnapshotTrustStateError::UnsupportedPlatform(
-            "persisted snapshot trust operations currently require Linux flock and authenticated fd-relative state access"
-                .to_owned(),
-        ))
-    }
-}
-''',
-    "refactor persisted store API",
-)
-
-replace_one(
-    "src/snapshot_trust_state.rs",
-    '''pub fn materialize_snapshot_store_object_persisted_trust_ed25519_atomic(
-    state_root: &Path,
-    state_key: &SnapshotTrustStateKey,
-    store_root: &Path,
-    identity: SnapshotIdentity,
-    destination: &Path,
-    policy: &SnapshotTrustPolicy,
-    signer: SnapshotTrustKeyId,
-    expected_signature: &[u8; SNAPSHOT_ED25519_SIGNATURE_BYTES],
-    limits: SnapshotArchiveLimits,
-) -> Result<SnapshotTrustedMaterializeReport, SnapshotTrustStateError> {
-    #[cfg(target_os = "linux")]
-    {
-        let _guard = linux::lock_shared_and_validate(state_root, state_key, policy.identity())?;
-        Ok(materialize_snapshot_store_object_trusted_ed25519_atomic(
-            store_root,
-            identity,
-            destination,
-            policy,
-            signer,
-            expected_signature,
-            limits,
-        )?)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (
-            state_root,
-            state_key,
-            store_root,
-            identity,
-            destination,
-            policy,
-            signer,
-            expected_signature,
-            limits,
-        );
-        Err(SnapshotTrustStateError::UnsupportedPlatform(
-            "persisted snapshot trust operations currently require Linux flock and authenticated fd-relative state access"
-                .to_owned(),
-        ))
-    }
-}
-''',
-    '''pub fn materialize_snapshot_store_object_persisted_trust_ed25519_atomic(
-    context: &SnapshotTrustStateContext<'_>,
-    store_root: &Path,
-    identity: SnapshotIdentity,
-    destination: &Path,
-    signer: SnapshotTrustKeyId,
-    expected_signature: &[u8; SNAPSHOT_ED25519_SIGNATURE_BYTES],
-    limits: SnapshotArchiveLimits,
-) -> Result<SnapshotTrustedMaterializeReport, SnapshotTrustStateError> {
-    #[cfg(target_os = "linux")]
-    {
-        let _guard = linux::lock_shared_and_validate(
-            context.state_root,
-            context.state_key,
-            context.policy.identity(),
-        )?;
-        Ok(materialize_snapshot_store_object_trusted_ed25519_atomic(
-            store_root,
-            identity,
-            destination,
-            context.policy,
-            signer,
-            expected_signature,
-            limits,
-        )?)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (
-            context,
-            store_root,
-            identity,
-            destination,
-            signer,
-            expected_signature,
-            limits,
-        );
-        Err(SnapshotTrustStateError::UnsupportedPlatform(
-            "persisted snapshot trust operations currently require Linux flock and authenticated fd-relative state access"
-                .to_owned(),
-        ))
-    }
-}
-''',
-    "refactor persisted materialize API",
-)
-
-replace_one(
-    "src/lib.rs",
-    '''    store_snapshot_archive_persisted_trust_ed25519_durable, SnapshotTrustStateError,
-    SnapshotTrustStateKey, SnapshotTrustStateReceipt, SNAPSHOT_TRUST_STATE_KEY_BYTES,
-''',
-    '''    store_snapshot_archive_persisted_trust_ed25519_durable, SnapshotTrustStateContext,
-    SnapshotTrustStateError, SnapshotTrustStateKey, SnapshotTrustStateReceipt,
-    SNAPSHOT_TRUST_STATE_KEY_BYTES,
-''',
-    "export persisted trust context",
-)
-
-Path("tests/snapshot_trust_state.rs").write_text(r'''#![cfg(target_os = "linux")]
+#![cfg(target_os = "linux")]
 
 use security_lab::{
     initialize_snapshot_trust_state, load_snapshot_trust_state_identity,
-    materialize_snapshot_store_object_persisted_trust_ed25519_atomic,
-    rotate_snapshot_trust_state, serialize_snapshot_archive, sign_snapshot_ed25519,
-    snapshot_trust_state_path, store_snapshot_archive_persisted_trust_ed25519_durable,
-    SnapshotArchiveLimits, SnapshotIdentityLimits, SnapshotTrustKey, SnapshotTrustKeyId,
-    SnapshotTrustKeyState, SnapshotTrustPolicy, SnapshotTrustStateContext, SnapshotTrustStateError,
-    SnapshotTrustStateKey,
+    materialize_snapshot_store_object_persisted_trust_ed25519_atomic, rotate_snapshot_trust_state,
+    serialize_snapshot_archive, sign_snapshot_ed25519, snapshot_trust_state_path,
+    store_snapshot_archive_persisted_trust_ed25519_durable, SnapshotArchiveLimits,
+    SnapshotIdentityLimits, SnapshotTrustKey, SnapshotTrustKeyId, SnapshotTrustKeyState,
+    SnapshotTrustPolicy, SnapshotTrustStateContext, SnapshotTrustStateError, SnapshotTrustStateKey,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -310,8 +58,7 @@ fn identity_limits() -> SnapshotIdentityLimits {
 fn create_source(workspace: &Path) -> PathBuf {
     let source = workspace.join("source");
     fs::create_dir(&source).expect("create source root");
-    fs::write(source.join("payload"), b"persisted-trust-payload\n")
-        .expect("write source payload");
+    fs::write(source.join("payload"), b"persisted-trust-payload\n").expect("write source payload");
     source
 }
 
@@ -325,10 +72,8 @@ fn persisted_rotation_rejects_stale_policy_before_store_access_and_accepts_succe
     fs::create_dir(&store).expect("create store root");
 
     let archive = serialize_snapshot_archive(&source, archive_limits()).expect("serialize archive");
-    let old =
-        sign_snapshot_ed25519(&source, &[0x71; 32], identity_limits()).expect("sign old key");
-    let new =
-        sign_snapshot_ed25519(&source, &[0x72; 32], identity_limits()).expect("sign new key");
+    let old = sign_snapshot_ed25519(&source, &[0x71; 32], identity_limits()).expect("sign old key");
+    let new = sign_snapshot_ed25519(&source, &[0x72; 32], identity_limits()).expect("sign new key");
     assert_eq!(old.snapshot, archive.identity);
     assert_eq!(new.snapshot, archive.identity);
 
@@ -505,7 +250,10 @@ fn persisted_state_authentication_rejects_wrong_key_and_same_size_tamper() {
 
     let state_path = snapshot_trust_state_path(&state_root);
     let mut bytes = fs::read(&state_path).expect("read persisted state bytes");
-    assert!(bytes.len() > 20, "trust-state fixture must contain authenticated header");
+    assert!(
+        bytes.len() > 20,
+        "trust-state fixture must contain authenticated header"
+    );
     bytes[20] ^= 0x40;
     fs::write(&state_path, &bytes).expect("tamper persisted state without changing length");
     assert!(matches!(
@@ -566,4 +314,3 @@ fn stale_rotation_cannot_overwrite_newer_persisted_generation() {
         generation_two.identity()
     );
 }
-''')

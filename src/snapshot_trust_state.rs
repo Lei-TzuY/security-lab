@@ -1,5 +1,7 @@
-use crate::snapshot_archive::{SnapshotArchiveLimits, SnapshotArchiveMaterializeReport};
-use crate::snapshot_signature::{SNAPSHOT_ED25519_PUBLIC_KEY_BYTES, SNAPSHOT_ED25519_SIGNATURE_BYTES};
+use crate::snapshot_archive::SnapshotArchiveLimits;
+use crate::snapshot_signature::{
+    SNAPSHOT_ED25519_PUBLIC_KEY_BYTES, SNAPSHOT_ED25519_SIGNATURE_BYTES,
+};
 use crate::snapshot_trust::{
     materialize_snapshot_store_object_trusted_ed25519_atomic,
     store_snapshot_archive_trusted_ed25519_durable, SnapshotTrustError, SnapshotTrustKeyId,
@@ -50,6 +52,31 @@ impl fmt::Debug for SnapshotTrustStateKey {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SnapshotTrustStateReceipt {
     pub policy: SnapshotTrustPolicyIdentity,
+}
+
+/// One persisted trust-state authority reused by state-backed snapshot operations.
+///
+/// The context binds the host-owned authenticated state location/key to the exact
+/// caller-supplied trust-policy snapshot. Each operation still reopens, locks,
+/// authenticates, and compares persisted state before touching snapshot storage.
+pub struct SnapshotTrustStateContext<'a> {
+    state_root: &'a Path,
+    state_key: &'a SnapshotTrustStateKey,
+    policy: &'a SnapshotTrustPolicy,
+}
+
+impl<'a> SnapshotTrustStateContext<'a> {
+    pub fn new(
+        state_root: &'a Path,
+        state_key: &'a SnapshotTrustStateKey,
+        policy: &'a SnapshotTrustPolicy,
+    ) -> Self {
+        Self {
+            state_root,
+            state_key,
+            policy,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -210,22 +237,24 @@ pub fn rotate_snapshot_trust_state(
 /// durable store operation, so a cooperating rotation cannot overtake an
 /// operation after the persisted-policy gate has accepted it.
 pub fn store_snapshot_archive_persisted_trust_ed25519_durable(
-    state_root: &Path,
-    state_key: &SnapshotTrustStateKey,
+    context: &SnapshotTrustStateContext<'_>,
     store_root: &Path,
     archive: &[u8],
-    policy: &SnapshotTrustPolicy,
     signer: SnapshotTrustKeyId,
     expected_signature: &[u8; SNAPSHOT_ED25519_SIGNATURE_BYTES],
     limits: SnapshotArchiveLimits,
 ) -> Result<SnapshotTrustedStorePutReport, SnapshotTrustStateError> {
     #[cfg(target_os = "linux")]
     {
-        let _guard = linux::lock_shared_and_validate(state_root, state_key, policy.identity())?;
+        let _guard = linux::lock_shared_and_validate(
+            context.state_root,
+            context.state_key,
+            context.policy.identity(),
+        )?;
         Ok(store_snapshot_archive_trusted_ed25519_durable(
             store_root,
             archive,
-            policy,
+            context.policy,
             signer,
             expected_signature,
             limits,
@@ -234,11 +263,9 @@ pub fn store_snapshot_archive_persisted_trust_ed25519_durable(
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (
-            state_root,
-            state_key,
+            context,
             store_root,
             archive,
-            policy,
             signer,
             expected_signature,
             limits,
@@ -254,24 +281,26 @@ pub fn store_snapshot_archive_persisted_trust_ed25519_durable(
 /// policy gate runs before store-object inspection and remains locked until the
 /// materializer returns.
 pub fn materialize_snapshot_store_object_persisted_trust_ed25519_atomic(
-    state_root: &Path,
-    state_key: &SnapshotTrustStateKey,
+    context: &SnapshotTrustStateContext<'_>,
     store_root: &Path,
     identity: SnapshotIdentity,
     destination: &Path,
-    policy: &SnapshotTrustPolicy,
     signer: SnapshotTrustKeyId,
     expected_signature: &[u8; SNAPSHOT_ED25519_SIGNATURE_BYTES],
     limits: SnapshotArchiveLimits,
 ) -> Result<SnapshotTrustedMaterializeReport, SnapshotTrustStateError> {
     #[cfg(target_os = "linux")]
     {
-        let _guard = linux::lock_shared_and_validate(state_root, state_key, policy.identity())?;
+        let _guard = linux::lock_shared_and_validate(
+            context.state_root,
+            context.state_key,
+            context.policy.identity(),
+        )?;
         Ok(materialize_snapshot_store_object_trusted_ed25519_atomic(
             store_root,
             identity,
             destination,
-            policy,
+            context.policy,
             signer,
             expected_signature,
             limits,
@@ -280,12 +309,10 @@ pub fn materialize_snapshot_store_object_persisted_trust_ed25519_atomic(
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (
-            state_root,
-            state_key,
+            context,
             store_root,
             identity,
             destination,
-            policy,
             signer,
             expected_signature,
             limits,
@@ -433,8 +460,8 @@ mod linux {
         let root = open_root(state_root)?;
         let lock = open_lock(root.raw())?;
         lock_fd(lock.raw(), libc::LOCK_SH)?;
-        let (identity, _) =
-            read_state_optional(root.raw(), state_key)?.ok_or(SnapshotTrustStateError::NotInitialized)?;
+        let (identity, _) = read_state_optional(root.raw(), state_key)?
+            .ok_or(SnapshotTrustStateError::NotInitialized)?;
         Ok(identity)
     }
 
@@ -448,8 +475,8 @@ mod linux {
         let root = open_root(state_root)?;
         let lock = open_lock(root.raw())?;
         lock_fd(lock.raw(), libc::LOCK_EX)?;
-        let (persisted, state_fd) =
-            read_state_optional(root.raw(), state_key)?.ok_or(SnapshotTrustStateError::NotInitialized)?;
+        let (persisted, state_fd) = read_state_optional(root.raw(), state_key)?
+            .ok_or(SnapshotTrustStateError::NotInitialized)?;
 
         if persisted == next {
             sync_fd(state_fd.raw(), "sync converged snapshot trust state")?;
@@ -474,8 +501,8 @@ mod linux {
         let root = open_root(state_root)?;
         let lock = open_lock(root.raw())?;
         lock_fd(lock.raw(), libc::LOCK_SH)?;
-        let (persisted, _) =
-            read_state_optional(root.raw(), state_key)?.ok_or(SnapshotTrustStateError::NotInitialized)?;
+        let (persisted, _) = read_state_optional(root.raw(), state_key)?
+            .ok_or(SnapshotTrustStateError::NotInitialized)?;
         if persisted != supplied {
             return Err(SnapshotTrustStateError::StalePolicy {
                 persisted,
@@ -646,8 +673,12 @@ mod linux {
 
     fn unique_temp_name() -> CString {
         let sequence = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
-        CString::new(format!(".trust-state.tmp.{}.{}", std::process::id(), sequence))
-            .expect("generated trust-state temp filename has no NUL")
+        CString::new(format!(
+            ".trust-state.tmp.{}.{}",
+            std::process::id(),
+            sequence
+        ))
+        .expect("generated trust-state temp filename has no NUL")
     }
 
     fn create_temp(root_fd: RawFd, name: &CString) -> Result<OwnedFd, SnapshotTrustStateError> {
@@ -655,11 +686,7 @@ mod linux {
             libc::openat(
                 root_fd,
                 name.as_ptr(),
-                libc::O_WRONLY
-                    | libc::O_CREAT
-                    | libc::O_EXCL
-                    | libc::O_CLOEXEC
-                    | libc::O_NOFOLLOW,
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
                 0o600,
             )
         };
@@ -726,12 +753,7 @@ mod linux {
                 return Err(io_error("install initial snapshot trust state", error));
             }
         } else if unsafe {
-            libc::renameat(
-                root_fd,
-                temp_name.as_ptr(),
-                root_fd,
-                state_name.as_ptr(),
-            )
+            libc::renameat(root_fd, temp_name.as_ptr(), root_fd, state_name.as_ptr())
         } != 0
         {
             return Err(io_error(

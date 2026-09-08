@@ -139,8 +139,9 @@ mod imp {
         pub fn bind(path: impl AsRef<Path>) -> Result<Self, RuntimeFdBrokerError> {
             let path = path.as_ref();
             validate_socket_path(path)?;
-            let listener = UnixListener::bind(path)
-                .map_err(|error| RuntimeFdBrokerError::io("cannot bind runtime FD broker", error))?;
+            let listener = UnixListener::bind(path).map_err(|error| {
+                RuntimeFdBrokerError::io("cannot bind runtime FD broker", error)
+            })?;
             let metadata = std::fs::symlink_metadata(path).map_err(|error| {
                 RuntimeFdBrokerError::io("cannot inspect runtime FD broker socket", error)
             })?;
@@ -378,8 +379,7 @@ mod imp {
                 std::io::Error::last_os_error(),
             ));
         }
-        if reopened_flags & libc::O_PATH != 0
-            || reopened_flags & libc::O_ACCMODE != libc::O_RDONLY
+        if reopened_flags & libc::O_PATH != 0 || reopened_flags & libc::O_ACCMODE != libc::O_RDONLY
         {
             return Err(RuntimeFdBrokerError::Protocol(
                 "runtime FD broker failed to attenuate source to O_RDONLY".to_owned(),

@@ -1,8 +1,8 @@
 #![cfg(target_os = "linux")]
 
 use security_lab::{
-    serialize_snapshot_archive, sign_snapshot_ed25519, SnapshotArchiveLimits, SnapshotIdentityLimits,
-    SNAPSHOT_ED25519_SIGNING_KEY_BYTES,
+    serialize_snapshot_archive, sign_snapshot_ed25519, SnapshotArchiveLimits,
+    SnapshotIdentityLimits, SNAPSHOT_ED25519_SIGNING_KEY_BYTES,
 };
 use std::fmt::Write as _;
 use std::fs;
@@ -185,11 +185,9 @@ fn credential_files_require_exact_lengths() {
         archive_limits().max_archive_bytes,
     );
     assert_eq!(key_output.status.code(), Some(1));
-    assert!(
-        String::from_utf8(key_output.stderr)
-            .expect("utf8 key stderr")
-            .contains("must contain exactly 32 bytes")
-    );
+    assert!(String::from_utf8(key_output.stderr)
+        .expect("utf8 key stderr")
+        .contains("must contain exactly 32 bytes"));
     assert!(!key_destination.exists());
 
     let signing_seed = [0x42; SNAPSHOT_ED25519_SIGNING_KEY_BYTES];
@@ -204,11 +202,9 @@ fn credential_files_require_exact_lengths() {
         archive_limits().max_archive_bytes,
     );
     assert_eq!(signature_output.status.code(), Some(1));
-    assert!(
-        String::from_utf8(signature_output.stderr)
-            .expect("utf8 signature stderr")
-            .contains("must contain exactly 64 bytes")
-    );
+    assert!(String::from_utf8(signature_output.stderr)
+        .expect("utf8 signature stderr")
+        .contains("must contain exactly 64 bytes"));
     assert!(!signature_destination.exists());
 }
 

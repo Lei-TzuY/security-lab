@@ -1763,6 +1763,38 @@ _start:
 
 .copy_on_write_root:
     sub $32, %rsp
+
+    # Metadata-only mutation must still leave a self-contained upper regular
+    # file for the post-run exporter (metacopy is forced off by the launcher).
+    mov $257, %eax
+    mov $-100, %edi
+    lea cow_meta_path(%rip), %rsi
+    xor %edx, %edx
+    xor %r10d, %r10d
+    syscall
+    test %rax, %rax
+    js .fail48_cow_stack
+    mov %rax, %r13
+    mov $91, %eax
+    mov %r13, %rdi
+    mov $416, %esi
+    syscall
+    test %rax, %rax
+    js .fail48_cow_stack
+    mov $3, %eax
+    mov %r13, %rdi
+    syscall
+    test %rax, %rax
+    js .fail48_cow_stack
+
+    # A lower/merged directory rename must not be represented through an
+    # OverlayFS redirect xattr because redirect_dir is forced to nofollow.
+    mov $82, %eax
+    lea cow_dir_path(%rip), %rdi
+    lea cow_renamed_path(%rip), %rsi
+    syscall
+    cmp $-18, %rax
+    jne .fail48_cow_stack
     mov $257, %eax
     mov $-100, %edi
     lea cow_base_path(%rip), %rsi
@@ -2725,6 +2757,12 @@ writable_volume_message:
 .set writable_volume_message_len, . - writable_volume_message
 cow_base_path:
     .asciz "/cow-base"
+cow_meta_path:
+    .asciz "/cow-meta"
+cow_dir_path:
+    .asciz "/cow-dir"
+cow_renamed_path:
+    .asciz "/cow-renamed"
 cow_child_path:
     .asciz "/cow-dir/child"
 cow_new_path:

@@ -2749,6 +2749,22 @@ mod x86_64 {
             launch_error,
             error_exit_syscall,
         );
+        fsconfig_string_or_fail(
+            overlay_fsfd,
+            b"metacopy\0",
+            b"off\0".as_ptr().cast::<libc::c_char>(),
+            PHASE_COW_OVERLAY_CREATE,
+            launch_error,
+            error_exit_syscall,
+        );
+        fsconfig_string_or_fail(
+            overlay_fsfd,
+            b"redirect_dir\0",
+            b"nofollow\0".as_ptr().cast::<libc::c_char>(),
+            PHASE_COW_OVERLAY_CREATE,
+            launch_error,
+            error_exit_syscall,
+        );
         if libc::syscall(
             libc::SYS_fsconfig,
             overlay_fsfd,
@@ -3910,6 +3926,7 @@ mod x86_64 {
             "exit" => libc::SYS_exit,
             "tgkill" => libc::SYS_tgkill,
             "openat" => libc::SYS_openat,
+            "fchmod" => libc::SYS_fchmod,
             "rename" => libc::SYS_rename,
             "mkdir" => libc::SYS_mkdir,
             "rmdir" => libc::SYS_rmdir,

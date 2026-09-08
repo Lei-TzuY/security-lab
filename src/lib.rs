@@ -10,6 +10,7 @@ pub mod policy;
 pub mod report;
 mod snapshot_auth;
 mod snapshot_identity;
+mod snapshot_signature;
 
 use std::error::Error;
 use std::fmt;
@@ -33,6 +34,11 @@ pub use snapshot_auth::{
 };
 pub use snapshot_identity::{
     snapshot_sha256, SnapshotIdentity, SnapshotIdentityError, SnapshotIdentityLimits,
+};
+pub use snapshot_signature::{
+    sign_snapshot_ed25519, verify_snapshot_ed25519, SnapshotEd25519Error, SnapshotEd25519Signature,
+    SNAPSHOT_ED25519_PUBLIC_KEY_BYTES, SNAPSHOT_ED25519_SIGNATURE_BYTES,
+    SNAPSHOT_ED25519_SIGNING_KEY_BYTES,
 };
 
 #[derive(Debug)]

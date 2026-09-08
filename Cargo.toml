@@ -23,3 +23,7 @@ path = "src/authority_delta_main.rs"
 [[bin]]
 name = "security-lab-runtime-receipt-gate"
 path = "src/runtime_receipt_gate_main.rs"
+
+[[bin]]
+name = "security-lab-snapshot-publish"
+path = "src/snapshot_publish_main.rs"

@@ -30,7 +30,9 @@ fn main() {
 
 fn run(args: Vec<OsString>) -> Result<(), CliError> {
     if args.len() != 8 {
-        return Err(CliError::Usage(usage(args.first().map(OsString::as_os_str))));
+        return Err(CliError::Usage(usage(
+            args.first().map(OsString::as_os_str),
+        )));
     }
 
     let archive_path = PathBuf::from(&args[1]);
@@ -38,28 +40,16 @@ fn run(args: Vec<OsString>) -> Result<(), CliError> {
     let signature_path = PathBuf::from(&args[3]);
     let destination = PathBuf::from(&args[4]);
     let limits = SnapshotArchiveLimits {
-        max_archive_bytes: parse_limit(
-            &args[5],
-            "max-archive-bytes",
-            MAX_ARCHIVE_BYTES,
-        )?,
-        max_identity_bytes: parse_limit(
-            &args[6],
-            "max-identity-bytes",
-            MAX_IDENTITY_BYTES,
-        )?,
+        max_archive_bytes: parse_limit(&args[5], "max-archive-bytes", MAX_ARCHIVE_BYTES)?,
+        max_identity_bytes: parse_limit(&args[6], "max-identity-bytes", MAX_IDENTITY_BYTES)?,
         max_nodes: parse_limit(&args[7], "max-nodes", MAX_ARCHIVE_NODES)?,
     };
 
     let archive = read_bounded(&archive_path, limits.max_archive_bytes, "archive")?;
-    let public_key = read_exact::<SNAPSHOT_ED25519_PUBLIC_KEY_BYTES>(
-        &public_key_path,
-        "Ed25519 public key",
-    )?;
-    let signature = read_exact::<SNAPSHOT_ED25519_SIGNATURE_BYTES>(
-        &signature_path,
-        "Ed25519 signature",
-    )?;
+    let public_key =
+        read_exact::<SNAPSHOT_ED25519_PUBLIC_KEY_BYTES>(&public_key_path, "Ed25519 public key")?;
+    let signature =
+        read_exact::<SNAPSHOT_ED25519_SIGNATURE_BYTES>(&signature_path, "Ed25519 signature")?;
 
     let report = materialize_snapshot_archive_ed25519_atomic(
         &archive,
@@ -105,13 +95,19 @@ fn parse_limit(value: &OsStr, label: &'static str, maximum: u64) -> Result<u64, 
 
 fn read_bounded(path: &Path, maximum: u64, label: &str) -> Result<Vec<u8>, CliError> {
     let file = File::open(path).map_err(|error| {
-        CliError::Failure(format!("failed to open {label} {}: {error}", path.display()))
+        CliError::Failure(format!(
+            "failed to open {label} {}: {error}",
+            path.display()
+        ))
     })?;
     let mut bytes = Vec::new();
     file.take(maximum + 1)
         .read_to_end(&mut bytes)
         .map_err(|error| {
-            CliError::Failure(format!("failed to read {label} {}: {error}", path.display()))
+            CliError::Failure(format!(
+                "failed to read {label} {}: {error}",
+                path.display()
+            ))
         })?;
     if bytes.len() as u64 > maximum {
         return Err(CliError::Failure(format!(
@@ -124,13 +120,19 @@ fn read_bounded(path: &Path, maximum: u64, label: &str) -> Result<Vec<u8>, CliEr
 
 fn read_exact<const N: usize>(path: &Path, label: &str) -> Result<[u8; N], CliError> {
     let file = File::open(path).map_err(|error| {
-        CliError::Failure(format!("failed to open {label} {}: {error}", path.display()))
+        CliError::Failure(format!(
+            "failed to open {label} {}: {error}",
+            path.display()
+        ))
     })?;
     let mut bytes = Vec::new();
     file.take(N as u64 + 1)
         .read_to_end(&mut bytes)
         .map_err(|error| {
-            CliError::Failure(format!("failed to read {label} {}: {error}", path.display()))
+            CliError::Failure(format!(
+                "failed to read {label} {}: {error}",
+                path.display()
+            ))
         })?;
     if bytes.len() != N {
         return Err(CliError::Failure(format!(

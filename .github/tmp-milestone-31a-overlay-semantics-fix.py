@@ -170,6 +170,29 @@ replace_one(
     "COW host-lower metadata preservation evidence",
 )
 
+# The budget-overflow test reuses raw mode z. Keep its fail-closed assertion,
+# but explicitly grant the new oracle syscalls so it reaches diff export rather
+# than terminating early in target behavior.
+replace_one(
+    "tests/sandbox.rs",
+    '''        &[
+            "execveat", "openat", "read", "write", "close", "unlink", "exit",
+        ],
+    );
+    cow.cow_root_bytes = Some(SCRATCH_BYTES);
+    cow.cow_diff_bytes = Some(64);
+''',
+    '''        &[
+            "execveat", "openat", "read", "write", "close", "fchmod", "rename", "unlink",
+            "exit",
+        ],
+    );
+    cow.cow_root_bytes = Some(SCRATCH_BYTES);
+    cow.cow_diff_bytes = Some(64);
+''',
+    "COW overflow oracle syscall grants",
+)
+
 # Exercise metadata-only copy-up and require lower-directory rename to retain
 # EXDEV semantics, proving redirect_dir is not silently encoding topology in
 # an xattr the exporter intentionally omits.

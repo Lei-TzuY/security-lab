@@ -848,6 +848,25 @@ Boundary: 34A is an optimistic precondition for a trusted/stable base. It does n
 
 After 34A integrates, seal expected-digest API aliases and mismatch variants. A materially stronger COW-lifecycle slice must close the identity-check-to-replay race with an executable frozen/immutable snapshot mechanism, add independently evidenced authenticity/provenance, or introduce separately specified durability/versioned-publication semantics; none may be inferred from 34A.
 
+## Independent host-local IPC frontier — post-launch object transfer
+
+### Receive-only SCM_RIGHTS over the exact-path AF_UNIX broker
+
+**Current verified candidate.** This is a materially new runtime object-capability handoff, not another AF_UNIX address spelling and not a new configuration-only broker name.
+
+Acceptance evidence is executable:
+
+- target seccomp may now explicitly name Linux x86_64 `recvmsg`; `sendmsg` is intentionally not added to the target syscall-name surface;
+- the capability channel reuses the existing exact host-path AF_UNIX stream broker and its optional exact `SO_PEERCRED` UID/GID narrowing rather than attaching a new host IPC namespace or exposing the host pathname inside chroot;
+- a raw target publishes one readiness byte from executed target code on broker fd 10; only after the host peer reads that byte does it call real `sendmsg(SCM_RIGHTS)` with one regular-file descriptor, proving the object handoff occurs after target exec rather than being preloaded before launch;
+- the raw target calls `recvmsg(..., MSG_CMSG_CLOEXEC)`, requires a non-truncated `SOL_SOCKET` / `SCM_RIGHTS` control message containing exactly one descriptor, reads exact `runtime-fd-handoff-ok\n` bytes through that descriptor, and closes it;
+- the same target then attempts the original absolute host file pathname and requires exact `ENOENT`, proving the descriptor grant does not make that host pathname reachable through the sandbox root;
+- existing broker, namespace, Landlock, seccomp, lifecycle, COW, and authority regressions remain active; exact candidate stable format/Clippy/full tests and the full Rust 1.74 suite are green.
+
+Boundary: this slice is receive-only target-side capability transfer over one already-authorized connected AF_UNIX stream. It does not add target `sendmsg`, a launcher-owned post-launch broker API, descriptor-rights attenuation/revocation, object-type policy for arbitrary received FDs, multiple broker channels, or a general bidirectional IPC/RPC graph. The peer UID/GID pin is kernel credential evidence, not cryptographic service identity.
+
+Promotion rule: do not farm additional payload bytes, target descriptor numbers, or ancillary-message spelling variants. A stronger host-local IPC phase must add materially new mediation such as bounded object-type/rights policy, launcher-owned dynamic brokering, revocation/lifetime control, or a generalized endpoint/object graph with executable evidence.
+
 ## Later frontiers
 
-Supplementary-group isolation with a viable mapping architecture, broader/generalized persistent-volume policy, routed/broader network authority beyond the bounded IPv4 brokers, generalized host-local IPC authority beyond the exact-path/peer-credential broker, and delegated aggregate cgroup accounting remain separate evidence-backed frontiers. Do not add configuration-only names without executable kernel behavior and integration evidence.
+Supplementary-group isolation with a viable mapping architecture, broader/generalized persistent-volume policy, routed/broader network authority beyond the bounded IPv4 brokers, broader host-local IPC mediation beyond the bounded receive-only SCM_RIGHTS handoff, and delegated aggregate cgroup accounting remain separate evidence-backed frontiers. Do not add configuration-only names without executable kernel behavior and integration evidence.

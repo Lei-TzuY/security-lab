@@ -1,3 +1,5 @@
+#[cfg(target_os = "linux")]
+use crate::snapshot_identity::CanonicalHasher;
 use crate::snapshot_identity::{
     snapshot_sha256, SnapshotIdentity, SnapshotIdentityError, SnapshotIdentityLimits,
 };
@@ -29,7 +31,8 @@ pub struct CowDiffApplyReport {
 /// Evidence returned when replay was gated by an expected canonical base identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CowDiffApplyBoundReport {
-    /// Canonical identity observed immediately before replay setup began.
+    /// Canonical identity derived from the exact metadata and bytes copied into
+    /// the private replay staging tree before diff replay begins.
     pub base_identity: SnapshotIdentity,
     /// Existing bounded/failure-atomic replay accounting.
     pub replay: CowDiffApplyReport,
@@ -135,13 +138,17 @@ pub fn apply_cow_diff_atomic(
 }
 
 /// Replay `diff` only when the current canonical identity of `base` matches
-/// `expected_base`. The identity check is completed before destination inspection
-/// or replay staging begins. A mismatch therefore cannot publish or stage a tree.
+/// `expected_base` both before replay setup and again after the base has been
+/// materialized into the private staging tree. The first gate preserves the 34A
+/// fail-fast ordering: a stale expected identity is rejected before destination
+/// inspection or staging creation. During the copy, the same canonical identity
+/// stream is derived from the opened object modes, symlink targets, and exact regular-file
+/// bytes written into staging. The second gate therefore binds replay to the actual
+/// materialized input rather than reopening staging through pathname permissions.
 ///
-/// This is an optimistic trusted-base precondition, not hostile-writer locking:
-/// callers must not infer protection against a concurrent mutation after the
-/// identity scan and before/during replay. The SHA-256 identity is also not an
-/// authenticity or provenance statement.
+/// This does not lock the hostile source tree while it is being copied: replay proceeds
+/// only when the completed materialized stream itself matches `expected_base`.
+/// The SHA-256 identity is also not an authenticity or provenance statement.
 pub fn apply_cow_diff_atomic_with_expected_base(
     base: &Path,
     destination: &Path,
@@ -151,20 +158,38 @@ pub fn apply_cow_diff_atomic_with_expected_base(
     replay_limits: CowDiffApplyLimits,
 ) -> Result<CowDiffApplyBoundReport, CowDiffApplyError> {
     validate_limits(replay_limits)?;
-    let actual = snapshot_sha256(base, identity_limits)
+    let initial = snapshot_sha256(base, identity_limits)
         .map_err(|source| CowDiffApplyError::BaseIdentity { source })?;
-    if actual.sha256 != expected_base.sha256 {
+    if initial.sha256 != expected_base.sha256 {
         return Err(CowDiffApplyError::BaseIdentityMismatch {
             expected: expected_base,
-            actual,
+            actual: initial,
         });
     }
 
-    let replay = apply_cow_diff_atomic(base, destination, diff, replay_limits)?;
-    Ok(CowDiffApplyBoundReport {
-        base_identity: actual,
-        replay,
-    })
+    #[cfg(target_os = "linux")]
+    {
+        let (replay, materialized) = linux::apply_with_verified_base(
+            base,
+            destination,
+            diff,
+            expected_base,
+            identity_limits,
+            replay_limits,
+        )?;
+        Ok(CowDiffApplyBoundReport {
+            base_identity: materialized,
+            replay,
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (destination, diff, expected_base, identity_limits);
+        Err(CowDiffApplyError::UnsupportedPlatform(
+            "atomic replay requires Linux renameat2 and fd-relative filesystem operations"
+                .to_owned(),
+        ))
+    }
 }
 
 fn validate_limits(limits: CowDiffApplyLimits) -> Result<(), CowDiffApplyError> {
@@ -304,6 +329,37 @@ mod linux {
         diff: &CowDiff,
         limits: CowDiffApplyLimits,
     ) -> Result<CowDiffApplyReport, CowDiffApplyError> {
+        let (report, materialized) = apply_inner(base, destination, diff, limits, None)?;
+        debug_assert!(materialized.is_none());
+        Ok(report)
+    }
+
+    pub(super) fn apply_with_verified_base(
+        base: &Path,
+        destination: &Path,
+        diff: &CowDiff,
+        expected_base: SnapshotIdentity,
+        identity_limits: SnapshotIdentityLimits,
+        limits: CowDiffApplyLimits,
+    ) -> Result<(CowDiffApplyReport, SnapshotIdentity), CowDiffApplyError> {
+        let (report, materialized) = apply_inner(
+            base,
+            destination,
+            diff,
+            limits,
+            Some((expected_base, identity_limits)),
+        )?;
+        let materialized = materialized.expect("verified replay must return staging identity");
+        Ok((report, materialized))
+    }
+
+    fn apply_inner(
+        base: &Path,
+        destination: &Path,
+        diff: &CowDiff,
+        limits: CowDiffApplyLimits,
+        expected_materialized: Option<(SnapshotIdentity, SnapshotIdentityLimits)>,
+    ) -> Result<(CowDiffApplyReport, Option<SnapshotIdentity>), CowDiffApplyError> {
         if !base.is_absolute() || !destination.is_absolute() {
             return Err(CowDiffApplyError::InvalidInput(
                 "base and destination must be absolute host paths".to_owned(),
@@ -352,16 +408,37 @@ mod linux {
             if unsafe { libc::fstat(base_fd.raw(), &mut root_stat) } == -1 {
                 return Err(io_error("stat base directory", io::Error::last_os_error()));
             }
+            let root_mode = (root_stat.st_mode & 0o7777) as u32;
             let mut directory_modes = BTreeMap::new();
-            directory_modes.insert(Vec::new(), (root_stat.st_mode & 0o7777) as u32);
+            directory_modes.insert(Vec::new(), root_mode);
+            let mut materialized_hasher = match expected_materialized {
+                Some((_, identity_limits)) => {
+                    let mut identity = identity_result(CanonicalHasher::new(identity_limits))?;
+                    identity_result(identity.consume_node())?;
+                    identity_result(identity.record_directory(b"/", root_mode))?;
+                    Some(identity)
+                }
+                None => None,
+            };
             copy_directory(
                 base_fd.raw(),
                 staging_fd.raw(),
                 &mut budget,
                 &mut directory_modes,
+                materialized_hasher.as_mut(),
                 &[],
                 0,
             )?;
+
+            let materialized_identity = materialized_hasher.map(CanonicalHasher::finish);
+            if let (Some((expected, _)), Some(actual)) =
+                (expected_materialized, materialized_identity)
+            {
+                if actual.sha256 != expected.sha256 {
+                    return Err(CowDiffApplyError::BaseIdentityMismatch { expected, actual });
+                }
+            }
+
             apply_entries(
                 staging_fd.raw(),
                 diff,
@@ -374,7 +451,7 @@ mod linux {
                 staging_name.as_c_str(),
                 destination_name.as_c_str(),
             )?;
-            Ok(budget.report())
+            Ok((budget.report(), materialized_identity))
         })();
 
         if let Err(primary) = replay_result {
@@ -609,6 +686,7 @@ mod linux {
         destination_fd: RawFd,
         budget: &mut Budget,
         directory_modes: &mut BTreeMap<Vec<u8>, u32>,
+        mut identity: Option<&mut CanonicalHasher>,
         relative: &[u8],
         depth: usize,
     ) -> Result<(), CowDiffApplyError> {
@@ -617,9 +695,11 @@ mod linux {
                 "base snapshot exceeds the 64-level replay depth ceiling".to_owned(),
             ));
         }
-        for name in read_directory_names_bounded(source_fd, Some(budget))? {
+        for name in read_directory_names_bounded(source_fd, Some(budget), identity.as_deref_mut())?
+        {
             let name_c = CString::new(name.clone()).expect("directory entry has no embedded NUL");
             let child_relative = join_relative(relative, &name);
+            let absolute_path = absolute_snapshot_path(&child_relative);
             let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
             if unsafe {
                 libc::fstatat(
@@ -648,17 +728,34 @@ mod linux {
                         name_c.as_c_str(),
                         "open base child directory",
                     )?;
+                    let mut current = unsafe { std::mem::zeroed::<libc::stat>() };
+                    if unsafe { libc::fstat(source_child.raw(), &mut current) } == -1 {
+                        return Err(io_error(
+                            "stat opened base child directory",
+                            io::Error::last_os_error(),
+                        ));
+                    }
+                    if current.st_mode & libc::S_IFMT != libc::S_IFDIR {
+                        return Err(CowDiffApplyError::InvalidInput(
+                            "base directory changed type during replay materialization".to_owned(),
+                        ));
+                    }
+                    let mode = (current.st_mode & 0o7777) as u32;
+                    if let Some(identity) = identity.as_deref_mut() {
+                        identity_result(identity.record_directory(&absolute_path, mode))?;
+                    }
                     let destination_child = open_child_directory(
                         destination_fd,
                         name_c.as_c_str(),
                         "open copied child directory",
                     )?;
-                    directory_modes.insert(child_relative.clone(), (stat.st_mode & 0o7777) as u32);
+                    directory_modes.insert(child_relative.clone(), mode);
                     copy_directory(
                         source_child.raw(),
                         destination_child.raw(),
                         budget,
                         directory_modes,
+                        identity.as_deref_mut(),
                         &child_relative,
                         depth + 1,
                     )?;
@@ -668,12 +765,20 @@ mod linux {
                         source_fd,
                         destination_fd,
                         name_c.as_c_str(),
-                        (stat.st_mode & 0o7777) as u32,
+                        &absolute_path,
                         budget,
+                        identity.as_deref_mut(),
                     )?;
                 }
                 libc::S_IFLNK => {
-                    copy_symlink(source_fd, destination_fd, name_c.as_c_str(), budget)?;
+                    copy_symlink(
+                        source_fd,
+                        destination_fd,
+                        name_c.as_c_str(),
+                        &absolute_path,
+                        budget,
+                        identity.as_deref_mut(),
+                    )?;
                 }
                 _ => {
                     return Err(CowDiffApplyError::InvalidInput(format!(
@@ -708,8 +813,9 @@ mod linux {
         source_parent: RawFd,
         destination_parent: RawFd,
         name: &std::ffi::CStr,
-        mode: u32,
+        path: &[u8],
         budget: &mut Budget,
+        mut identity: Option<&mut CanonicalHasher>,
     ) -> Result<(), CowDiffApplyError> {
         let source_fd = unsafe {
             libc::openat(
@@ -725,6 +831,25 @@ mod linux {
             ));
         }
         let source_fd = Fd(source_fd);
+        let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
+        if unsafe { libc::fstat(source_fd.raw(), &mut stat) } == -1 {
+            return Err(io_error(
+                "stat opened base regular file",
+                io::Error::last_os_error(),
+            ));
+        }
+        if stat.st_mode & libc::S_IFMT != libc::S_IFREG || stat.st_size < 0 {
+            return Err(CowDiffApplyError::InvalidInput(
+                "base regular file changed type or has invalid size during replay materialization"
+                    .to_owned(),
+            ));
+        }
+        let mode = (stat.st_mode & 0o7777) as u32;
+        let length = stat.st_size as u64;
+        if let Some(identity) = identity.as_deref_mut() {
+            identity_result(identity.begin_file(path, mode, length))?;
+        }
+
         let destination_fd = unsafe {
             libc::openat(
                 destination_parent,
@@ -740,27 +865,67 @@ mod linux {
             ));
         }
         let destination_fd = Fd(destination_fd);
+        let mut remaining = length;
         let mut buffer = [0u8; 8192];
-        loop {
+        while remaining > 0 {
+            let request = std::cmp::min(remaining, buffer.len() as u64) as usize;
+            let count = loop {
+                let count = unsafe {
+                    libc::read(
+                        source_fd.raw(),
+                        buffer.as_mut_ptr().cast::<libc::c_void>(),
+                        request,
+                    )
+                };
+                if count == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                break count;
+            };
+            if count == -1 {
+                return Err(io_error(
+                    "read base regular file",
+                    io::Error::last_os_error(),
+                ));
+            }
+            if count == 0 {
+                return Err(CowDiffApplyError::InvalidInput(
+                    "base regular file shrank during replay materialization".to_owned(),
+                ));
+            }
+            let bytes = &buffer[..count as usize];
+            budget.consume_base_bytes(count as u64)?;
+            write_all(destination_fd.raw(), bytes)?;
+            if let Some(identity) = identity.as_deref_mut() {
+                identity_result(identity.update(bytes))?;
+            }
+            remaining -= count as u64;
+        }
+
+        let mut extra = [0u8; 1];
+        let extra_count = loop {
             let count = unsafe {
                 libc::read(
                     source_fd.raw(),
-                    buffer.as_mut_ptr().cast::<libc::c_void>(),
-                    buffer.len(),
+                    extra.as_mut_ptr().cast::<libc::c_void>(),
+                    extra.len(),
                 )
             };
-            if count == -1 {
-                let error = io::Error::last_os_error();
-                if error.raw_os_error() == Some(libc::EINTR) {
-                    continue;
-                }
-                return Err(io_error("read base regular file", error));
+            if count == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
             }
-            if count == 0 {
-                break;
-            }
-            budget.consume_base_bytes(count as u64)?;
-            write_all(destination_fd.raw(), &buffer[..count as usize])?;
+            break count;
+        };
+        if extra_count == -1 {
+            return Err(io_error(
+                "verify base regular file length",
+                io::Error::last_os_error(),
+            ));
+        }
+        if extra_count != 0 {
+            return Err(CowDiffApplyError::InvalidInput(
+                "base regular file grew during replay materialization".to_owned(),
+            ));
         }
         if unsafe { libc::fchmod(destination_fd.raw(), mode as libc::mode_t) } == -1 {
             return Err(io_error(
@@ -775,7 +940,9 @@ mod linux {
         source_parent: RawFd,
         destination_parent: RawFd,
         name: &std::ffi::CStr,
+        path: &[u8],
         budget: &mut Budget,
+        identity: Option<&mut CanonicalHasher>,
     ) -> Result<(), CowDiffApplyError> {
         let mut target = [0u8; MAX_SYMLINK_TARGET_BYTES + 1];
         let count = unsafe {
@@ -801,6 +968,9 @@ mod linux {
         })?;
         if unsafe { libc::symlinkat(target.as_ptr(), destination_parent, name.as_ptr()) } == -1 {
             return Err(io_error("copy base symlink", io::Error::last_os_error()));
+        }
+        if let Some(identity) = identity {
+            identity_result(identity.record_symlink(path, target.as_bytes()))?;
         }
         Ok(())
     }
@@ -1049,7 +1219,7 @@ mod linux {
     }
 
     fn clear_directory(directory_fd: RawFd) -> Result<(), CowDiffApplyError> {
-        for name in read_directory_names_bounded(directory_fd, None)? {
+        for name in read_directory_names_bounded(directory_fd, None, None)? {
             let name = CString::new(name).expect("directory entry has no embedded NUL");
             remove_any(directory_fd, name.as_c_str())?;
         }
@@ -1059,6 +1229,7 @@ mod linux {
     fn read_directory_names_bounded(
         directory_fd: RawFd,
         mut base_budget: Option<&mut Budget>,
+        mut identity: Option<&mut CanonicalHasher>,
     ) -> Result<Vec<Vec<u8>>, CowDiffApplyError> {
         if unsafe { libc::lseek(directory_fd, 0, libc::SEEK_SET) } == -1 {
             return Err(io_error(
@@ -1120,6 +1291,9 @@ mod linux {
                         // buffering instead of applying only after collection.
                         budget.consume_base_node()?;
                     }
+                    if let Some(identity) = identity.as_deref_mut() {
+                        identity_result(identity.consume_node())?;
+                    }
                     names.push(name.to_vec());
                 }
                 offset += reclen;
@@ -1138,6 +1312,19 @@ mod linux {
         }
         result.extend_from_slice(name);
         result
+    }
+
+    fn absolute_snapshot_path(relative: &[u8]) -> Vec<u8> {
+        let mut result = Vec::with_capacity(relative.len() + 1);
+        result.push(b'/');
+        result.extend_from_slice(relative);
+        result
+    }
+
+    fn identity_result<T>(
+        result: Result<T, SnapshotIdentityError>,
+    ) -> Result<T, CowDiffApplyError> {
+        result.map_err(|source| CowDiffApplyError::BaseIdentity { source })
     }
 
     fn write_all(fd: RawFd, mut bytes: &[u8]) -> Result<(), CowDiffApplyError> {
@@ -1194,5 +1381,108 @@ mod linux {
 
     fn io_error(phase: &'static str, source: io::Error) -> CowDiffApplyError {
         CowDiffApplyError::Io { phase, source }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod verified_staging_tests {
+    use super::*;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    struct TempTree(PathBuf);
+
+    impl TempTree {
+        fn new() -> Self {
+            let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let root = std::env::temp_dir().join(format!(
+                "security-lab-verified-staging-{}-{id}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&root);
+            fs::create_dir(&root).expect("create verified-staging test root");
+            Self(root)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempTree {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn identity_limits() -> SnapshotIdentityLimits {
+        SnapshotIdentityLimits {
+            max_bytes: 1024 * 1024,
+            max_nodes: 1024,
+        }
+    }
+
+    fn replay_limits() -> CowDiffApplyLimits {
+        CowDiffApplyLimits {
+            max_bytes: 1024 * 1024,
+            max_nodes: 1024,
+        }
+    }
+
+    #[test]
+    fn materialized_identity_gate_rejects_base_change_after_initial_gate() {
+        let tree = TempTree::new();
+        let base = tree.path().join("base");
+        let destination = tree.path().join("snapshot");
+        fs::create_dir(&base).expect("create base");
+        fs::write(base.join("value"), b"expected\n").expect("write expected base");
+        let expected = snapshot_sha256(&base, identity_limits()).expect("hash expected base");
+
+        // This private entry point models the exact state immediately after the
+        // public 34A early gate has succeeded. A mutation here must be detected
+        // by the new materialized-staging gate before diff replay/publication.
+        fs::write(base.join("value"), b"mutated-after-first-gate\n")
+            .expect("mutate base after simulated first gate");
+        let mutated = snapshot_sha256(&base, identity_limits()).expect("hash mutated base");
+        assert_ne!(mutated.sha256, expected.sha256);
+
+        let empty = CowDiff {
+            entries: Vec::new(),
+            encoded_bytes: 6,
+        };
+        let error = linux::apply_with_verified_base(
+            &base,
+            &destination,
+            &empty,
+            expected,
+            identity_limits(),
+            replay_limits(),
+        )
+        .expect_err("materialized staging identity must reject post-gate base mutation");
+
+        match error {
+            CowDiffApplyError::BaseIdentityMismatch {
+                expected: observed_expected,
+                actual,
+            } => {
+                assert_eq!(observed_expected, expected);
+                assert_eq!(actual, mutated);
+            }
+            other => panic!("unexpected verified-staging failure: {other}"),
+        }
+        assert!(!destination.exists());
+        let residue = fs::read_dir(tree.path())
+            .expect("read verified-staging parent")
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .as_encoded_bytes()
+                    .starts_with(b".security-lab-cow-apply-")
+            });
+        assert!(!residue, "verified-staging mismatch left replay residue");
     }
 }

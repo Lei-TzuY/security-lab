@@ -831,7 +831,7 @@ Boundary: 33A is canonical SHA-256 identity evidence for the supported tree mode
 
 ### Slice 34A — expected-base identity gate
 
-**Current verified candidate.** Binds the 32A new-snapshot replay path to one explicitly supplied 33A canonical base identity without changing the legacy unbound replay API.
+**Status: complete on `main`.** Binds the 32A new-snapshot replay path to one explicitly supplied 33A canonical base identity without changing the legacy unbound replay API.
 
 Acceptance evidence is executable:
 
@@ -846,13 +846,36 @@ Boundary: 34A is an optimistic precondition for a trusted/stable base. It does n
 
 ### Milestone 34 promotion rule
 
-After 34A integrates, seal expected-digest API aliases and mismatch variants. A materially stronger COW-lifecycle slice must close the identity-check-to-replay race with an executable frozen/immutable snapshot mechanism, add independently evidenced authenticity/provenance, or introduce separately specified durability/versioned-publication semantics; none may be inferred from 34A.
+34A is sealed on `main`; do not farm expected-digest aliases or mismatch variants. The current promotion is 35A, which closes the check-to-replay mis-binding for the actual private replay input by requiring the completed materialized canonical identity to match before diff application. Stronger later work must add independently evidenced authenticity/provenance, a true frozen/serialized source snapshot, or separately specified durability/versioned-publication semantics.
+
+
+## Milestone 35 — materialized replay-input binding
+
+### Slice 35A — verified materialized base
+
+**Current verified candidate.** Binds expected-base replay to the exact supported metadata and bytes materialized into the private staging tree before diff application, rather than trusting only the earlier live-source scan.
+
+Acceptance evidence is executable:
+
+- the existing 34A early gate remains first: replay limits validate, then `snapshot_sha256(base, identity_limits)` must match before destination-parent inspection or staging creation, preserving fail-fast stale-base behavior;
+- after that gate, the 32A base-copy walk derives the same 33A canonical stream in sorted traversal order while it materializes staging, using opened directory/regular-file permission modes, exact symlink targets, and the exact regular-file bytes written to staging;
+- independent 33A identity byte/node ceilings remain fail-closed during materialization; opened regular files commit to one observed size and fail closed if they shrink or grow across the copy boundary;
+- the completed materialized `SnapshotIdentity` must match the caller-supplied expectation before any diff entry is applied. Mismatch returns `BaseIdentityMismatch`, removes the private staging tree, and publishes no destination;
+- successful checked replay returns the materialized replay-input identity plus the existing bounded replay accounting; the unbound `apply_cow_diff_atomic` API remains available with unchanged semantics;
+- a deterministic private regression models a source mutation after the first gate, requires materialized mismatch and zero staging residue, while the public 34A matching/early-mismatch regressions and the 33A fixed canonical SHA-256 vector remain active;
+- stable rustfmt/Clippy/full tests and the full Rust 1.74 suite are green on the exact implementation head.
+
+Boundary: 35A closes the 34A identity-check-to-replay **mis-binding for the input that is actually replayed**: diff application cannot begin unless the completed private materialization reproduces the expected supported-tree identity. It does not freeze, lock, or serialize the live source tree as a point-in-time filesystem snapshot while copying, does not add authenticity/provenance/attestation, and does not add durability/crash recovery or versioned publication. The identity model still omits UID/GID, timestamps, xattrs/ACLs, hard-link identity, and unsupported special nodes.
+
+### Milestone 35 promotion rule
+
+After 35A integrates, do not farm second-hash placements or identity API aliases. A stronger COW-lifecycle phase must add independently evidenced authenticity/provenance, a real frozen/serialized source snapshot, or separately specified durability/versioned publication. A separate architectural promotion may instead move to launcher-owned dynamic host-local IPC mediation; target-side self-inspection must not be relabeled as broker enforcement.
 
 ## Independent host-local IPC frontier — post-launch object transfer
 
 ### Receive-only SCM_RIGHTS over the exact-path AF_UNIX broker
 
-**Current verified candidate.** This is a materially new runtime object-capability handoff, not another AF_UNIX address spelling and not a new configuration-only broker name.
+**Status: complete on `main`.** This is a materially new runtime object-capability handoff, not another AF_UNIX address spelling and not a new configuration-only broker name.
 
 Acceptance evidence is executable:
 

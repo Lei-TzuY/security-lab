@@ -976,7 +976,7 @@ Boundary: 40A is a trusted host-local bounded object store. Mode `0444` is an AP
 
 ### Slice 40B — success-return durable content-addressed publication
 
-**Current verified candidate.** Adds a real durability barrier to the authenticated 40A object lifecycle rather than another content-address or tamper variant.
+**Status: complete on `main`.** Adds a real durability barrier to the authenticated 40A object lifecycle rather than another content-address or tamper variant.
 
 Acceptance evidence is executable:
 
@@ -991,7 +991,28 @@ Boundary: 40B claims only success-return durability under the local Linux kernel
 
 ### Milestone 40 promotion rule
 
-After 40B integrates, the bounded host-local publication/durability path is sealed at this scope. Do not farm extra `fsync` orderings, filenames, or repeated failure aliases. Promote to an independently specified trust/key lifecycle boundary (key identity/provenance plus rotation or revocation semantics) or another materially different storage lifecycle capability with executable evidence.
+40B is sealed on `main`; do not farm additional `fsync` orderings, filenames, or repeated failure aliases. The project is promoted to an independent trust/key lifecycle boundary.
+
+## Milestone 41 — explicit snapshot trust lifecycle
+
+### Slice 41A — key identity, policy provenance, rotation, and revocation
+
+**Current verified candidate.** Adds an explicit authorization layer above the existing strict Ed25519 verifier and durable content-addressed store instead of treating an arbitrary caller-supplied public key as the whole trust decision.
+
+Acceptance evidence is executable:
+
+- `SnapshotTrustKeyId` is a domain-separated SHA-256 identity of the exact 32-byte Ed25519 public key; `SnapshotTrustPolicy` requires a non-zero generation, at least one key, and at most 64 keys, rejects duplicate key IDs and invalid public-key encodings, and canonicalizes records by key ID;
+- the deterministic `SnapshotTrustPolicyIdentity` hashes a versioned domain, generation, key count, and the complete sorted `(key_id, state, public_key)` records, so changing generation or `Active`/`Revoked` state changes the reported trust snapshot while input ordering does not;
+- `rotate(next_generation, new_active_keys, revoke)` requires a strictly advancing generation, rejects unknown revocations, carries old keys forward, marks selected keys revoked, adds new active keys, and refuses to reactivate a revoked key through that transition;
+- trusted durable-store and materialization wrappers resolve the signer as active before touching the store and then reuse the existing 37A strict Ed25519 verification plus 40A/40B object identity, atomic publication, deduplication, and durability mechanisms; trust membership is not a signature-verification bypass;
+- an end-to-end rotation regression publishes one archive under generation 1/key A, rotates to generation 2 with A revoked and key B active, proves the still-cryptographically-valid A signature fails as `RevokedSigner` before a deliberately missing store root is inspected, proves an unknown signer fails at the same pre-store gate, then uses B to deduplicate and materialize the exact frozen object;
+- successful trusted reports expose the exact policy generation/hash plus signer key ID, and stable rustfmt/Clippy/full tests plus the complete Rust 1.74 suite are green on the exact implementation head.
+
+Boundary: 41A authenticates decisions only relative to the exact trust-policy snapshot supplied by the caller. It does not persist or authenticate the policy itself, prevent a caller from reusing an older snapshot, provide a monotonic anti-rollback counter, certificate/PKI semantics, key generation/custody, validity times, secure distribution, hardware roots of trust, or key-compromise recovery.
+
+### Milestone 41 promotion rule
+
+After 41A integrates, do not farm key-ID encodings, additional revoked-key aliases, or wrappers around the same policy gate. Promote only to a materially stronger trust lifecycle such as authenticated/persisted policy state with real rollback resistance, or to another independent executable frontier with similarly explicit evidence.
 
 ## Independent host-local IPC frontier — post-launch object transfer
 

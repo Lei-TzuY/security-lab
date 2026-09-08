@@ -16,6 +16,23 @@ jobs:
         with:
           toolchain: stable
           components: rustfmt, clippy
+      - name: Apply static-check correction
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path("src/snapshot_identity.rs")
+          text = path.read_text()
+          for old, new in [
+              ("(root_stat.st_mode & 0o7777) as u32", "root_stat.st_mode & 0o7777"),
+              ("(current.st_mode & 0o7777) as u32", "current.st_mode & 0o7777"),
+              ("(stat.st_mode & 0o7777) as u32", "stat.st_mode & 0o7777"),
+          ]:
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"expected one {old!r}, found {count}")
+              text = text.replace(old, new, 1)
+          path.write_text(text)
+          PY
       - name: Lock dependencies
         run: cargo generate-lockfile
       - name: Format

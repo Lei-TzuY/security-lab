@@ -21,13 +21,27 @@ jobs:
           python3 .github/tmp-31a-mode-metadata-fix.py
           python3 - <<'PY'
           from pathlib import Path
-          p = Path("src/platform/linux_cow_diff.rs")
-          text = p.read_text()
-          old = "        | CowDiffEntry::EnsureDirectory { path }\n"
-          new = "        | CowDiffEntry::EnsureDirectory { path, .. }\n"
-          if text.count(old) != 1:
-              raise SystemExit(f"entry_path EnsureDirectory pattern: expected one match, got {text.count(old)}")
-          p.write_text(text.replace(old, new, 1))
+
+          replacements = [
+              (
+                  "src/platform/linux_cow_diff.rs",
+                  "        | CowDiffEntry::EnsureDirectory { path }\n",
+                  "        | CowDiffEntry::EnsureDirectory { path, .. }\n",
+                  "entry_path EnsureDirectory pattern",
+              ),
+              (
+                  "src/cli_json.rs",
+                  "        CowDiffEntry::EnsureDirectory { path } => (\"ensure_directory\", path),\n",
+                  "        CowDiffEntry::EnsureDirectory { path, .. } => (\"ensure_directory\", path),\n",
+                  "CLI EnsureDirectory kind pattern",
+              ),
+          ]
+          for path, old, new, label in replacements:
+              p = Path(path)
+              text = p.read_text()
+              if text.count(old) != 1:
+                  raise SystemExit(f"{label}: expected one match, got {text.count(old)}")
+              p.write_text(text.replace(old, new, 1))
           PY
       - name: Enable user namespace capability tests
         run: |

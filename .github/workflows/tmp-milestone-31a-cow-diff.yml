@@ -35,6 +35,75 @@ jobs:
           PY
       - name: Materialize candidate
         run: python3 .github/tmp-milestone-31a-cow-diff.py
+      - name: Tighten generated ownership and traversal bounds
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          cow = Path('src/platform/linux_cow_diff.rs')
+          text = cow.read_text()
+          text = text.replace(
+              'const DIRENT_BUFFER_BYTES: usize = 8192;\n',
+              'const DIRENT_BUFFER_BYTES: usize = 8192;\nconst MAX_EXPORT_DEPTH: usize = 64;\n',
+              1,
+          )
+          old = '    let result = walk_directory(root_fd, state, &mut path, 0);\n    let close_result = libc::close(root_fd);\n    if let Err(errno) = result {\n        return Err(errno);\n    }\n'
+          new = '    let result = walk_directory(root_fd, state, &mut path, 0, 0);\n    let close_result = libc::close(root_fd);\n    result?;\n'
+          if text.count(old) != 1:
+              raise SystemExit(f'root walk result anchor count={text.count(old)}')
+          text = text.replace(old, new, 1)
+          old = '    path: &mut [u8; PATH_BYTES_MAX],\n    path_len: usize,\n) -> Result<(), i32> {\n    let mut buffer = [0u8; DIRENT_BUFFER_BYTES];\n'
+          new = '    path: &mut [u8; PATH_BYTES_MAX],\n    path_len: usize,\n    depth: usize,\n) -> Result<(), i32> {\n    if depth > MAX_EXPORT_DEPTH {\n        return Err(libc::ELOOP);\n    }\n    let mut buffer = [0u8; DIRENT_BUFFER_BYTES];\n'
+          if text.count(old) != 1:
+              raise SystemExit(f'walk signature anchor count={text.count(old)}')
+          text = text.replace(old, new, 1)
+          old = '                export_entry(directory_fd, name_ptr, state, path, next_len)?;\n'
+          new = '                export_entry(directory_fd, name_ptr, state, path, next_len, depth)?;\n'
+          if text.count(old) != 1:
+              raise SystemExit(f'export entry call anchor count={text.count(old)}')
+          text = text.replace(old, new, 1)
+          old = '    path: &mut [u8; PATH_BYTES_MAX],\n    path_len: usize,\n) -> Result<(), i32> {\n    let mut stat = std::mem::zeroed::<libc::stat>();\n'
+          new = '    path: &mut [u8; PATH_BYTES_MAX],\n    path_len: usize,\n    depth: usize,\n) -> Result<(), i32> {\n    let mut stat = std::mem::zeroed::<libc::stat>();\n'
+          if text.count(old) != 1:
+              raise SystemExit(f'export entry signature anchor count={text.count(old)}')
+          text = text.replace(old, new, 1)
+          old = '        let result = walk_directory(fd, state, path, path_len);\n        let close_result = libc::close(fd);\n        if let Err(errno) = result {\n            return Err(errno);\n        }\n'
+          new = '        let result = walk_directory(fd, state, path, path_len, depth + 1);\n        let close_result = libc::close(fd);\n        result?;\n'
+          if text.count(old) != 1:
+              raise SystemExit(f'recursive walk result anchor count={text.count(old)}')
+          text = text.replace(old, new, 1)
+          old = '        let result = append_file(state, &path[..path_len], fd, stat.st_size as usize);\n        let close_result = libc::close(fd);\n        if let Err(errno) = result {\n            return Err(errno);\n        }\n'
+          new = '        let result = append_file(state, &path[..path_len], fd, stat.st_size as usize);\n        let close_result = libc::close(fd);\n        result?;\n'
+          if text.count(old) != 1:
+              raise SystemExit(f'file result anchor count={text.count(old)}')
+          cow.write_text(text.replace(old, new, 1))
+
+          lifecycle = Path('src/platform/linux_pid_lifecycle.rs')
+          text = lifecycle.read_text()
+          old = 'pub(super) unsafe fn become_direct_target_or_reap(\n    lifecycle: *mut TargetLifecycleRecord,\n'
+          new = 'pub(super) struct CowDiffControl {\n    pub(super) upper_fd: libc::c_int,\n    pub(super) state: *mut CowDiffState,\n}\n\npub(super) unsafe fn become_direct_target_or_reap(\n    lifecycle: *mut TargetLifecycleRecord,\n'
+          if text.count(old) != 1:
+              raise SystemExit(f'cow control struct anchor count={text.count(old)}')
+          text = text.replace(old, new, 1)
+          old = '    output_limit_fd: libc::c_int,\n    cow_upper_fd: libc::c_int,\n    cow_diff_state: *mut CowDiffState,\n    phases: TargetSupervisionPhases,\n) {\n'
+          new = '    output_limit_fd: libc::c_int,\n    cow_diff: CowDiffControl,\n    phases: TargetSupervisionPhases,\n) {\n    let CowDiffControl {\n        upper_fd: cow_upper_fd,\n        state: cow_diff_state,\n    } = cow_diff;\n'
+          if text.count(old) != 1:
+              raise SystemExit(f'cow control signature anchor count={text.count(old)}')
+          lifecycle.write_text(text.replace(old, new, 1))
+
+          linux = Path('src/platform/linux.rs')
+          text = linux.read_text()
+          old = '        become_direct_target_or_reap, become_pid_namespace_init_or_exit, LaunchErrorRecord,\n        SharedTargetLifecycle, TargetLifecycleRecord, TargetSupervisionPhases,\n'
+          new = '        become_direct_target_or_reap, become_pid_namespace_init_or_exit, CowDiffControl, LaunchErrorRecord,\n        SharedTargetLifecycle, TargetLifecycleRecord, TargetSupervisionPhases,\n'
+          if text.count(old) != 1:
+              raise SystemExit(f'lifecycle import anchor count={text.count(old)}')
+          text = text.replace(old, new, 1)
+          old = '            output_limit_fd,\n            cow_upper_fd,\n            cow_diff_state,\n            TargetSupervisionPhases {\n'
+          new = '            output_limit_fd,\n            CowDiffControl {\n                upper_fd: cow_upper_fd,\n                state: cow_diff_state,\n            },\n            TargetSupervisionPhases {\n'
+          if text.count(old) != 1:
+              raise SystemExit(f'lifecycle call anchor count={text.count(old)}')
+          linux.write_text(text.replace(old, new, 1))
+          PY
       - name: Format
         run: cargo fmt --all
       - name: Enable user namespace capability tests

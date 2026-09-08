@@ -20,6 +20,7 @@ jobs:
         run: |
           python3 .github/tmp-milestone-32a-cow-diff-apply.py
           sed -i '/use std::os::unix::fs::PermissionsExt;/d' src/cow_diff_apply.rs
+          sed -i 's/assert!(report.accounted_nodes >= changes.entries.len() as u64 + 1);/assert!(report.accounted_nodes > changes.entries.len() as u64);/' tests/cow_diff_apply.rs
       - name: Format
         run: cargo fmt --all
       - name: Enable user namespace capability tests

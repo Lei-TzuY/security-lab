@@ -263,11 +263,7 @@ impl ArchiveWriter {
         self.append(&length.to_le_bytes())
     }
 
-    fn record_symlink(
-        &mut self,
-        path: &[u8],
-        target: &[u8],
-    ) -> Result<(), SnapshotArchiveError> {
+    fn record_symlink(&mut self, path: &[u8], target: &[u8]) -> Result<(), SnapshotArchiveError> {
         let target_len = u32::try_from(target.len()).map_err(|_| {
             SnapshotArchiveError::InvalidInput("symlink target length overflow".to_owned())
         })?;
@@ -367,11 +363,7 @@ impl IdentityBuilder {
         self.update(&length.to_le_bytes())
     }
 
-    fn record_symlink(
-        &mut self,
-        path: &[u8],
-        target: &[u8],
-    ) -> Result<(), SnapshotIdentityError> {
+    fn record_symlink(&mut self, path: &[u8], target: &[u8]) -> Result<(), SnapshotIdentityError> {
         let target_len = u32::try_from(target.len()).map_err(|_| {
             SnapshotIdentityError::InvalidInput("symlink target length overflow".to_owned())
         })?;
@@ -412,9 +404,9 @@ enum ParsedEntry<'a> {
 impl<'a> ParsedEntry<'a> {
     fn path(&self) -> &'a [u8] {
         match self {
-            Self::Directory { path, .. }
-            | Self::File { path, .. }
-            | Self::Symlink { path, .. } => path,
+            Self::Directory { path, .. } | Self::File { path, .. } | Self::Symlink { path, .. } => {
+                path
+            }
         }
     }
 }
@@ -609,9 +601,9 @@ fn take<'a>(
     length: usize,
     label: &str,
 ) -> Result<&'a [u8], SnapshotArchiveError> {
-    let end = offset.checked_add(length).ok_or_else(|| {
-        SnapshotArchiveError::InvalidInput(format!("{label} offset overflow"))
-    })?;
+    let end = offset
+        .checked_add(length)
+        .ok_or_else(|| SnapshotArchiveError::InvalidInput(format!("{label} offset overflow")))?;
     if end > archive.len() {
         return Err(SnapshotArchiveError::InvalidInput(format!(
             "archive is truncated while reading {label}"
@@ -622,20 +614,12 @@ fn take<'a>(
     Ok(value)
 }
 
-fn read_u32(
-    archive: &[u8],
-    offset: &mut usize,
-    label: &str,
-) -> Result<u32, SnapshotArchiveError> {
+fn read_u32(archive: &[u8], offset: &mut usize, label: &str) -> Result<u32, SnapshotArchiveError> {
     let bytes = take(archive, offset, 4, label)?;
     Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
 }
 
-fn read_u64(
-    archive: &[u8],
-    offset: &mut usize,
-    label: &str,
-) -> Result<u64, SnapshotArchiveError> {
+fn read_u64(archive: &[u8], offset: &mut usize, label: &str) -> Result<u64, SnapshotArchiveError> {
     let bytes = take(archive, offset, 8, label)?;
     Ok(u64::from_le_bytes([
         bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
@@ -645,7 +629,6 @@ fn read_u64(
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
-    use std::cmp::Ordering as CmpOrdering;
     use std::ffi::{CString, OsString};
     use std::fs;
     use std::io;
@@ -695,7 +678,7 @@ mod linux {
 
         let mut writer = ArchiveWriter::new(limits)?;
         writer.reserve_node()?;
-        writer.record_directory(b"/", (root_stat.st_mode & 0o7777) as u32)?;
+        writer.record_directory(b"/", root_stat.st_mode & 0o7777)?;
         serialize_directory(root_fd.raw(), &[], 0, &mut writer)?;
         writer.finish()
     }
@@ -729,16 +712,11 @@ mod linux {
                             "snapshot directory changed type during archive capture".to_owned(),
                         ));
                     }
-                    writer.record_directory(&path, (current.st_mode & 0o7777) as u32)?;
+                    writer.record_directory(&path, current.st_mode & 0o7777)?;
                     serialize_directory(child.raw(), &child_relative, depth + 1, writer)?;
                 }
                 libc::S_IFREG => {
-                    serialize_regular_file(
-                        directory_fd,
-                        name_c.as_c_str(),
-                        &path,
-                        writer,
-                    )?;
+                    serialize_regular_file(directory_fd, name_c.as_c_str(), &path, writer)?;
                 }
                 libc::S_IFLNK => {
                     serialize_symlink(directory_fd, name_c.as_c_str(), &path, writer)?;
@@ -782,7 +760,7 @@ mod linux {
             ));
         }
         let length = stat.st_size as u64;
-        writer.begin_file(path, (stat.st_mode & 0o7777) as u32, length)?;
+        writer.begin_file(path, stat.st_mode & 0o7777, length)?;
 
         let mut remaining = length;
         let mut buffer = [0u8; 8192];
@@ -1018,7 +996,7 @@ mod linux {
         let (staging_name, staging_fd) = create_staging(parent_fd.raw())?;
         let mut directory_modes = vec![(Vec::new(), root_mode)];
 
-        let materialize_result = (|| {
+        let materialize_result: Result<(), SnapshotArchiveError> = (|| {
             for entry in parsed.entries.iter().skip(1) {
                 let relative = &entry.path()[1..];
                 match entry {
@@ -1088,11 +1066,7 @@ mod linux {
             libc::openat(
                 parent_fd.raw(),
                 leaf.as_ptr(),
-                libc::O_WRONLY
-                    | libc::O_CREAT
-                    | libc::O_EXCL
-                    | libc::O_CLOEXEC
-                    | libc::O_NOFOLLOW,
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
                 0o600,
             )
         };
@@ -1526,14 +1500,7 @@ mod linux {
                 offset += reclen;
             }
         }
-        names.sort_by(|left, right| {
-            let primary = left.cmp(right);
-            if primary == CmpOrdering::Equal {
-                CmpOrdering::Equal
-            } else {
-                primary
-            }
-        });
+        names.sort();
         Ok(names)
     }
 

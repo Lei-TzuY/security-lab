@@ -59,11 +59,8 @@ fn populate(root: &Path) {
     fs::set_permissions(root.join("nested"), fs::Permissions::from_mode(0o750))
         .expect("set nested mode");
     fs::write(root.join("nested/value"), b"captured-value\n").expect("write nested value");
-    fs::set_permissions(
-        root.join("nested/value"),
-        fs::Permissions::from_mode(0o600),
-    )
-    .expect("set nested value mode");
+    fs::set_permissions(root.join("nested/value"), fs::Permissions::from_mode(0o600))
+        .expect("set nested value mode");
     symlink("../alpha", root.join("nested/link")).expect("create symlink");
     fs::set_permissions(root, fs::Permissions::from_mode(0o751)).expect("set root mode");
 }
@@ -91,7 +88,10 @@ fn deterministic_archive_round_trip_preserves_captured_identity() {
     let live_identity = snapshot_sha256(&source, identity_limits()).expect("hash source");
     let first = serialize_snapshot_archive(&source, archive_limits()).expect("serialize source");
     let second = serialize_snapshot_archive(&source, archive_limits()).expect("serialize again");
-    assert_eq!(first.bytes, second.bytes, "archive bytes must be deterministic");
+    assert_eq!(
+        first.bytes, second.bytes,
+        "archive bytes must be deterministic"
+    );
     assert_eq!(first.identity, second.identity);
     assert_eq!(first.identity, live_identity);
     assert_eq!(
@@ -122,7 +122,11 @@ fn deterministic_archive_round_trip_preserves_captured_identity() {
         PathBuf::from("../alpha")
     );
     assert_eq!(
-        fs::metadata(&destination).expect("stat root").permissions().mode() & 0o7777,
+        fs::metadata(&destination)
+            .expect("stat root")
+            .permissions()
+            .mode()
+            & 0o7777,
         0o751
     );
     assert_eq!(

@@ -97,13 +97,21 @@ pub fn verify_snapshot_ed25519(
     limits: SnapshotIdentityLimits,
 ) -> Result<SnapshotIdentity, SnapshotEd25519Error> {
     let snapshot = snapshot_sha256(root, limits)?;
+    verify_snapshot_identity_ed25519(snapshot, public_key, expected_signature)?;
+    Ok(snapshot)
+}
+
+pub(crate) fn verify_snapshot_identity_ed25519(
+    snapshot: SnapshotIdentity,
+    public_key: &[u8; SNAPSHOT_ED25519_PUBLIC_KEY_BYTES],
+    expected_signature: &[u8; SNAPSHOT_ED25519_SIGNATURE_BYTES],
+) -> Result<(), SnapshotEd25519Error> {
     let verifying_key =
         VerifyingKey::from_bytes(public_key).map_err(|_| SnapshotEd25519Error::InvalidPublicKey)?;
     let signature = Signature::from_bytes(expected_signature);
     verifying_key
         .verify_strict(&signature_message(snapshot), &signature)
-        .map_err(|_| SnapshotEd25519Error::VerificationFailed)?;
-    Ok(snapshot)
+        .map_err(|_| SnapshotEd25519Error::VerificationFailed)
 }
 
 fn signature_message(snapshot: SnapshotIdentity) -> Vec<u8> {

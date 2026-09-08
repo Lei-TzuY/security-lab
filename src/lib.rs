@@ -30,8 +30,9 @@ pub use report::{
     RunReport,
 };
 pub use snapshot_archive::{
-    materialize_snapshot_archive_atomic, serialize_snapshot_archive, snapshot_archive_identity,
-    SnapshotArchive, SnapshotArchiveError, SnapshotArchiveLimits, SnapshotArchiveMaterializeReport,
+    materialize_snapshot_archive_atomic, materialize_snapshot_archive_ed25519_atomic,
+    serialize_snapshot_archive, snapshot_archive_identity, SnapshotArchive, SnapshotArchiveError,
+    SnapshotArchiveLimits, SnapshotArchiveMaterializeReport,
 };
 pub use snapshot_auth::{
     snapshot_hmac_sha256, verify_snapshot_hmac_sha256, SnapshotHmac, SnapshotHmacError,

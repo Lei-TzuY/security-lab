@@ -15,7 +15,8 @@ use std::fmt;
 
 pub use cancellation::CancellationToken;
 pub use cow_diff_apply::{
-    apply_cow_diff_atomic, CowDiffApplyError, CowDiffApplyLimits, CowDiffApplyReport,
+    apply_cow_diff_atomic, apply_cow_diff_atomic_with_expected_base, CowDiffApplyBoundReport,
+    CowDiffApplyError, CowDiffApplyLimits, CowDiffApplyReport,
 };
 pub use policy::{
     PolicyError, ResourceLimits, SandboxPolicy, SeccompArgRangeRule, SeccompArgRule, SeccompPolicy,

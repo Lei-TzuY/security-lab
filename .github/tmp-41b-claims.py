@@ -1,0 +1,67 @@
+from pathlib import Path
+
+
+def replace_one(path: str, old: str, new: str, label: str) -> None:
+    p = Path(path)
+    text = p.read_text()
+    count = text.count(old)
+    if count != 1:
+        raise SystemExit(f"{label}: expected exactly one match, got {count}")
+    p.write_text(text.replace(old, new, 1))
+
+
+replace_one(
+    "README.md",
+    "The current Milestone 39A verified candidate adds **Ed25519-verified archive publication**: a frozen canonical archive must strictly verify under the exact caller-supplied public key and signature before destination inspection, staging, or publication can begin.",
+    "Milestone 39A added **Ed25519-verified archive publication** before destination inspection or staging. Milestones 40A–40B added **authenticated content-addressed snapshot storage with success-return Linux `fsync` durability**, and Milestone 41A added **explicit signer trust-policy identity, rotation, and revocation**. The current Milestone 41B verified candidate adds **authenticated persisted trust-policy identity state** so state-backed snapshot operations reject a stale caller-supplied policy before store or destination access while the trusted state directory and host-held authentication key remain intact.",
+    "README milestone summary",
+)
+
+replace_one(
+    "README.md",
+    "This is explicit trust-snapshot provenance and rotation/revocation semantics for the policy object the caller supplies. It is **not** a persistent trust store, certificate chain, key custody system, timestamp/validity service, secure policy distribution mechanism, hardware root of trust, compromise-recovery protocol, or anti-rollback guarantee. A caller that deliberately supplies an older policy snapshot can still obtain that older snapshot's decisions.",
+    "Milestone 41A remains explicit trust-snapshot provenance and rotation/revocation semantics for the in-memory policy object the caller supplies. Its compatibility APIs still make no freshness or rollback claim.\n\nMilestone 41B adds a separate host-owned persisted identity gate. `SnapshotTrustStateKey` authenticates a compact versioned policy identity with HMAC-SHA256; initialization and rotation use a launcher-owned state directory, advisory locking, fresh temporary files, file/directory `fsync`, and atomic rename publication. `SnapshotTrustStateContext` binds the state root/key to the exact supplied `SnapshotTrustPolicy`; state-backed durable-store and materialization APIs hold the shared state lock through the operation and reject a mismatched older policy as `StalePolicy` before store/destination inspection. Executable evidence proves exact initialization retry and rotation retry convergence, generation-1 publication followed by generation-2 revocation/new-key deduplication and materialization, stale-policy rejection before deliberately missing filesystem paths are touched, wrong-key and same-size state tamper authentication failure, and stale-rotation refusal without replacing the newer state.\n\nThe rollback claim is intentionally bounded: it holds only relative to an intact trusted state directory and undisclosed host-held state key. 41B does **not** persist the full key policy, provide certificate/PKI or key-custody semantics, supply an external/hardware monotonic counter, or resist a privileged actor that can restore the entire state directory to an older snapshot or disclose the state key.",
+    "README persisted trust claims",
+)
+
+replace_one(
+    "ROADMAP.md",
+    "**Current verified candidate.** Adds an explicit authorization layer above the existing strict Ed25519 verifier and durable content-addressed store instead of treating an arbitrary caller-supplied public key as the whole trust decision.",
+    "**Status: complete on `main`.** Adds an explicit authorization layer above the existing strict Ed25519 verifier and durable content-addressed store instead of treating an arbitrary caller-supplied public key as the whole trust decision.",
+    "ROADMAP 41A status",
+)
+
+replace_one(
+    "ROADMAP.md",
+    "### Milestone 41 promotion rule\n\nAfter 41A integrates, do not farm key-ID encodings, additional revoked-key aliases, or wrappers around the same policy gate. Promote only to a materially stronger trust lifecycle such as authenticated/persisted policy state with real rollback resistance, or to another independent executable frontier with similarly explicit evidence.",
+    "### Slice 41B — authenticated persisted policy identity and stale-policy rollback gate\n\n**Current verified candidate.** Adds host-owned authenticated state for the exact trust-policy identity so cooperating state-backed operations cannot silently reuse an older caller-supplied policy while that state and its authentication key remain intact.\n\nAcceptance evidence is executable:\n\n- `SnapshotTrustStateKey` is a fixed 32-byte host-held key and the persisted state is a fixed-size versioned record containing the exact `SnapshotTrustPolicyIdentity`, authenticated with domain-separated HMAC-SHA256; malformed size/version/count and authentication failure are fail-closed;\n- Linux initialization serializes through an exclusive `flock`, writes a fresh `0600` temporary regular file, `fsync`s it, installs with `renameat2(RENAME_NOREPLACE)`, and `fsync`s the state directory. Repeating the exact initialized identity converges without replacing it;\n- rotation constructs the successor only through the existing 41A `rotate()` rules, holds the exclusive state lock, rejects a persisted identity that matches neither supplied current nor computed successor as `StalePolicy`, atomically replaces state only after temp-file `fsync`, and allows an exact retry to converge when the successor is already persisted;\n- `SnapshotTrustStateContext` binds the state root/key to one exact caller-supplied policy. State-backed durable store and atomic materialization hold a shared state lock from authenticated identity comparison through the delegated 41A/40B operation, so a cooperating rotation cannot overtake an accepted operation;\n- end-to-end evidence initializes generation 1, publishes under key A, persists generation 2 with A revoked/key B active, proves the generation-1 context returns `StalePolicy` before deliberately missing store/destination paths are touched, then uses generation 2/key B to deduplicate and materialize the authenticated frozen object;\n- separate evidence rejects a wrong HMAC key and a same-length state-byte tamper as `AuthenticationFailed`, proves stale rotation cannot overwrite a newer persisted generation, and proves exact rotation retry convergence; stable rustfmt/Clippy/full tests and the complete Rust 1.74 suite are green on the exact candidate head.\n\nBoundary: 41B persists and authenticates only the policy identity, not the full policy/key set. Its stale-caller rollback resistance assumes the trusted state directory and host-held HMAC key remain intact. It does not resist privileged whole-directory rollback/restoration, key disclosure, or hostile replacement of the trusted host environment; it provides no hardware/external monotonic counter, PKI/certificate semantics, key custody/distribution, validity clock, or compromise-recovery protocol.\n\n### Milestone 41 promotion rule\n\nAfter 41B integrates, seal the current host-local snapshot trust lifecycle. Do not farm state filenames, HMAC encodings, generation aliases, or wrappers around the same persisted-identity gate. A stronger rollback phase requires an independently anchored monotonic state or other evidence not restorable with the local directory; otherwise promote to another materially different executable authority/integration frontier.",
+    "ROADMAP 41B section",
+)
+
+replace_one(
+    "THREAT_MODEL.md",
+    "The trust policy is itself caller-provided in-memory state. Its deterministic generation/hash is provenance for the policy snapshot used by one operation, **not** proof that the snapshot is newest or independently authentic. There is no persistent monotonic generation store, anti-rollback state, certificate chain, key custody, validity clock, secure distribution, hardware root, or compromise-recovery channel. Supplying an older policy snapshot intentionally recovers that snapshot's older authorization decisions.",
+    "Milestone 41A's trust policy remains caller-provided in-memory state. Its deterministic generation/hash is provenance for the policy snapshot used by a compatibility operation, **not** proof that the snapshot is newest or independently authentic.\n\nMilestone 41B optionally adds an authenticated persisted **policy identity** gate rather than persisting the complete policy. A fixed host-held `SnapshotTrustStateKey` authenticates the versioned generation/hash/key-count record with domain-separated HMAC-SHA256. Initialization/rotation serialize cooperating writers with `flock` and publish state through a fresh fsynced file plus atomic rename and directory `fsync`. State-backed store/materialization operations take a shared lock, authenticate the current record, require it to equal the supplied policy identity, and retain that lock through the delegated trusted operation. This rejects stale caller policy before snapshot-store or destination access and prevents a cooperating rotation from overtaking an accepted operation.\n\nThis is bounded stale-caller rollback resistance, not an external monotonic root. A privileged actor that can restore the whole trusted state directory to an older snapshot, replace the trusted host environment, or obtain the HMAC key can defeat that freshness assumption. There is still no certificate chain, key custody/distribution service, validity clock, hardware root/counter, or compromise-recovery channel.",
+    "THREAT_MODEL persisted trust semantics",
+)
+
+replace_one(
+    "THREAT_MODEL.md",
+    "- A caller using Milestone 41A trusted snapshot APIs is trusted to choose the `SnapshotTrustPolicy` snapshot. The reported generation/hash identifies that exact snapshot but does not make it fresh, persistent, or rollback-resistant; deliberately supplying an older policy restores its older decisions.",
+    "- A caller using Milestone 41A compatibility trusted snapshot APIs is trusted to choose the `SnapshotTrustPolicy` snapshot. The reported generation/hash identifies that exact snapshot but does not make it fresh or persistent; deliberately supplying an older policy restores its older decisions.\n- A caller using Milestone 41B state-backed APIs trusts the configured state directory and host-held `SnapshotTrustStateKey` to remain intact and unavailable to untrusted rollback. Within that assumption, the authenticated persisted identity is the freshness anchor and an older supplied policy is rejected before store/destination access. Whole-directory rollback by a privileged actor and state-key disclosure are explicit non-goals.",
+    "THREAT_MODEL trust assumptions",
+)
+
+replace_one(
+    "THREAT_MODEL.md",
+    "- all Milestones 1–3B descriptor, stdio, filesystem, capability, rlimit, launch-error, capture, PID identity, descendant cleanup, timeout, and exit-vs-signal regressions;",
+    "- persisted snapshot trust-state regressions initialize and reload an authenticated identity, converge exact initialization/rotation retries, publish under generation 1 then rotate to generation 2, require stale generation-1 store/materialization attempts to fail before deliberately missing filesystem paths are touched, reject wrong-key and same-size state tampering, reject a stale writer without replacing generation 2, and successfully deduplicate/materialize under the current generation;\n- all Milestones 1–3B descriptor, stdio, filesystem, capability, rlimit, launch-error, capture, PID identity, descendant cleanup, timeout, and exit-vs-signal regressions;",
+    "THREAT_MODEL 41B evidence",
+)
+
+replace_one(
+    "THREAT_MODEL.md",
+    "Milestones through 33A are integrated on `main`, including bounded COW root mutation, post-run diff export, failure-atomic host-side replay, and canonical snapshot identity. The current Milestone 34A verified candidate consumes that identity as an explicit replay precondition and fails before replay setup on mismatch without claiming concurrency locking or authenticity. Milestone 4A cgroup-v2 aggregate process accounting remains blocked by missing unprivileged delegation; supplementary-group isolation also remains blocked on a viable mapping architecture. Future promotion must target a materially stronger executable COW lifecycle property or another independent authority/enforcement frontier without overstating evidence.",
+    "Milestones through 41A are integrated on `main`, including bounded COW snapshot lifecycle, authenticated/durable content-addressed frozen-object storage, and explicit signer trust-policy rotation/revocation. The current Milestone 41B verified candidate persists and authenticates the exact policy identity, serializes cooperating rotations, and rejects stale caller policy before state-backed store/materialization access while keeping privileged whole-directory rollback outside the claim. Milestone 4A cgroup-v2 aggregate process accounting remains blocked by missing unprivileged delegation; supplementary-group isolation also remains blocked on a viable mapping architecture. Future promotion must target a materially stronger independently anchored trust state or another distinct executable authority/integration frontier without overstating evidence.",
+    "THREAT_MODEL phase promotion",
+)

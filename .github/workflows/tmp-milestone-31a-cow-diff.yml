@@ -47,36 +47,43 @@ jobs:
               'const DIRENT_BUFFER_BYTES: usize = 8192;\nconst MAX_EXPORT_DEPTH: usize = 64;\n',
               1,
           )
-          old = '    let result = walk_directory(root_fd, state, &mut path, 0);\n    let close_result = libc::close(root_fd);\n    if let Err(errno) = result {\n        return Err(errno);\n    }\n'
-          new = '    let result = walk_directory(root_fd, state, &mut path, 0, 0);\n    let close_result = libc::close(root_fd);\n    result?;\n'
-          if text.count(old) != 1:
-              raise SystemExit(f'root walk result anchor count={text.count(old)}')
-          text = text.replace(old, new, 1)
-          old = '    path: &mut [u8; PATH_BYTES_MAX],\n    path_len: usize,\n) -> Result<(), i32> {\n    let mut buffer = [0u8; DIRENT_BUFFER_BYTES];\n'
-          new = '    path: &mut [u8; PATH_BYTES_MAX],\n    path_len: usize,\n    depth: usize,\n) -> Result<(), i32> {\n    if depth > MAX_EXPORT_DEPTH {\n        return Err(libc::ELOOP);\n    }\n    let mut buffer = [0u8; DIRENT_BUFFER_BYTES];\n'
-          if text.count(old) != 1:
-              raise SystemExit(f'walk signature anchor count={text.count(old)}')
-          text = text.replace(old, new, 1)
-          old = '                export_entry(directory_fd, name_ptr, state, path, next_len)?;\n'
-          new = '                export_entry(directory_fd, name_ptr, state, path, next_len, depth)?;\n'
-          if text.count(old) != 1:
-              raise SystemExit(f'export entry call anchor count={text.count(old)}')
-          text = text.replace(old, new, 1)
-          old = '    path: &mut [u8; PATH_BYTES_MAX],\n    path_len: usize,\n) -> Result<(), i32> {\n    let mut stat = std::mem::zeroed::<libc::stat>();\n'
-          new = '    path: &mut [u8; PATH_BYTES_MAX],\n    path_len: usize,\n    depth: usize,\n) -> Result<(), i32> {\n    let mut stat = std::mem::zeroed::<libc::stat>();\n'
-          if text.count(old) != 1:
-              raise SystemExit(f'export entry signature anchor count={text.count(old)}')
-          text = text.replace(old, new, 1)
-          old = '        let result = walk_directory(fd, state, path, path_len);\n        let close_result = libc::close(fd);\n        if let Err(errno) = result {\n            return Err(errno);\n        }\n'
-          new = '        let result = walk_directory(fd, state, path, path_len, depth + 1);\n        let close_result = libc::close(fd);\n        result?;\n'
-          if text.count(old) != 1:
-              raise SystemExit(f'recursive walk result anchor count={text.count(old)}')
-          text = text.replace(old, new, 1)
-          old = '        let result = append_file(state, &path[..path_len], fd, stat.st_size as usize);\n        let close_result = libc::close(fd);\n        if let Err(errno) = result {\n            return Err(errno);\n        }\n'
-          new = '        let result = append_file(state, &path[..path_len], fd, stat.st_size as usize);\n        let close_result = libc::close(fd);\n        result?;\n'
-          if text.count(old) != 1:
-              raise SystemExit(f'file result anchor count={text.count(old)}')
-          cow.write_text(text.replace(old, new, 1))
+          replacements = [
+              (
+                  '    let result = walk_directory(root_fd, state, &mut path, 0);\n    let close_result = libc::close(root_fd);\n    if let Err(errno) = result {\n        return Err(errno);\n    }\n',
+                  '    let result = walk_directory(root_fd, state, &mut path, 0, 0);\n    let close_result = libc::close(root_fd);\n    result?;\n',
+                  'root walk result',
+              ),
+              (
+                  '    path: &mut [u8; PATH_BYTES_MAX],\n    path_len: usize,\n) -> Result<(), i32> {\n    let mut buffer = [0u8; DIRENT_BUFFER_BYTES];\n',
+                  '    path: &mut [u8; PATH_BYTES_MAX],\n    path_len: usize,\n    depth: usize,\n) -> Result<(), i32> {\n    if depth > MAX_EXPORT_DEPTH {\n        return Err(libc::ELOOP);\n    }\n    let mut buffer = [0u8; DIRENT_BUFFER_BYTES];\n',
+                  'walk signature',
+              ),
+              (
+                  '                export_entry(directory_fd, name_ptr, state, path, next_len)?;\n',
+                  '                export_entry(directory_fd, name_ptr, state, path, next_len, depth)?;\n',
+                  'export entry call',
+              ),
+              (
+                  '    path: &mut [u8; PATH_BYTES_MAX],\n    path_len: usize,\n) -> Result<(), i32> {\n    let mut stat = std::mem::zeroed::<libc::stat>();\n',
+                  '    path: &mut [u8; PATH_BYTES_MAX],\n    path_len: usize,\n    depth: usize,\n) -> Result<(), i32> {\n    let mut stat = std::mem::zeroed::<libc::stat>();\n',
+                  'export entry signature',
+              ),
+              (
+                  '        let result = walk_directory(fd, state, path, path_len);\n        let close_result = libc::close(fd);\n        if let Err(errno) = result {\n            return Err(errno);\n        }\n',
+                  '        let result = walk_directory(fd, state, path, path_len, depth + 1);\n        let close_result = libc::close(fd);\n        result?;\n',
+                  'recursive walk result',
+              ),
+              (
+                  '        let result = append_file(state, &path[..path_len], fd, stat.st_size as usize);\n        let close_result = libc::close(fd);\n        if let Err(errno) = result {\n            return Err(errno);\n        }\n',
+                  '        let result = append_file(state, &path[..path_len], fd, stat.st_size as usize);\n        let close_result = libc::close(fd);\n        result?;\n',
+                  'file result',
+              ),
+          ]
+          for old, new, label in replacements:
+              if text.count(old) != 1:
+                  raise SystemExit(f'{label} anchor count={text.count(old)}')
+              text = text.replace(old, new, 1)
+          cow.write_text(text)
 
           lifecycle = Path('src/platform/linux_pid_lifecycle.rs')
           text = lifecycle.read_text()
@@ -93,8 +100,8 @@ jobs:
 
           linux = Path('src/platform/linux.rs')
           text = linux.read_text()
-          old = '        become_direct_target_or_reap, become_pid_namespace_init_or_exit, LaunchErrorRecord,\n        SharedTargetLifecycle, TargetLifecycleRecord, TargetSupervisionPhases,\n'
-          new = '        become_direct_target_or_reap, become_pid_namespace_init_or_exit, CowDiffControl, LaunchErrorRecord,\n        SharedTargetLifecycle, TargetLifecycleRecord, TargetSupervisionPhases,\n'
+          old = '    use super::pid_lifecycle::{\n        self, LaunchErrorRecord, SharedTargetLifecycle, TargetLifecycleRecord,\n        TargetSupervisionPhases,\n    };\n'
+          new = '    use super::pid_lifecycle::{\n        self, CowDiffControl, LaunchErrorRecord, SharedTargetLifecycle, TargetLifecycleRecord,\n        TargetSupervisionPhases,\n    };\n'
           if text.count(old) != 1:
               raise SystemExit(f'lifecycle import anchor count={text.count(old)}')
           text = text.replace(old, new, 1)

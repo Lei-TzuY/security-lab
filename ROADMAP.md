@@ -875,7 +875,7 @@ After 35A integrates, do not farm second-hash placements or identity API aliases
 
 ### Slice 36A — HMAC-SHA256 snapshot authentication
 
-**Current verified candidate.** Adds a symmetric authentication property over the existing bounded canonical snapshot identity rather than another digest placement or replay gate.
+**Status: complete on `main`.** Adds a symmetric authentication property over the existing bounded canonical snapshot identity rather than another digest placement or replay gate.
 
 Acceptance evidence is executable:
 
@@ -891,6 +891,28 @@ Boundary: 36A is symmetric key-possession authentication for the existing canoni
 ### Milestone 36 promotion rule
 
 After 36A integrates, do not farm tag encodings, key-length aliases, MAC algorithm names, or extra verification wrappers. A stronger authentication/provenance phase must add independently evidenced public-key identity/signature semantics or a real trusted key lifecycle; otherwise promote to a frozen/serialized source snapshot, durability/versioned publication, or launcher-owned dynamic host-local IPC mediation.
+
+## Milestone 37 — public-key canonical snapshot signatures
+
+### Slice 37A — Ed25519 signature over canonical snapshot identity
+
+**Current verified candidate.** Adds independently verifiable public-key signature semantics to the existing bounded canonical snapshot identity rather than another symmetric tag encoding.
+
+Acceptance evidence is executable:
+
+- `sign_snapshot_ed25519(root, signing_key, limits)` accepts exactly one caller-supplied 32-byte Ed25519 signing seed, reuses the bounded 33A canonical scan, and returns the checked `SnapshotIdentity`, corresponding 32-byte public key, and 64-byte signature;
+- the signature message is unambiguous and versioned: `security-lab-snapshot-ed25519-v1\0` followed by canonical SHA-256, `encoded_bytes` little-endian `u64`, and `nodes` little-endian `u64`;
+- `verify_snapshot_ed25519(root, public_key, signature, limits)` independently recomputes the bounded identity, rejects malformed public keys, and uses pinned `ed25519-dalek` 2.1.1 `verify_strict` rather than permissive verification;
+- backend evidence reproduces RFC 8032 test vector 1; deterministic same-seed/same-identity signing reproduces the same evidence; content mutation, a different public key, and signature-bit mutation each fail verification;
+- public-API integration evidence proves an Edwards-identity weak key is decoded/classified as weak and that the classic `R=B, S=1` universal-forgery shape is rejected by the snapshot verification path;
+- identity byte/node budget failures remain distinct `SnapshotIdentityError` failures rather than being converted into signature mismatch;
+- stable rustfmt/Clippy/full tests and the full Rust 1.74 suite must remain green on the exact candidate head.
+
+Boundary: 37A proves signature validity under the exact supplied public key for the existing canonical identity tuple. It does not provide certificate/trust-store semantics, signer provenance beyond possession of the corresponding secret key, hardware/remote attestation, key generation/storage/rotation/revocation, immutable point-in-time source capture, a broader metadata identity model, or durability/crash recovery.
+
+### Milestone 37 promotion rule
+
+After 37A integrates, do not farm key encodings, signature text formats, algorithm aliases, or extra verify wrappers. A stronger provenance phase requires an independently specified trust/key lifecycle or attestation model. Otherwise promote to a real frozen/serialized source snapshot, durability/versioned publication, or a materially new launcher-owned mediation boundary.
 
 ## Independent host-local IPC frontier — post-launch object transfer
 

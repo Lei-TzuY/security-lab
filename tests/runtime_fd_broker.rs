@@ -3,7 +3,6 @@
 use security_lab::{run, ChildOutcome, RuntimeFdBroker, RuntimeFdBrokerError, SandboxPolicy};
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
-use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::net::UnixStream;

@@ -896,7 +896,7 @@ After 36A integrates, do not farm tag encodings, key-length aliases, MAC algorit
 
 ### Slice 37A — Ed25519 signature over canonical snapshot identity
 
-**Current verified candidate.** Adds independently verifiable public-key signature semantics to the existing bounded canonical snapshot identity rather than another symmetric tag encoding.
+**Status: complete on `main`.** Adds independently verifiable public-key signature semantics to the existing bounded canonical snapshot identity rather than another symmetric tag encoding.
 
 Acceptance evidence is executable:
 
@@ -912,7 +912,28 @@ Boundary: 37A proves signature validity under the exact supplied public key for 
 
 ### Milestone 37 promotion rule
 
-After 37A integrates, do not farm key encodings, signature text formats, algorithm aliases, or extra verify wrappers. A stronger provenance phase requires an independently specified trust/key lifecycle or attestation model. Otherwise promote to a real frozen/serialized source snapshot, durability/versioned publication, or a materially new launcher-owned mediation boundary.
+37A is sealed on `main`; do not farm key encodings, signature text formats, algorithm aliases, or extra verify wrappers. A stronger provenance phase requires an independently specified trust/key lifecycle or attestation model. The active promotion is instead a serialized snapshot artifact with executable round-trip/publication evidence.
+
+## Milestone 38 — bounded serialized snapshot artifact
+
+### Slice 38A — deterministic canonical snapshot archive
+
+**Current verified candidate.** Freezes the supported snapshot object model into bounded deterministic bytes and can materialize those bytes into a new failure-atomically published host tree.
+
+Acceptance evidence is executable:
+
+- `serialize_snapshot_archive` walks the supported Linux tree fd-relatively, preserves directory/regular-file permission bits and exact symlink target bytes, rejects unsupported node kinds, and enforces explicit archive-byte, canonical-identity-byte, and node ceilings;
+- the completed archive is reparsed before success, and `snapshot_archive_identity` derives the existing Milestone 33A canonical identity from archive records alone without consulting the live tree;
+- parser canonicality requires root-first records, strictly increasing raw path order, directory-before-child topology, safe absolute snapshot-relative paths, bounded symlink targets, exact declared node count, and no trailing bytes;
+- two captures of one unchanged tree produce byte-identical archives, archive identity equals an independent live-tree `snapshot_sha256`, later source mutation diverges from but cannot alter the captured bytes, and materialization reproduces the captured contents, modes, symlink target, and canonical identity;
+- `materialize_snapshot_archive_atomic` validates the entire artifact before mutation, builds a private sibling staging tree through fd-relative non-symlink parent resolution, restores supported modes, and publishes only with `renameat2(RENAME_NOREPLACE)`; malformed/budget failures, an existing destination, and a symlink-parent archive leave no published destination or staging residue;
+- exact candidate stable rustfmt/Clippy/full tests and the full Rust 1.74 suite are green.
+
+Boundary: 38A freezes the bytes returned after a successful capture, not an atomic point-in-time view against a hostile concurrent source writer. Publication is failure-atomic at the rename boundary but not `fsync` durability/crash consistency. The archive intentionally omits UID/GID, timestamps, xattrs/ACLs, hard-link identity, and unsupported special nodes, and preserved symlink objects are not a confinement guarantee for later consumers that follow them.
+
+### Milestone 38 promotion rule
+
+After 38A integrates, do not farm archive encodings, filename suffixes, compression wrappers, or duplicate identity helpers. Promote only to materially new durability/versioned publication, independently authenticated archive transport/key lifecycle, or another executable authority boundary.
 
 ## Independent host-local IPC frontier — post-launch object transfer
 

@@ -918,7 +918,7 @@ Boundary: 37A proves signature validity under the exact supplied public key for 
 
 ### Slice 38A — deterministic canonical snapshot archive
 
-**Current verified candidate.** Freezes the supported snapshot object model into bounded deterministic bytes and can materialize those bytes into a new failure-atomically published host tree.
+**Status: complete on `main`.** Freezes the supported snapshot object model into bounded deterministic bytes and can materialize those bytes into a new failure-atomically published host tree.
 
 Acceptance evidence is executable:
 
@@ -933,7 +933,28 @@ Boundary: 38A freezes the bytes returned after a successful capture, not an atom
 
 ### Milestone 38 promotion rule
 
-After 38A integrates, do not farm archive encodings, filename suffixes, compression wrappers, or duplicate identity helpers. Promote only to materially new durability/versioned publication, independently authenticated archive transport/key lifecycle, or another executable authority boundary.
+38A is sealed on `main`; do not farm archive encodings, filename suffixes, compression wrappers, or duplicate identity helpers. The active promotion is authenticated use of the frozen artifact rather than another serialization variant.
+
+## Milestone 39 — authenticated snapshot archive publication
+
+### Slice 39A — Ed25519 verification before atomic publication
+
+**Current verified candidate.** Composes the existing 37A strict public-key signature verifier with the 38A frozen archive/materialization path so unauthenticated archive bytes cannot reach destination inspection or staging.
+
+Acceptance evidence is executable:
+
+- `materialize_snapshot_archive_ed25519_atomic` validates the complete bounded/canonical archive and derives its 33A identity directly from artifact records before signature verification;
+- the exact caller-supplied 32-byte public key and 64-byte signature are checked by the existing `ed25519-dalek` strict verifier over the same versioned 37A identity message;
+- only successful verification may enter 38A fd-relative staging and `renameat2(RENAME_NOREPLACE)` publication;
+- an archive signed before later live-source mutation still publishes the original captured bytes and reproduces the captured canonical identity;
+- a wrong public key fails before a deliberately missing destination parent is inspected, while a parse-valid archive content tamper fails verification with no destination or staging residue;
+- existing 37A strict-verification security regressions and all 38A malformed/budget/publication regressions remain active; stable rustfmt/Clippy/full tests and the full Rust 1.74 suite remain green.
+
+Boundary: 39A proves signature validity under the exact supplied public key for the frozen supported archive semantics. It does not establish public-key ownership/provenance, certificate or trust-store policy, key generation/storage/rotation/revocation, remote/hardware attestation, authenticated transport, `fsync` crash durability, overwrite/version-retention semantics, or a broader metadata/object model.
+
+### Milestone 39 promotion rule
+
+After 39A integrates, do not farm signature encodings, duplicate verify wrappers, key-file spelling, or extra tamper vectors that exercise the same gate. Promote only to a real trust/key lifecycle, crash-durable/versioned publication, or another independent executable authority boundary.
 
 ## Independent host-local IPC frontier — post-launch object transfer
 

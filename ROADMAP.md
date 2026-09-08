@@ -786,7 +786,7 @@ Boundary: 31A is a bounded content/topology/permission-mode export for supported
 
 ### Slice 32A — atomic new-snapshot replay
 
-**Current verified candidate.** Adds a bounded host-side apply path for the canonical 31A diff without mutating the trusted base directory in place.
+**Status: complete on `main`.** Adds a bounded host-side apply path for the canonical 31A diff without mutating the trusted base directory in place.
 
 Acceptance evidence is executable:
 
@@ -803,7 +803,29 @@ Boundary: 32A provides failure-atomic publication of a **new** snapshot up to th
 
 ### Milestone 32 promotion rule
 
-After 32A integrates, seal basic replay/apply semantics rather than farming path aliases, extra failure codes, or duplicate record variants. Promote to stronger snapshot identity/integrity evidence or another independent executable authority/enforcement frontier; any durability or overwrite-transaction phase requires its own fsync/crash semantics and deterministic evidence.
+32A is sealed on `main`; do not farm replay path aliases, extra failure codes, or duplicate record variants. Promotion is now stronger snapshot identity/integrity evidence or another independent executable authority/enforcement frontier; any durability or overwrite-transaction phase requires its own fsync/crash semantics and deterministic evidence.
+
+## Milestone 33 — canonical snapshot identity
+
+### Slice 33A — bounded SHA-256 identity for supported snapshot trees
+
+**Current verified candidate.** Adds deterministic cryptographic content identity for the exact regular-file/directory/symlink tree model already preserved by the 31A/32A lifecycle, without claiming authenticity or a broader metadata snapshot.
+
+Acceptance evidence is executable:
+
+- `snapshot_sha256(root, limits)` requires an absolute trusted host root and exposes `SnapshotIdentityLimits` with fail-closed byte and node ceilings;
+- one versioned/domain-separated canonical stream hashes sorted raw path bytes plus node type; directories commit to Unix permission bits, regular files commit to permission bits plus exact length/content, and symlinks commit to exact target bytes;
+- traversal opens child directories and regular files without following symlinks, verifies opened object type, detects regular-file shrink/growth across the committed size/read boundary, and rejects unsupported special-node kinds instead of omitting them;
+- two independently materialized equivalent fixture trees produce the exact fixed SHA-256 `b3ff412811f2f9298015ab9320339ab3d35bd53a531b6b4e645ae8656d3c1c85`, with 5 accounted nodes and 140 canonical bytes;
+- independent mutations to regular-file content, permission mode, symlink target, and topology each produce a different identity;
+- a 32A diff replay leaves the trusted base identity unchanged and produces a destination identity exactly equal to an independently materialized expected tree;
+- stable rustfmt/Clippy/full tests and the full Rust 1.74 suite are green on the exact implementation candidate.
+
+Boundary: 33A is canonical SHA-256 identity evidence for the supported tree model. It is not a signature, MAC, trusted provenance statement, or automatic replay precondition; it omits UID/GID ownership, timestamps, xattrs/ACLs, hard-link identity, and special nodes, and it does not establish a point-in-time snapshot against hostile concurrent host writers or any durability/crash guarantee.
+
+### Milestone 33 promotion rule
+
+After 33A integrates, seal hash-algorithm/vector variants. A materially stronger next COW-lifecycle slice is to bind replay to an explicitly expected base identity and fail before publication on mismatch, or to add independently evidenced authenticity/provenance; neither should be inferred from a bare digest.
 
 ## Later frontiers
 

@@ -8,6 +8,7 @@ mod cow_diff_apply;
 mod platform;
 pub mod policy;
 pub mod report;
+mod snapshot_identity;
 
 use std::error::Error;
 use std::fmt;
@@ -23,6 +24,9 @@ pub use policy::{
 pub use report::{
     CapturedOutput, ChildOutcome, CowDiff, CowDiffEntry, EnforcementReceipt, ProcessTreeUsage,
     RunReport,
+};
+pub use snapshot_identity::{
+    snapshot_sha256, SnapshotIdentity, SnapshotIdentityError, SnapshotIdentityLimits,
 };
 
 #[derive(Debug)]

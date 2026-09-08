@@ -12,6 +12,7 @@ mod snapshot_archive;
 mod snapshot_auth;
 mod snapshot_identity;
 mod snapshot_signature;
+mod snapshot_store;
 
 use std::error::Error;
 use std::fmt;
@@ -45,6 +46,10 @@ pub use snapshot_signature::{
     sign_snapshot_ed25519, verify_snapshot_ed25519, SnapshotEd25519Error, SnapshotEd25519Signature,
     SNAPSHOT_ED25519_PUBLIC_KEY_BYTES, SNAPSHOT_ED25519_SIGNATURE_BYTES,
     SNAPSHOT_ED25519_SIGNING_KEY_BYTES,
+};
+pub use snapshot_store::{
+    materialize_snapshot_store_object_ed25519_atomic, snapshot_store_object_path,
+    store_snapshot_archive_ed25519_atomic, SnapshotStoreError, SnapshotStorePutReport,
 };
 
 #[derive(Debug)]

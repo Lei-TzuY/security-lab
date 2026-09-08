@@ -13,6 +13,7 @@ mod snapshot_auth;
 mod snapshot_identity;
 mod snapshot_signature;
 mod snapshot_store;
+mod snapshot_store_durable;
 
 use std::error::Error;
 use std::fmt;
@@ -51,6 +52,7 @@ pub use snapshot_store::{
     materialize_snapshot_store_object_ed25519_atomic, snapshot_store_object_path,
     store_snapshot_archive_ed25519_atomic, SnapshotStoreError, SnapshotStorePutReport,
 };
+pub use snapshot_store_durable::store_snapshot_archive_ed25519_durable;
 
 #[derive(Debug)]
 pub enum SandboxError {

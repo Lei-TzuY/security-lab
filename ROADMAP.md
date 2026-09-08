@@ -939,7 +939,7 @@ Boundary: 38A freezes the bytes returned after a successful capture, not an atom
 
 ### Slice 39A — Ed25519 verification before atomic publication
 
-**Current verified candidate.** Composes the existing 37A strict public-key signature verifier with the 38A frozen archive/materialization path so unauthenticated archive bytes cannot reach destination inspection or staging.
+**Status: complete on `main`.** Composes the existing 37A strict public-key signature verifier with the 38A frozen archive/materialization path so unauthenticated archive bytes cannot reach destination inspection or staging.
 
 Acceptance evidence is executable:
 
@@ -954,7 +954,29 @@ Boundary: 39A proves signature validity under the exact supplied public key for 
 
 ### Milestone 39 promotion rule
 
-After 39A integrates, do not farm signature encodings, duplicate verify wrappers, key-file spelling, or extra tamper vectors that exercise the same gate. Promote only to a real trust/key lifecycle, crash-durable/versioned publication, or another independent executable authority boundary.
+39A is sealed on `main`; the bounded verified publication CLI is integrated tooling over the same gate and does not widen the trust model. Do not farm signature encodings, duplicate verify wrappers, key-file spelling, or extra tamper vectors that exercise the same gate.
+
+## Milestone 40 — authenticated content-addressed snapshot storage
+
+### Slice 40A — immutable identity-addressed frozen archive objects
+
+**Current verified candidate.** Adds a bounded host-local object lifecycle for already-authenticated frozen archives rather than another signature or publication wrapper.
+
+Acceptance evidence is executable:
+
+- `store_snapshot_archive_ed25519_atomic(store_root, archive, public_key, signature, limits)` lexically validates a trusted absolute store root, fully validates the canonical archive under the existing byte/identity/node limits, and strictly verifies its Ed25519 evidence before store filesystem inspection or mutation;
+- the deterministic object address encodes the complete canonical identity tuple `(sha256, encoded_bytes, nodes)`, preserving the accounting covered by the signature message rather than treating the digest alone as the whole identity;
+- insertion creates a private sibling temporary object, writes the exact archive bytes, sets mode `0444`, and publishes only with Linux `renameat2(RENAME_NOREPLACE)`; there is no overwrite fallback;
+- an existing object at the same address is accepted as an idempotent deduplication hit only if it is a regular file with no write bits, has the exact archive length, and matches every archive byte. Any mismatch is `ObjectConflict`;
+- `materialize_snapshot_store_object_ed25519_atomic` opens the exact requested address, enforces the archive byte ceiling, re-derives the canonical identity and requires an exact tuple match, re-verifies the supplied Ed25519 signature, and only then delegates to the existing failure-atomic authenticated materialization path;
+- deterministic integration evidence proves first insert plus dedup, materialization of frozen bytes after the live source changes, wrong-key failure before a deliberately missing store root is inspected, and rejection of a same-size parse-valid stored-object tamper with no destination publication;
+- rustfmt, Clippy with `-D warnings`, the full stable suite, and the full Rust 1.74 suite are green on the exact implementation head.
+
+Boundary: 40A is a trusted host-local bounded object store. Mode `0444` is an API immutability convention, not protection from a privileged writer controlling the store root. It does not provide `fsync` crash durability/recovery, trust-store or key provenance/rotation/revocation, garbage collection/indexing, version retention, remote/distributed CAS, replication, or hostile concurrent store-writer protection.
+
+### Milestone 40 promotion rule
+
+After 40A integrates, do not farm object filename encodings, extra dedup aliases, or repeated tamper vectors. Promote to a materially stronger lifecycle boundary such as crash-durable publication/recovery or independently specified trust/key lifecycle semantics.
 
 ## Independent host-local IPC frontier — post-launch object transfer
 

@@ -1033,7 +1033,7 @@ After 41B integrates, seal the current host-local snapshot trust lifecycle. Do n
 
 ### Slice 42A — read-only bounded inventory validation
 
-**Current verified candidate.** Adds a whole-store read-only integrity pass over the existing Milestones 40A/40B object format rather than another publication or materialization wrapper.
+**Status: complete on `main`.** Adds a whole-store read-only integrity pass over the existing Milestones 40A/40B object format rather than another publication or materialization wrapper.
 
 Acceptance evidence is executable:
 
@@ -1048,6 +1048,29 @@ Boundary: 42A is a read-only integrity inventory for a quiescent or cooperativel
 ### Milestone 42 promotion rule
 
 After 42A integrates, do not farm more malformed filenames, tamper bytes, link counts, or budget aliases that repeat the same audit path. Promote only to a materially different executable store-lifecycle or authority boundary with safe mutation/concurrency semantics and deterministic evidence, or to another independent frontier if that evidence is not yet available.
+
+
+## Milestone 43 — canonical audited store inventory commitment
+
+### Slice 43A — deterministic whole-store membership identity
+
+**Current verified candidate.** Adds a cross-run store-membership commitment above the complete 42A integrity audit rather than another malformed-object variant.
+
+Acceptance evidence is executable:
+
+- `snapshot_store_inventory_identity(store_root, limits)` reuses the exact bounded 42A scan and receives a record only after that object passes canonical filename, object-type/link/mode, archive-byte, canonical-parser, and archive-derived identity checks;
+- every accepted record commits to the complete snapshot identity tuple `(sha256, encoded_bytes, nodes)` plus exact archive byte length; records are sorted before hashing so filesystem enumeration and insertion order do not affect the result;
+- the versioned SHA-256 stream commits to `security-lab-snapshot-store-inventory-v1\0`, exact object count, aggregate archive bytes, and all sorted records;
+- two equivalent two-object stores populated in opposite orders produce the fixed golden identity `74ac767d1be69f143d68b88a8202214af6cf464aa2307b4397f84eb9baef0af1` with exactly 2 objects and 198 archive bytes;
+- `verify_snapshot_store_inventory_identity` accepts an unchanged independently expected inventory, while deterministic addition/deletion evidence changes the identity and returns `IdentityMismatch` with the newly observed counts;
+- existing 42A content-tamper failure propagates as the original audit error rather than being hidden behind an inventory mismatch;
+- exact candidate rustfmt, Clippy with `-D warnings`, complete stable tests, and the complete Rust 1.74 suite are green.
+
+Boundary: 43A is an unkeyed commitment to one successfully audited observed store inventory. It does not authenticate signer/trust-policy provenance, persist or independently protect the expected identity, prevent rollback when expected state is restored with the store, serialize independent publishers, provide a point-in-time concurrent snapshot, or repair/quarantine/delete/garbage-collect objects.
+
+### Milestone 43 promotion rule
+
+After 43A integrates, seal this inventory-commitment encoding. Do not farm digest renderings, record-order aliases, or more add/delete variants. A stronger store-lifecycle phase must introduce materially new safe concurrency/mutation semantics or an independently anchored authentication/rollback boundary with executable evidence; otherwise promote to another independent authority frontier.
 
 ## Independent host-local IPC frontier — post-launch object transfer
 

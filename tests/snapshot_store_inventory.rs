@@ -127,7 +127,11 @@ fn inventory_identity_is_repeatable_and_creation_order_independent() {
     assert_eq!(identity_a, identity_a_again);
     assert_eq!(identity_a, identity_b);
     assert_eq!(identity_a.objects, 2);
-    assert_eq!(identity_a.sha256_hex().len(), 64);
+    assert_eq!(identity_a.archive_bytes, 198);
+    assert_eq!(
+        identity_a.sha256_hex(),
+        "74ac767d1be69f143d68b88a8202214af6cf464aa2307b4397f84eb9baef0af1"
+    );
 }
 
 #[test]

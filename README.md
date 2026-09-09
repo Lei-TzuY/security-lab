@@ -337,3 +337,11 @@ cargo test --locked --all-targets --all-features
 ```
 
 `Cargo.lock` is committed. CI pins action revisions, runs locked stable fmt/Clippy/tests, and separately executes the full locked suite on Rust 1.74.
+
+## Cooperative snapshot-store transactions
+
+The current Milestone 44A verified candidate makes the store's previous “quiescent or cooperatively serialized” precondition executable for participating callers. `SnapshotStoreReadTransaction` holds a shared Linux `flock` on the already-existing store-root directory and offers the complete store audit, inventory identity, and expected-inventory verification while that lock is live. `SnapshotStoreWriteTransaction` holds an exclusive lock on the same directory inode and offers authenticated durable snapshot publication. Blocking `begin` and nonblocking `try_begin` variants are explicit; a nonblocking conflict returns `SnapshotStoreTransactionError::LockContended` with the requested read/write mode.
+
+This is deliberately an opt-in cooperation protocol rather than a silent semantic change to the existing direct store, audit, or inventory APIs. Legacy direct functions remain available and do not acquire the transaction lock automatically; callers that need read/write linearization must consistently use the transaction types. The lock is advisory and host-local: it does not exclude privileged or non-cooperating writers, create a kernel/filesystem snapshot, provide database rollback or serializable transactions, authenticate/anchor inventory history, or claim distributed/remote-filesystem lease semantics.
+
+Executable regressions prove shared-reader coexistence, read/write and write/write exclusion, typed nonblocking contention, RAII release, authenticated durable publication under the exclusive transaction, and complete one-object → two-object inventory transitions under shared read transactions. The exact candidate remains covered by stable rustfmt/Clippy/full tests and the complete Rust 1.74 suite.

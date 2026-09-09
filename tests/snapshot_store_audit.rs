@@ -200,11 +200,59 @@ fn symlink_entry_is_rejected_without_following_it() {
 }
 
 #[test]
+fn writable_object_is_rejected_even_when_archive_identity_is_valid() {
+    let workspace = TempDir::new("writable-object");
+    let store = workspace.path().join("store");
+    fs::create_dir(&store).expect("create store root");
+    let (identity, _) = store_fixture(
+        workspace.path(),
+        &store,
+        "writable",
+        b"writable-object-payload\n",
+        0x62,
+    );
+    let object = snapshot_store_object_path(&store, identity);
+    fs::set_permissions(&object, fs::Permissions::from_mode(0o644))
+        .expect("make stored object writable");
+
+    match audit_snapshot_store(&store, audit_limits()).unwrap_err() {
+        SnapshotStoreAuditError::UnsafeObject { reason, .. } => {
+            assert!(reason.contains("write permission"));
+        }
+        other => panic!("unexpected writable-object audit result: {other}"),
+    }
+}
+
+#[test]
+fn hard_linked_object_is_rejected_even_when_archive_identity_is_valid() {
+    let workspace = TempDir::new("hard-link");
+    let store = workspace.path().join("store");
+    fs::create_dir(&store).expect("create store root");
+    let (identity, _) = store_fixture(
+        workspace.path(),
+        &store,
+        "hard-link",
+        b"hard-linked-object-payload\n",
+        0x63,
+    );
+    let object = snapshot_store_object_path(&store, identity);
+    let alias = workspace.path().join("outside-store-object-alias");
+    fs::hard_link(&object, &alias).expect("create second hard link to stored object");
+
+    match audit_snapshot_store(&store, audit_limits()).unwrap_err() {
+        SnapshotStoreAuditError::UnsafeObject { reason, .. } => {
+            assert!(reason.contains("hard link"));
+        }
+        other => panic!("unexpected hard-link audit result: {other}"),
+    }
+}
+
+#[test]
 fn audit_budgets_fail_closed_before_unbounded_inventory_work() {
     let workspace = TempDir::new("budget");
     let store = workspace.path().join("store");
     fs::create_dir(&store).expect("create store root");
-    store_fixture(workspace.path(), &store, "one", b"budget-one\n", 0x71);
+    let (_, first_bytes) = store_fixture(workspace.path(), &store, "one", b"budget-one\n", 0x71);
     store_fixture(workspace.path(), &store, "two", b"budget-two\n", 0x72);
 
     let mut limits = audit_limits();
@@ -220,5 +268,20 @@ fn audit_budgets_fail_closed_before_unbounded_inventory_work() {
             assert_eq!(attempted, 2);
         }
         other => panic!("unexpected entry-budget result: {other}"),
+    }
+
+    let mut limits = audit_limits();
+    limits.max_total_archive_bytes = first_bytes.saturating_sub(1);
+    match audit_snapshot_store(&store, limits).unwrap_err() {
+        SnapshotStoreAuditError::BudgetExceeded {
+            resource,
+            limit,
+            attempted,
+        } => {
+            assert_eq!(resource, "aggregate byte");
+            assert_eq!(limit, first_bytes - 1);
+            assert!(attempted >= first_bytes);
+        }
+        other => panic!("unexpected aggregate-budget result: {other}"),
     }
 }

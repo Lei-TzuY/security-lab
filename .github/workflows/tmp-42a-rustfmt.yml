@@ -1,0 +1,28 @@
+name: materialize milestone 42A rustfmt
+
+on:
+  push:
+    branches: [tmp-42a-rustfmt]
+
+permissions:
+  contents: write
+
+jobs:
+  format:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: stable
+          components: rustfmt
+      - name: Format candidate
+        run: cargo fmt --all
+      - name: Remove construction workflow and commit formatted tree
+        run: |
+          rm .github/workflows/tmp-42a-rustfmt.yml
+          git config user.name LeiZ
+          git config user.email 52287354+Lei-TzuY@users.noreply.github.com
+          git add -A
+          git commit -m "style: format snapshot store audit"
+          git push origin HEAD:tmp-42a-rustfmt

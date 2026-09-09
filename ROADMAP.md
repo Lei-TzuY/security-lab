@@ -1054,7 +1054,7 @@ After 42A integrates, do not farm more malformed filenames, tamper bytes, link c
 
 ### Slice 43A — deterministic whole-store membership identity
 
-**Current verified candidate.** Adds a cross-run store-membership commitment above the complete 42A integrity audit rather than another malformed-object variant.
+**Status: complete on `main`.** Adds a cross-run store-membership commitment above the complete 42A integrity audit rather than another malformed-object variant.
 
 Acceptance evidence is executable:
 
@@ -1071,6 +1071,29 @@ Boundary: 43A is an unkeyed commitment to one successfully audited observed stor
 ### Milestone 43 promotion rule
 
 After 43A integrates, seal this inventory-commitment encoding. Do not farm digest renderings, record-order aliases, or more add/delete variants. A stronger store-lifecycle phase must introduce materially new safe concurrency/mutation semantics or an independently anchored authentication/rollback boundary with executable evidence; otherwise promote to another independent authority frontier.
+
+## Milestone 44 — cooperative snapshot-store transaction serialization
+
+### Slice 44A — shared-read / exclusive-write store transactions
+
+**Current verified candidate.** Adds an explicit host-local cooperation protocol around durable publication and whole-store read operations instead of pretending the existing read-only audit is a concurrent filesystem snapshot.
+
+Acceptance evidence is executable:
+
+- `SnapshotStoreReadTransaction::{begin,try_begin}` opens the pre-existing store-root directory and holds Linux `flock(LOCK_SH)` on that directory inode for the transaction lifetime; multiple cooperating readers can coexist;
+- `SnapshotStoreWriteTransaction::{begin,try_begin}` uses `flock(LOCK_EX)` on the same store-root inode, and nonblocking lock contention returns the typed `SnapshotStoreTransactionError::LockContended` rather than falling through to an unlocked operation;
+- read transactions expose the existing complete store audit, deterministic inventory identity, and expected-inventory verification while the shared lock remains live;
+- write transactions expose the existing authenticated `fsync`-backed durable publication path while the exclusive lock remains live;
+- deterministic Linux regressions prove two shared readers coexist, a writer cannot acquire while either reader is live, a reader or second writer cannot acquire while the writer is live, and locks become available after RAII release;
+- a durable two-publication regression proves the cooperating inventory advances from a complete one-object state to a complete two-object state, while nonblocking writers/readers are rejected at the opposite lock boundary;
+- legacy direct store/audit/inventory functions remain API-compatible and intentionally do not acquire this lock automatically, avoiding hidden nested-lock semantics. Callers requiring cooperative linearization must enter the transaction API explicitly;
+- exact candidate rustfmt, Clippy with `-D warnings`, complete stable tests, and the complete Rust 1.74 suite are green.
+
+Boundary: 44A is advisory cooperation among callers that use these transaction APIs against the same local store-root inode. It is not a mandatory-access-control boundary, does not stop privileged or non-cooperating writers, does not provide a filesystem point-in-time snapshot, database isolation/rollback, distributed leases, remote-filesystem lock guarantees, or independently anchored rollback protection.
+
+### Milestone 44 promotion rule
+
+After 44A integrates, seal the shared/exclusive advisory-lock vocabulary. Do not farm lock-name aliases, timeout knobs, or more reader-count variants. A stronger store-lifecycle phase must introduce materially new semantics such as independently anchored rollback state, hostile/non-cooperating mutation detection, or a genuine point-in-time snapshot/transaction mechanism with deterministic evidence; otherwise promote to another independent authority frontier.
 
 ## Independent host-local IPC frontier — post-launch object transfer
 

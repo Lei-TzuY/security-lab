@@ -1,0 +1,1219 @@
+name: materialize milestone 43A mediated SCM_RIGHTS
+
+on:
+  push:
+    branches: [tmp-43a-mediated-scm-rights]
+
+permissions:
+  contents: write
+
+jobs:
+  construct:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - name: Materialize candidate
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_one(path, old, new, label):
+              p = Path(path)
+              text = p.read_text()
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{label}: expected exactly one match, got {count}")
+              p.write_text(text.replace(old, new, 1))
+
+          def insert_before(path, marker, addition, label):
+              replace_one(path, marker, addition + marker, label)
+
+          # Policy: one explicit receive policy that attenuates a host-UNIX broker.
+          replace_one(
+              "src/policy.rs",
+              '''#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+          pub struct StdioPolicy {
+              pub stdin: StdioMode,
+              pub stdout: StdioMode,
+              pub stderr: StdioMode,
+          }
+          ''',
+              '''#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+          pub struct StdioPolicy {
+              pub stdin: StdioMode,
+              pub stdout: StdioMode,
+              pub stderr: StdioMode,
+          }
+
+          #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+          pub enum HostUnixFdReceivePolicy {
+              /// A launcher-owned mediator accepts exactly one SCM_RIGHTS descriptor,
+              /// requires a regular file opened O_RDONLY, then forwards only that FD.
+              ReadOnlyRegularFile,
+          }
+          ''',
+              "policy receive enum",
+          )
+          replace_one(
+              "src/policy.rs",
+              '''    pub host_unix_stream_peer_uid: Option<u32>,
+              pub host_unix_stream_peer_gid: Option<u32>,
+          ''',
+              '''    pub host_unix_stream_peer_uid: Option<u32>,
+              pub host_unix_stream_peer_gid: Option<u32>,
+              /// Optional launcher-owned receive mediation for one post-launch
+              /// SCM_RIGHTS descriptor on the declared host-UNIX broker.
+              pub host_unix_stream_receive_fd: Option<HostUnixFdReceivePolicy>,
+          ''',
+              "policy receive field",
+          )
+          insert_before(
+              "src/policy.rs",
+              '''        match (
+              self.host_loopback_tcp_listen_port,
+              self.host_loopback_tcp_listen_target_fd,
+          ) {
+          ''',
+              '''        if self.host_unix_stream_receive_fd.is_some() {
+              if self.host_unix_stream_path.is_none() || self.host_unix_stream_target_fd.is_none() {
+                  return Err(PolicyError::new(
+                      "ipc.host_unix_stream_receive_fd requires a brokered host-UNIX stream endpoint",
+                  ));
+              }
+              if !self.seccomp.allowed_syscalls.contains("recvmsg") {
+                  return Err(PolicyError::new(
+                      "ipc.host_unix_stream_receive_fd requires recvmsg in seccomp.allow",
+                  ));
+              }
+              if !self.seccomp.allowed_syscalls.contains("write") {
+                  return Err(PolicyError::new(
+                      "ipc.host_unix_stream_receive_fd requires write in seccomp.allow for post-exec readiness",
+                  ));
+              }
+          }
+
+          ''',
+              "policy mediation validation",
+          )
+          replace_one(
+              "src/policy.rs",
+              '''        let mut host_unix_stream_peer_uid = None;
+              let mut host_unix_stream_peer_gid = None;
+              let mut host_loopback_tcp_listen_port = None;
+          ''',
+              '''        let mut host_unix_stream_peer_uid = None;
+              let mut host_unix_stream_peer_gid = None;
+              let mut host_unix_stream_receive_fd = None;
+              let mut host_loopback_tcp_listen_port = None;
+          ''',
+              "policy parser receive variable",
+          )
+          insert_before(
+              "src/policy.rs",
+              '''                "network.host_loopback_tcp_listen_port" => set_once(
+          ''',
+              '''                "ipc.host_unix_stream_receive_fd" => set_once(
+                      &mut host_unix_stream_receive_fd,
+                      parse_host_unix_fd_receive_policy(value, line_no, key)?,
+                      line_no,
+                      key,
+                  )?,
+          ''',
+              "policy parser receive key",
+          )
+          replace_one(
+              "src/policy.rs",
+              '''            host_unix_stream_peer_uid,
+              host_unix_stream_peer_gid,
+              host_loopback_tcp_listen_port,
+          ''',
+              '''            host_unix_stream_peer_uid,
+              host_unix_stream_peer_gid,
+              host_unix_stream_receive_fd,
+              host_loopback_tcp_listen_port,
+          ''',
+              "policy parser constructor field",
+          )
+          insert_before(
+              "src/policy.rs",
+              '''fn parse_seccomp_arg_rule(
+          ''',
+              '''fn parse_host_unix_fd_receive_policy(
+              value: &str,
+              line: usize,
+              key: &str,
+          ) -> Result<HostUnixFdReceivePolicy, PolicyError> {
+              match value {
+                  "readonly_regular_file" => Ok(HostUnixFdReceivePolicy::ReadOnlyRegularFile),
+                  _ => Err(PolicyError::at(
+                      line,
+                      format!("{key} must be readonly_regular_file"),
+                  )),
+              }
+          }
+
+          ''',
+              "policy receive parser helper",
+          )
+          insert_before(
+              "src/policy.rs",
+              '''    #[test]
+              fn parses_brokered_host_loopback_tcp_endpoint() {
+          ''',
+              '''    #[test]
+              fn parses_and_validates_mediated_host_unix_fd_receive_policy() {
+                  let base = volume_valid().replace(
+                      "seccomp.allow = execveat,read,write,exit_group",
+                      "seccomp.allow = execveat,read,write,recvmsg,exit_group",
+                  );
+                  let text = format!(
+                      "{base}\\nipc.host_unix_stream_path = /run/security-lab.sock\\nipc.host_unix_stream_target_fd = 14\\nipc.host_unix_stream_receive_fd = readonly_regular_file"
+                  );
+                  let policy: SandboxPolicy = text.parse().unwrap();
+                  assert_eq!(
+                      policy.host_unix_stream_receive_fd,
+                      Some(HostUnixFdReceivePolicy::ReadOnlyRegularFile)
+                  );
+
+                  let detached = format!(
+                      "{base}\\nipc.host_unix_stream_receive_fd = readonly_regular_file"
+                  );
+                  assert!(detached.parse::<SandboxPolicy>().is_err());
+
+                  let no_recvmsg = format!(
+                      "{}\\nipc.host_unix_stream_path = /run/security-lab.sock\\nipc.host_unix_stream_target_fd = 14\\nipc.host_unix_stream_receive_fd = readonly_regular_file",
+                      volume_valid()
+                  );
+                  let error = no_recvmsg.parse::<SandboxPolicy>().unwrap_err();
+                  assert!(error.to_string().contains("requires recvmsg"));
+              }
+
+          ''',
+              "policy receive tests",
+          )
+
+          # Authority manifest/delta must make the attenuation visible.
+          replace_one(
+              "src/authority_manifest.rs",
+              '''use security_lab::{SandboxPolicy, StdioMode};
+          ''',
+              '''use security_lab::policy::HostUnixFdReceivePolicy;
+          use security_lab::{SandboxPolicy, StdioMode};
+          ''',
+              "manifest receive import",
+          )
+          replace_one(
+              "src/authority_manifest.rs",
+              '''                _ => output.push_str("null"),
+                      }
+                      output.push('}');
+                  }
+                  _ => output.push_str("null"),
+              }
+              output.push('}');
+
+              output.push_str(",\\\"descriptors\\\":{\\\"stdio\\\":{\\\"stdin\\\":");
+          ''',
+              '''                _ => output.push_str("null"),
+                      }
+                      output.push_str(",\\\"received_fd_policy\\\":");
+                      match policy.host_unix_stream_receive_fd {
+                          Some(HostUnixFdReceivePolicy::ReadOnlyRegularFile) => {
+                              push_json_string(&mut output, "readonly_regular_file")
+                          }
+                          None => output.push_str("null"),
+                      }
+                      output.push('}');
+                  }
+                  _ => output.push_str("null"),
+              }
+              output.push('}');
+
+              output.push_str(",\\\"descriptors\\\":{\\\"stdio\\\":{\\\"stdin\\\":");
+          ''',
+              "manifest receive field",
+          )
+          insert_before(
+              "src/authority_delta.rs",
+              '''    compare_stdio(
+              "descriptors.stdin",
+          ''',
+              '''    compare_optional_restriction(
+                  "host_ipc.unix_stream_receive_fd",
+                  baseline.host_unix_stream_receive_fd,
+                  candidate.host_unix_stream_receive_fd,
+                  &mut changes,
+              );
+
+          ''',
+              "authority delta receive restriction",
+          )
+
+          # Linux launch preparation: replace the direct host socket with a private
+          # socketpair endpoint only for the explicit mediated receive policy.
+          replace_one(
+              "src/platform/linux.rs",
+              '''    use crate::policy::{StdioMode, StdioPolicy};
+          ''',
+              '''    use crate::policy::{HostUnixFdReceivePolicy, StdioMode, StdioPolicy};
+          ''',
+              "linux receive import",
+          )
+          replace_one(
+              "src/platform/linux.rs",
+              '''    const PHASE_COW_DIFF_EXPORT: u32 = 65;
+          ''',
+              '''    const PHASE_COW_DIFF_EXPORT: u32 = 65;
+              const PHASE_RUNTIME_FD_MEDIATION: u32 = 66;
+          ''',
+              "linux mediation phase",
+          )
+          insert_before(
+              "src/platform/linux.rs",
+              '''    #[derive(Clone, Copy, PartialEq, Eq)]
+              enum VolumeAccess {
+          ''',
+              '''    struct RuntimeFdMediator {
+                  host_fd: OwnedFd,
+                  bridge_fd: OwnedFd,
+              }
+
+          ''',
+              "linux mediator struct",
+          )
+          insert_before(
+              "src/platform/linux.rs",
+              '''    fn listen_host_loopback_tcp(
+          ''',
+              '''    fn prepare_runtime_fd_mediator(
+                  broker: PreparedSelectedHandle,
+                  storage_floor: RawFd,
+              ) -> Result<(PreparedSelectedHandle, RuntimeFdMediator), SandboxError> {
+                  let PreparedSelectedHandle {
+                      storage_fd: host_fd,
+                      target_fd,
+                  } = broker;
+                  let mut pair = [-1, -1];
+                  if unsafe {
+                      libc::socketpair(
+                          libc::AF_UNIX,
+                          libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+                          0,
+                          pair.as_mut_ptr(),
+                      )
+                  } == -1
+                  {
+                      return Err(SandboxError::SetupFailed(format!(
+                          "cannot create private runtime-FD mediation socketpair: {}",
+                          io::Error::last_os_error()
+                      )));
+                  }
+                  let target_storage = move_owned_fd_to_selected_storage(
+                      OwnedFd(pair[0]),
+                      storage_floor,
+                      "mediated target socket",
+                  )?;
+                  let bridge_fd = move_owned_fd_to_selected_storage(
+                      OwnedFd(pair[1]),
+                      storage_floor,
+                      "launcher runtime-FD mediation socket",
+                  )?;
+                  Ok((
+                      PreparedSelectedHandle {
+                          storage_fd: target_storage,
+                          target_fd,
+                      },
+                      RuntimeFdMediator { host_fd, bridge_fd },
+                  ))
+              }
+
+          ''',
+              "linux mediator preparation",
+          )
+          replace_one(
+              "src/platform/linux.rs",
+              '''        selected_handles: Vec<PreparedSelectedHandle>,
+              selected_storage_floor: RawFd,
+              landlock: PreparedLandlock,
+          ''',
+              '''        selected_handles: Vec<PreparedSelectedHandle>,
+              selected_storage_floor: RawFd,
+              runtime_fd_mediator: Option<RuntimeFdMediator>,
+              landlock: PreparedLandlock,
+          ''',
+              "prepared launch mediator field",
+          )
+          replace_one(
+              "src/platform/linux.rs",
+              '''            match (
+                  &policy.host_unix_stream_path,
+                  policy.host_unix_stream_target_fd,
+              ) {
+                  (Some(path), Some(target_fd)) => selected_handles.push(connect_host_unix_stream(
+                      path,
+                      target_fd,
+                      selected_storage_floor,
+                      host_unix_expected_peer,
+                  )?),
+                  (None, None) if host_unix_expected_peer.is_none() => {}
+                  (None, None) => {
+                      return Err(SandboxError::InvalidPolicy(PolicyError::new(
+                          "host-UNIX peer credentials require a brokered endpoint",
+                      )));
+                  }
+                  _ => {
+                      return Err(SandboxError::InvalidPolicy(PolicyError::new(
+                          "ipc.host_unix_stream_path and ipc.host_unix_stream_target_fd must be specified together",
+                      )));
+                  }
+              }
+          ''',
+              '''            let mut runtime_fd_mediator = None;
+              match (
+                  &policy.host_unix_stream_path,
+                  policy.host_unix_stream_target_fd,
+              ) {
+                  (Some(path), Some(target_fd)) => {
+                      let broker = connect_host_unix_stream(
+                          path,
+                          target_fd,
+                          selected_storage_floor,
+                          host_unix_expected_peer,
+                      )?;
+                      if policy.host_unix_stream_receive_fd
+                          == Some(HostUnixFdReceivePolicy::ReadOnlyRegularFile)
+                      {
+                          let (target_handle, mediator) =
+                              prepare_runtime_fd_mediator(broker, selected_storage_floor)?;
+                          selected_handles.push(target_handle);
+                          runtime_fd_mediator = Some(mediator);
+                      } else {
+                          selected_handles.push(broker);
+                      }
+                  }
+                  (None, None) if host_unix_expected_peer.is_none() => {}
+                  (None, None) => {
+                      return Err(SandboxError::InvalidPolicy(PolicyError::new(
+                          "host-UNIX peer credentials require a brokered endpoint",
+                      )));
+                  }
+                  _ => {
+                      return Err(SandboxError::InvalidPolicy(PolicyError::new(
+                          "ipc.host_unix_stream_path and ipc.host_unix_stream_target_fd must be specified together",
+                      )));
+                  }
+              }
+          ''',
+              "linux host unix mediation selection",
+          )
+          replace_one(
+              "src/platform/linux.rs",
+              '''                selected_handles,
+                  selected_storage_floor,
+                  landlock: PreparedLandlock {
+          ''',
+              '''                selected_handles,
+                  selected_storage_floor,
+                  runtime_fd_mediator,
+                  landlock: PreparedLandlock {
+          ''',
+              "prepared launch mediator constructor",
+          )
+          replace_one(
+              "src/platform/linux.rs",
+              '''        output_limit_fd: RawFd,
+              cow_diff_state: *mut CowDiffState,
+              wall_clock_milliseconds: u64,
+          ''',
+              '''        output_limit_fd: RawFd,
+              runtime_host_fd: RawFd,
+              runtime_bridge_fd: RawFd,
+              cow_diff_state: *mut CowDiffState,
+              wall_clock_milliseconds: u64,
+          ''',
+              "child control mediator fds",
+          )
+          replace_one(
+              "src/platform/linux.rs",
+              '''        ensure_supervision_support(
+                  policy.wall_clock_milliseconds,
+                  cancellation.is_some(),
+                  policy.stdout_total_bytes.is_some(),
+              )?;
+          ''',
+              '''        ensure_supervision_support(
+                  policy.wall_clock_milliseconds,
+                  cancellation.is_some(),
+                  policy.stdout_total_bytes.is_some(),
+                  policy.host_unix_stream_receive_fd.is_some(),
+              )?;
+          ''',
+              "supervision preflight call",
+          )
+          replace_one(
+              "src/platform/linux.rs",
+              '''        let capture_read_fd = capture.as_ref().map_or(-1, |pipe| pipe.read_fd.raw());
+              let capture_write_fd = capture.as_ref().map_or(-1, |pipe| pipe.write_fd.raw());
+              let child_control = ChildControl {
+          ''',
+              '''        let capture_read_fd = capture.as_ref().map_or(-1, |pipe| pipe.read_fd.raw());
+              let capture_write_fd = capture.as_ref().map_or(-1, |pipe| pipe.write_fd.raw());
+              let runtime_host_fd = prepared
+                  .runtime_fd_mediator
+                  .as_ref()
+                  .map_or(-1, |mediator| mediator.host_fd.raw());
+              let runtime_bridge_fd = prepared
+                  .runtime_fd_mediator
+                  .as_ref()
+                  .map_or(-1, |mediator| mediator.bridge_fd.raw());
+              let child_control = ChildControl {
+          ''',
+              "child control mediator extraction",
+          )
+          replace_one(
+              "src/platform/linux.rs",
+              '''            capture_write_fd,
+                  output_limit_fd,
+                  cow_diff_state: cow_diff
+          ''',
+              '''            capture_write_fd,
+                  output_limit_fd,
+                  runtime_host_fd,
+                  runtime_bridge_fd,
+                  cow_diff_state: cow_diff
+          ''',
+              "child control mediator initialize",
+          )
+          replace_one(
+              "src/platform/linux.rs",
+              '''    fn ensure_supervision_support(
+              deadline: Option<u64>,
+              cancellable: bool,
+              output_limited: bool,
+          ) -> Result<(), SandboxError> {
+              if deadline.is_none() && !cancellable && !output_limited {
+          ''',
+              '''    fn ensure_supervision_support(
+              deadline: Option<u64>,
+              cancellable: bool,
+              output_limited: bool,
+              runtime_fd_mediated: bool,
+          ) -> Result<(), SandboxError> {
+              if deadline.is_none() && !cancellable && !output_limited && !runtime_fd_mediated {
+          ''',
+              "supervision preflight signature",
+          )
+          replace_one(
+              "src/platform/linux.rs",
+              '''        let purpose = if output_limited {
+              "stdout output-limit supervision"
+          } else {
+              match (deadline.is_some(), cancellable) {
+                  (true, true) => "deadline/cancellation supervision",
+                  (true, false) => "wall-clock deadline",
+                  (false, true) => "external cancellation",
+                  (false, false) => unreachable!(),
+              }
+          };
+          ''',
+              '''        let purpose = if output_limited {
+              "stdout output-limit supervision"
+          } else if runtime_fd_mediated {
+              "runtime descriptor mediation"
+          } else {
+              match (deadline.is_some(), cancellable) {
+                  (true, true) => "deadline/cancellation supervision",
+                  (true, false) => "wall-clock deadline",
+                  (false, true) => "external cancellation",
+                  (false, false) => unreachable!(),
+              }
+          };
+          ''',
+              "supervision mediation purpose",
+          )
+          replace_one(
+              "src/platform/linux.rs",
+              '''            output_limit_fd,
+              cow_diff_state,
+              wall_clock_milliseconds,
+          ''',
+              '''            output_limit_fd,
+              runtime_host_fd,
+              runtime_bridge_fd,
+              cow_diff_state,
+              wall_clock_milliseconds,
+          ''',
+              "child exec mediator destructure",
+          )
+          replace_one(
+              "src/platform/linux.rs",
+              '''            output_limit_fd,
+              CowDiffControl {
+          ''',
+              '''            output_limit_fd,
+              runtime_host_fd,
+              runtime_bridge_fd,
+              CowDiffControl {
+          ''',
+              "pid lifecycle mediator arguments",
+          )
+          replace_one(
+              "src/platform/linux.rs",
+              '''                cow_diff_export: PHASE_COW_DIFF_EXPORT,
+          ''',
+              '''                cow_diff_export: PHASE_COW_DIFF_EXPORT,
+                  runtime_fd_mediation: PHASE_RUNTIME_FD_MEDIATION,
+          ''',
+              "pid lifecycle mediation phase",
+          )
+          insert_before(
+              "src/platform/linux.rs",
+              '''            _ => "unknown launch phase",
+          ''',
+              '''            PHASE_RUNTIME_FD_MEDIATION => "launcher-owned runtime descriptor mediation",
+          ''',
+              "decode mediation phase",
+          )
+
+          # PID1 owns the mediation state machine so invalid objects cannot leave
+          # an unsupervised target alive and cancellation/deadline remain active.
+          replace_one(
+              "src/platform/linux_pid_lifecycle.rs",
+              '''    pub(super) cow_diff_export: u32,
+          ''',
+              '''    pub(super) cow_diff_export: u32,
+              pub(super) runtime_fd_mediation: u32,
+          ''',
+              "lifecycle mediation phase field",
+          )
+          replace_one(
+              "src/platform/linux_pid_lifecycle.rs",
+              '''    cancellation_fd: libc::c_int,
+              output_limit_fd: libc::c_int,
+              cow_diff: CowDiffControl,
+          ''',
+              '''    cancellation_fd: libc::c_int,
+              output_limit_fd: libc::c_int,
+              runtime_host_fd: libc::c_int,
+              runtime_bridge_fd: libc::c_int,
+              cow_diff: CowDiffControl,
+          ''',
+              "lifecycle mediator arguments",
+          )
+          replace_one(
+              "src/platform/linux_pid_lifecycle.rs",
+              '''        for control_fd in [cancellation_fd, output_limit_fd, cow_upper_fd] {
+          ''',
+              '''        for control_fd in [
+                  cancellation_fd,
+                  output_limit_fd,
+                  runtime_host_fd,
+                  runtime_bridge_fd,
+                  cow_upper_fd,
+              ] {
+          ''',
+              "target closes mediator controls",
+          )
+          replace_one(
+              "src/platform/linux_pid_lifecycle.rs",
+              '''    if let Err(errno) = close_nonstdio_except(cancellation_fd, output_limit_fd, cow_upper_fd) {
+          ''',
+              '''    if let Err(errno) = close_nonstdio_except([
+              cancellation_fd,
+              output_limit_fd,
+              runtime_host_fd,
+              runtime_bridge_fd,
+              cow_upper_fd,
+          ]) {
+          ''',
+              "PID1 retains mediator controls",
+          )
+          replace_one(
+              "src/platform/linux_pid_lifecycle.rs",
+              '''        cancellation_fd,
+              output_limit_fd,
+              launch_error,
+          ''',
+              '''        cancellation_fd,
+              output_limit_fd,
+              runtime_host_fd,
+              runtime_bridge_fd,
+              launch_error,
+          ''',
+              "wait mediator arguments",
+          )
+          replace_one(
+              "src/platform/linux_pid_lifecycle.rs",
+              '''    let reaped_descendants = kill_and_reap_remaining(launch_error, phases.kill, phases.reap);
+          ''',
+              '''    for mediator_fd in [runtime_host_fd, runtime_bridge_fd] {
+              if mediator_fd >= 3 && libc::close(mediator_fd) == -1 {
+                  fail(launch_error, phases.close);
+              }
+          }
+              let reaped_descendants = kill_and_reap_remaining(launch_error, phases.kill, phases.reap);
+          ''',
+              "PID1 closes mediator controls after target",
+          )
+          replace_one(
+              "src/platform/linux_pid_lifecycle.rs",
+              '''    cancellation_fd: libc::c_int,
+              output_limit_fd: libc::c_int,
+              launch_error: *mut LaunchErrorRecord,
+          ''',
+              '''    cancellation_fd: libc::c_int,
+              output_limit_fd: libc::c_int,
+              runtime_host_fd: libc::c_int,
+              runtime_bridge_fd: libc::c_int,
+              launch_error: *mut LaunchErrorRecord,
+          ''',
+              "wait mediator signature",
+          )
+          replace_one(
+              "src/platform/linux_pid_lifecycle.rs",
+              '''    if wall_clock_milliseconds == 0 && cancellation_fd < 0 && output_limit_fd < 0 {
+          ''',
+              '''    let mediation_active = runtime_host_fd >= 3 || runtime_bridge_fd >= 3;
+              if (runtime_host_fd >= 3) != (runtime_bridge_fd >= 3) {
+                  fail_errno(launch_error, phases.runtime_fd_mediation, libc::EINVAL);
+              }
+              if wall_clock_milliseconds == 0
+                  && cancellation_fd < 0
+                  && output_limit_fd < 0
+                  && !mediation_active
+              {
+          ''',
+              "wait mediation activation",
+          )
+          replace_one(
+              "src/platform/linux_pid_lifecycle.rs",
+              '''        } else if cancellation_fd >= 0 {
+              phases.cancellation_pidfd
+          } else {
+              phases.pidfd
+          };
+          ''',
+              '''        } else if cancellation_fd >= 0 {
+              phases.cancellation_pidfd
+          } else if mediation_active {
+              phases.runtime_fd_mediation
+          } else {
+              phases.pidfd
+          };
+          ''',
+              "mediator pidfd phase",
+          )
+          replace_one(
+              "src/platform/linux_pid_lifecycle.rs",
+              '''        libc::pollfd {
+                  fd: output_limit_fd,
+                  events: libc::POLLIN,
+                  revents: 0,
+              },
+          ];
+
+          loop {
+              for fd in &mut fds {
+                  fd.revents = 0;
+              }
+          ''',
+              '''        libc::pollfd {
+                  fd: output_limit_fd,
+                  events: libc::POLLIN,
+                  revents: 0,
+              },
+              libc::pollfd {
+                  fd: -1,
+                  events: libc::POLLIN,
+                  revents: 0,
+              },
+              libc::pollfd {
+                  fd: -1,
+                  events: libc::POLLIN,
+                  revents: 0,
+              },
+          ];
+              let mut mediation_stage = if mediation_active { 0u8 } else { 2u8 };
+
+          loop {
+              for fd in &mut fds {
+                  fd.revents = 0;
+              }
+              fds[4].fd = if mediation_stage == 0 { runtime_bridge_fd } else { -1 };
+              fds[5].fd = if mediation_stage == 1 { runtime_host_fd } else { -1 };
+          ''',
+              "poll mediator descriptors",
+          )
+          replace_one(
+              "src/platform/linux_pid_lifecycle.rs",
+              '''            } else if cancellation_fd >= 0 {
+                  phases.cancellation_poll
+              } else {
+                  phases.poll
+              };
+              fail_errno(launch_error, phase, errno);
+          ''',
+              '''            } else if cancellation_fd >= 0 {
+                  phases.cancellation_poll
+              } else if mediation_active {
+                  phases.runtime_fd_mediation
+              } else {
+                  phases.poll
+              };
+              fail_errno(launch_error, phase, errno);
+          ''',
+              "poll syscall mediation phase",
+          )
+          replace_one(
+              "src/platform/linux_pid_lifecycle.rs",
+              '''        let invalid_events = libc::POLLERR | libc::POLLNVAL;
+              if fds
+                  .iter()
+                  .any(|fd| fd.fd >= 0 && fd.revents & invalid_events != 0)
+              {
+                  let phase = if output_limit_fd >= 0 {
+                      phases.output_limit_poll
+                  } else if cancellation_fd >= 0 {
+                      phases.cancellation_poll
+                  } else {
+                      phases.poll
+                  };
+                  fail_errno(launch_error, phase, libc::EIO);
+              }
+
+              if fds[2].revents & libc::POLLIN != 0 {
+                  let status = terminate_direct_target(pid, launch_error, phases);
+                  return (status, false, true, false);
+              }
+              if fds[1].revents & libc::POLLIN != 0 {
+                  let status = terminate_direct_target(pid, launch_error, phases);
+                  return (status, true, false, false);
+              }
+          ''',
+              '''        let invalid_events = libc::POLLERR | libc::POLLNVAL;
+              if fds
+                  .iter()
+                  .any(|fd| fd.fd >= 0 && fd.revents & invalid_events != 0)
+              {
+                  if mediation_stage < 2
+                      && ((fds[4].fd >= 0 && fds[4].revents & invalid_events != 0)
+                          || (fds[5].fd >= 0 && fds[5].revents & invalid_events != 0))
+                  {
+                      mediation_fail(pid, launch_error, phases, libc::EIO);
+                  }
+                  let phase = if output_limit_fd >= 0 {
+                      phases.output_limit_poll
+                  } else if cancellation_fd >= 0 {
+                      phases.cancellation_poll
+                  } else {
+                      phases.poll
+                  };
+                  fail_errno(launch_error, phase, libc::EIO);
+              }
+
+              // Existing launcher control paths win before a capability is
+              // forwarded when they are simultaneously observable.
+              if fds[2].revents & libc::POLLIN != 0 {
+                  let status = terminate_direct_target(pid, launch_error, phases);
+                  return (status, false, true, false);
+              }
+              if fds[1].revents & libc::POLLIN != 0 {
+                  let status = terminate_direct_target(pid, launch_error, phases);
+                  return (status, true, false, false);
+              }
+
+              if mediation_stage == 0 {
+                  if fds[4].revents & libc::POLLIN != 0 {
+                      match read_exact_byte(runtime_bridge_fd) {
+                          Ok(b'R') => {}
+                          Ok(_) => mediation_fail(pid, launch_error, phases, libc::EPROTO),
+                          Err(errno) => mediation_fail(pid, launch_error, phases, errno),
+                      }
+                      if let Err(errno) = write_exact_byte(runtime_host_fd, b'R') {
+                          mediation_fail(pid, launch_error, phases, errno);
+                      }
+                      mediation_stage = 1;
+                      continue;
+                  }
+                  if fds[4].revents & libc::POLLHUP != 0 {
+                      mediation_fail(pid, launch_error, phases, libc::EPIPE);
+                  }
+              } else if mediation_stage == 1 {
+                  if fds[5].revents & libc::POLLIN != 0 {
+                      let received_fd = match receive_one_readonly_regular_fd(runtime_host_fd) {
+                          Ok(fd) => fd,
+                          Err(errno) => mediation_fail(pid, launch_error, phases, errno),
+                      };
+                      let send_result = send_one_fd(runtime_bridge_fd, received_fd);
+                      let close_result = libc::close(received_fd);
+                      if let Err(errno) = send_result {
+                          mediation_fail(pid, launch_error, phases, errno);
+                      }
+                      if close_result == -1 {
+                          mediation_fail(pid, launch_error, phases, *libc::__errno_location());
+                      }
+                      mediation_stage = 2;
+                      continue;
+                  }
+                  if fds[5].revents & libc::POLLHUP != 0 {
+                      mediation_fail(pid, launch_error, phases, libc::EPIPE);
+                  }
+              }
+          ''',
+              "runtime mediation poll state machine",
+          )
+          insert_before(
+              "src/platform/linux_pid_lifecycle.rs",
+              '''unsafe fn terminate_direct_target(
+          ''',
+              '''#[repr(C, align(8))]
+          struct OneFdControl([u8; 24]);
+
+          unsafe fn read_exact_byte(fd: libc::c_int) -> Result<u8, i32> {
+              let mut byte = 0u8;
+              loop {
+                  let read = libc::read(
+                      fd,
+                      (&mut byte as *mut u8).cast::<libc::c_void>(),
+                      1,
+                  );
+                  if read == 1 {
+                      return Ok(byte);
+                  }
+                  if read == 0 {
+                      return Err(libc::EPIPE);
+                  }
+                  if read == -1 {
+                      let errno = *libc::__errno_location();
+                      if errno == libc::EINTR {
+                          continue;
+                      }
+                      return Err(errno);
+                  }
+                  return Err(libc::EPROTO);
+              }
+          }
+
+          unsafe fn write_exact_byte(fd: libc::c_int, byte: u8) -> Result<(), i32> {
+              loop {
+                  let written = libc::send(
+                      fd,
+                      (&byte as *const u8).cast::<libc::c_void>(),
+                      1,
+                      libc::MSG_NOSIGNAL,
+                  );
+                  if written == 1 {
+                      return Ok(());
+                  }
+                  if written == -1 {
+                      let errno = *libc::__errno_location();
+                      if errno == libc::EINTR {
+                          continue;
+                      }
+                      return Err(errno);
+                  }
+                  return Err(libc::EPIPE);
+              }
+          }
+
+          unsafe fn receive_one_readonly_regular_fd(socket_fd: libc::c_int) -> Result<libc::c_int, i32> {
+              let mut payload = 0u8;
+              let mut iov = libc::iovec {
+                  iov_base: (&mut payload as *mut u8).cast::<libc::c_void>(),
+                  iov_len: 1,
+              };
+              let mut control = OneFdControl([0u8; 24]);
+              let mut message = std::mem::zeroed::<libc::msghdr>();
+              message.msg_iov = &mut iov;
+              message.msg_iovlen = 1;
+              message.msg_control = control.0.as_mut_ptr().cast::<libc::c_void>();
+              message.msg_controllen = control.0.len();
+              loop {
+                  let received = libc::recvmsg(socket_fd, &mut message, libc::MSG_CMSG_CLOEXEC);
+                  if received == 1 {
+                      break;
+                  }
+                  if received == 0 {
+                      return Err(libc::EPIPE);
+                  }
+                  if received == -1 {
+                      let errno = *libc::__errno_location();
+                      if errno == libc::EINTR {
+                          continue;
+                      }
+                      return Err(errno);
+                  }
+                  return Err(libc::EPROTO);
+              }
+              if payload != b'F'
+                  || message.msg_flags & (libc::MSG_CTRUNC | libc::MSG_TRUNC) != 0
+                  || message.msg_controllen != 24
+              {
+                  return Err(libc::EPROTO);
+              }
+              let header = control.0.as_ptr().cast::<libc::cmsghdr>();
+              if (*header).cmsg_len != 20
+                  || (*header).cmsg_level != libc::SOL_SOCKET
+                  || (*header).cmsg_type != libc::SCM_RIGHTS
+              {
+                  return Err(libc::EPROTO);
+              }
+              let received_fd = control.0.as_ptr().add(16).cast::<libc::c_int>().read();
+              if received_fd < 0 {
+                  return Err(libc::EBADF);
+              }
+              let mut stat = std::mem::zeroed::<libc::stat>();
+              if libc::fstat(received_fd, &mut stat) == -1 {
+                  let errno = *libc::__errno_location();
+                  libc::close(received_fd);
+                  return Err(errno);
+              }
+              if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+                  libc::close(received_fd);
+                  return Err(libc::EPERM);
+              }
+              let flags = libc::fcntl(received_fd, libc::F_GETFL);
+              if flags == -1 {
+                  let errno = *libc::__errno_location();
+                  libc::close(received_fd);
+                  return Err(errno);
+              }
+              if flags & libc::O_ACCMODE != libc::O_RDONLY {
+                  libc::close(received_fd);
+                  return Err(libc::EACCES);
+              }
+              Ok(received_fd)
+          }
+
+          unsafe fn send_one_fd(socket_fd: libc::c_int, source_fd: libc::c_int) -> Result<(), i32> {
+              let payload = b'F';
+              let mut iov = libc::iovec {
+                  iov_base: (&payload as *const u8).cast::<libc::c_void>() as *mut libc::c_void,
+                  iov_len: 1,
+              };
+              let mut control = OneFdControl([0u8; 24]);
+              let header = control.0.as_mut_ptr().cast::<libc::cmsghdr>();
+              (*header).cmsg_len = 20;
+              (*header).cmsg_level = libc::SOL_SOCKET;
+              (*header).cmsg_type = libc::SCM_RIGHTS;
+              control.0.as_mut_ptr().add(16).cast::<libc::c_int>().write(source_fd);
+              let mut message = std::mem::zeroed::<libc::msghdr>();
+              message.msg_iov = &mut iov;
+              message.msg_iovlen = 1;
+              message.msg_control = control.0.as_mut_ptr().cast::<libc::c_void>();
+              message.msg_controllen = control.0.len();
+              loop {
+                  let sent = libc::sendmsg(socket_fd, &message, libc::MSG_NOSIGNAL);
+                  if sent == 1 {
+                      return Ok(());
+                  }
+                  if sent == -1 {
+                      let errno = *libc::__errno_location();
+                      if errno == libc::EINTR {
+                          continue;
+                      }
+                      return Err(errno);
+                  }
+                  return Err(libc::EPIPE);
+              }
+          }
+
+          unsafe fn mediation_fail(
+              pid: libc::pid_t,
+              launch_error: *mut LaunchErrorRecord,
+              phases: TargetSupervisionPhases,
+              errno: i32,
+          ) -> ! {
+              let _ = terminate_direct_target(pid, launch_error, phases);
+              let _ = kill_and_reap_remaining(launch_error, phases.kill, phases.reap);
+              fail_errno(launch_error, phases.runtime_fd_mediation, errno)
+          }
+
+          ''',
+              "runtime mediation helpers",
+          )
+          replace_one(
+              "src/platform/linux_pid_lifecycle.rs",
+              '''unsafe fn close_nonstdio_except(
+              keep_a: libc::c_int,
+              keep_b: libc::c_int,
+              keep_c: libc::c_int,
+          ) -> Result<(), i32> {
+              let mut keep = [keep_a, keep_b, keep_c];
+          ''',
+              '''unsafe fn close_nonstdio_except(mut keep: [libc::c_int; 5]) -> Result<(), i32> {
+          ''',
+              "close except five controls",
+          )
+
+          # Integration: preserve direct broker behavior and add mediated positive
+          # plus two negative object/rights gates using the existing raw probe mode 0.
+          replace_one(
+              "tests/sandbox.rs",
+              '''use security_lab::{
+          ''',
+              '''use security_lab::policy::HostUnixFdReceivePolicy;
+          use security_lab::{
+          ''',
+              "sandbox receive import",
+          )
+          replace_one(
+              "tests/sandbox.rs",
+              '''        host_unix_stream_peer_uid: None,
+              host_unix_stream_peer_gid: None,
+              host_loopback_tcp_listen_port: None,
+          ''',
+              '''        host_unix_stream_peer_uid: None,
+              host_unix_stream_peer_gid: None,
+              host_unix_stream_receive_fd: None,
+              host_loopback_tcp_listen_port: None,
+          ''',
+              "sandbox policy helper receive field",
+          )
+          insert_before(
+              "tests/sandbox.rs",
+              '''#[test]
+          fn brokered_host_unix_stream_rejects_wrong_peer_credentials_before_target_exec() {
+          ''',
+              '''#[test]
+          fn mediated_host_unix_scm_rights_forwards_only_readonly_regular_file() {
+              let socket_path = std::env::temp_dir().join(format!(
+                  "security-lab-mediated-rights-{}.sock",
+                  process::id()
+              ));
+              let marker_path = std::env::temp_dir().join(format!(
+                  "security-lab-mediated-rights-marker-{}",
+                  process::id()
+              ));
+              let _ = std::fs::remove_file(&socket_path);
+              let _ = std::fs::remove_file(&marker_path);
+              std::fs::write(&marker_path, b"runtime-fd-handoff-ok\\n")
+                  .expect("seed mediated runtime descriptor marker");
+              let listener = UnixListener::bind(&socket_path).expect("bind mediated SCM_RIGHTS endpoint");
+              let marker_for_server = marker_path.clone();
+              let server = thread::spawn(move || {
+                  let (stream, _) = listener.accept().expect("accept mediated host UNIX broker");
+                  let mut ready = [0u8; 1];
+                  read_exact_fd(stream.as_raw_fd(), &mut ready);
+                  assert_eq!(&ready, b"R");
+                  let marker = std::fs::File::open(marker_for_server)
+                      .expect("open mediated readonly regular file");
+                  send_one_fd(stream.as_raw_fd(), marker.as_raw_fd());
+              });
+
+              let marker_argument = marker_path.to_string_lossy().into_owned();
+              let mut brokered = policy(
+                  "0",
+                  &[marker_argument.as_str()],
+                  &["execveat", "write", "recvmsg", "read", "close", "openat", "exit"],
+              );
+              brokered.host_unix_stream_path = Some(socket_path.clone());
+              brokered.host_unix_stream_target_fd = Some(10);
+              brokered.host_unix_stream_peer_uid = Some(unsafe { libc::geteuid() });
+              brokered.host_unix_stream_peer_gid = Some(unsafe { libc::getegid() });
+              brokered.host_unix_stream_receive_fd =
+                  Some(HostUnixFdReceivePolicy::ReadOnlyRegularFile);
+              brokered.wall_clock_milliseconds = Some(2000);
+
+              let result = run(&brokered);
+              server.join().expect("mediated SCM_RIGHTS server failed");
+              let _ = std::fs::remove_file(&socket_path);
+              let _ = std::fs::remove_file(&marker_path);
+              assert_eq!(result.unwrap(), ChildOutcome::Exited(0));
+          }
+
+          fn run_rejected_mediated_fd(source: std::fs::File, label: &str) {
+              let socket_path = std::env::temp_dir().join(format!(
+                  "security-lab-mediated-reject-{label}-{}.sock",
+                  process::id()
+              ));
+              let hidden_path = std::env::temp_dir().join(format!(
+                  "security-lab-mediated-hidden-{label}-{}",
+                  process::id()
+              ));
+              let _ = std::fs::remove_file(&socket_path);
+              let listener = UnixListener::bind(&socket_path).expect("bind rejected mediation endpoint");
+              let server = thread::spawn(move || {
+                  let (stream, _) = listener.accept().expect("accept rejected mediation broker");
+                  let mut ready = [0u8; 1];
+                  read_exact_fd(stream.as_raw_fd(), &mut ready);
+                  assert_eq!(&ready, b"R");
+                  send_one_fd(stream.as_raw_fd(), source.as_raw_fd());
+              });
+
+              let hidden_argument = hidden_path.to_string_lossy().into_owned();
+              let mut brokered = policy(
+                  "0",
+                  &[hidden_argument.as_str()],
+                  &["execveat", "write", "recvmsg", "read", "close", "openat", "exit"],
+              );
+              brokered.host_unix_stream_path = Some(socket_path.clone());
+              brokered.host_unix_stream_target_fd = Some(10);
+              brokered.host_unix_stream_receive_fd =
+                  Some(HostUnixFdReceivePolicy::ReadOnlyRegularFile);
+              brokered.wall_clock_milliseconds = Some(2000);
+
+              let result = run(&brokered);
+              server.join().expect("rejected mediation server failed");
+              let _ = std::fs::remove_file(&socket_path);
+              match result.unwrap_err() {
+                  SandboxError::SetupFailed(message) => {
+                      assert!(message.contains("runtime descriptor mediation"));
+                  }
+                  other => panic!("unexpected mediated rejection result: {other}"),
+              }
+          }
+
+          #[test]
+          fn mediated_host_unix_scm_rights_rejects_writable_or_nonregular_fd() {
+              let writable_path = std::env::temp_dir().join(format!(
+                  "security-lab-mediated-writable-{}",
+                  process::id()
+              ));
+              let _ = std::fs::remove_file(&writable_path);
+              std::fs::write(&writable_path, b"runtime-fd-handoff-ok\\n")
+                  .expect("seed writable mediation fixture");
+              let writable = std::fs::OpenOptions::new()
+                  .read(true)
+                  .write(true)
+                  .open(&writable_path)
+                  .expect("open writable mediation fixture");
+              run_rejected_mediated_fd(writable, "writable");
+              let _ = std::fs::remove_file(&writable_path);
+
+              let directory = std::fs::File::open(std::env::temp_dir())
+                  .expect("open directory mediation fixture");
+              run_rejected_mediated_fd(directory, "directory");
+          }
+
+          ''',
+              "mediated SCM_RIGHTS integration tests",
+          )
+          PY
+      - name: Format
+        run: cargo fmt --all
+      - name: Enable user namespace capability tests
+        run: |
+          if [ -e /proc/sys/kernel/unprivileged_userns_clone ]; then
+            sudo sysctl -w kernel.unprivileged_userns_clone=1
+          fi
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - name: Clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Test
+        run: cargo test --locked --all-targets --all-features
+      - name: Remove construction workflow and commit candidate tree
+        run: |
+          rm .github/workflows/tmp-milestone-43a-mediated-scm-rights.yml
+          git config user.name LeiZ
+          git config user.email 52287354+Lei-TzuY@users.noreply.github.com
+          git add -A
+          git commit -m "feat: mediate runtime descriptor handoff"
+          git push origin HEAD:tmp-43a-mediated-scm-rights

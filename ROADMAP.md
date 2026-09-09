@@ -1076,7 +1076,7 @@ After 43A integrates, seal this inventory-commitment encoding. Do not farm diges
 
 ### Slice 44A — shared-read / exclusive-write store transactions
 
-**Current verified candidate.** Adds an explicit host-local cooperation protocol around durable publication and whole-store read operations instead of pretending the existing read-only audit is a concurrent filesystem snapshot.
+**Status: complete on `main`.** Adds an explicit host-local cooperation protocol around durable publication and whole-store read operations instead of pretending the existing read-only audit is a concurrent filesystem snapshot.
 
 Acceptance evidence is executable:
 
@@ -1093,7 +1093,29 @@ Boundary: 44A is advisory cooperation among callers that use these transaction A
 
 ### Milestone 44 promotion rule
 
-After 44A integrates, seal the shared/exclusive advisory-lock vocabulary. Do not farm lock-name aliases, timeout knobs, or more reader-count variants. A stronger store-lifecycle phase must introduce materially new semantics such as independently anchored rollback state, hostile/non-cooperating mutation detection, or a genuine point-in-time snapshot/transaction mechanism with deterministic evidence; otherwise promote to another independent authority frontier.
+44A is sealed on `main`. Do not farm lock-name aliases, timeout knobs, or more reader-count variants. Stronger store-lifecycle work must add materially new mutation/concurrency semantics rather than another lock spelling.
+
+## Milestone 45 — inventory-guarded cooperative mutation
+
+### Slice 45A — optimistic whole-store precondition for durable publication
+
+**Current verified candidate.** Composes the 43A complete-store commitment, the 44A exclusive transaction, and the 40B authenticated durable publication path into one compare-and-publish boundary for cooperating writers.
+
+Acceptance evidence is executable:
+
+- `SnapshotStoreWriteTransaction::inventory_identity` derives the complete bounded audited inventory while the exclusive transaction lock remains live, allowing a writer to retain a successor identity before releasing serialization;
+- `store_ed25519_durable_if_inventory` recomputes that inventory under the same exclusive lock and compares it with a caller-retained expected identity before invoking the object publication path;
+- mismatch returns typed `SnapshotStoreTransactionError::InventoryConflict { expected, actual }`, preserving both complete identities for caller conflict handling;
+- deterministic regression captures a one-object identity, lets an intervening cooperating writer advance the store to two objects, then proves a stale guarded attempt reports expected=one/actual=two and leaves the candidate third-object content address absent;
+- using the current two-object identity permits authenticated `fsync`-backed publication of that third object, after which the same still-live writer derives a distinct three-object successor identity while a cooperating reader remains lock-contended;
+- after writer release, an independent read transaction observes exactly that successor identity; existing audit, inventory, transaction, durable-store, trust, sandbox, and tooling regressions remain active;
+- exact candidate rustfmt, Clippy with `-D warnings`, complete stable tests, and the complete Rust 1.74 suite are green.
+
+Boundary: 45A is optimistic concurrency control only among callers that cooperate with the 44A store-root lock and carry a previously observed 43A inventory identity. It is not an independently authenticated or monotonic rollback anchor, does not stop privileged/non-cooperating filesystem mutation, does not roll back a publication after its durable path begins, and does not provide general database transactions, multi-object atomic commits, or distributed compare-and-swap.
+
+### Milestone 45 promotion rule
+
+After 45A integrates, seal simple expected-inventory guarded single-object publication. Do not farm extra conflict spellings, retry helpers, or token wrappers. A stronger snapshot-store phase must add independently anchored history/rollback semantics, hostile-writer detection, multi-object atomic mutation, or a genuine point-in-time filesystem/store mechanism with executable evidence; otherwise promote to another authority frontier.
 
 ## Independent host-local IPC frontier — post-launch object transfer
 

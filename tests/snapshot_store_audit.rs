@@ -102,13 +102,7 @@ fn healthy_multi_object_store_audits_exact_inventory() {
     let workspace = TempDir::new("healthy");
     let store = workspace.path().join("store");
     fs::create_dir(&store).expect("create store root");
-    let (_, bytes_a) = store_fixture(
-        workspace.path(),
-        &store,
-        "a",
-        b"audit-object-a\n",
-        0x31,
-    );
+    let (_, bytes_a) = store_fixture(workspace.path(), &store, "a", b"audit-object-a\n", 0x31);
     let (_, bytes_b) = store_fixture(
         workspace.path(),
         &store,
@@ -143,7 +137,9 @@ fn content_tamper_is_detected_as_identity_mismatch() {
         .expect("restore read-only mode");
 
     match audit_snapshot_store(&store, audit_limits()).unwrap_err() {
-        SnapshotStoreAuditError::IdentityMismatch { expected, actual, .. } => {
+        SnapshotStoreAuditError::IdentityMismatch {
+            expected, actual, ..
+        } => {
             assert_eq!(expected, identity);
             assert_ne!(actual, identity);
         }

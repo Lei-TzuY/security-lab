@@ -62,10 +62,16 @@ impl fmt::Display for SnapshotStoreTransactionError {
                 "snapshot store {requested} transaction lock is contended"
             ),
             Self::UnsupportedPlatform(message) => {
-                write!(f, "unsupported snapshot store transaction platform: {message}")
+                write!(
+                    f,
+                    "unsupported snapshot store transaction platform: {message}"
+                )
             }
             Self::Io { phase, source } => {
-                write!(f, "snapshot store transaction failed during {phase}: {source}")
+                write!(
+                    f,
+                    "snapshot store transaction failed during {phase}: {source}"
+                )
             }
             Self::Store(source) => write!(f, "snapshot store transaction write failed: {source}"),
             Self::Audit(source) => write!(f, "snapshot store transaction audit failed: {source}"),

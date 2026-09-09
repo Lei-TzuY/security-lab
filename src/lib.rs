@@ -15,6 +15,7 @@ mod snapshot_signature;
 mod snapshot_store;
 mod snapshot_store_audit;
 mod snapshot_store_durable;
+mod snapshot_store_inventory;
 mod snapshot_trust;
 mod snapshot_trust_state;
 
@@ -60,6 +61,10 @@ pub use snapshot_store_audit::{
     SnapshotStoreAuditReport,
 };
 pub use snapshot_store_durable::store_snapshot_archive_ed25519_durable;
+pub use snapshot_store_inventory::{
+    snapshot_store_inventory_identity, verify_snapshot_store_inventory_identity,
+    SnapshotStoreInventoryError, SnapshotStoreInventoryIdentity,
+};
 pub use snapshot_trust::{
     materialize_snapshot_store_object_trusted_ed25519_atomic,
     store_snapshot_archive_trusted_ed25519_durable, SnapshotTrustDecision, SnapshotTrustError,

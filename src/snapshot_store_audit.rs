@@ -127,16 +127,27 @@ pub fn audit_snapshot_store(
     store_root: &Path,
     limits: SnapshotStoreAuditLimits,
 ) -> Result<SnapshotStoreAuditReport, SnapshotStoreAuditError> {
+    audit_snapshot_store_objects(store_root, limits, |_, _| {})
+}
+
+pub(crate) fn audit_snapshot_store_objects<F>(
+    store_root: &Path,
+    limits: SnapshotStoreAuditLimits,
+    mut on_object: F,
+) -> Result<SnapshotStoreAuditReport, SnapshotStoreAuditError>
+where
+    F: FnMut(SnapshotIdentity, u64),
+{
     validate_store_root(store_root)?;
     validate_limits(limits)?;
 
     #[cfg(target_os = "linux")]
     {
-        linux::audit(store_root, limits)
+        linux::audit(store_root, limits, &mut on_object)
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (store_root, limits);
+        let _ = (store_root, limits, &mut on_object);
         Err(SnapshotStoreAuditError::UnsupportedPlatform(
             "snapshot-store integrity audit currently requires Linux fd-relative directory enumeration and O_NOFOLLOW object access"
                 .to_owned(),
@@ -250,8 +261,8 @@ fn invalid_name(name: &[u8]) -> SnapshotStoreAuditError {
 #[cfg(target_os = "linux")]
 mod linux {
     use super::{
-        audit_archive, invalid_name, parse_object_filename, SnapshotStoreAuditError,
-        SnapshotStoreAuditLimits, SnapshotStoreAuditReport,
+        audit_archive, invalid_name, parse_object_filename, SnapshotIdentity,
+        SnapshotStoreAuditError, SnapshotStoreAuditLimits, SnapshotStoreAuditReport,
     };
     use std::ffi::{CStr, CString};
     use std::mem::MaybeUninit;
@@ -298,10 +309,14 @@ mod linux {
         }
     }
 
-    pub(super) fn audit(
+    pub(super) fn audit<F>(
         store_root: &Path,
         limits: SnapshotStoreAuditLimits,
-    ) -> Result<SnapshotStoreAuditReport, SnapshotStoreAuditError> {
+        on_object: &mut F,
+    ) -> Result<SnapshotStoreAuditReport, SnapshotStoreAuditError>
+    where
+        F: FnMut(SnapshotIdentity, u64),
+    {
         let root = open_store_root(store_root)?;
         let Some(objects) = open_objects_stream(root.raw())? else {
             return Ok(SnapshotStoreAuditReport {
@@ -400,6 +415,7 @@ mod linux {
                     actual,
                 });
             }
+            on_object(actual, size);
             total_bytes = attempted_total;
             object_count += 1;
         }

@@ -216,9 +216,15 @@ match report.outcome {
 
 ### Bounded snapshot-store integrity audit
 
-The current Milestone 42A verified candidate adds `audit_snapshot_store(store_root, limits)`, a read-only bounded integrity pass over the existing content-addressed snapshot object format. On Linux it opens the trusted store root and `objects/` directory without following symlinks, enumerates through the already-open directory, opens each observed object fd-relatively with `O_NOFOLLOW`, requires a single-link regular file with no write permission bits, enforces explicit entry/per-object/aggregate byte and archive identity/node ceilings, parses the complete canonical identity tuple from the object filename, validates the complete archive, and requires the archive-derived identity to match the filename exactly.
+Milestone 42A adds `audit_snapshot_store(store_root, limits)`, a read-only bounded integrity pass over the existing content-addressed snapshot object format. On Linux it opens the trusted store root and `objects/` directory without following symlinks, enumerates through the already-open directory, opens each observed object fd-relatively with `O_NOFOLLOW`, requires a single-link regular file with no write permission bits, enforces explicit entry/per-object/aggregate byte and archive identity/node ceilings, parses the complete canonical identity tuple from the object filename, validates the complete archive, and requires the archive-derived identity to match the filename exactly.
 
 This audit assumes a quiescent or cooperatively serialized host-local store. It is integrity inventory, not signer/trust-policy authentication: the store does not persist signature evidence beside each object, and authenticated publication/materialization remain the responsibility of the existing Ed25519/trust-state APIs. The audit does not lock out independent publishers and does not repair, quarantine, delete, garbage-collect, snapshot, or provide rollback/replication guarantees.
+
+### Canonical snapshot-store inventory identity
+
+The current Milestone 43A verified candidate adds `snapshot_store_inventory_identity` and `verify_snapshot_store_inventory_identity`. The identity is derived only after every observed object crosses the exact 42A integrity gate. Audited `(SnapshotIdentity, archive_bytes)` records are sorted by the complete canonical identity tuple, then a versioned SHA-256 domain covers exact object count, aggregate archive bytes, and every fixed-width record. This makes the fingerprint independent of filesystem enumeration/insertion order while changing when store membership or an audited object's identity/length changes.
+
+The SHA-256 value is an unkeyed integrity fingerprint, not signer authentication or rollback resistance. `verify_snapshot_store_inventory_identity` treats its expected identity as trusted caller input; cross-run change detection therefore requires retaining that expected value in an independently trusted location or state channel rather than inside the same rollbackable store. Unsafe, tampered, or over-budget stores fail through the existing 42A audit path before a new inventory identity is accepted.
 
 ## Test evidence
 

@@ -13,6 +13,7 @@ mod snapshot_auth;
 mod snapshot_identity;
 mod snapshot_signature;
 mod snapshot_store;
+mod snapshot_store_audit;
 mod snapshot_store_durable;
 mod snapshot_trust;
 mod snapshot_trust_state;
@@ -53,6 +54,10 @@ pub use snapshot_signature::{
 pub use snapshot_store::{
     materialize_snapshot_store_object_ed25519_atomic, snapshot_store_object_path,
     store_snapshot_archive_ed25519_atomic, SnapshotStoreError, SnapshotStorePutReport,
+};
+pub use snapshot_store_audit::{
+    audit_snapshot_store, SnapshotStoreAuditError, SnapshotStoreAuditLimits,
+    SnapshotStoreAuditReport,
 };
 pub use snapshot_store_durable::store_snapshot_archive_ed25519_durable;
 pub use snapshot_trust::{

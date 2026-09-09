@@ -1012,7 +1012,7 @@ Boundary: 41A authenticates decisions only relative to the exact trust-policy sn
 
 ### Slice 41B — authenticated persisted policy identity and stale-policy rollback gate
 
-**Current verified candidate.** Adds host-owned authenticated state for the exact trust-policy identity so cooperating state-backed operations cannot silently reuse an older caller-supplied policy while that state and its authentication key remain intact.
+**Status: complete on `main`.** Adds host-owned authenticated state for the exact trust-policy identity so cooperating state-backed operations cannot silently reuse an older caller-supplied policy while that state and its authentication key remain intact.
 
 Acceptance evidence is executable:
 
@@ -1028,6 +1028,26 @@ Boundary: 41B persists and authenticates only the policy identity, not the full 
 ### Milestone 41 promotion rule
 
 After 41B integrates, seal the current host-local snapshot trust lifecycle. Do not farm state filenames, HMAC encodings, generation aliases, or wrappers around the same persisted-identity gate. A stronger rollback phase requires an independently anchored monotonic state or other evidence not restorable with the local directory; otherwise promote to another materially different executable authority/integration frontier.
+
+## Milestone 42 — bounded content-addressed store integrity audit
+
+### Slice 42A — read-only bounded inventory validation
+
+**Current verified candidate.** Adds a whole-store read-only integrity pass over the existing Milestones 40A/40B object format rather than another publication or materialization wrapper.
+
+Acceptance evidence is executable:
+
+- `audit_snapshot_store(store_root, limits)` requires a trusted absolute non-root store path and explicit non-zero entry, aggregate archive-byte, per-object archive-byte, canonical identity-byte, and archive-node ceilings;
+- Linux opens the store root and `objects/` with `O_NOFOLLOW`, enumerates through the already-open directory, opens every observed object fd-relatively with `O_NOFOLLOW`, and rejects non-canonical names, symlink/special entries, non-regular files, multi-link objects, or files retaining write bits;
+- every canonical filename is parsed as the complete `(sha256, encoded_bytes, nodes)` identity tuple; the complete bounded archive is read, required not to change length during that read, validated by the existing canonical archive parser, and its derived identity must exactly match the filename identity;
+- a healthy two-object store reports exact object and aggregate-byte counts; deterministic regressions reject content tamper, canonical filename/identity mismatch, a symlink entry, a writable object, an external hard-link alias, entry-budget overflow, and aggregate-byte overflow;
+- exact candidate rustfmt, Clippy with `-D warnings`, complete stable tests, and the complete Rust 1.74 suite are green.
+
+Boundary: 42A is a read-only integrity inventory for a quiescent or cooperatively serialized trusted host-local store. It does not verify signer provenance/trust-policy membership or persisted signatures, lock out independent concurrent publishers, repair/quarantine/delete/garbage-collect objects, provide a point-in-time concurrent snapshot, or strengthen rollback/remote-replica guarantees.
+
+### Milestone 42 promotion rule
+
+After 42A integrates, do not farm more malformed filenames, tamper bytes, link counts, or budget aliases that repeat the same audit path. Promote only to a materially different executable store-lifecycle or authority boundary with safe mutation/concurrency semantics and deterministic evidence, or to another independent frontier if that evidence is not yet available.
 
 ## Independent host-local IPC frontier — post-launch object transfer
 

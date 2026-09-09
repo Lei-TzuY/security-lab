@@ -1,4 +1,6 @@
-use crate::snapshot_archive::{snapshot_archive_identity, SnapshotArchiveError, SnapshotArchiveLimits};
+use crate::snapshot_archive::{
+    snapshot_archive_identity, SnapshotArchiveError, SnapshotArchiveLimits,
+};
 use crate::snapshot_identity::SnapshotIdentity;
 use std::error::Error;
 use std::fmt;
@@ -232,7 +234,9 @@ fn parse_canonical_decimal(bytes: &[u8]) -> Option<u64> {
         if !byte.is_ascii_digit() {
             return None;
         }
-        value = value.checked_mul(10)?.checked_add(u64::from(*byte - b'0'))?;
+        value = value
+            .checked_mul(10)?
+            .checked_add(u64::from(*byte - b'0'))?;
     }
     Some(value)
 }
@@ -330,13 +334,14 @@ mod linux {
             if name == b"." || name == b".." {
                 continue;
             }
-            entries_seen = entries_seen.checked_add(1).ok_or(
-                SnapshotStoreAuditError::BudgetExceeded {
-                    resource: "entry",
-                    limit: limits.max_entries,
-                    attempted: u64::MAX,
-                },
-            )?;
+            entries_seen =
+                entries_seen
+                    .checked_add(1)
+                    .ok_or(SnapshotStoreAuditError::BudgetExceeded {
+                        resource: "entry",
+                        limit: limits.max_entries,
+                        attempted: u64::MAX,
+                    })?;
             if entries_seen > limits.max_entries {
                 return Err(SnapshotStoreAuditError::BudgetExceeded {
                     resource: "entry",
@@ -357,13 +362,14 @@ mod linux {
                     attempted: size,
                 });
             }
-            let attempted_total = total_bytes.checked_add(size).ok_or(
-                SnapshotStoreAuditError::BudgetExceeded {
-                    resource: "aggregate byte",
-                    limit: limits.max_total_archive_bytes,
-                    attempted: u64::MAX,
-                },
-            )?;
+            let attempted_total =
+                total_bytes
+                    .checked_add(size)
+                    .ok_or(SnapshotStoreAuditError::BudgetExceeded {
+                        resource: "aggregate byte",
+                        limit: limits.max_total_archive_bytes,
+                        attempted: u64::MAX,
+                    })?;
             if attempted_total > limits.max_total_archive_bytes {
                 return Err(SnapshotStoreAuditError::BudgetExceeded {
                     resource: "aggregate byte",
@@ -478,10 +484,7 @@ mod linux {
         Ok(OwnedFd(fd))
     }
 
-    fn require_safe_object(
-        fd: RawFd,
-        name: &str,
-    ) -> Result<u64, SnapshotStoreAuditError> {
+    fn require_safe_object(fd: RawFd, name: &str) -> Result<u64, SnapshotStoreAuditError> {
         let mut stat = MaybeUninit::<libc::stat>::uninit();
         if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
             return Err(io_error(
@@ -517,11 +520,7 @@ mod linux {
         Ok(stat.st_size as u64)
     }
 
-    fn read_exact(
-        fd: RawFd,
-        bytes: &mut [u8],
-        name: &str,
-    ) -> Result<(), SnapshotStoreAuditError> {
+    fn read_exact(fd: RawFd, bytes: &mut [u8], name: &str) -> Result<(), SnapshotStoreAuditError> {
         let mut offset = 0usize;
         while offset < bytes.len() {
             let read = unsafe {
@@ -551,13 +550,8 @@ mod linux {
 
     fn retry_read(fd: RawFd, bytes: &mut [u8]) -> Result<usize, SnapshotStoreAuditError> {
         loop {
-            let read = unsafe {
-                libc::read(
-                    fd,
-                    bytes.as_mut_ptr().cast::<libc::c_void>(),
-                    bytes.len(),
-                )
-            };
+            let read =
+                unsafe { libc::read(fd, bytes.as_mut_ptr().cast::<libc::c_void>(), bytes.len()) };
             if read >= 0 {
                 return Ok(read as usize);
             }

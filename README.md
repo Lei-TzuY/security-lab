@@ -214,6 +214,12 @@ match report.outcome {
 
 `filesystem.cow_root_bytes = <bytes>` is an optional final-root mode with a validated range of 4096 through 1 GiB. Without it, the existing recursively read-only root behavior is unchanged. With it, the launcher still pins/revalidates and recursively marks the lower tree read-only, then uses Linux `fsopen`/`fsconfig`/`fsmount` plus `move_mount` to assemble a private OverlayFS root over a bounded tmpfs upper/work layer. Preflight deliberately reports this request as `unprobed` because real user/mount-namespace execution is required; the authority manifest records the declared byte budget, authority-delta treats enabling or enlarging the COW layer as widening, and the runtime receipt/completeness gate require `copy_on_write_root` instead of `readonly_root` for that policy. This is ephemeral mutation authority only: it is not a persistent snapshot, export format, transaction layer, durability guarantee, or cryptographic lower-tree integrity proof.
 
+### Bounded snapshot-store integrity audit
+
+The current Milestone 42A verified candidate adds `audit_snapshot_store(store_root, limits)`, a read-only bounded integrity pass over the existing content-addressed snapshot object format. On Linux it opens the trusted store root and `objects/` directory without following symlinks, enumerates through the already-open directory, opens each observed object fd-relatively with `O_NOFOLLOW`, requires a single-link regular file with no write permission bits, enforces explicit entry/per-object/aggregate byte and archive identity/node ceilings, parses the complete canonical identity tuple from the object filename, validates the complete archive, and requires the archive-derived identity to match the filename exactly.
+
+This audit assumes a quiescent or cooperatively serialized host-local store. It is integrity inventory, not signer/trust-policy authentication: the store does not persist signature evidence beside each object, and authenticated publication/materialization remain the responsibility of the existing Ed25519/trust-state APIs. The audit does not lock out independent publishers and does not repair, quarantine, delete, garbage-collect, snapshot, or provide rollback/replication guarantees.
+
 ## Test evidence
 
 Linux x86_64 integration tests prove that:

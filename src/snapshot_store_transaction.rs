@@ -41,6 +41,10 @@ pub enum SnapshotStoreTransactionError {
     LockContended {
         requested: SnapshotStoreTransactionMode,
     },
+    InventoryConflict {
+        expected: SnapshotStoreInventoryIdentity,
+        actual: SnapshotStoreInventoryIdentity,
+    },
     UnsupportedPlatform(String),
     Io {
         phase: &'static str,
@@ -60,6 +64,16 @@ impl fmt::Display for SnapshotStoreTransactionError {
             Self::LockContended { requested } => write!(
                 f,
                 "snapshot store {requested} transaction lock is contended"
+            ),
+            Self::InventoryConflict { expected, actual } => write!(
+                f,
+                "snapshot store inventory changed before guarded write: expected {} objects={} bytes={} actual {} objects={} bytes={}",
+                expected.sha256_hex(),
+                expected.objects,
+                expected.archive_bytes,
+                actual.sha256_hex(),
+                actual.objects,
+                actual.archive_bytes,
             ),
             Self::UnsupportedPlatform(message) => {
                 write!(
@@ -213,6 +227,16 @@ impl SnapshotStoreWriteTransaction {
         Self::acquire(store_root, true)
     }
 
+    /// Recompute the complete audited inventory while the exclusive store
+    /// transaction lock is held. This is useful for obtaining a successor token
+    /// before releasing the write transaction.
+    pub fn inventory_identity(
+        &self,
+        limits: SnapshotStoreAuditLimits,
+    ) -> Result<SnapshotStoreInventoryIdentity, SnapshotStoreTransactionError> {
+        Ok(snapshot_store_inventory_identity(&self.store_root, limits)?)
+    }
+
     /// Authenticated durable publication while the exclusive store transaction
     /// lock is held.
     pub fn store_ed25519_durable(
@@ -229,6 +253,34 @@ impl SnapshotStoreWriteTransaction {
             expected_signature,
             limits,
         )?)
+    }
+
+    /// Optimistic guarded durable publication. The complete audited store
+    /// inventory is compared with a caller-retained expected identity while the
+    /// exclusive transaction lock is held. A mismatch is a typed conflict and
+    /// returns before the supplied archive reaches the publication path.
+    ///
+    /// Participating writers can therefore use a previously observed inventory
+    /// identity as a compare-and-swap style precondition without weakening the
+    /// existing authenticated, no-replace, fsync-backed object publication.
+    pub fn store_ed25519_durable_if_inventory(
+        &self,
+        expected_inventory: SnapshotStoreInventoryIdentity,
+        inventory_limits: SnapshotStoreAuditLimits,
+        archive: &[u8],
+        public_key: &[u8; SNAPSHOT_ED25519_PUBLIC_KEY_BYTES],
+        expected_signature: &[u8; SNAPSHOT_ED25519_SIGNATURE_BYTES],
+        limits: SnapshotArchiveLimits,
+    ) -> Result<SnapshotStorePutReport, SnapshotStoreTransactionError> {
+        let actual_inventory =
+            snapshot_store_inventory_identity(&self.store_root, inventory_limits)?;
+        if actual_inventory != expected_inventory {
+            return Err(SnapshotStoreTransactionError::InventoryConflict {
+                expected: expected_inventory,
+                actual: actual_inventory,
+            });
+        }
+        self.store_ed25519_durable(archive, public_key, expected_signature, limits)
     }
 
     fn acquire(

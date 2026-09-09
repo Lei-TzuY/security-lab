@@ -997,7 +997,7 @@ Boundary: 40B claims only success-return durability under the local Linux kernel
 
 ### Slice 41A — key identity, policy provenance, rotation, and revocation
 
-**Current verified candidate.** Adds an explicit authorization layer above the existing strict Ed25519 verifier and durable content-addressed store instead of treating an arbitrary caller-supplied public key as the whole trust decision.
+**Status: complete on `main`.** Adds an explicit authorization layer above the existing strict Ed25519 verifier and durable content-addressed store instead of treating an arbitrary caller-supplied public key as the whole trust decision.
 
 Acceptance evidence is executable:
 
@@ -1010,9 +1010,24 @@ Acceptance evidence is executable:
 
 Boundary: 41A authenticates decisions only relative to the exact trust-policy snapshot supplied by the caller. It does not persist or authenticate the policy itself, prevent a caller from reusing an older snapshot, provide a monotonic anti-rollback counter, certificate/PKI semantics, key generation/custody, validity times, secure distribution, hardware roots of trust, or key-compromise recovery.
 
+### Slice 41B — authenticated persisted policy identity and stale-policy rollback gate
+
+**Current verified candidate.** Adds host-owned authenticated state for the exact trust-policy identity so cooperating state-backed operations cannot silently reuse an older caller-supplied policy while that state and its authentication key remain intact.
+
+Acceptance evidence is executable:
+
+- `SnapshotTrustStateKey` is a fixed 32-byte host-held key and the persisted state is a fixed-size versioned record containing the exact `SnapshotTrustPolicyIdentity`, authenticated with domain-separated HMAC-SHA256; malformed size/version/count and authentication failure are fail-closed;
+- Linux initialization serializes through an exclusive `flock`, writes a fresh `0600` temporary regular file, `fsync`s it, installs with `renameat2(RENAME_NOREPLACE)`, and `fsync`s the state directory. Repeating the exact initialized identity converges without replacing it;
+- rotation constructs the successor only through the existing 41A `rotate()` rules, holds the exclusive state lock, rejects a persisted identity that matches neither supplied current nor computed successor as `StalePolicy`, atomically replaces state only after temp-file `fsync`, and allows an exact retry to converge when the successor is already persisted;
+- `SnapshotTrustStateContext` binds the state root/key to one exact caller-supplied policy. State-backed durable store and atomic materialization hold a shared state lock from authenticated identity comparison through the delegated 41A/40B operation, so a cooperating rotation cannot overtake an accepted operation;
+- end-to-end evidence initializes generation 1, publishes under key A, persists generation 2 with A revoked/key B active, proves the generation-1 context returns `StalePolicy` before deliberately missing store/destination paths are touched, then uses generation 2/key B to deduplicate and materialize the authenticated frozen object;
+- separate evidence rejects a wrong HMAC key and a same-length state-byte tamper as `AuthenticationFailed`, proves stale rotation cannot overwrite a newer persisted generation, and proves exact rotation retry convergence; stable rustfmt/Clippy/full tests and the complete Rust 1.74 suite are green on the exact candidate head.
+
+Boundary: 41B persists and authenticates only the policy identity, not the full policy/key set. Its stale-caller rollback resistance assumes the trusted state directory and host-held HMAC key remain intact. It does not resist privileged whole-directory rollback/restoration, key disclosure, or hostile replacement of the trusted host environment; it provides no hardware/external monotonic counter, PKI/certificate semantics, key custody/distribution, validity clock, or compromise-recovery protocol.
+
 ### Milestone 41 promotion rule
 
-After 41A integrates, do not farm key-ID encodings, additional revoked-key aliases, or wrappers around the same policy gate. Promote only to a materially stronger trust lifecycle such as authenticated/persisted policy state with real rollback resistance, or to another independent executable frontier with similarly explicit evidence.
+After 41B integrates, seal the current host-local snapshot trust lifecycle. Do not farm state filenames, HMAC encodings, generation aliases, or wrappers around the same persisted-identity gate. A stronger rollback phase requires an independently anchored monotonic state or other evidence not restorable with the local directory; otherwise promote to another materially different executable authority/integration frontier.
 
 ## Independent host-local IPC frontier — post-launch object transfer
 

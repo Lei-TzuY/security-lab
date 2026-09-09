@@ -15,6 +15,7 @@ mod snapshot_signature;
 mod snapshot_store;
 mod snapshot_store_durable;
 mod snapshot_trust;
+mod snapshot_trust_state;
 
 use std::error::Error;
 use std::fmt;
@@ -60,6 +61,13 @@ pub use snapshot_trust::{
     SnapshotTrustKey, SnapshotTrustKeyId, SnapshotTrustKeyState, SnapshotTrustPolicy,
     SnapshotTrustPolicyIdentity, SnapshotTrustedMaterializeReport, SnapshotTrustedStorePutReport,
     SNAPSHOT_TRUST_MAX_KEYS,
+};
+pub use snapshot_trust_state::{
+    initialize_snapshot_trust_state, load_snapshot_trust_state_identity,
+    materialize_snapshot_store_object_persisted_trust_ed25519_atomic, rotate_snapshot_trust_state,
+    snapshot_trust_state_path, store_snapshot_archive_persisted_trust_ed25519_durable,
+    SnapshotTrustStateContext, SnapshotTrustStateError, SnapshotTrustStateKey,
+    SnapshotTrustStateReceipt, SNAPSHOT_TRUST_STATE_KEY_BYTES,
 };
 
 #[derive(Debug)]

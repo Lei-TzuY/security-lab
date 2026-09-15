@@ -61,6 +61,16 @@ pub struct SnapshotStoreHeadPutReport {
     pub successor: SnapshotStoreHeadStateIdentity,
 }
 
+/// Inputs for one authenticated durable publication guarded by the persisted
+/// whole-store head.
+pub struct SnapshotStoreHeadPublishRequest<'a> {
+    pub inventory_limits: SnapshotStoreAuditLimits,
+    pub archive: &'a [u8],
+    pub public_key: &'a [u8; SNAPSHOT_ED25519_PUBLIC_KEY_BYTES],
+    pub expected_signature: &'a [u8; SNAPSHOT_ED25519_SIGNATURE_BYTES],
+    pub archive_limits: SnapshotArchiveLimits,
+}
+
 #[derive(Debug)]
 pub enum SnapshotStoreHeadStateError {
     InvalidInput(String),
@@ -79,7 +89,7 @@ pub enum SnapshotStoreHeadStateError {
         phase: &'static str,
         source: std::io::Error,
     },
-    Transaction(SnapshotStoreTransactionError),
+    Transaction(Box<SnapshotStoreTransactionError>),
 }
 
 impl fmt::Display for SnapshotStoreHeadStateError {
@@ -129,7 +139,7 @@ impl Error for SnapshotStoreHeadStateError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Io { source, .. } => Some(source),
-            Self::Transaction(source) => Some(source),
+            Self::Transaction(source) => Some(source.as_ref()),
             _ => None,
         }
     }
@@ -137,7 +147,7 @@ impl Error for SnapshotStoreHeadStateError {
 
 impl From<SnapshotStoreTransactionError> for SnapshotStoreHeadStateError {
     fn from(value: SnapshotStoreTransactionError) -> Self {
-        Self::Transaction(value)
+        Self::Transaction(Box::new(value))
     }
 }
 
@@ -232,38 +242,16 @@ pub fn store_snapshot_archive_ed25519_durable_with_head_state(
     state_root: &Path,
     state_key: &SnapshotStoreHeadStateKey,
     store_root: &Path,
-    inventory_limits: SnapshotStoreAuditLimits,
-    archive: &[u8],
-    public_key: &[u8; SNAPSHOT_ED25519_PUBLIC_KEY_BYTES],
-    expected_signature: &[u8; SNAPSHOT_ED25519_SIGNATURE_BYTES],
-    archive_limits: SnapshotArchiveLimits,
+    request: SnapshotStoreHeadPublishRequest<'_>,
 ) -> Result<SnapshotStoreHeadPutReport, SnapshotStoreHeadStateError> {
     validate_roots(state_root, store_root)?;
     #[cfg(target_os = "linux")]
     {
-        linux::store(
-            state_root,
-            state_key,
-            store_root,
-            inventory_limits,
-            archive,
-            public_key,
-            expected_signature,
-            archive_limits,
-        )
+        linux::store(state_root, state_key, store_root, request)
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (
-            state_root,
-            state_key,
-            store_root,
-            inventory_limits,
-            archive,
-            public_key,
-            expected_signature,
-            archive_limits,
-        );
+        let _ = (state_root, state_key, store_root, request);
         Err(SnapshotStoreHeadStateError::UnsupportedPlatform(
             "authenticated durable store-head publication currently requires Linux flock, fsync, and cooperative snapshot-store transactions"
                 .to_owned(),
@@ -374,11 +362,10 @@ fn decode_state(
 #[cfg(target_os = "linux")]
 mod linux {
     use super::{
-        decode_state, encode_state, SnapshotArchiveLimits, SnapshotStoreAuditLimits,
+        decode_state, encode_state, SnapshotStoreAuditLimits, SnapshotStoreHeadPublishRequest,
         SnapshotStoreHeadPutReport, SnapshotStoreHeadStateError, SnapshotStoreHeadStateIdentity,
         SnapshotStoreHeadStateKey, SnapshotStoreInventoryIdentity, SnapshotStoreReadTransaction,
         SnapshotStoreWriteTransaction, HEAD_STATE_BYTES, HEAD_STATE_FILE, HEAD_STATE_LOCK,
-        SNAPSHOT_ED25519_PUBLIC_KEY_BYTES, SNAPSHOT_ED25519_SIGNATURE_BYTES,
     };
     use std::ffi::CString;
     use std::mem::MaybeUninit;
@@ -456,16 +443,11 @@ mod linux {
         Ok(anchored)
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn store(
         state_root: &Path,
         state_key: &SnapshotStoreHeadStateKey,
         store_root: &Path,
-        inventory_limits: SnapshotStoreAuditLimits,
-        archive: &[u8],
-        public_key: &[u8; SNAPSHOT_ED25519_PUBLIC_KEY_BYTES],
-        expected_signature: &[u8; SNAPSHOT_ED25519_SIGNATURE_BYTES],
-        archive_limits: SnapshotArchiveLimits,
+        request: SnapshotStoreHeadPublishRequest<'_>,
     ) -> Result<SnapshotStoreHeadPutReport, SnapshotStoreHeadStateError> {
         let guard = lock_state(state_root, libc::LOCK_EX)?;
         let previous = read_state_optional(guard.root.raw(), state_key)?
@@ -477,14 +459,14 @@ mod linux {
         }
 
         let writer = SnapshotStoreWriteTransaction::begin(store_root)?;
-        let actual = writer.inventory_identity(inventory_limits)?;
+        let actual = writer.inventory_identity(request.inventory_limits)?;
         require_inventory(previous, actual)?;
 
         let put = writer.store_ed25519_durable(
-            archive,
-            public_key,
-            expected_signature,
-            archive_limits,
+            request.archive,
+            request.public_key,
+            request.expected_signature,
+            request.archive_limits,
         )?;
         if !put.inserted {
             return Ok(SnapshotStoreHeadPutReport {
@@ -494,7 +476,7 @@ mod linux {
             });
         }
 
-        let successor_inventory = writer.inventory_identity(inventory_limits)?;
+        let successor_inventory = writer.inventory_identity(request.inventory_limits)?;
         let successor = SnapshotStoreHeadStateIdentity {
             generation: previous.generation + 1,
             inventory: successor_inventory,
@@ -517,7 +499,10 @@ mod linux {
         Ok(())
     }
 
-    fn lock_state(state_root: &Path, operation: libc::c_int) -> Result<StateGuard, SnapshotStoreHeadStateError> {
+    fn lock_state(
+        state_root: &Path,
+        operation: libc::c_int,
+    ) -> Result<StateGuard, SnapshotStoreHeadStateError> {
         let root = open_root(state_root)?;
         let lock = open_lock(root.raw())?;
         if unsafe { libc::flock(lock.raw(), operation) } != 0 {
@@ -624,7 +609,8 @@ mod linux {
         }
         drop(temp_fd);
 
-        let state_name = CString::new(HEAD_STATE_FILE).expect("fixed state filename contains no NUL");
+        let state_name =
+            CString::new(HEAD_STATE_FILE).expect("fixed state filename contains no NUL");
         let rename_result = if replace {
             unsafe { libc::renameat(root_fd, temp_name.as_ptr(), root_fd, state_name.as_ptr()) }
         } else {
@@ -684,7 +670,10 @@ mod linux {
             };
             if fd >= 0 {
                 let fd = OwnedFd(fd);
-                require_regular_single_link(fd.raw(), "validate temporary snapshot store head state")?;
+                require_regular_single_link(
+                    fd.raw(),
+                    "validate temporary snapshot store head state",
+                )?;
                 return Ok((fd, name));
             }
             let source = std::io::Error::last_os_error();
@@ -792,8 +781,7 @@ mod linux {
     }
 
     fn cstring_path(path: &Path, label: &str) -> Result<CString, SnapshotStoreHeadStateError> {
-        CString::new(path.as_os_str().as_bytes()).map_err(|_| {
-            SnapshotStoreHeadStateError::InvalidInput(format!("{label} contains NUL"))
-        })
+        CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| SnapshotStoreHeadStateError::InvalidInput(format!("{label} contains NUL")))
     }
 }

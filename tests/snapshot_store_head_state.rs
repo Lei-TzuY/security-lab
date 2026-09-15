@@ -4,8 +4,9 @@ use security_lab::{
     initialize_snapshot_store_head_state, load_snapshot_store_head_state,
     serialize_snapshot_archive, sign_snapshot_ed25519, snapshot_store_head_state_path,
     snapshot_store_object_path, store_snapshot_archive_ed25519_durable_with_head_state,
-    verify_snapshot_store_head_state, SnapshotArchiveLimits, SnapshotIdentity, SnapshotIdentityLimits,
-    SnapshotStoreAuditLimits, SnapshotStoreHeadStateError, SnapshotStoreHeadStateKey,
+    verify_snapshot_store_head_state, SnapshotArchiveLimits, SnapshotIdentity,
+    SnapshotIdentityLimits, SnapshotStoreAuditLimits, SnapshotStoreHeadPublishRequest,
+    SnapshotStoreHeadStateError, SnapshotStoreHeadStateKey,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -93,6 +94,16 @@ fn roots(workspace: &Path) -> (PathBuf, PathBuf) {
     (store, state)
 }
 
+fn publish_request(fixture: &Fixture) -> SnapshotStoreHeadPublishRequest<'_> {
+    SnapshotStoreHeadPublishRequest {
+        inventory_limits: audit_limits(),
+        archive: &fixture.archive,
+        public_key: &fixture.public_key,
+        expected_signature: &fixture.signature,
+        archive_limits: archive_limits(),
+    }
+}
+
 #[test]
 fn anchored_publication_advances_once_and_exact_dedup_keeps_same_head() {
     let workspace = TempDir::new("advance");
@@ -100,13 +111,8 @@ fn anchored_publication_advances_once_and_exact_dedup_keeps_same_head() {
     let key = SnapshotStoreHeadStateKey::new([0xA5; 32]);
     let first = fixture(workspace.path(), "first", b"head-state-first\n", 0x51);
 
-    let initial = initialize_snapshot_store_head_state(
-        &state,
-        &key,
-        &store,
-        audit_limits(),
-    )
-    .expect("initialize empty store head");
+    let initial = initialize_snapshot_store_head_state(&state, &key, &store, audit_limits())
+        .expect("initialize empty store head");
     assert_eq!(initial.generation, 1);
     assert_eq!(initial.inventory.objects, 0);
 
@@ -114,11 +120,7 @@ fn anchored_publication_advances_once_and_exact_dedup_keeps_same_head() {
         &state,
         &key,
         &store,
-        audit_limits(),
-        &first.archive,
-        &first.public_key,
-        &first.signature,
-        archive_limits(),
+        publish_request(&first),
     )
     .expect("publish first object under authenticated head");
     assert!(inserted.put.inserted);
@@ -142,11 +144,7 @@ fn anchored_publication_advances_once_and_exact_dedup_keeps_same_head() {
         &state,
         &key,
         &store,
-        audit_limits(),
-        &first.archive,
-        &first.public_key,
-        &first.signature,
-        archive_limits(),
+        publish_request(&first),
     )
     .expect("deduplicate exact object under authenticated head");
     assert!(!dedup.put.inserted);
@@ -172,17 +170,16 @@ fn store_only_rollback_is_detected_before_later_publication() {
         &state,
         &key,
         &store,
-        audit_limits(),
-        &first.archive,
-        &first.public_key,
-        &first.signature,
-        archive_limits(),
+        publish_request(&first),
     )
     .expect("commit first rollback fixture");
     assert_eq!(committed.successor.inventory.objects, 1);
 
     let first_path = snapshot_store_object_path(&store, first.identity);
-    assert!(first_path.exists(), "first object should exist before rollback");
+    assert!(
+        first_path.exists(),
+        "first object should exist before rollback"
+    );
     fs::remove_file(&first_path).expect("simulate hostile store-only rollback");
 
     match verify_snapshot_store_head_state(&state, &key, &store, audit_limits()) {
@@ -199,11 +196,7 @@ fn store_only_rollback_is_detected_before_later_publication() {
         &state,
         &key,
         &store,
-        audit_limits(),
-        &second.archive,
-        &second.public_key,
-        &second.signature,
-        archive_limits(),
+        publish_request(&second),
     ) {
         Err(SnapshotStoreHeadStateError::StoreDiverged { anchored, actual }) => {
             assert_eq!(anchored, committed.successor);
@@ -225,13 +218,8 @@ fn head_state_authentication_rejects_wrong_key_and_byte_tamper() {
     let key = SnapshotStoreHeadStateKey::new([0xC7; 32]);
     let wrong_key = SnapshotStoreHeadStateKey::new([0xD8; 32]);
 
-    let initialized = initialize_snapshot_store_head_state(
-        &state,
-        &key,
-        &store,
-        audit_limits(),
-    )
-    .expect("initialize authentication head");
+    let initialized = initialize_snapshot_store_head_state(&state, &key, &store, audit_limits())
+        .expect("initialize authentication head");
     assert_eq!(initialized.generation, 1);
 
     assert!(matches!(
@@ -261,12 +249,7 @@ fn configured_state_and_store_roots_must_be_disjoint() {
     let key = SnapshotStoreHeadStateKey::new([0xE9; 32]);
 
     assert!(matches!(
-        initialize_snapshot_store_head_state(
-            &nested_state,
-            &key,
-            &store,
-            audit_limits(),
-        ),
+        initialize_snapshot_store_head_state(&nested_state, &key, &store, audit_limits(),),
         Err(SnapshotStoreHeadStateError::InvalidInput(_))
     ));
 
@@ -275,12 +258,7 @@ fn configured_state_and_store_roots_must_be_disjoint() {
     let nested_store = outer_state.join("nested-store");
     fs::create_dir(&nested_store).expect("create nested store root");
     assert!(matches!(
-        initialize_snapshot_store_head_state(
-            &outer_state,
-            &key,
-            &nested_store,
-            audit_limits(),
-        ),
+        initialize_snapshot_store_head_state(&outer_state, &key, &nested_store, audit_limits(),),
         Err(SnapshotStoreHeadStateError::InvalidInput(_))
     ));
 }

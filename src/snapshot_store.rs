@@ -120,6 +120,17 @@ pub fn snapshot_store_object_path(store_root: &Path, identity: SnapshotIdentity)
 /// after its type, read-only mode, exact length, and every archive byte match the
 /// supplied artifact. This does not claim fsync-backed crash durability or
 /// protection from a privileged hostile writer that controls the store root.
+pub(crate) fn validate_snapshot_archive_ed25519(
+    archive: &[u8],
+    public_key: &[u8; SNAPSHOT_ED25519_PUBLIC_KEY_BYTES],
+    expected_signature: &[u8; SNAPSHOT_ED25519_SIGNATURE_BYTES],
+    limits: SnapshotArchiveLimits,
+) -> Result<SnapshotIdentity, SnapshotStoreError> {
+    let identity = snapshot_archive_identity(archive, limits)?;
+    verify_snapshot_identity_ed25519(identity, public_key, expected_signature)?;
+    Ok(identity)
+}
+
 pub fn store_snapshot_archive_ed25519_atomic(
     store_root: &Path,
     archive: &[u8],
@@ -128,8 +139,8 @@ pub fn store_snapshot_archive_ed25519_atomic(
     limits: SnapshotArchiveLimits,
 ) -> Result<SnapshotStorePutReport, SnapshotStoreError> {
     validate_store_root(store_root)?;
-    let identity = snapshot_archive_identity(archive, limits)?;
-    verify_snapshot_identity_ed25519(identity, public_key, expected_signature)?;
+    let identity =
+        validate_snapshot_archive_ed25519(archive, public_key, expected_signature, limits)?;
 
     #[cfg(target_os = "linux")]
     {

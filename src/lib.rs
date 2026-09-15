@@ -66,8 +66,8 @@ pub use snapshot_store_durable::store_snapshot_archive_ed25519_durable;
 pub use snapshot_store_head_state::{
     initialize_snapshot_store_head_state, load_snapshot_store_head_state,
     snapshot_store_head_state_path, store_snapshot_archive_ed25519_durable_with_head_state,
-    verify_snapshot_store_head_state, SnapshotStoreHeadPutReport, SnapshotStoreHeadStateError,
-    SnapshotStoreHeadStateIdentity, SnapshotStoreHeadStateKey,
+    verify_snapshot_store_head_state, SnapshotStoreHeadPublishRequest, SnapshotStoreHeadPutReport,
+    SnapshotStoreHeadStateError, SnapshotStoreHeadStateIdentity, SnapshotStoreHeadStateKey,
     SNAPSHOT_STORE_HEAD_STATE_KEY_BYTES,
 };
 pub use snapshot_store_inventory::{

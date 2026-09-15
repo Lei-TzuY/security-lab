@@ -2,7 +2,9 @@ use crate::snapshot_archive::SnapshotArchiveLimits;
 use crate::snapshot_signature::{
     SNAPSHOT_ED25519_PUBLIC_KEY_BYTES, SNAPSHOT_ED25519_SIGNATURE_BYTES,
 };
-use crate::snapshot_store::SnapshotStorePutReport;
+use crate::snapshot_store::{
+    validate_snapshot_archive_ed25519, SnapshotStoreError, SnapshotStorePutReport,
+};
 use crate::snapshot_store_audit::SnapshotStoreAuditLimits;
 use crate::snapshot_store_inventory::SnapshotStoreInventoryIdentity;
 use crate::snapshot_store_transaction::{
@@ -22,6 +24,7 @@ const HEAD_STATE_BYTES: usize = HEAD_STATE_HEADER_BYTES + HEAD_STATE_MAC_BYTES;
 const HEAD_STATE_FILE: &str = "snapshot-store-head";
 const HEAD_STATE_LOCK: &str = ".snapshot-store-head.lock";
 pub const SNAPSHOT_STORE_HEAD_STATE_KEY_BYTES: usize = 32;
+pub const SNAPSHOT_STORE_HEAD_MAX_BATCH_ITEMS: usize = 16;
 
 /// Host-held authentication key for the independently persisted store head.
 ///
@@ -71,6 +74,25 @@ pub struct SnapshotStoreHeadPublishRequest<'a> {
     pub archive_limits: SnapshotArchiveLimits,
 }
 
+pub struct SnapshotStoreHeadBatchItem<'a> {
+    pub archive: &'a [u8],
+    pub public_key: &'a [u8; SNAPSHOT_ED25519_PUBLIC_KEY_BYTES],
+    pub expected_signature: &'a [u8; SNAPSHOT_ED25519_SIGNATURE_BYTES],
+    pub archive_limits: SnapshotArchiveLimits,
+}
+
+pub struct SnapshotStoreHeadBatchPublishRequest<'a> {
+    pub inventory_limits: SnapshotStoreAuditLimits,
+    pub items: &'a [SnapshotStoreHeadBatchItem<'a>],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotStoreHeadBatchPutReport {
+    pub puts: Vec<SnapshotStorePutReport>,
+    pub previous: SnapshotStoreHeadStateIdentity,
+    pub successor: SnapshotStoreHeadStateIdentity,
+}
+
 #[derive(Debug)]
 pub enum SnapshotStoreHeadStateError {
     InvalidInput(String),
@@ -84,6 +106,10 @@ pub enum SnapshotStoreHeadStateError {
     StoreDiverged {
         anchored: SnapshotStoreHeadStateIdentity,
         actual: SnapshotStoreInventoryIdentity,
+    },
+    BatchItemInvalid {
+        index: usize,
+        source: Box<SnapshotStoreError>,
     },
     Io {
         phase: &'static str,
@@ -125,6 +151,10 @@ impl fmt::Display for SnapshotStoreHeadStateError {
                 actual.objects,
                 actual.archive_bytes,
             ),
+            Self::BatchItemInvalid { index, source } => write!(
+                f,
+                "snapshot store head-state batch item {index} failed prevalidation: {source}"
+            ),
             Self::Io { phase, source } => {
                 write!(f, "snapshot store head state failed during {phase}: {source}")
             }
@@ -138,6 +168,7 @@ impl fmt::Display for SnapshotStoreHeadStateError {
 impl Error for SnapshotStoreHeadStateError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::BatchItemInvalid { source, .. } => Some(source.as_ref()),
             Self::Io { source, .. } => Some(source),
             Self::Transaction(source) => Some(source.as_ref()),
             _ => None,
@@ -259,6 +290,77 @@ pub fn store_snapshot_archive_ed25519_durable_with_head_state(
     }
 }
 
+/// Bounded multi-object publication under one authenticated store-head generation.
+///
+/// Every archive/signature pair is completely validated before either state or
+/// store filesystem mutation is attempted. The head-state lock and exclusive
+/// store transaction remain held across the whole publication loop, so
+/// cooperating readers observe the inventory before or after a successful
+/// batch, not an intermediate member. A successful batch advances the head at
+/// most once; an all-deduplicated batch leaves it unchanged.
+///
+/// This is not a crash-atomic all-or-nothing filesystem transaction. If a later
+/// object/durability operation fails after an earlier member was published, the
+/// call returns an error and the unchanged authenticated head makes that
+/// partial store advancement detectable as divergence.
+pub fn store_snapshot_archives_ed25519_durable_with_head_state(
+    state_root: &Path,
+    state_key: &SnapshotStoreHeadStateKey,
+    store_root: &Path,
+    request: SnapshotStoreHeadBatchPublishRequest<'_>,
+) -> Result<SnapshotStoreHeadBatchPutReport, SnapshotStoreHeadStateError> {
+    validate_roots(state_root, store_root)?;
+    validate_batch_request(&request)?;
+    #[cfg(target_os = "linux")]
+    {
+        linux::store_batch(state_root, state_key, store_root, request)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (state_root, state_key, store_root, request);
+        Err(SnapshotStoreHeadStateError::UnsupportedPlatform(
+            "authenticated durable store-head batch publication currently requires Linux flock, fsync, and cooperative snapshot-store transactions"
+                .to_owned(),
+        ))
+    }
+}
+
+fn validate_batch_request(
+    request: &SnapshotStoreHeadBatchPublishRequest<'_>,
+) -> Result<(), SnapshotStoreHeadStateError> {
+    if request.items.is_empty() {
+        return Err(SnapshotStoreHeadStateError::InvalidInput(
+            "batch publication requires at least one item".to_owned(),
+        ));
+    }
+    if request.items.len() > SNAPSHOT_STORE_HEAD_MAX_BATCH_ITEMS {
+        return Err(SnapshotStoreHeadStateError::InvalidInput(format!(
+            "batch publication accepts at most {SNAPSHOT_STORE_HEAD_MAX_BATCH_ITEMS} items"
+        )));
+    }
+
+    let mut identities = Vec::with_capacity(request.items.len());
+    for (index, item) in request.items.iter().enumerate() {
+        let identity = validate_snapshot_archive_ed25519(
+            item.archive,
+            item.public_key,
+            item.expected_signature,
+            item.archive_limits,
+        )
+        .map_err(|source| SnapshotStoreHeadStateError::BatchItemInvalid {
+            index,
+            source: Box::new(source),
+        })?;
+        if let Some(first_index) = identities.iter().position(|existing| *existing == identity) {
+            return Err(SnapshotStoreHeadStateError::InvalidInput(format!(
+                "batch item {index} duplicates canonical identity from item {first_index}"
+            )));
+        }
+        identities.push(identity);
+    }
+    Ok(())
+}
+
 fn validate_roots(state_root: &Path, store_root: &Path) -> Result<(), SnapshotStoreHeadStateError> {
     validate_root("state_root", state_root)?;
     validate_root("store_root", store_root)?;
@@ -362,7 +464,8 @@ fn decode_state(
 #[cfg(target_os = "linux")]
 mod linux {
     use super::{
-        decode_state, encode_state, SnapshotStoreAuditLimits, SnapshotStoreHeadPublishRequest,
+        decode_state, encode_state, SnapshotStoreAuditLimits, SnapshotStoreHeadBatchPublishRequest,
+        SnapshotStoreHeadBatchPutReport, SnapshotStoreHeadPublishRequest,
         SnapshotStoreHeadPutReport, SnapshotStoreHeadStateError, SnapshotStoreHeadStateIdentity,
         SnapshotStoreHeadStateKey, SnapshotStoreInventoryIdentity, SnapshotStoreReadTransaction,
         SnapshotStoreWriteTransaction, HEAD_STATE_BYTES, HEAD_STATE_FILE, HEAD_STATE_LOCK,
@@ -484,6 +587,57 @@ mod linux {
         write_state(guard.root.raw(), state_key, successor, true)?;
         Ok(SnapshotStoreHeadPutReport {
             put,
+            previous,
+            successor,
+        })
+    }
+
+    pub(super) fn store_batch(
+        state_root: &Path,
+        state_key: &SnapshotStoreHeadStateKey,
+        store_root: &Path,
+        request: SnapshotStoreHeadBatchPublishRequest<'_>,
+    ) -> Result<SnapshotStoreHeadBatchPutReport, SnapshotStoreHeadStateError> {
+        let guard = lock_state(state_root, libc::LOCK_EX)?;
+        let previous = read_state_optional(guard.root.raw(), state_key)?
+            .ok_or(SnapshotStoreHeadStateError::NotInitialized)?;
+        if previous.generation == u64::MAX {
+            return Err(SnapshotStoreHeadStateError::InvalidState(
+                "store-head generation is exhausted".to_owned(),
+            ));
+        }
+
+        let writer = SnapshotStoreWriteTransaction::begin(store_root)?;
+        let actual = writer.inventory_identity(request.inventory_limits)?;
+        require_inventory(previous, actual)?;
+
+        let mut puts = Vec::with_capacity(request.items.len());
+        let mut inserted_any = false;
+        for item in request.items {
+            let put = writer.store_ed25519_durable(
+                item.archive,
+                item.public_key,
+                item.expected_signature,
+                item.archive_limits,
+            )?;
+            inserted_any |= put.inserted;
+            puts.push(put);
+        }
+
+        let successor = if inserted_any {
+            let inventory = writer.inventory_identity(request.inventory_limits)?;
+            let successor = SnapshotStoreHeadStateIdentity {
+                generation: previous.generation + 1,
+                inventory,
+            };
+            write_state(guard.root.raw(), state_key, successor, true)?;
+            successor
+        } else {
+            previous
+        };
+
+        Ok(SnapshotStoreHeadBatchPutReport {
+            puts,
             previous,
             successor,
         })

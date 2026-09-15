@@ -1099,7 +1099,7 @@ Boundary: 44A is advisory cooperation among callers that use these transaction A
 
 ### Slice 45A — optimistic whole-store precondition for durable publication
 
-**Current verified candidate.** Composes the 43A complete-store commitment, the 44A exclusive transaction, and the 40B authenticated durable publication path into one compare-and-publish boundary for cooperating writers.
+**Status: complete on `main`.** Composes the 43A complete-store commitment, the 44A exclusive transaction, and the 40B authenticated durable publication path into one compare-and-publish boundary for cooperating writers.
 
 Acceptance evidence is executable:
 
@@ -1116,6 +1116,30 @@ Boundary: 45A is optimistic concurrency control only among callers that cooperat
 ### Milestone 45 promotion rule
 
 After 45A integrates, seal simple expected-inventory guarded single-object publication. Do not farm extra conflict spellings, retry helpers, or token wrappers. A stronger snapshot-store phase must add independently anchored history/rollback semantics, hostile-writer detection, multi-object atomic mutation, or a genuine point-in-time filesystem/store mechanism with executable evidence; otherwise promote to another authority frontier.
+
+## Milestone 46 — independently authenticated store head
+
+### Slice 46A — persisted authenticated whole-store head state
+
+**Current verified candidate.** Adds one independently persisted host-side generation/inventory anchor outside the snapshot object store, rather than another caller-retained comparison token.
+
+Acceptance evidence is executable:
+
+- `SnapshotStoreHeadStateKey` holds exactly 32 host-supplied bytes and redacts them from `Debug`; the fixed state encoding authenticates a versioned domain, non-zero generation, complete inventory SHA-256, object count, and aggregate archive bytes with HMAC-SHA256;
+- configured `state_root` and `store_root` must be absolute, non-root, `..`-free, and lexically disjoint; Linux state access is fd-relative and protected by a dedicated `flock` lock;
+- initialization establishes generation 1 from the complete audited inventory while holding the head-state exclusive lock and a cooperative store read transaction, then publishes the authenticated state with fsync-backed state-file/directory barriers;
+- load authenticates persisted state independently of the store, while verify authenticates the state and requires a complete audited store inventory derived under a read transaction to match exactly;
+- guarded publication acquires the head-state lock before the exclusive store transaction, rejects pre-existing inventory divergence before candidate publication, reuses the authenticated durable object-store path, advances the generation only for a newly inserted object, and leaves the generation unchanged for exact deduplication;
+- deleting a previously anchored object while keeping the independent state intact produces typed `StoreDiverged`; a later guarded publication is rejected before its candidate object appears;
+- a wrong HMAC key and direct head-state byte tamper both fail authentication; overlapping configured state/store roots fail validation;
+- the public durable-publication API uses a coherent `SnapshotStoreHeadPublishRequest`, and transaction errors are boxed so the public result type does not carry the large underlying transaction error inline;
+- exact candidate rustfmt, Clippy with `-D warnings`, complete stable tests, and the complete Rust 1.74 suite are green.
+
+Boundary: 46A detects store-only rollback/divergence only while the separately persisted state root and host-held HMAC key remain trustworthy. It does not resist coordinated rollback/replacement of both roots, provide TPM/secure-counter or remote-witness monotonicity, freeze a hostile live filesystem into a point-in-time view, or make object-store publication plus state-head publication one crash-atomic transaction. If the store advances and a later state write fails, the operation fails and the resulting mismatch is intentionally detected on subsequent verification.
+
+### Milestone 46 promotion rule
+
+After 46A integrates, seal caller-hosted local HMAC head-state rollback detection. Do not farm generation formatting, extra MAC encodings, or retry wrappers. A stronger snapshot-store phase must add materially different hostile-writer/point-in-time semantics, genuine multi-object atomic mutation, or an external/hardware monotonic witness with executable evidence; otherwise promote to another independent authority frontier.
 
 ## Independent host-local IPC frontier — post-launch object transfer
 

@@ -144,6 +144,12 @@ replace_one(
 """,
     "linux imports",
 )
+replace_one(
+    source,
+    "decode_state, encode_state, SnapshotArchiveLimits, SnapshotStoreAuditLimits,",
+    "decode_state, encode_state, SnapshotStoreAuditLimits,",
+    "remove stale linux archive-limit import",
+)
 
 old_internal = """    #[allow(clippy::too_many_arguments)]
     pub(super) fn store(

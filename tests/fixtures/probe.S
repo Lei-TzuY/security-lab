@@ -1159,6 +1159,18 @@ _start:
     cmpl $1, 92(%rsp)
     jne .brokered_host_unix_scm_rights_fail
     mov 96(%rsp), %r12d
+
+    # The handed-off capability must be read-only in the actual sandbox target.
+    # write(2) is explicitly allowed by this fixture for the readiness byte, so
+    # exact EBADF here proves the received open-file-description lacks write access.
+    mov $1, %eax
+    mov %r12d, %edi
+    lea runtime_fd_handoff_marker(%rip), %rsi
+    mov $1, %edx
+    syscall
+    cmp $-9, %rax
+    jne .brokered_host_unix_scm_rights_fail
+
     test %r12d, %r12d
     js .brokered_host_unix_scm_rights_fail
 

@@ -106,6 +106,10 @@ pub struct SandboxPolicy {
     pub hostname: String,
     /// Absolute path interpreted inside `root_dir`.
     pub executable: PathBuf,
+    /// Optional exact SHA-256 for the bytes of the initial executable image.
+    /// When present, Linux execution uses a verified sealed memfd copy rather
+    /// than executing the mutable host inode directly.
+    pub executable_sha256: Option<[u8; 32]>,
     pub args: Vec<String>,
     pub environment: BTreeMap<String, String>,
     /// Absolute path interpreted inside `root_dir`.
@@ -1143,6 +1147,7 @@ impl FromStr for SandboxPolicy {
         let mut cow_diff_bytes = None;
         let mut hostname = None;
         let mut executable = None;
+        let mut executable_sha256 = None;
         let mut args = Vec::new();
         let mut environment = BTreeMap::new();
         let mut working_dir = None;
@@ -1373,6 +1378,12 @@ impl FromStr for SandboxPolicy {
                     key,
                 )?,
                 "executable" => set_once(&mut executable, value.to_owned(), line_no, key)?,
+                "executable.sha256" => set_once(
+                    &mut executable_sha256,
+                    parse_sha256(value, line_no, key)?,
+                    line_no,
+                    key,
+                )?,
                 "arg" => args.push(value.to_owned()),
                 "working_dir" => set_once(&mut working_dir, value.to_owned(), line_no, key)?,
                 "landlock.read_execute" => landlock_read_execute.push(value.to_owned()),
@@ -1643,6 +1654,7 @@ impl FromStr for SandboxPolicy {
             cow_diff_bytes,
             hostname: required(hostname, "identity.hostname")?,
             executable: PathBuf::from(required(executable, "executable")?),
+            executable_sha256,
             args,
             environment,
             working_dir: PathBuf::from(required(working_dir, "working_dir")?),
@@ -1844,6 +1856,41 @@ fn validate_landlock_tcp_ports(label: &str, ports: &[u16]) -> Result<(), PolicyE
     Ok(())
 }
 
+fn parse_sha256(value: &str, line_no: usize, key: &str) -> Result<[u8; 32], PolicyError> {
+    if value.len() != 64 || !value.is_ascii() {
+        return Err(PolicyError::at(
+            line_no,
+            format!("{key} must be exactly 64 hexadecimal characters"),
+        ));
+    }
+    let nibble = |byte: u8| -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        }
+    };
+    let bytes = value.as_bytes();
+    let mut digest = [0u8; 32];
+    for index in 0..32 {
+        let high = nibble(bytes[index * 2]).ok_or_else(|| {
+            PolicyError::at(
+                line_no,
+                format!("{key} must contain only hexadecimal characters"),
+            )
+        })?;
+        let low = nibble(bytes[index * 2 + 1]).ok_or_else(|| {
+            PolicyError::at(
+                line_no,
+                format!("{key} must contain only hexadecimal characters"),
+            )
+        })?;
+        digest[index] = (high << 4) | low;
+    }
+    Ok(digest)
+}
+
 fn parse_stdio_mode(value: &str, line: usize, key: &str) -> Result<StdioMode, PolicyError> {
     match value {
         "inherit" => Ok(StdioMode::Inherit),
@@ -1957,12 +2004,30 @@ mod tests {
     }
 
     #[test]
+    fn parses_executable_sha256_and_rejects_malformed_digest() {
+        let hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let text = format!("{VALID}\nexecutable.sha256 = {hex}");
+        let policy: SandboxPolicy = text.parse().unwrap();
+        let mut expected = [0u8; 32];
+        for (index, byte) in expected.iter_mut().enumerate() {
+            *byte = if index % 2 == 0 { 0x01 } else { 0x23 };
+        }
+        assert_eq!(policy.executable_sha256.unwrap().len(), 32);
+
+        let short = format!("{VALID}\nexecutable.sha256 = deadbeef");
+        assert!(short.parse::<SandboxPolicy>().is_err());
+        let bad = format!("{VALID}\nexecutable.sha256 = {}g", "0".repeat(63));
+        assert!(bad.parse::<SandboxPolicy>().is_err());
+    }
+
+    #[test]
     fn parses_complete_policy() {
         let policy: SandboxPolicy = VALID.parse().unwrap();
         assert_eq!(policy.root_dir, PathBuf::from("/"));
         assert_eq!(policy.cow_root_bytes, None);
         assert_eq!(policy.cow_diff_bytes, None);
         assert_eq!(policy.hostname, "security-lab");
+        assert_eq!(policy.executable_sha256, None);
         assert!(!policy.loopback_enabled);
         assert!(!policy.procfs_enabled);
         assert_eq!(policy.host_loopback_tcp_port, None);

@@ -5,6 +5,7 @@ use security_lab::{
     ResourceLimits, SandboxError, SandboxPolicy, SeccompArgRangeRule, SeccompArgRule,
     SeccompPolicy, StdioMode, StdioPolicy,
 };
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CString;
 use std::net::{Ipv4Addr, TcpListener, TcpStream, UdpSocket};
@@ -336,6 +337,7 @@ fn policy(mode: &str, extra_args: &[&str], syscalls: &[&str]) -> SandboxPolicy {
         cow_diff_bytes: None,
         hostname: "security-lab".to_owned(),
         executable: PathBuf::from("/probe"),
+        executable_sha256: None,
         args,
         environment: BTreeMap::new(),
         working_dir: PathBuf::from("/work"),
@@ -393,6 +395,29 @@ fn policy(mode: &str, extra_args: &[&str], syscalls: &[&str]) -> SandboxPolicy {
             argument_range_rules: BTreeMap::new(),
             argument_forbidden_mask_rules: BTreeMap::new(),
         },
+    }
+}
+
+fn fixture_executable_sha256() -> [u8; 32] {
+    let bytes = std::fs::read(fixture_root().join("probe")).expect("read raw fixture executable");
+    Sha256::digest(bytes).into()
+}
+
+#[test]
+fn executable_sha256_runs_verified_sealed_image_and_mismatch_fails_closed() {
+    let mut verified = policy("X", &[], &["execveat", "exit"]);
+    verified.executable_sha256 = Some(fixture_executable_sha256());
+    assert_eq!(run(&verified).unwrap(), ChildOutcome::Exited(42));
+
+    let mut mismatch = verified;
+    let mut wrong = mismatch.executable_sha256.expect("digest configured");
+    wrong[0] ^= 0x80;
+    mismatch.executable_sha256 = Some(wrong);
+    match run(&mismatch).unwrap_err() {
+        SandboxError::SetupFailed(message) => {
+            assert!(message.contains("executable SHA-256 does not match"));
+        }
+        other => panic!("unexpected executable digest mismatch result: {other}"),
     }
 }
 

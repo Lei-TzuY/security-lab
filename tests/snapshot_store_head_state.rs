@@ -4,9 +4,10 @@ use security_lab::{
     initialize_snapshot_store_head_state, load_snapshot_store_head_state,
     serialize_snapshot_archive, sign_snapshot_ed25519, snapshot_store_head_state_path,
     snapshot_store_object_path, store_snapshot_archive_ed25519_durable_with_head_state,
-    verify_snapshot_store_head_state, SnapshotArchiveLimits, SnapshotIdentity,
-    SnapshotIdentityLimits, SnapshotStoreAuditLimits, SnapshotStoreHeadPublishRequest,
-    SnapshotStoreHeadStateError, SnapshotStoreHeadStateKey,
+    store_snapshot_archives_ed25519_durable_with_head_state, verify_snapshot_store_head_state,
+    SnapshotArchiveLimits, SnapshotIdentity, SnapshotIdentityLimits, SnapshotStoreAuditLimits,
+    SnapshotStoreHeadBatchItem, SnapshotStoreHeadBatchPublishRequest,
+    SnapshotStoreHeadPublishRequest, SnapshotStoreHeadStateError, SnapshotStoreHeadStateKey,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -97,6 +98,15 @@ fn roots(workspace: &Path) -> (PathBuf, PathBuf) {
 fn publish_request(fixture: &Fixture) -> SnapshotStoreHeadPublishRequest<'_> {
     SnapshotStoreHeadPublishRequest {
         inventory_limits: audit_limits(),
+        archive: &fixture.archive,
+        public_key: &fixture.public_key,
+        expected_signature: &fixture.signature,
+        archive_limits: archive_limits(),
+    }
+}
+
+fn batch_item(fixture: &Fixture) -> SnapshotStoreHeadBatchItem<'_> {
+    SnapshotStoreHeadBatchItem {
         archive: &fixture.archive,
         public_key: &fixture.public_key,
         expected_signature: &fixture.signature,
@@ -261,4 +271,207 @@ fn configured_state_and_store_roots_must_be_disjoint() {
         initialize_snapshot_store_head_state(&outer_state, &key, &nested_store, audit_limits(),),
         Err(SnapshotStoreHeadStateError::InvalidInput(_))
     ));
+}
+
+#[test]
+fn batch_publication_advances_one_generation_for_two_objects_and_dedups_as_a_unit() {
+    let workspace = TempDir::new("batch-success");
+    let (store, state) = roots(workspace.path());
+    let key = SnapshotStoreHeadStateKey::new([0x7A; 32]);
+    let first = fixture(workspace.path(), "batch-first", b"batch-first\n", 0x31);
+    let second = fixture(workspace.path(), "batch-second", b"batch-second\n", 0x32);
+
+    let initial = initialize_snapshot_store_head_state(&state, &key, &store, audit_limits())
+        .expect("initialize batch head");
+    assert_eq!(initial.generation, 1);
+    assert_eq!(initial.inventory.objects, 0);
+
+    let items = [batch_item(&first), batch_item(&second)];
+    let committed = store_snapshot_archives_ed25519_durable_with_head_state(
+        &state,
+        &key,
+        &store,
+        SnapshotStoreHeadBatchPublishRequest {
+            inventory_limits: audit_limits(),
+            items: &items,
+        },
+    )
+    .expect("publish two-object batch");
+    assert_eq!(committed.previous, initial);
+    assert_eq!(committed.puts.len(), 2);
+    assert!(committed.puts.iter().all(|put| put.inserted));
+    assert_eq!(committed.successor.generation, 2);
+    assert_eq!(committed.successor.inventory.objects, 2);
+    assert_eq!(
+        verify_snapshot_store_head_state(&state, &key, &store, audit_limits())
+            .expect("verify batch successor"),
+        committed.successor
+    );
+
+    let dedup_items = [batch_item(&first), batch_item(&second)];
+    let dedup = store_snapshot_archives_ed25519_durable_with_head_state(
+        &state,
+        &key,
+        &store,
+        SnapshotStoreHeadBatchPublishRequest {
+            inventory_limits: audit_limits(),
+            items: &dedup_items,
+        },
+    )
+    .expect("deduplicate full batch");
+    assert_eq!(dedup.previous, committed.successor);
+    assert_eq!(dedup.successor, committed.successor);
+    assert_eq!(dedup.puts.len(), 2);
+    assert!(dedup.puts.iter().all(|put| !put.inserted));
+}
+
+#[test]
+fn batch_prevalidates_every_item_before_first_object_publication() {
+    let workspace = TempDir::new("batch-preflight");
+    let (store, state) = roots(workspace.path());
+    let key = SnapshotStoreHeadStateKey::new([0x8B; 32]);
+    let first = fixture(
+        workspace.path(),
+        "preflight-first",
+        b"preflight-first\n",
+        0x41,
+    );
+    let second = fixture(
+        workspace.path(),
+        "preflight-second",
+        b"preflight-second\n",
+        0x42,
+    );
+    let initial = initialize_snapshot_store_head_state(&state, &key, &store, audit_limits())
+        .expect("initialize preflight head");
+
+    let mut bad_signature = second.signature;
+    bad_signature[0] ^= 0x80;
+    let items = [
+        batch_item(&first),
+        SnapshotStoreHeadBatchItem {
+            archive: &second.archive,
+            public_key: &second.public_key,
+            expected_signature: &bad_signature,
+            archive_limits: archive_limits(),
+        },
+    ];
+    match store_snapshot_archives_ed25519_durable_with_head_state(
+        &state,
+        &key,
+        &store,
+        SnapshotStoreHeadBatchPublishRequest {
+            inventory_limits: audit_limits(),
+            items: &items,
+        },
+    ) {
+        Err(SnapshotStoreHeadStateError::BatchItemInvalid { index: 1, .. }) => {}
+        Err(other) => panic!("unexpected batch prevalidation result: {other}"),
+        Ok(_) => panic!("invalid second batch member unexpectedly published"),
+    }
+
+    assert!(
+        !snapshot_store_object_path(&store, first.identity).exists(),
+        "first object was published before later batch prevalidation failed"
+    );
+    assert!(
+        !snapshot_store_object_path(&store, second.identity).exists(),
+        "invalid second object was published"
+    );
+    assert_eq!(
+        verify_snapshot_store_head_state(&state, &key, &store, audit_limits())
+            .expect("verify unchanged head after batch prevalidation failure"),
+        initial
+    );
+}
+
+#[test]
+fn batch_rejects_duplicate_identity_before_store_mutation() {
+    let workspace = TempDir::new("batch-duplicate");
+    let (store, state) = roots(workspace.path());
+    let key = SnapshotStoreHeadStateKey::new([0x9C; 32]);
+    let first = fixture(workspace.path(), "duplicate", b"duplicate-batch\n", 0x52);
+    let initial = initialize_snapshot_store_head_state(&state, &key, &store, audit_limits())
+        .expect("initialize duplicate head");
+    let items = [batch_item(&first), batch_item(&first)];
+
+    assert!(matches!(
+        store_snapshot_archives_ed25519_durable_with_head_state(
+            &state,
+            &key,
+            &store,
+            SnapshotStoreHeadBatchPublishRequest {
+                inventory_limits: audit_limits(),
+                items: &items,
+            },
+        ),
+        Err(SnapshotStoreHeadStateError::InvalidInput(_))
+    ));
+    assert!(!snapshot_store_object_path(&store, first.identity).exists());
+    assert_eq!(
+        verify_snapshot_store_head_state(&state, &key, &store, audit_limits())
+            .expect("verify unchanged head after duplicate batch"),
+        initial
+    );
+}
+
+#[test]
+fn batch_post_store_failure_leaves_detectable_head_divergence() {
+    let workspace = TempDir::new("batch-post-store-failure");
+    let (store, state) = roots(workspace.path());
+    let key = SnapshotStoreHeadStateKey::new([0xAD; 32]);
+    let first = fixture(
+        workspace.path(),
+        "post-store-first",
+        b"post-store-first\n",
+        0x71,
+    );
+    let second = fixture(
+        workspace.path(),
+        "post-store-second",
+        b"post-store-second\n",
+        0x72,
+    );
+    let initial = initialize_snapshot_store_head_state(&state, &key, &store, audit_limits())
+        .expect("initialize post-store failure head");
+
+    let mut successor_limits = audit_limits();
+    successor_limits.max_total_archive_bytes = first.archive.len() as u64;
+    let items = [batch_item(&first), batch_item(&second)];
+    assert!(
+        store_snapshot_archives_ed25519_durable_with_head_state(
+            &state,
+            &key,
+            &store,
+            SnapshotStoreHeadBatchPublishRequest {
+                inventory_limits: successor_limits,
+                items: &items,
+            },
+        )
+        .is_err(),
+        "successor inventory budget should fail after durable object publication"
+    );
+
+    assert!(
+        snapshot_store_object_path(&store, first.identity).exists(),
+        "first object should remain durably published after later failure"
+    );
+    assert!(
+        snapshot_store_object_path(&store, second.identity).exists(),
+        "second object should remain durably published before successor audit failure"
+    );
+    assert_eq!(
+        load_snapshot_store_head_state(&state, &key).expect("load unchanged head after failure"),
+        initial,
+        "failed batch must not advance authenticated head"
+    );
+
+    match verify_snapshot_store_head_state(&state, &key, &store, audit_limits()) {
+        Err(SnapshotStoreHeadStateError::StoreDiverged { anchored, actual }) => {
+            assert_eq!(anchored, initial);
+            assert_eq!(actual.objects, 2);
+        }
+        Err(other) => panic!("unexpected post-store divergence result: {other}"),
+        Ok(_) => panic!("unanchored durable batch advancement was not detected"),
+    }
 }

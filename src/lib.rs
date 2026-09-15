@@ -66,9 +66,11 @@ pub use snapshot_store_durable::store_snapshot_archive_ed25519_durable;
 pub use snapshot_store_head_state::{
     initialize_snapshot_store_head_state, load_snapshot_store_head_state,
     snapshot_store_head_state_path, store_snapshot_archive_ed25519_durable_with_head_state,
-    verify_snapshot_store_head_state, SnapshotStoreHeadPublishRequest, SnapshotStoreHeadPutReport,
+    store_snapshot_archives_ed25519_durable_with_head_state, verify_snapshot_store_head_state,
+    SnapshotStoreHeadBatchItem, SnapshotStoreHeadBatchPublishRequest,
+    SnapshotStoreHeadBatchPutReport, SnapshotStoreHeadPublishRequest, SnapshotStoreHeadPutReport,
     SnapshotStoreHeadStateError, SnapshotStoreHeadStateIdentity, SnapshotStoreHeadStateKey,
-    SNAPSHOT_STORE_HEAD_STATE_KEY_BYTES,
+    SNAPSHOT_STORE_HEAD_MAX_BATCH_ITEMS, SNAPSHOT_STORE_HEAD_STATE_KEY_BYTES,
 };
 pub use snapshot_store_inventory::{
     snapshot_store_inventory_identity, verify_snapshot_store_inventory_identity,

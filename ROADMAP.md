@@ -1121,7 +1121,7 @@ After 45A integrates, seal simple expected-inventory guarded single-object publi
 
 ### Slice 46A — persisted authenticated whole-store head state
 
-**Current verified candidate.** Adds one independently persisted host-side generation/inventory anchor outside the snapshot object store, rather than another caller-retained comparison token.
+**Status: complete on `main`.** Adds one independently persisted host-side generation/inventory anchor outside the snapshot object store, rather than another caller-retained comparison token.
 
 Acceptance evidence is executable:
 
@@ -1140,6 +1140,28 @@ Boundary: 46A detects store-only rollback/divergence only while the separately p
 ### Milestone 46 promotion rule
 
 After 46A integrates, seal caller-hosted local HMAC head-state rollback detection. Do not farm generation formatting, extra MAC encodings, or retry wrappers. A stronger snapshot-store phase must add materially different hostile-writer/point-in-time semantics, genuine multi-object atomic mutation, or an external/hardware monotonic witness with executable evidence; otherwise promote to another independent authority frontier.
+
+## Milestone 47 — bounded authenticated multi-object publication
+
+### Slice 47A — one-generation batch head publication
+
+**Current verified candidate.** Extends the authenticated head from one-object guarded publication to a bounded cooperative batch without claiming crash-atomic rollback of durable members.
+
+Acceptance evidence is executable:
+
+- the public batch request accepts 1 through `SNAPSHOT_STORE_HEAD_MAX_BATCH_ITEMS` (16) members; each member carries one archive, Ed25519 public key/signature, and archive limits;
+- every archive/signature pair is completely validated before either durable store or head-state mutation, and duplicate canonical identities are rejected during the same preflight;
+- one authenticated head-state exclusive lock is acquired before one exclusive snapshot-store transaction that remains held across the whole batch; the current audited store inventory must exactly equal the authenticated head before the first member is published;
+- a two-object valid batch durably inserts both objects, re-audits the complete successor inventory, and advances the authenticated head exactly once from generation 1 to generation 2; replaying the same batch deduplicates both objects and leaves the generation unchanged;
+- an invalid second signature is rejected before the first object is published, and a duplicate canonical identity is rejected before store mutation;
+- a deterministic post-store failure oracle uses a successor inventory budget that passes the initial empty-store check but fails only after two valid objects have been durably inserted. The call returns an error, both objects remain in the store, the authenticated head stays at its prior generation, and a later normal-budget verification returns typed `StoreDiverged` with two actual objects;
+- exact formal rustfmt, Clippy with `-D warnings`, complete stable tests, and the complete Rust 1.74 suite are green.
+
+Boundary: 47A is a bounded cooperative publication unit, not a crash-atomic all-or-nothing filesystem transaction. A failure after one or more durable object insertions may leave those objects present while the authenticated head remains old; the supported guarantee is fail-closed divergence detection on later verification, not rollback. It does not serialize hostile non-cooperating writers, freeze a hostile live filesystem, provide coordinated store+state rollback resistance, or add TPM/secure-counter/remote-witness monotonicity.
+
+### Milestone 47 promotion rule
+
+After 47A integrates, seal bounded cooperative batch publication under one authenticated head generation. Do not farm larger caps, batch aliases, retry wrappers, or alternate duplicate spellings. A stronger snapshot-store phase must add true crash-atomic/point-in-time semantics or an external/hardware monotonic witness with executable evidence; otherwise promote to another independent authority frontier.
 
 ## Independent host-local IPC frontier — post-launch object transfer
 

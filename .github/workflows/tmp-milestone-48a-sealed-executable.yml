@@ -16,6 +16,8 @@ jobs:
         with:
           toolchain: stable
           components: rustfmt, clippy
+      - name: Align generator to live parser helper
+        run: python3 .github/tmp-milestone-48a-generator-anchor-fix.py
       - name: Materialize candidate
         run: python3 .github/tmp-milestone-48a-sealed-executable.py
       - name: Format
@@ -34,6 +36,7 @@ jobs:
         run: cargo test --locked --all-targets --all-features
       - name: Remove construction files and commit candidate tree
         run: |
+          rm .github/tmp-milestone-48a-generator-anchor-fix.py
           rm .github/tmp-milestone-48a-sealed-executable.py
           rm .github/workflows/tmp-milestone-48a-sealed-executable.yml
           git config user.name LeiZ

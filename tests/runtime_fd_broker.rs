@@ -1058,9 +1058,14 @@ fn revocable_runtime_stream_reaches_real_target_and_revokes_future_bytes() {
     let mut session = broker
         .accept()
         .expect("accept sandbox revocable connection");
-    session
-        .wait_for_ready(b'R')
-        .expect("revocable target must publish post-exec readiness");
+    if let Err(readiness_error) = session.wait_for_ready(b'R') {
+        let runner_result = runner
+            .join()
+            .expect("revocable stream runner panicked before readiness");
+        panic!(
+            "revocable target failed before post-exec readiness: {readiness_error}; runner result: {runner_result:?}"
+        );
+    }
     session
         .send_revocable_byte_stream(grant)
         .expect("transfer sandbox revocable stream");

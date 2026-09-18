@@ -188,14 +188,10 @@ fn activating_landlock_read_envelope_is_detected_as_reduction() {
 fn executable_sha256_is_modeled_as_an_exact_execution_restriction() {
     let root = unique_absent_root("executable-sha256");
     let baseline_text = base_policy(&root);
-    let first_digest =
-        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    let second_digest =
-        "1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    let restricted_text =
-        format!("{baseline_text}executable.sha256 = {first_digest}\n");
-    let changed_text =
-        format!("{baseline_text}executable.sha256 = {second_digest}\n");
+    let first_digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let second_digest = "1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let restricted_text = format!("{baseline_text}executable.sha256 = {first_digest}\n");
+    let changed_text = format!("{baseline_text}executable.sha256 = {second_digest}\n");
 
     let baseline = TempPolicy::new("baseline", &baseline_text);
     let restricted = TempPolicy::new("restricted", &restricted_text);
@@ -205,25 +201,19 @@ fn executable_sha256_is_modeled_as_an_exact_execution_restriction() {
     assert_eq!(reduced.status.code(), Some(0));
     let stdout = String::from_utf8(reduced.stdout).expect("utf8 output");
     assert!(stdout.contains("\"status\":\"reduced\""));
-    assert!(stdout.contains(
-        "\"field\":\"execution.executable_sha256\",\"class\":\"reduced\""
-    ));
+    assert!(stdout.contains("\"field\":\"execution.executable_sha256\",\"class\":\"reduced\""));
 
     let widened = run_json(&restricted, &baseline);
     assert_eq!(widened.status.code(), Some(5));
     let stdout = String::from_utf8(widened.stdout).expect("utf8 output");
     assert!(stdout.contains("\"status\":\"widened\""));
-    assert!(stdout.contains(
-        "\"field\":\"execution.executable_sha256\",\"class\":\"widened\""
-    ));
+    assert!(stdout.contains("\"field\":\"execution.executable_sha256\",\"class\":\"widened\""));
 
     let incomparable = run_json(&restricted, &changed);
     assert_eq!(incomparable.status.code(), Some(6));
     let stdout = String::from_utf8(incomparable.stdout).expect("utf8 output");
     assert!(stdout.contains("\"status\":\"incomparable\""));
-    assert!(stdout.contains(
-        "\"field\":\"execution.executable_sha256\",\"class\":\"incomparable\""
-    ));
+    assert!(stdout.contains("\"field\":\"execution.executable_sha256\",\"class\":\"incomparable\""));
 }
 
 #[test]

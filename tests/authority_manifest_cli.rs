@@ -128,7 +128,9 @@ fn manifest_human_summarizes_authority_without_secret_values() {
     assert!(output.stderr.is_empty());
     let stdout = String::from_utf8(output.stdout).expect("manifest human output is UTF-8");
     assert!(stdout.starts_with("policy-authority-manifest:\nruntime-preflight: false\n"));
-    assert!(stdout.contains("executable-sha256: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n"));
+    assert!(stdout.contains(
+        "executable-sha256: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n"
+    ));
     assert!(stdout.contains("arguments: 1\n"));
     assert!(stdout.contains("private-procfs: enabled\n"));
     assert!(stdout.contains("environment-keys: SECRET_TOKEN\n"));

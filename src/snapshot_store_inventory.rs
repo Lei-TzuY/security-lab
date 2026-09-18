@@ -128,6 +128,121 @@ pub fn snapshot_store_inventory_identity(
     Ok(hash_inventory(report, &records))
 }
 
+pub(crate) fn projected_snapshot_store_inventory_identity(
+    store_root: &Path,
+    limits: SnapshotStoreAuditLimits,
+    candidate_identity: SnapshotIdentity,
+    candidate_archive_bytes: u64,
+) -> Result<
+    (
+        SnapshotStoreInventoryIdentity,
+        SnapshotStoreInventoryIdentity,
+    ),
+    SnapshotStoreInventoryError,
+> {
+    let mut records = Vec::new();
+    let mut allocation_failure = None;
+    let report = audit_snapshot_store_objects(store_root, limits, |identity, archive_bytes| {
+        if allocation_failure.is_some() {
+            return;
+        }
+        let attempted_entries = u64::try_from(records.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        if records.try_reserve(1).is_err() {
+            allocation_failure = Some(attempted_entries);
+            return;
+        }
+        records.push(InventoryRecord {
+            identity,
+            archive_bytes,
+        });
+    })?;
+
+    if let Some(attempted_entries) = allocation_failure {
+        return Err(SnapshotStoreInventoryError::AllocationFailed { attempted_entries });
+    }
+
+    records.sort_unstable_by(compare_records);
+    let current = hash_inventory(report, &records);
+    if records
+        .iter()
+        .any(|record| record.identity == candidate_identity)
+    {
+        return Ok((current, current));
+    }
+
+    let attempted_objects =
+        report
+            .objects
+            .checked_add(1)
+            .ok_or(SnapshotStoreAuditError::BudgetExceeded {
+                resource: "entry",
+                limit: limits.max_entries,
+                attempted: u64::MAX,
+            })?;
+    if attempted_objects > limits.max_entries {
+        return Err(SnapshotStoreAuditError::BudgetExceeded {
+            resource: "entry",
+            limit: limits.max_entries,
+            attempted: attempted_objects,
+        }
+        .into());
+    }
+    if candidate_archive_bytes > limits.archive.max_archive_bytes {
+        return Err(SnapshotStoreAuditError::BudgetExceeded {
+            resource: "per-object byte",
+            limit: limits.archive.max_archive_bytes,
+            attempted: candidate_archive_bytes,
+        }
+        .into());
+    }
+    let attempted_archive_bytes = report
+        .archive_bytes
+        .checked_add(candidate_archive_bytes)
+        .ok_or(SnapshotStoreAuditError::BudgetExceeded {
+            resource: "aggregate byte",
+            limit: limits.max_total_archive_bytes,
+            attempted: u64::MAX,
+        })?;
+    if attempted_archive_bytes > limits.max_total_archive_bytes {
+        return Err(SnapshotStoreAuditError::BudgetExceeded {
+            resource: "aggregate byte",
+            limit: limits.max_total_archive_bytes,
+            attempted: attempted_archive_bytes,
+        }
+        .into());
+    }
+
+    if records.try_reserve(1).is_err() {
+        return Err(SnapshotStoreInventoryError::AllocationFailed {
+            attempted_entries: attempted_objects,
+        });
+    }
+    records.push(InventoryRecord {
+        identity: candidate_identity,
+        archive_bytes: candidate_archive_bytes,
+    });
+    records.sort_unstable_by(compare_records);
+    let successor = hash_inventory(
+        SnapshotStoreAuditReport {
+            objects: attempted_objects,
+            archive_bytes: attempted_archive_bytes,
+        },
+        &records,
+    );
+    Ok((current, successor))
+}
+
+/// Project the exact audited inventory that would result from adding one
+/// canonical object without mutating the store.
+///
+/// If the candidate identity is already present, the projected successor is
+/// identical to the current inventory; the eventual store path must still
+/// perform its byte-for-byte deduplication check. Otherwise the same canonical
+/// record ordering, hash domain, and inventory budgets used by the full audit
+/// are applied to the synthetic one-object successor.
+
 /// Recompute the bounded audited inventory and require exact equality with a
 /// caller-retained expected identity.
 ///

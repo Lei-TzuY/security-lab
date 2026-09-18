@@ -1003,12 +1003,17 @@ fn revocable_runtime_stream_rejects_invalid_ceiling_and_poisoned_send_retry() {
     let (grant, mut controller) = RuntimeFdBroker::prepare_revocable_byte_stream(64).unwrap();
     session.send_revocable_byte_stream(grant).unwrap();
     let received = receive_one_fd(&client);
-    drop(received);
+    assert_eq!(
+        unsafe { libc::shutdown(received.raw(), libc::SHUT_RD) },
+        0,
+        "explicit peer read shutdown must make controller send failure deterministic"
+    );
 
     assert!(matches!(
         controller.send_all(b"will-fail"),
         Err(RuntimeFdBrokerError::Io { .. })
     ));
+    drop(received);
     assert!(matches!(
         controller.send_all(b"retry"),
         Err(RuntimeFdBrokerError::Protocol(message)) if message.contains("closed after")

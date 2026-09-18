@@ -16,7 +16,7 @@ replace_one(
     r'''pub struct SnapshotStorePutReport {
     pub identity: SnapshotIdentity,
     pub archive_bytes: u64,
-    /// \`true\` when this call published a new object, \`false\` when an exact
+    /// `true` when this call published a new object, `false` when an exact
     /// immutable object already occupied the same content address.
     pub inserted: bool,
 }
@@ -26,7 +26,7 @@ pub enum SnapshotStoreError {''',
     r'''pub struct SnapshotStorePutReport {
     pub identity: SnapshotIdentity,
     pub archive_bytes: u64,
-    /// \`true\` when this call published a new object, \`false\` when an exact
+    /// `true` when this call published a new object, `false` when an exact
     /// immutable object already occupied the same content address.
     pub inserted: bool,
 }

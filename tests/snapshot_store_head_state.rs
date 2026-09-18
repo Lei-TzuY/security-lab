@@ -9,9 +9,9 @@ use security_lab::{
     store_snapshot_archive_ed25519_durable_with_head_state,
     store_snapshot_archives_ed25519_durable_with_head_state, verify_snapshot_store_head_state,
     SnapshotArchiveLimits, SnapshotIdentity, SnapshotIdentityLimits, SnapshotStoreAuditLimits,
-    SnapshotStoreHeadBatchItem, SnapshotStoreHeadBatchPublishRequest,
+    SnapshotStoreError, SnapshotStoreHeadBatchItem, SnapshotStoreHeadBatchPublishRequest,
     SnapshotStoreHeadPublishRequest, SnapshotStoreHeadStateError, SnapshotStoreHeadStateIdentity,
-    SnapshotStoreHeadStateKey, SnapshotStoreError, SnapshotStoreTransactionError,
+    SnapshotStoreHeadStateKey, SnapshotStoreTransactionError,
 };
 use sha2::Sha256;
 use std::fs;
@@ -563,8 +563,7 @@ fn pending_intent_authentication_fails_closed() {
     );
 }
 
-const RECOVERY_FSYNC_HELPER_ROOT: &str =
-    "SECURITY_LAB_HEAD_RECOVERY_FSYNC_HELPER_ROOT";
+const RECOVERY_FSYNC_HELPER_ROOT: &str = "SECURITY_LAB_HEAD_RECOVERY_FSYNC_HELPER_ROOT";
 
 #[test]
 fn recovery_fsync_failure_helper() {
@@ -635,7 +634,10 @@ fn recovery_requires_durability_barrier_before_advancing_head() {
     let status = command
         .status()
         .expect("run denied-fsync recovery helper subprocess");
-    assert!(status.success(), "denied-fsync recovery helper failed: {status}");
+    assert!(
+        status.success(),
+        "denied-fsync recovery helper failed: {status}"
+    );
 
     assert!(
         pending_path(&state).exists(),
@@ -703,8 +705,7 @@ fn install_fsync_deny_filter() -> std::io::Result<()> {
         filter: filter.as_mut_ptr(),
     };
 
-    let no_new_privs =
-        unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
+    let no_new_privs = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
     if no_new_privs != 0 {
         return Err(std::io::Error::last_os_error());
     }

@@ -1350,7 +1350,7 @@ Boundary: 53A freezes the **completed copied byte sequence and length** after pr
 
 ### Slice 54A — bounded ordered sealed snapshot bundle
 
-**Current verified candidate.** Adds a bounded multi-object runtime protocol with explicit ordering and fail-closed partial-failure semantics rather than another single-object grant alias.
+**Status: complete on `main`.** Adds a bounded multi-object runtime protocol with explicit ordering and fail-closed partial-failure semantics rather than another single-object grant alias.
 
 Acceptance evidence is executable:
 
@@ -1366,9 +1366,26 @@ Acceptance evidence is executable:
 
 Boundary: 54A bounds and orders one sender-side multi-FD ancillary message; it is not a distributed transaction or receiver-acknowledged commit. A successful `sendmsg` does not prove the receiver consumed or retained every descriptor, and a receiver can always close granted descriptors. The slice adds no post-transfer revocation, no multiple successful grants per session, no arbitrary object-class mixture, and no general RPC protocol.
 
-### Milestone 54 promotion rule
+### Slice 55A — bounded revocable runtime byte stream
 
-After 54A integrates, do not farm bundle sizes, payload-byte aliases, or equivalent multi-FD shapes. Promote to a materially different runtime-capability property such as explicit lifetime/revocation or another object class with demonstrable rights attenuation beyond regular-file snapshots.
+**Current verified candidate.** Adds an explicit runtime-capability lifetime property rather than another immutable-file or multi-FD handoff variant.
+
+Acceptance evidence is executable:
+
+- `prepare_revocable_byte_stream(max_bytes)` requires an explicit 1-byte through 64-MiB lifetime byte ceiling and creates one private `AF_UNIX/SOCK_STREAM` socketpair; the endpoint prepared for the target is write-shutdown and the trusted controller peer is read-shutdown before transfer;
+- the prepared target endpoint uses the existing one-readiness/one-successful-grant runtime broker state machine and is transferred only after executed target code publishes the exact readiness byte;
+- `RevocableByteStreamController::send_all()` checks the complete requested slice against the remaining lifetime byte budget before sending, accounts only bytes actually sent, retries `EINTR`, uses `MSG_NOSIGNAL`, and poisons the controller after an ambiguous I/O/zero-progress failure so callers cannot retry an uncertain partial send;
+- `revoke()` is one-shot and performs `shutdown(SHUT_WR)` on the trusted controller peer. Bytes already queued remain readable; after they drain, the target observes EOF. Revocation does not remotely close/invalidate the target descriptor and does not roll back already delivered bytes;
+- local executable evidence proves the received endpoint cannot send (`EPIPE`), an over-budget send fails before any byte is supplied, exact marker bytes arrive, revoke converges to EOF, later sends/double-revoke fail, and the runtime session still permits only one successful grant;
+- the raw-syscall sandbox target explicitly grants `recvmsg` and `sendmsg`, publishes post-exec readiness, receives exactly one endpoint with `MSG_CMSG_CLOEXEC`, proves the endpoint is send-disabled with `sendmsg(MSG_NOSIGNAL) -> EPIPE`, reads the exact `runtime-revocable-stream\n` marker, then requires EOF after host revocation;
+- the Linux x86_64 syscall-name table includes `sendmsg` only as an explicit policy-resolvable syscall; the runtime broker does not silently add it to target seccomp authority;
+- exact candidate stable format/Clippy/full tests and the full Rust 1.74 suite are green.
+
+Boundary: 55A revokes only **future host-to-target byte supply** on one bounded stream. It does not revoke bytes already queued or read, remotely invalidate/close the target descriptor, provide target-to-host request traffic, reset/rearm a revoked stream, transfer a replacement stream on the consumed session, or provide a general long-lived RPC/control protocol.
+
+### Milestone 55 promotion rule
+
+After 55A integrates, do not farm stream byte ceilings, extra EOF spellings, or equivalent one-way socket wrappers. Promote to a materially different runtime-capability lifecycle or protocol property only when it has a distinct kernel mechanism and executable evidence.
 
 ## Later frontiers
 

@@ -268,6 +268,83 @@ fn fixture_root() -> &'static Path {
             .status()
             .expect("Linux x86_64 integration tests require a C toolchain with cc");
         assert!(status.success(), "failed to assemble raw-syscall fixture");
+
+        let loader_source = std::fs::canonicalize("/lib64/ld-linux-x86-64.so.2")
+            .expect("Ubuntu x86_64 integration tests require the system ELF interpreter");
+        let loader_bytes =
+            std::fs::read(&loader_source).expect("read system ELF interpreter bytes");
+        std::fs::write(root.join("loader"), &loader_bytes)
+            .expect("copy ELF interpreter into fixture root");
+        std::fs::set_permissions(root.join("loader"), std::fs::Permissions::from_mode(0o555))
+            .expect("make fixture ELF interpreter executable");
+
+        let dynamic_output = root.join("dynamic-probe");
+        let dynamic_source =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dynamic_probe.S");
+        let dynamic_status = Command::new("cc")
+            .args([
+                "-nostdlib",
+                "-fPIE",
+                "-pie",
+                "-Wl,--build-id=none",
+                "-Wl,--dynamic-linker=/loader",
+                "-Wl,-e,_start",
+                "-o",
+            ])
+            .arg(&dynamic_output)
+            .arg(&dynamic_source)
+            .status()
+            .expect("Linux x86_64 integration tests require a PIE-capable C toolchain");
+        assert!(
+            dynamic_status.success(),
+            "failed to assemble dynamic PT_INTERP fixture"
+        );
+
+        let dependency_output = root.join("dependency");
+        let dependency_source =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/needed_dependency.S");
+        let dependency_status = Command::new("cc")
+            .args([
+                "-nostdlib",
+                "-shared",
+                "-fPIC",
+                "-Wl,--build-id=none",
+                "-Wl,-soname,/dependency",
+                "-o",
+            ])
+            .arg(&dependency_output)
+            .arg(&dependency_source)
+            .status()
+            .expect("Linux x86_64 integration tests require shared-object linker support");
+        assert!(
+            dependency_status.success(),
+            "failed to assemble path-qualified DT_NEEDED fixture dependency"
+        );
+        std::fs::set_permissions(&dependency_output, std::fs::Permissions::from_mode(0o555))
+            .expect("make fixture DT_NEEDED dependency executable");
+
+        let dynamic_needed_output = root.join("dynamic-needed-probe");
+        let dynamic_needed_source =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dynamic_needed_probe.S");
+        let dynamic_needed_status = Command::new("cc")
+            .args([
+                "-nostdlib",
+                "-fPIE",
+                "-pie",
+                "-Wl,--build-id=none",
+                "-Wl,--dynamic-linker=/loader",
+                "-Wl,-e,_start",
+                "-o",
+            ])
+            .arg(&dynamic_needed_output)
+            .arg(&dynamic_needed_source)
+            .arg(&dependency_output)
+            .status()
+            .expect("Linux x86_64 integration tests require PIE shared-object linking");
+        assert!(
+            dynamic_needed_status.success(),
+            "failed to assemble path-qualified DT_NEEDED dynamic fixture"
+        );
         root
     })
     .as_path()
@@ -338,6 +415,10 @@ fn policy(mode: &str, extra_args: &[&str], syscalls: &[&str]) -> SandboxPolicy {
         hostname: "security-lab".to_owned(),
         executable: PathBuf::from("/probe"),
         executable_sha256: None,
+        executable_interpreter: None,
+        executable_interpreter_sha256: None,
+        executable_needed: None,
+        executable_needed_sha256: None,
         args,
         environment: BTreeMap::new(),
         working_dir: PathBuf::from("/work"),
@@ -403,6 +484,27 @@ fn fixture_executable_sha256() -> [u8; 32] {
     Sha256::digest(bytes).into()
 }
 
+fn dynamic_fixture_sha256() -> [u8; 32] {
+    let bytes = std::fs::read(fixture_root().join("dynamic-probe")).expect("read dynamic fixture");
+    Sha256::digest(bytes).into()
+}
+
+fn dynamic_needed_fixture_sha256() -> [u8; 32] {
+    let bytes =
+        std::fs::read(fixture_root().join("dynamic-needed-probe")).expect("read needed fixture");
+    Sha256::digest(bytes).into()
+}
+
+fn fixture_needed_sha256() -> [u8; 32] {
+    let bytes = std::fs::read(fixture_root().join("dependency")).expect("read fixture dependency");
+    Sha256::digest(bytes).into()
+}
+
+fn fixture_loader_sha256() -> [u8; 32] {
+    let bytes = std::fs::read(fixture_root().join("loader")).expect("read fixture loader");
+    Sha256::digest(bytes).into()
+}
+
 #[test]
 fn executable_sha256_runs_verified_sealed_image_and_mismatch_fails_closed() {
     let mut verified = policy("X", &[], &["exit"]);
@@ -418,6 +520,157 @@ fn executable_sha256_runs_verified_sealed_image_and_mismatch_fails_closed() {
             assert!(message.contains("executable SHA-256 does not match"));
         }
         other => panic!("unexpected executable digest mismatch result: {other}"),
+    }
+}
+
+#[test]
+fn sealed_pt_interp_executes_through_immutable_loader_mount() {
+    let loader_before =
+        std::fs::read(fixture_root().join("loader")).expect("read host fixture loader before run");
+    let mut verified = policy(
+        "unused",
+        &[],
+        &[
+            "read",
+            "close",
+            "fstat",
+            "mmap",
+            "mprotect",
+            "munmap",
+            "brk",
+            "arch_prctl",
+            "set_tid_address",
+            "set_robust_list",
+            "prlimit64",
+            "getrandom",
+            "openat",
+            "newfstatat",
+            "pread64",
+            "access",
+            "madvise",
+            "exit",
+            "exit_group",
+        ],
+    );
+    verified.executable = PathBuf::from("/dynamic-probe");
+    verified.executable_sha256 = Some(dynamic_fixture_sha256());
+    verified.executable_interpreter = Some(PathBuf::from("/loader"));
+    verified.executable_interpreter_sha256 = Some(fixture_loader_sha256());
+
+    assert_eq!(run(&verified).unwrap(), ChildOutcome::Exited(73));
+    assert_eq!(
+        std::fs::read(fixture_root().join("loader")).expect("read host fixture loader after run"),
+        loader_before,
+        "sealed interpreter mount must not mutate the host loader copy"
+    );
+}
+
+#[test]
+fn sealed_pt_interp_mismatch_fails_closed_before_target_execution() {
+    let mut verified = policy("unused", &[], &["exit"]);
+    verified.executable = PathBuf::from("/dynamic-probe");
+    verified.executable_sha256 = Some(dynamic_fixture_sha256());
+    verified.executable_interpreter = Some(PathBuf::from("/loader"));
+    let mut wrong = fixture_loader_sha256();
+    wrong[0] ^= 0x80;
+    verified.executable_interpreter_sha256 = Some(wrong);
+
+    match run(&verified).unwrap_err() {
+        SandboxError::SetupFailed(message) => {
+            assert!(message.contains(
+                "ELF interpreter SHA-256 does not match executable.interpreter_sha256 policy"
+            ));
+        }
+        other => panic!("unexpected interpreter digest mismatch result: {other}"),
+    }
+
+    let mut wrong_path = verified;
+    wrong_path.executable_interpreter_sha256 = Some(fixture_loader_sha256());
+    wrong_path.executable_interpreter = Some(PathBuf::from("/not-the-declared-loader"));
+    match run(&wrong_path).unwrap_err() {
+        SandboxError::SetupFailed(message) => {
+            assert!(message.contains("PT_INTERP"));
+            assert!(message.contains("does not match executable.interpreter"));
+        }
+        other => panic!("unexpected PT_INTERP mismatch result: {other}"),
+    }
+}
+
+#[test]
+fn sealed_path_qualified_dt_needed_executes_through_immutable_dependency_mount() {
+    let dependency_before = std::fs::read(fixture_root().join("dependency"))
+        .expect("read host fixture dependency before run");
+    let mut verified = policy(
+        "unused",
+        &[],
+        &[
+            "read",
+            "close",
+            "fstat",
+            "mmap",
+            "mprotect",
+            "munmap",
+            "brk",
+            "arch_prctl",
+            "set_tid_address",
+            "set_robust_list",
+            "prlimit64",
+            "getrandom",
+            "openat",
+            "newfstatat",
+            "pread64",
+            "access",
+            "madvise",
+            "exit",
+            "exit_group",
+        ],
+    );
+    verified.executable = PathBuf::from("/dynamic-needed-probe");
+    verified.executable_sha256 = Some(dynamic_needed_fixture_sha256());
+    verified.executable_interpreter = Some(PathBuf::from("/loader"));
+    verified.executable_interpreter_sha256 = Some(fixture_loader_sha256());
+    verified.executable_needed = Some(PathBuf::from("/dependency"));
+    verified.executable_needed_sha256 = Some(fixture_needed_sha256());
+
+    assert_eq!(run(&verified).unwrap(), ChildOutcome::Exited(91));
+    assert_eq!(
+        std::fs::read(fixture_root().join("dependency"))
+            .expect("read host fixture dependency after run"),
+        dependency_before,
+        "sealed DT_NEEDED mount must not mutate the host dependency copy"
+    );
+}
+
+#[test]
+fn sealed_path_qualified_dt_needed_mismatch_fails_closed_before_target_execution() {
+    let mut verified = policy("unused", &[], &["exit"]);
+    verified.executable = PathBuf::from("/dynamic-needed-probe");
+    verified.executable_sha256 = Some(dynamic_needed_fixture_sha256());
+    verified.executable_interpreter = Some(PathBuf::from("/loader"));
+    verified.executable_interpreter_sha256 = Some(fixture_loader_sha256());
+    verified.executable_needed = Some(PathBuf::from("/dependency"));
+    let mut wrong = fixture_needed_sha256();
+    wrong[0] ^= 0x80;
+    verified.executable_needed_sha256 = Some(wrong);
+
+    match run(&verified).unwrap_err() {
+        SandboxError::SetupFailed(message) => {
+            assert!(message.contains(
+                "ELF direct dependency SHA-256 does not match executable.needed_sha256 policy"
+            ));
+        }
+        other => panic!("unexpected DT_NEEDED digest mismatch result: {other}"),
+    }
+
+    let mut wrong_path = verified;
+    wrong_path.executable_needed_sha256 = Some(fixture_needed_sha256());
+    wrong_path.executable_needed = Some(PathBuf::from("/not-the-needed-object"));
+    match run(&wrong_path).unwrap_err() {
+        SandboxError::SetupFailed(message) => {
+            assert!(message.contains("DT_NEEDED"));
+            assert!(message.contains("exactly one"));
+        }
+        other => panic!("unexpected DT_NEEDED path mismatch result: {other}"),
     }
 }
 

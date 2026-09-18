@@ -1182,7 +1182,7 @@ Boundary: 48A binds only the byte content of the initial executable file selecte
 
 ### Slice 48B — one-shot bootstrap `execveat`
 
-**Current verified candidate.** Separates the launcher-required initial `execveat` transition from persistent target `execveat` authority.
+**Status: complete on `main`.** Separates the launcher-required initial `execveat` transition from persistent target `execveat` authority.
 
 Acceptance evidence is executable:
 
@@ -1199,7 +1199,45 @@ Boundary: 48B narrows only implicit `execveat` authority needed for the initial 
 
 ### Milestone 48 promotion rule
 
-After 48B integrates, seal the initial executable byte binding and bootstrap/later-`execveat` authority split. Do not farm hash aliases, descriptor-number variants, copy ceilings, or alternate seal masks. A stronger execution-integrity phase must bind a materially different dependency such as `PT_INTERP`/library closure, explicitly granted later execution, or another independent authority frontier with executable evidence.
+48A–48B are sealed on `main`. Do not farm hash aliases, descriptor-number variants, copy ceilings, or alternate seal masks. Stronger execution integrity must bind a materially different dependency or execution transition with executable evidence.
+
+## Milestone 49 — content-bound initial ELF interpreter
+
+### Slice 49A — sealed exact `PT_INTERP` loader
+
+**Status: complete on `main`.** Extends initial-executable content binding to the dynamic ELF loader named by that exact executable rather than trusting a mutable host loader pathname at exec time.
+
+Acceptance evidence is executable:
+
+- `executable.interpreter` and `executable.interpreter_sha256` are an all-or-nothing restriction and require `executable.sha256`; the interpreter path is absolute, differs from the main executable, and cannot overlap private procfs, scratch, or persistent-volume targets;
+- the launcher parses `PT_INTERP` from the already content-bound ELF64 little-endian x86_64 initial executable, rejects malformed/multiple/oversized interpreter segments, and requires the embedded path to equal the policy path byte-for-byte;
+- the declared loader is pinned beneath `filesystem.root`, required to be a regular executable, identity-revalidated during sealed copying, SHA-256 checked under the existing 64 MiB ceiling, and retained as an immutable sealed memfd image;
+- before chroot, the child copies only those sealed bytes into a private tmpfs file, clones that file as a detached mount, applies read-only + `nosuid` + `nodev`, and attaches it exactly over the declared `PT_INTERP` target path;
+- configured-filesystem preflight read-only validates the content-bound executable's `PT_INTERP`, interpreter shape, and interpreter digest; static authority manifest/delta surfaces include the interpreter path+digest restriction;
+- a deliberately dynamic PIE fixture embeds `/loader`, launches successfully through the sealed loader and exits 73, while a wrong loader digest and a policy path different from the content-bound `PT_INTERP` both fail before target execution; the trusted parent also proves the host loader copy is unchanged;
+- exact branch rustfmt, Clippy with `-D warnings`, complete stable tests, and the complete Rust 1.74 suite are green.
+
+Boundary: 49A binds only the initial ELF64 x86_64 `PT_INTERP` loader selected by the already content-bound main image. The expected digest is not signer/provenance evidence. This slice does not bind shared libraries opened by the loader, statically linked images without `PT_INTERP`, later target `execve` or explicitly granted later `execveat`, or provide a process-lifetime executable closure.
+
+### Slice 49B — one sealed path-qualified direct `DT_NEEDED`
+
+**Current verified candidate.** Extends the sealed initial-execution chain to one direct shared object whose pathname is selected by the content-bound main ELF itself, without claiming general dynamic-loader search or a transitive library closure.
+
+Acceptance evidence is executable:
+
+- `executable.needed` / `executable.needed_sha256` are an all-or-nothing restriction that requires both `executable.sha256` and the sealed `PT_INTERP` binding; the dependency path is absolute, not `/`, differs from the main executable/interpreter, rejects dynamic-linker `$` tokens, and cannot overlap private procfs, scratch, or persistent-volume targets;
+- the launcher parses bounded little-endian ELF64 x86_64 `PT_DYNAMIC` metadata from the already content-bound main image, resolves `DT_STRTAB` only through a containing `PT_LOAD`, bounds the dynamic/string tables and direct-needed count, requires a terminating `DT_NULL`, and requires exactly one `DT_NEEDED` string to match the configured path byte-for-byte;
+- the matched object is pinned beneath `filesystem.root`, required to be a regular executable, identity-revalidated while copying, SHA-256 checked under the existing 64 MiB ceiling, and retained as an immutable sealed memfd image;
+- before target execution, the child reuses the sealed-image mount path to copy only those verified bytes into private tmpfs state, clone the file, apply read-only + `nosuid` + `nodev`, and attach it exactly over the declared dependency pathname;
+- configured-filesystem preflight independently validates direct-needed membership, object shape, and digest; static authority manifest/delta surfaces include the direct-needed path+digest restriction;
+- a dynamic PIE fixture containing `DT_NEEDED=/dependency` executes through the sealed main + interpreter + dependency chain and exits 91. A one-bit dependency-digest mismatch and a configured path absent from the sealed main's direct-needed list both fail before target execution; the trusted parent proves the host dependency bytes remain unchanged;
+- the exact candidate retains all prior regressions and has passed stable rustfmt, Clippy with `-D warnings`, the complete stable suite, and the complete Rust 1.74 suite.
+
+Boundary: 49B binds at most one direct **path-qualified** `DT_NEEDED` object from the sealed main executable. It intentionally does not resolve ordinary slashless SONAME dependencies, `DT_RPATH`/`DT_RUNPATH`, `ld.so.cache`, dependency search order, transitive `DT_NEEDED` edges, dynamic-string token expansion, `LD_PRELOAD`, `dlopen`, later exec transitions, or a process-lifetime shared-library closure. The expected digest remains content evidence, not signer/provenance identity.
+
+### Milestone 49 promotion rule
+
+After 49B integrates, seal this bounded direct-path dependency slice. Do not farm extra direct paths, parser tags, SONAME spellings, or mount aliases. A stronger execution-integrity phase must either model materially broader loader resolution/transitive closure with executable evidence, bind explicitly authorized later execution, or move to another independent authority frontier.
 
 ## Independent host-local IPC frontier — post-launch object transfer
 

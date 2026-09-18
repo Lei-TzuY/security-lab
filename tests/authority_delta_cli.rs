@@ -124,6 +124,44 @@ fn forbidden_seccomp_mask_is_modeled_as_a_restriction() {
 }
 
 #[test]
+fn direct_needed_binding_is_modeled_as_an_exact_execution_restriction() {
+    let root = unique_absent_root("needed-binding");
+    let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let second = "1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let sealed = format!(
+        "{}executable.sha256 = {digest}\nexecutable.interpreter = /loader\nexecutable.interpreter_sha256 = {digest}\n",
+        base_policy(&root)
+    );
+    let restricted_text =
+        format!("{sealed}executable.needed = /dependency\nexecutable.needed_sha256 = {digest}\n");
+    let changed_text =
+        format!("{sealed}executable.needed = /dependency\nexecutable.needed_sha256 = {second}\n");
+    let baseline = TempPolicy::new("baseline", &sealed);
+    let restricted = TempPolicy::new("restricted", &restricted_text);
+    let changed = TempPolicy::new("changed", &changed_text);
+
+    let reduced = run_json(&baseline, &restricted);
+    assert_eq!(reduced.status.code(), Some(0));
+    let stdout = String::from_utf8(reduced.stdout).expect("utf8 output");
+    assert!(
+        stdout.contains("\"field\":\"execution.executable_needed_binding\",\"class\":\"reduced\"")
+    );
+
+    let widened = run_json(&restricted, &baseline);
+    assert_eq!(widened.status.code(), Some(5));
+    let stdout = String::from_utf8(widened.stdout).expect("utf8 output");
+    assert!(
+        stdout.contains("\"field\":\"execution.executable_needed_binding\",\"class\":\"widened\"")
+    );
+
+    let incomparable = run_json(&restricted, &changed);
+    assert_eq!(incomparable.status.code(), Some(6));
+    let stdout = String::from_utf8(incomparable.stdout).expect("utf8 output");
+    assert!(stdout
+        .contains("\"field\":\"execution.executable_needed_binding\",\"class\":\"incomparable\""));
+}
+
+#[test]
 fn copy_on_write_root_is_modeled_as_ephemeral_write_authority() {
     let root = unique_absent_root("cow-root");
     let baseline_text = base_policy(&root);
@@ -214,6 +252,48 @@ fn executable_sha256_is_modeled_as_an_exact_execution_restriction() {
     let stdout = String::from_utf8(incomparable.stdout).expect("utf8 output");
     assert!(stdout.contains("\"status\":\"incomparable\""));
     assert!(stdout.contains("\"field\":\"execution.executable_sha256\",\"class\":\"incomparable\""));
+}
+
+#[test]
+fn interpreter_binding_is_modeled_as_an_exact_execution_restriction() {
+    let root = unique_absent_root("interpreter-binding");
+    let baseline_text = base_policy(&root);
+    let main_digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let loader_digest = "1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let changed_digest = "2123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let restricted_text = format!(
+        "{baseline_text}executable.sha256 = {main_digest}\nexecutable.interpreter = /loader\nexecutable.interpreter_sha256 = {loader_digest}\n"
+    );
+    let changed_text = format!(
+        "{baseline_text}executable.sha256 = {main_digest}\nexecutable.interpreter = /loader\nexecutable.interpreter_sha256 = {changed_digest}\n"
+    );
+
+    let baseline = TempPolicy::new(
+        "baseline-interpreter",
+        &format!("{baseline_text}executable.sha256 = {main_digest}\n"),
+    );
+    let restricted = TempPolicy::new("restricted-interpreter", &restricted_text);
+    let changed = TempPolicy::new("changed-interpreter", &changed_text);
+
+    let reduced = run_json(&baseline, &restricted);
+    assert_eq!(reduced.status.code(), Some(0));
+    let stdout = String::from_utf8(reduced.stdout).expect("utf8 output");
+    assert!(
+        stdout.contains(r#""field":"execution.executable_interpreter_binding","class":"reduced""#)
+    );
+
+    let widened = run_json(&restricted, &baseline);
+    assert_eq!(widened.status.code(), Some(5));
+    let stdout = String::from_utf8(widened.stdout).expect("utf8 output");
+    assert!(
+        stdout.contains(r#""field":"execution.executable_interpreter_binding","class":"widened""#)
+    );
+
+    let incomparable = run_json(&restricted, &changed);
+    assert_eq!(incomparable.status.code(), Some(6));
+    let stdout = String::from_utf8(incomparable.stdout).expect("utf8 output");
+    assert!(stdout
+        .contains(r#""field":"execution.executable_interpreter_binding","class":"incomparable""#));
 }
 
 #[test]

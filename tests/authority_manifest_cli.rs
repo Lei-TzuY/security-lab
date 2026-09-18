@@ -91,6 +91,10 @@ fn manifest_json_is_deterministic_redacted_and_static() {
         "{\"ok\":true,\"manifest\":{\"kind\":\"static_authority\",\"runtime_preflight\":false,\"identity\":{\"hostname\":\"manifest-test\""
     ));
     assert!(stdout.contains("\"executable_sha256\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\""));
+    assert!(stdout.contains("\"executable_interpreter\":null"));
+    assert!(stdout.contains("\"executable_interpreter_sha256\":null"));
+    assert!(stdout.contains("\"executable_needed\":null"));
+    assert!(stdout.contains("\"executable_needed_sha256\":null"));
     assert!(stdout.contains("\"argument_count\":1,\"environment_keys\":[\"SECRET_TOKEN\"]"));
     assert!(stdout.contains("\"private_procfs\":true"));
     assert!(stdout.contains("\"selected\":[{\"target_fd\":9,\"source_fd\":200}]"));

@@ -789,8 +789,7 @@ mod imp {
     struct FdControl([u8; 48]);
 
     fn cmsg_space_for_fd_count(count: usize) -> usize {
-        let unaligned = std::mem::size_of::<libc::cmsghdr>()
-            + count * std::mem::size_of::<RawFd>();
+        let unaligned = std::mem::size_of::<libc::cmsghdr>() + count * std::mem::size_of::<RawFd>();
         let alignment = std::mem::size_of::<usize>();
         (unaligned + alignment - 1) & !(alignment - 1)
     }

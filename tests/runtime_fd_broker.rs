@@ -123,8 +123,7 @@ fn receive_bundle_fds(stream: &UnixStream, expected_count: usize) -> Vec<TestFd>
         assert_eq!((*header).cmsg_type, libc::SCM_RIGHTS);
         assert_eq!(
             (*header).cmsg_len,
-            std::mem::size_of::<libc::cmsghdr>()
-                + expected_count * std::mem::size_of::<RawFd>()
+            std::mem::size_of::<libc::cmsghdr>() + expected_count * std::mem::size_of::<RawFd>()
         );
         let data = control
             .0
@@ -592,7 +591,6 @@ fn sealed_runtime_snapshot_reaches_real_target_with_frozen_preparation_bytes() {
     std::fs::remove_dir_all(&root).expect("remove sealed runtime root");
 }
 
-
 #[test]
 fn sealed_snapshot_bundle_is_bounded_ordered_and_one_shot() {
     let socket_path = unique_path("runtime-bundle-local.sock");
@@ -629,10 +627,7 @@ fn sealed_snapshot_bundle_is_bounded_ordered_and_one_shot() {
         Err(RuntimeFdBrokerError::InvalidConfiguration(_))
     ));
     assert!(matches!(
-        RuntimeFdBroker::prepare_sealed_snapshot_bundle(
-            vec![make_first(), make_second()],
-            0,
-        ),
+        RuntimeFdBroker::prepare_sealed_snapshot_bundle(vec![make_first(), make_second()], 0,),
         Err(RuntimeFdBrokerError::InvalidConfiguration(_))
     ));
     assert!(matches!(
@@ -650,11 +645,9 @@ fn sealed_snapshot_bundle_is_bounded_ordered_and_one_shot() {
         Err(RuntimeFdBrokerError::SnapshotBundleTooLarge { .. })
     ));
 
-    let bundle = RuntimeFdBroker::prepare_sealed_snapshot_bundle(
-        vec![make_first(), make_second()],
-        4096,
-    )
-    .expect("prepare sealed snapshot bundle");
+    let bundle =
+        RuntimeFdBroker::prepare_sealed_snapshot_bundle(vec![make_first(), make_second()], 4096)
+            .expect("prepare sealed snapshot bundle");
     assert_eq!(bundle.item_count(), 2);
     assert_eq!(
         bundle.total_len(),
@@ -673,7 +666,10 @@ fn sealed_snapshot_bundle_is_bounded_ordered_and_one_shot() {
         .expect("send sealed snapshot bundle");
 
     let received = receive_bundle_fds(&client, 2);
-    assert_eq!(read_exact_fd(received[0].raw(), first_marker.len()), first_marker);
+    assert_eq!(
+        read_exact_fd(received[0].raw(), first_marker.len()),
+        first_marker
+    );
     assert_eq!(
         read_exact_fd(received[1].raw(), second_marker.len()),
         second_marker
@@ -735,8 +731,7 @@ fn failed_bundle_send_poison_session_against_retry() {
         Err(RuntimeFdBrokerError::Io { .. })
     ));
 
-    let retry =
-        RuntimeFdBroker::prepare_sealed_regular_file_snapshot(&first, 4096).unwrap();
+    let retry = RuntimeFdBroker::prepare_sealed_regular_file_snapshot(&first, 4096).unwrap();
     assert!(matches!(
         session.send_sealed_regular_file_snapshot(retry),
         Err(RuntimeFdBrokerError::Protocol(message)) if message.contains("closed after")
@@ -809,7 +804,10 @@ fn sealed_snapshot_bundle_reaches_real_target_in_order() {
         .send_sealed_snapshot_bundle(bundle)
         .expect("send sandbox sealed bundle");
     assert_eq!(
-        runner.join().expect("sandbox bundle runner panicked").unwrap(),
+        runner
+            .join()
+            .expect("sandbox bundle runner panicked")
+            .unwrap(),
         ChildOutcome::Exited(0)
     );
 
@@ -874,7 +872,10 @@ fn sealed_snapshot_bundle_target_rejects_truncated_control() {
     session.wait_for_ready(b'R').unwrap();
     session.send_sealed_snapshot_bundle(bundle).unwrap();
     assert_eq!(
-        runner.join().expect("truncated bundle runner panicked").unwrap(),
+        runner
+            .join()
+            .expect("truncated bundle runner panicked")
+            .unwrap(),
         ChildOutcome::Exited(29)
     );
 

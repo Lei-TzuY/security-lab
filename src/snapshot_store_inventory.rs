@@ -136,7 +136,6 @@ pub fn snapshot_store_inventory_identity(
 /// perform its byte-for-byte deduplication check. Otherwise the same canonical
 /// record ordering, hash domain, and inventory budgets used by the full audit
 /// are applied to the synthetic one-object successor.
-
 pub(crate) fn projected_snapshot_store_inventory_identity(
     store_root: &Path,
     limits: SnapshotStoreAuditLimits,

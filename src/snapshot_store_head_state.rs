@@ -6,7 +6,9 @@ use crate::snapshot_store::{
     validate_snapshot_archive_ed25519, SnapshotStoreError, SnapshotStorePutReport,
 };
 use crate::snapshot_store_audit::SnapshotStoreAuditLimits;
-use crate::snapshot_store_inventory::SnapshotStoreInventoryIdentity;
+use crate::snapshot_store_inventory::{
+    projected_snapshot_store_inventory_identity, SnapshotStoreInventoryIdentity,
+};
 use crate::snapshot_store_transaction::{
     SnapshotStoreReadTransaction, SnapshotStoreTransactionError, SnapshotStoreWriteTransaction,
 };
@@ -23,6 +25,12 @@ const HEAD_STATE_MAC_BYTES: usize = 32;
 const HEAD_STATE_BYTES: usize = HEAD_STATE_HEADER_BYTES + HEAD_STATE_MAC_BYTES;
 const HEAD_STATE_FILE: &str = "snapshot-store-head";
 const HEAD_STATE_LOCK: &str = ".snapshot-store-head.lock";
+const HEAD_PENDING_DOMAIN: &[u8] = b"security-lab-snapshot-store-head-pending-v1\0";
+const HEAD_PENDING_MAGIC: [u8; 8] = *b"SLHPND1\0";
+const HEAD_PENDING_HEADER_BYTES: usize = 120;
+const HEAD_PENDING_MAC_BYTES: usize = 32;
+const HEAD_PENDING_BYTES: usize = HEAD_PENDING_HEADER_BYTES + HEAD_PENDING_MAC_BYTES;
+const HEAD_PENDING_FILE: &str = "snapshot-store-head-pending";
 pub const SNAPSHOT_STORE_HEAD_STATE_KEY_BYTES: usize = 32;
 pub const SNAPSHOT_STORE_HEAD_MAX_BATCH_ITEMS: usize = 16;
 
@@ -55,6 +63,27 @@ impl fmt::Debug for SnapshotStoreHeadStateKey {
 pub struct SnapshotStoreHeadStateIdentity {
     pub generation: u64,
     pub inventory: SnapshotStoreInventoryIdentity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SnapshotStoreHeadPendingIntent {
+    previous: SnapshotStoreHeadStateIdentity,
+    successor: SnapshotStoreHeadStateIdentity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotStoreHeadRecoveryOutcome {
+    NoPending,
+    ClearedUnchanged {
+        head: SnapshotStoreHeadStateIdentity,
+    },
+    AdvancedHead {
+        previous: SnapshotStoreHeadStateIdentity,
+        successor: SnapshotStoreHeadStateIdentity,
+    },
+    ClearedCommitted {
+        head: SnapshotStoreHeadStateIdentity,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,6 +136,16 @@ pub enum SnapshotStoreHeadStateError {
         anchored: SnapshotStoreHeadStateIdentity,
         actual: SnapshotStoreInventoryIdentity,
     },
+    RecoveryRequired {
+        previous: SnapshotStoreHeadStateIdentity,
+        successor: SnapshotStoreHeadStateIdentity,
+    },
+    PendingStateDiverged {
+        previous: SnapshotStoreHeadStateIdentity,
+        successor: SnapshotStoreHeadStateIdentity,
+        anchored: SnapshotStoreHeadStateIdentity,
+        actual: SnapshotStoreInventoryIdentity,
+    },
     BatchItemInvalid {
         index: usize,
         source: Box<SnapshotStoreError>,
@@ -147,6 +186,35 @@ impl fmt::Display for SnapshotStoreHeadStateError {
                 anchored.inventory.sha256_hex(),
                 anchored.inventory.objects,
                 anchored.inventory.archive_bytes,
+                actual.sha256_hex(),
+                actual.objects,
+                actual.archive_bytes,
+            ),
+            Self::RecoveryRequired {
+                previous,
+                successor,
+            } => write!(
+                f,
+                "snapshot store head recovery is required: pending generation {} inventory {} -> generation {} inventory {}",
+                previous.generation,
+                previous.inventory.sha256_hex(),
+                successor.generation,
+                successor.inventory.sha256_hex(),
+            ),
+            Self::PendingStateDiverged {
+                previous,
+                successor,
+                anchored,
+                actual,
+            } => write!(
+                f,
+                "snapshot store pending publication diverged: pending generation {} inventory {} -> generation {} inventory {}, persisted generation {} inventory {}, actual store {} objects={} bytes={}",
+                previous.generation,
+                previous.inventory.sha256_hex(),
+                successor.generation,
+                successor.inventory.sha256_hex(),
+                anchored.generation,
+                anchored.inventory.sha256_hex(),
                 actual.sha256_hex(),
                 actual.objects,
                 actual.archive_bytes,
@@ -250,6 +318,36 @@ pub fn verify_snapshot_store_head_state(
         let _ = (state_root, state_key, store_root, inventory_limits);
         Err(SnapshotStoreHeadStateError::UnsupportedPlatform(
             "authenticated store-head verification currently requires Linux flock and cooperative snapshot-store transactions"
+                .to_owned(),
+        ))
+    }
+}
+
+/// Recover an authenticated pending single-object publication.
+///
+/// Recovery never accepts the currently observed store as authoritative merely
+/// because it differs from the persisted head. The HMAC-authenticated pending
+/// intent commits to one exact predecessor and one exact successor inventory.
+/// Under the existing head-state/store lock ordering, recovery clears an intent
+/// only when the observed head/store pair is exactly predecessor/predecessor,
+/// predecessor/successor, or successor/successor. Any other state remains
+/// pending and fails closed.
+pub fn recover_snapshot_store_head_state(
+    state_root: &Path,
+    state_key: &SnapshotStoreHeadStateKey,
+    store_root: &Path,
+    inventory_limits: SnapshotStoreAuditLimits,
+) -> Result<SnapshotStoreHeadRecoveryOutcome, SnapshotStoreHeadStateError> {
+    validate_roots(state_root, store_root)?;
+    #[cfg(target_os = "linux")]
+    {
+        linux::recover(state_root, state_key, store_root, inventory_limits)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (state_root, state_key, store_root, inventory_limits);
+        Err(SnapshotStoreHeadStateError::UnsupportedPlatform(
+            "authenticated store-head recovery currently requires Linux flock, fsync, and cooperative snapshot-store transactions"
                 .to_owned(),
         ))
     }
@@ -461,14 +559,137 @@ fn decode_state(
     })
 }
 
+fn encode_pending(
+    intent: SnapshotStoreHeadPendingIntent,
+    state_key: &SnapshotStoreHeadStateKey,
+) -> [u8; HEAD_PENDING_BYTES] {
+    let mut bytes = [0u8; HEAD_PENDING_BYTES];
+    bytes[0..8].copy_from_slice(&HEAD_PENDING_MAGIC);
+    encode_identity_fields(&mut bytes[8..64], intent.previous);
+    encode_identity_fields(&mut bytes[64..120], intent.successor);
+
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(state_key.as_bytes())
+        .expect("fixed-size HMAC key is always accepted");
+    mac.update(HEAD_PENDING_DOMAIN);
+    mac.update(&bytes[..HEAD_PENDING_HEADER_BYTES]);
+    bytes[HEAD_PENDING_HEADER_BYTES..].copy_from_slice(&mac.finalize().into_bytes());
+    bytes
+}
+
+fn decode_pending(
+    bytes: &[u8; HEAD_PENDING_BYTES],
+    state_key: &SnapshotStoreHeadStateKey,
+) -> Result<SnapshotStoreHeadPendingIntent, SnapshotStoreHeadStateError> {
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(state_key.as_bytes())
+        .expect("fixed-size HMAC key is always accepted");
+    mac.update(HEAD_PENDING_DOMAIN);
+    mac.update(&bytes[..HEAD_PENDING_HEADER_BYTES]);
+    mac.verify_slice(&bytes[HEAD_PENDING_HEADER_BYTES..])
+        .map_err(|_| SnapshotStoreHeadStateError::AuthenticationFailed)?;
+
+    if bytes[0..8] != HEAD_PENDING_MAGIC {
+        return Err(SnapshotStoreHeadStateError::InvalidState(
+            "unexpected pending store-head magic/version".to_owned(),
+        ));
+    }
+    let previous = decode_identity_fields(&bytes[8..64])?;
+    let successor = decode_identity_fields(&bytes[64..120])?;
+    let expected_generation = previous.generation.checked_add(1).ok_or_else(|| {
+        SnapshotStoreHeadStateError::InvalidState(
+            "pending predecessor generation is exhausted".to_owned(),
+        )
+    })?;
+    if successor.generation != expected_generation {
+        return Err(SnapshotStoreHeadStateError::InvalidState(
+            "pending successor generation must advance exactly once".to_owned(),
+        ));
+    }
+    if successor.inventory.objects
+        != previous
+            .inventory
+            .objects
+            .checked_add(1)
+            .ok_or_else(|| {
+                SnapshotStoreHeadStateError::InvalidState(
+                    "pending predecessor object count is exhausted".to_owned(),
+                )
+            })?
+    {
+        return Err(SnapshotStoreHeadStateError::InvalidState(
+            "pending successor must add exactly one object".to_owned(),
+        ));
+    }
+    if successor.inventory.archive_bytes <= previous.inventory.archive_bytes {
+        return Err(SnapshotStoreHeadStateError::InvalidState(
+            "pending successor archive bytes must increase".to_owned(),
+        ));
+    }
+    Ok(SnapshotStoreHeadPendingIntent {
+        previous,
+        successor,
+    })
+}
+
+fn encode_identity_fields(bytes: &mut [u8], identity: SnapshotStoreHeadStateIdentity) {
+    debug_assert_eq!(bytes.len(), 56);
+    bytes[0..8].copy_from_slice(&identity.generation.to_le_bytes());
+    bytes[8..40].copy_from_slice(&identity.inventory.sha256);
+    bytes[40..48].copy_from_slice(&identity.inventory.objects.to_le_bytes());
+    bytes[48..56].copy_from_slice(&identity.inventory.archive_bytes.to_le_bytes());
+}
+
+fn decode_identity_fields(
+    bytes: &[u8],
+) -> Result<SnapshotStoreHeadStateIdentity, SnapshotStoreHeadStateError> {
+    if bytes.len() != 56 {
+        return Err(SnapshotStoreHeadStateError::InvalidState(
+            "invalid pending store-head identity width".to_owned(),
+        ));
+    }
+    let generation = u64::from_le_bytes(
+        bytes[0..8]
+            .try_into()
+            .expect("fixed pending generation width"),
+    );
+    if generation == 0 {
+        return Err(SnapshotStoreHeadStateError::InvalidState(
+            "pending store-head generation must be non-zero".to_owned(),
+        ));
+    }
+    let mut sha256 = [0u8; 32];
+    sha256.copy_from_slice(&bytes[8..40]);
+    let objects = u64::from_le_bytes(
+        bytes[40..48]
+            .try_into()
+            .expect("fixed pending object-count width"),
+    );
+    let archive_bytes = u64::from_le_bytes(
+        bytes[48..56]
+            .try_into()
+            .expect("fixed pending archive-byte width"),
+    );
+    Ok(SnapshotStoreHeadStateIdentity {
+        generation,
+        inventory: SnapshotStoreInventoryIdentity {
+            sha256,
+            objects,
+            archive_bytes,
+        },
+    })
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
     use super::{
-        decode_state, encode_state, SnapshotStoreAuditLimits, SnapshotStoreHeadBatchPublishRequest,
-        SnapshotStoreHeadBatchPutReport, SnapshotStoreHeadPublishRequest,
-        SnapshotStoreHeadPutReport, SnapshotStoreHeadStateError, SnapshotStoreHeadStateIdentity,
-        SnapshotStoreHeadStateKey, SnapshotStoreInventoryIdentity, SnapshotStoreReadTransaction,
-        SnapshotStoreWriteTransaction, HEAD_STATE_BYTES, HEAD_STATE_FILE, HEAD_STATE_LOCK,
+        decode_pending, decode_state, encode_pending, encode_state,
+        projected_snapshot_store_inventory_identity, validate_snapshot_archive_ed25519,
+        SnapshotStoreAuditLimits, SnapshotStoreHeadBatchPublishRequest,
+        SnapshotStoreHeadBatchPutReport, SnapshotStoreHeadPendingIntent,
+        SnapshotStoreHeadPublishRequest, SnapshotStoreHeadPutReport,
+        SnapshotStoreHeadRecoveryOutcome, SnapshotStoreHeadStateError,
+        SnapshotStoreHeadStateIdentity, SnapshotStoreHeadStateKey, SnapshotStoreInventoryIdentity,
+        SnapshotStoreReadTransaction, SnapshotStoreTransactionError, SnapshotStoreWriteTransaction,
+        HEAD_PENDING_BYTES, HEAD_PENDING_FILE, HEAD_STATE_BYTES, HEAD_STATE_FILE, HEAD_STATE_LOCK,
     };
     use std::ffi::CString;
     use std::mem::MaybeUninit;
@@ -508,6 +729,7 @@ mod linux {
         inventory_limits: SnapshotStoreAuditLimits,
     ) -> Result<SnapshotStoreHeadStateIdentity, SnapshotStoreHeadStateError> {
         let guard = lock_state(state_root, libc::LOCK_EX)?;
+        require_no_pending(guard.root.raw(), state_key)?;
         if let Some(persisted) = read_state_optional(guard.root.raw(), state_key)? {
             return Err(SnapshotStoreHeadStateError::AlreadyInitialized { persisted });
         }
@@ -527,6 +749,7 @@ mod linux {
         state_key: &SnapshotStoreHeadStateKey,
     ) -> Result<SnapshotStoreHeadStateIdentity, SnapshotStoreHeadStateError> {
         let guard = lock_state(state_root, libc::LOCK_SH)?;
+        require_no_pending(guard.root.raw(), state_key)?;
         read_state_optional(guard.root.raw(), state_key)?
             .ok_or(SnapshotStoreHeadStateError::NotInitialized)
     }
@@ -538,6 +761,7 @@ mod linux {
         inventory_limits: SnapshotStoreAuditLimits,
     ) -> Result<SnapshotStoreHeadStateIdentity, SnapshotStoreHeadStateError> {
         let guard = lock_state(state_root, libc::LOCK_SH)?;
+        require_no_pending(guard.root.raw(), state_key)?;
         let anchored = read_state_optional(guard.root.raw(), state_key)?
             .ok_or(SnapshotStoreHeadStateError::NotInitialized)?;
         let reader = SnapshotStoreReadTransaction::begin(store_root)?;
@@ -553,6 +777,7 @@ mod linux {
         request: SnapshotStoreHeadPublishRequest<'_>,
     ) -> Result<SnapshotStoreHeadPutReport, SnapshotStoreHeadStateError> {
         let guard = lock_state(state_root, libc::LOCK_EX)?;
+        require_no_pending(guard.root.raw(), state_key)?;
         let previous = read_state_optional(guard.root.raw(), state_key)?
             .ok_or(SnapshotStoreHeadStateError::NotInitialized)?;
         if previous.generation == u64::MAX {
@@ -561,17 +786,51 @@ mod linux {
             ));
         }
 
-        let writer = SnapshotStoreWriteTransaction::begin(store_root)?;
-        let actual = writer.inventory_identity(request.inventory_limits)?;
-        require_inventory(previous, actual)?;
-
-        let put = writer.store_ed25519_durable(
+        let candidate_identity = validate_snapshot_archive_ed25519(
             request.archive,
             request.public_key,
             request.expected_signature,
             request.archive_limits,
-        )?;
-        if !put.inserted {
+        )
+        .map_err(|source| {
+            SnapshotStoreHeadStateError::Transaction(Box::new(
+                SnapshotStoreTransactionError::Store(source),
+            ))
+        })?;
+        let candidate_archive_bytes = u64::try_from(request.archive.len()).map_err(|_| {
+            SnapshotStoreHeadStateError::InvalidInput(
+                "snapshot archive length does not fit u64".to_owned(),
+            )
+        })?;
+
+        let writer = SnapshotStoreWriteTransaction::begin(store_root)?;
+        let (current, projected) = projected_snapshot_store_inventory_identity(
+            store_root,
+            request.inventory_limits,
+            candidate_identity,
+            candidate_archive_bytes,
+        )
+        .map_err(|source| {
+            SnapshotStoreHeadStateError::Transaction(Box::new(
+                SnapshotStoreTransactionError::Inventory(source),
+            ))
+        })?;
+        require_inventory(previous, current)?;
+
+        if projected == current {
+            let put = writer.store_ed25519_durable(
+                request.archive,
+                request.public_key,
+                request.expected_signature,
+                request.archive_limits,
+            )?;
+            if put.inserted {
+                let actual = writer.inventory_identity(request.inventory_limits)?;
+                return Err(SnapshotStoreHeadStateError::StoreDiverged {
+                    anchored: previous,
+                    actual,
+                });
+            }
             return Ok(SnapshotStoreHeadPutReport {
                 put,
                 previous,
@@ -579,12 +838,34 @@ mod linux {
             });
         }
 
-        let successor_inventory = writer.inventory_identity(request.inventory_limits)?;
         let successor = SnapshotStoreHeadStateIdentity {
             generation: previous.generation + 1,
-            inventory: successor_inventory,
+            inventory: projected,
         };
+        let pending = SnapshotStoreHeadPendingIntent {
+            previous,
+            successor,
+        };
+        write_pending(guard.root.raw(), state_key, pending)?;
+
+        let put = writer.store_ed25519_durable(
+            request.archive,
+            request.public_key,
+            request.expected_signature,
+            request.archive_limits,
+        )?;
+        let actual = writer.inventory_identity(request.inventory_limits)?;
+        if actual != successor.inventory {
+            return Err(SnapshotStoreHeadStateError::PendingStateDiverged {
+                previous,
+                successor,
+                anchored: previous,
+                actual,
+            });
+        }
+
         write_state(guard.root.raw(), state_key, successor, true)?;
+        clear_pending(guard.root.raw())?;
         Ok(SnapshotStoreHeadPutReport {
             put,
             previous,
@@ -599,6 +880,7 @@ mod linux {
         request: SnapshotStoreHeadBatchPublishRequest<'_>,
     ) -> Result<SnapshotStoreHeadBatchPutReport, SnapshotStoreHeadStateError> {
         let guard = lock_state(state_root, libc::LOCK_EX)?;
+        require_no_pending(guard.root.raw(), state_key)?;
         let previous = read_state_optional(guard.root.raw(), state_key)?
             .ok_or(SnapshotStoreHeadStateError::NotInitialized)?;
         if previous.generation == u64::MAX {
@@ -643,12 +925,186 @@ mod linux {
         })
     }
 
+    pub(super) fn recover(
+        state_root: &Path,
+        state_key: &SnapshotStoreHeadStateKey,
+        store_root: &Path,
+        inventory_limits: SnapshotStoreAuditLimits,
+    ) -> Result<SnapshotStoreHeadRecoveryOutcome, SnapshotStoreHeadStateError> {
+        let guard = lock_state(state_root, libc::LOCK_EX)?;
+        let Some(pending) = read_pending_optional(guard.root.raw(), state_key)? else {
+            return Ok(SnapshotStoreHeadRecoveryOutcome::NoPending);
+        };
+        let anchored = read_state_optional(guard.root.raw(), state_key)?
+            .ok_or(SnapshotStoreHeadStateError::NotInitialized)?;
+        let writer = SnapshotStoreWriteTransaction::begin(store_root)?;
+        let actual = writer.inventory_identity(inventory_limits)?;
+
+        if anchored == pending.previous && actual == pending.previous.inventory {
+            clear_pending(guard.root.raw())?;
+            return Ok(SnapshotStoreHeadRecoveryOutcome::ClearedUnchanged {
+                head: anchored,
+            });
+        }
+
+        if anchored == pending.previous && actual == pending.successor.inventory {
+            write_state(guard.root.raw(), state_key, pending.successor, true)?;
+            clear_pending(guard.root.raw())?;
+            return Ok(SnapshotStoreHeadRecoveryOutcome::AdvancedHead {
+                previous: pending.previous,
+                successor: pending.successor,
+            });
+        }
+
+        if anchored == pending.successor && actual == pending.successor.inventory {
+            clear_pending(guard.root.raw())?;
+            return Ok(SnapshotStoreHeadRecoveryOutcome::ClearedCommitted {
+                head: anchored,
+            });
+        }
+
+        Err(SnapshotStoreHeadStateError::PendingStateDiverged {
+            previous: pending.previous,
+            successor: pending.successor,
+            anchored,
+            actual,
+        })
+    }
+
     fn require_inventory(
         anchored: SnapshotStoreHeadStateIdentity,
         actual: SnapshotStoreInventoryIdentity,
     ) -> Result<(), SnapshotStoreHeadStateError> {
         if anchored.inventory != actual {
             return Err(SnapshotStoreHeadStateError::StoreDiverged { anchored, actual });
+        }
+        Ok(())
+    }
+
+    fn require_no_pending(
+        root_fd: RawFd,
+        state_key: &SnapshotStoreHeadStateKey,
+    ) -> Result<(), SnapshotStoreHeadStateError> {
+        if let Some(pending) = read_pending_optional(root_fd, state_key)? {
+            return Err(SnapshotStoreHeadStateError::RecoveryRequired {
+                previous: pending.previous,
+                successor: pending.successor,
+            });
+        }
+        Ok(())
+    }
+
+    fn read_pending_optional(
+        root_fd: RawFd,
+        state_key: &SnapshotStoreHeadStateKey,
+    ) -> Result<Option<SnapshotStoreHeadPendingIntent>, SnapshotStoreHeadStateError> {
+        let name = CString::new(HEAD_PENDING_FILE).expect("fixed pending filename contains no NUL");
+        let fd = unsafe {
+            libc::openat(
+                root_fd,
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if fd < 0 {
+            let source = std::io::Error::last_os_error();
+            if source.raw_os_error() == Some(libc::ENOENT) {
+                return Ok(None);
+            }
+            return Err(SnapshotStoreHeadStateError::Io {
+                phase: "open pending snapshot store head publication",
+                source,
+            });
+        }
+        let fd = OwnedFd(fd);
+        let stat =
+            require_regular_single_link(fd.raw(), "validate pending snapshot store head publication")?;
+        if stat.st_size != HEAD_PENDING_BYTES as libc::off_t {
+            return Err(SnapshotStoreHeadStateError::InvalidState(format!(
+                "pending state file length {} does not equal {HEAD_PENDING_BYTES}",
+                stat.st_size
+            )));
+        }
+        let mut bytes = [0u8; HEAD_PENDING_BYTES];
+        read_exact_pending(fd.raw(), &mut bytes)?;
+        Ok(Some(decode_pending(&bytes, state_key)?))
+    }
+
+    fn write_pending(
+        root_fd: RawFd,
+        state_key: &SnapshotStoreHeadStateKey,
+        pending: SnapshotStoreHeadPendingIntent,
+    ) -> Result<(), SnapshotStoreHeadStateError> {
+        let name = CString::new(HEAD_PENDING_FILE).expect("fixed pending filename contains no NUL");
+        let fd = unsafe {
+            libc::openat(
+                root_fd,
+                name.as_ptr(),
+                libc::O_WRONLY
+                    | libc::O_CREAT
+                    | libc::O_EXCL
+                    | libc::O_CLOEXEC
+                    | libc::O_NOFOLLOW,
+                0o600,
+            )
+        };
+        if fd < 0 {
+            let source = std::io::Error::last_os_error();
+            if source.raw_os_error() == Some(libc::EEXIST) {
+                return Err(SnapshotStoreHeadStateError::InvalidState(
+                    "pending store-head publication appeared while state lock was held".to_owned(),
+                ));
+            }
+            return Err(SnapshotStoreHeadStateError::Io {
+                phase: "create pending snapshot store head publication",
+                source,
+            });
+        }
+        let fd = OwnedFd(fd);
+        require_regular_single_link(
+            fd.raw(),
+            "validate pending snapshot store head publication",
+        )?;
+        let bytes = encode_pending(pending, state_key);
+        if let Err(error) = write_all_pending(fd.raw(), &bytes) {
+            unsafe {
+                libc::unlinkat(root_fd, name.as_ptr(), 0);
+            }
+            return Err(error);
+        }
+        if unsafe { libc::fsync(fd.raw()) } != 0 {
+            let source = std::io::Error::last_os_error();
+            unsafe {
+                libc::unlinkat(root_fd, name.as_ptr(), 0);
+            }
+            return Err(SnapshotStoreHeadStateError::Io {
+                phase: "fsync pending snapshot store head publication",
+                source,
+            });
+        }
+        drop(fd);
+        if unsafe { libc::fsync(root_fd) } != 0 {
+            return Err(SnapshotStoreHeadStateError::Io {
+                phase: "fsync head-state directory after pending publication",
+                source: std::io::Error::last_os_error(),
+            });
+        }
+        Ok(())
+    }
+
+    fn clear_pending(root_fd: RawFd) -> Result<(), SnapshotStoreHeadStateError> {
+        let name = CString::new(HEAD_PENDING_FILE).expect("fixed pending filename contains no NUL");
+        if unsafe { libc::unlinkat(root_fd, name.as_ptr(), 0) } != 0 {
+            return Err(SnapshotStoreHeadStateError::Io {
+                phase: "remove completed snapshot store head pending publication",
+                source: std::io::Error::last_os_error(),
+            });
+        }
+        if unsafe { libc::fsync(root_fd) } != 0 {
+            return Err(SnapshotStoreHeadStateError::Io {
+                phase: "fsync head-state directory after pending removal",
+                source: std::io::Error::last_os_error(),
+            });
         }
         Ok(())
     }
@@ -894,6 +1350,72 @@ mod linux {
                 ));
             }
             offset += read as usize;
+        }
+        Ok(())
+    }
+
+    fn read_exact_pending(
+        fd: RawFd,
+        bytes: &mut [u8],
+    ) -> Result<(), SnapshotStoreHeadStateError> {
+        let mut offset = 0usize;
+        while offset < bytes.len() {
+            let read = unsafe {
+                libc::read(
+                    fd,
+                    bytes[offset..].as_mut_ptr().cast::<libc::c_void>(),
+                    bytes.len() - offset,
+                )
+            };
+            if read < 0 {
+                let source = std::io::Error::last_os_error();
+                if source.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                return Err(SnapshotStoreHeadStateError::Io {
+                    phase: "read pending snapshot store head publication",
+                    source,
+                });
+            }
+            if read == 0 {
+                return Err(SnapshotStoreHeadStateError::InvalidState(
+                    "pending snapshot store head publication ended early".to_owned(),
+                ));
+            }
+            offset += read as usize;
+        }
+        Ok(())
+    }
+
+    fn write_all_pending(
+        fd: RawFd,
+        bytes: &[u8],
+    ) -> Result<(), SnapshotStoreHeadStateError> {
+        let mut offset = 0usize;
+        while offset < bytes.len() {
+            let written = unsafe {
+                libc::write(
+                    fd,
+                    bytes[offset..].as_ptr().cast::<libc::c_void>(),
+                    bytes.len() - offset,
+                )
+            };
+            if written < 0 {
+                let source = std::io::Error::last_os_error();
+                if source.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                return Err(SnapshotStoreHeadStateError::Io {
+                    phase: "write pending snapshot store head publication",
+                    source,
+                });
+            }
+            if written == 0 {
+                return Err(SnapshotStoreHeadStateError::InvalidState(
+                    "pending snapshot store head publication write made no progress".to_owned(),
+                ));
+            }
+            offset += written as usize;
         }
         Ok(())
     }

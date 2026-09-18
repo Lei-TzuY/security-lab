@@ -1314,7 +1314,7 @@ Promotion rule: do not farm additional payload bytes, target descriptor numbers,
 
 ### Slice 52A — one-shot read-only regular-file runtime grant
 
-**Current verified candidate.** Converts the previously peer-driven receive-only `SCM_RIGHTS` channel into a bounded trusted-caller mediation API for one regular-file data capability.
+**Status: complete on `main`.** Converts the previously peer-driven receive-only `SCM_RIGHTS` channel into a bounded trusted-caller mediation API for one regular-file data capability.
 
 Acceptance evidence is executable:
 
@@ -1328,10 +1328,26 @@ Acceptance evidence is executable:
 
 Boundary: 52A attenuates the transferred regular file's **open-file-description data access mode** to `O_RDONLY`; it does not make the underlying inode immutable, revoke metadata-changing authority independently granted by target syscalls/kernel ownership/Landlock state, provide descriptor revocation after transfer, accept directory/device/socket capabilities, multiplex multiple grants per session, add target `sendmsg`, provide cryptographic peer identity, or create a general post-launch IPC/RPC broker.
 
-### Milestone 52 promotion rule
+### Slice 53A — bounded sealed runtime byte snapshot grant
 
-After 52A integrates, seal regular-file/read-only aliases and readiness-byte variants. A stronger runtime-object phase must add a materially different property such as explicit lifetime/revocation control, another carefully specified object class with real rights attenuation, or a bounded multi-object protocol whose ordering and partial-failure semantics are executable—not merely more `SCM_RIGHTS` payloads.
+**Current verified candidate.** Adds content-lifetime isolation after preparation rather than another regular-file descriptor-number or access-mode variant.
+
+Acceptance evidence is executable:
+
+- `prepare_sealed_regular_file_snapshot(source, max_bytes)` accepts only the existing readable regular-file source class and requires an explicit 1-byte through 64-MiB ceiling; zero, ceilings above the public maximum, and a source that actually exceeds the chosen ceiling fail closed;
+- preparation first reuses the 52A independent `O_RDONLY` procfd reopen, then copies through that separate description into `memfd_create(MFD_CLOEXEC|MFD_ALLOW_SEALING)`; the copy loop is byte-bounded, checked for overflow, handles `EINTR`, and refuses zero-progress writes;
+- before the snapshot becomes transferable, the launcher sets mode `0400`, applies `F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL`, verifies every required seal with `F_GET_SEALS`, reopens the same memfd inode as an independent `O_RDONLY|O_CLOEXEC` description, and verifies identity/access-mode/seals again;
+- the sealed snapshot grant shares the exact 52A one-shot `RuntimeFdSession` state machine, so readiness-before-grant and one-successful-grant-per-session remain enforced across both regular-file grant kinds;
+- local executable evidence prepares exact `runtime-fd-handoff-ok\n` bytes, mutates the original host file after preparation, then proves the received object still has the complete required seal set, mode `0400`, `O_RDONLY`, exact `EBADF` on write, and the original frozen bytes while the caller's source offset remains unchanged;
+- a real sandbox run repeats the mutate-after-preparation oracle: target-executed readiness occurs first, the sealed object is transferred with the existing `SCM_RIGHTS` path, target write is denied by the received descriptor's access mode, the target reads the frozen pre-mutation marker, and the original host pathname remains hidden even though the trusted parent proves that host file now contains different bytes;
+- exact candidate stable format/Clippy/full tests and the full Rust 1.74 suite are green.
+
+Boundary: 53A freezes the **completed copied byte sequence and length** after preparation. It is not a point-in-time/atomic source snapshot while copying, does not serialize or detect a hostile concurrent source writer, does not authenticate/hash/sign the bytes, does not make memfd mode or other metadata immutable, provides no post-transfer revocation, and still permits only one successful grant on one 52A session.
+
+### Milestone 53 promotion rule
+
+After 53A integrates, do not farm alternative byte ceilings, seal spelling, or immutable-copy aliases. Promotion must add a different runtime-capability property such as explicit lifetime/revocation, a bounded multi-object transaction protocol with executable partial-failure semantics, or another object class whose rights can be demonstrably attenuated beyond what 52A/53A already cover.
 
 ## Later frontiers
 
-Supplementary-group isolation with a viable mapping architecture, broader/generalized persistent-volume policy, routed/broader network authority beyond the bounded IPv4 brokers, broader host-local IPC mediation beyond the bounded one-shot read-only regular-file grant, interpreter/shared-library closure or later-exec authority beyond 48A, and delegated aggregate cgroup accounting remain separate evidence-backed frontiers. Do not add configuration-only names without executable kernel behavior and integration evidence.
+Supplementary-group isolation with a viable mapping architecture, broader/generalized persistent-volume policy, routed/broader network authority beyond the bounded IPv4 brokers, broader host-local IPC mediation beyond the bounded one-shot read-only and sealed-byte regular-file grants, interpreter/shared-library closure or later-exec authority beyond 48A, and delegated aggregate cgroup accounting remain separate evidence-backed frontiers. Do not add configuration-only names without executable kernel behavior and integration evidence.

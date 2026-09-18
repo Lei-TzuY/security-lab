@@ -50,6 +50,35 @@ impl SnapshotStoreHeadStateKey {
     pub fn as_bytes(&self) -> &[u8; SNAPSHOT_STORE_HEAD_STATE_KEY_BYTES] {
         &self.0
     }
+
+    /// Recover an authenticated pending single-object publication and return
+    /// the exact head identity after convergence.
+    ///
+    /// Recovery never accepts an arbitrary observed store inventory as the new
+    /// head. The pending HMAC record commits to one exact predecessor and one
+    /// exact successor. Only predecessor/predecessor,
+    /// predecessor/successor, or successor/successor can converge; every other
+    /// combination remains pending and fails closed.
+    pub fn recover_pending_publication(
+        &self,
+        state_root: &Path,
+        store_root: &Path,
+        inventory_limits: SnapshotStoreAuditLimits,
+    ) -> Result<SnapshotStoreHeadStateIdentity, SnapshotStoreHeadStateError> {
+        validate_roots(state_root, store_root)?;
+        #[cfg(target_os = "linux")]
+        {
+            linux::recover(state_root, self, store_root, inventory_limits)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (state_root, store_root, inventory_limits);
+            Err(SnapshotStoreHeadStateError::UnsupportedPlatform(
+                "authenticated store-head recovery currently requires Linux flock, fsync, and cooperative snapshot-store transactions"
+                    .to_owned(),
+            ))
+        }
+    }
 }
 
 impl fmt::Debug for SnapshotStoreHeadStateKey {
@@ -69,21 +98,6 @@ pub struct SnapshotStoreHeadStateIdentity {
 struct SnapshotStoreHeadPendingIntent {
     previous: SnapshotStoreHeadStateIdentity,
     successor: SnapshotStoreHeadStateIdentity,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SnapshotStoreHeadRecoveryOutcome {
-    NoPending,
-    ClearedUnchanged {
-        head: SnapshotStoreHeadStateIdentity,
-    },
-    AdvancedHead {
-        previous: SnapshotStoreHeadStateIdentity,
-        successor: SnapshotStoreHeadStateIdentity,
-    },
-    ClearedCommitted {
-        head: SnapshotStoreHeadStateIdentity,
-    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,8 +155,8 @@ pub enum SnapshotStoreHeadStateError {
         successor: SnapshotStoreHeadStateIdentity,
     },
     PendingStateDiverged {
-        previous: SnapshotStoreHeadStateIdentity,
-        successor: SnapshotStoreHeadStateIdentity,
+        previous: Box<SnapshotStoreHeadStateIdentity>,
+        successor: Box<SnapshotStoreHeadStateIdentity>,
         anchored: SnapshotStoreHeadStateIdentity,
         actual: SnapshotStoreInventoryIdentity,
     },
@@ -318,36 +332,6 @@ pub fn verify_snapshot_store_head_state(
         let _ = (state_root, state_key, store_root, inventory_limits);
         Err(SnapshotStoreHeadStateError::UnsupportedPlatform(
             "authenticated store-head verification currently requires Linux flock and cooperative snapshot-store transactions"
-                .to_owned(),
-        ))
-    }
-}
-
-/// Recover an authenticated pending single-object publication.
-///
-/// Recovery never accepts the currently observed store as authoritative merely
-/// because it differs from the persisted head. The HMAC-authenticated pending
-/// intent commits to one exact predecessor and one exact successor inventory.
-/// Under the existing head-state/store lock ordering, recovery clears an intent
-/// only when the observed head/store pair is exactly predecessor/predecessor,
-/// predecessor/successor, or successor/successor. Any other state remains
-/// pending and fails closed.
-pub fn recover_snapshot_store_head_state(
-    state_root: &Path,
-    state_key: &SnapshotStoreHeadStateKey,
-    store_root: &Path,
-    inventory_limits: SnapshotStoreAuditLimits,
-) -> Result<SnapshotStoreHeadRecoveryOutcome, SnapshotStoreHeadStateError> {
-    validate_roots(state_root, store_root)?;
-    #[cfg(target_os = "linux")]
-    {
-        linux::recover(state_root, state_key, store_root, inventory_limits)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (state_root, state_key, store_root, inventory_limits);
-        Err(SnapshotStoreHeadStateError::UnsupportedPlatform(
-            "authenticated store-head recovery currently requires Linux flock, fsync, and cooperative snapshot-store transactions"
                 .to_owned(),
         ))
     }
@@ -682,7 +666,7 @@ mod linux {
         SnapshotStoreAuditLimits, SnapshotStoreHeadBatchPublishRequest,
         SnapshotStoreHeadBatchPutReport, SnapshotStoreHeadPendingIntent,
         SnapshotStoreHeadPublishRequest, SnapshotStoreHeadPutReport,
-        SnapshotStoreHeadRecoveryOutcome, SnapshotStoreHeadStateError,
+        SnapshotStoreHeadStateError,
         SnapshotStoreHeadStateIdentity, SnapshotStoreHeadStateKey, SnapshotStoreInventoryIdentity,
         SnapshotStoreReadTransaction, SnapshotStoreTransactionError, SnapshotStoreWriteTransaction,
         HEAD_PENDING_BYTES, HEAD_PENDING_FILE, HEAD_STATE_BYTES, HEAD_STATE_FILE, HEAD_STATE_LOCK,
@@ -853,8 +837,8 @@ mod linux {
         let actual = writer.inventory_identity(request.inventory_limits)?;
         if actual != successor.inventory {
             return Err(SnapshotStoreHeadStateError::PendingStateDiverged {
-                previous,
-                successor,
+                previous: Box::new(previous),
+                successor: Box::new(successor),
                 anchored: previous,
                 actual,
             });
@@ -926,38 +910,37 @@ mod linux {
         state_key: &SnapshotStoreHeadStateKey,
         store_root: &Path,
         inventory_limits: SnapshotStoreAuditLimits,
-    ) -> Result<SnapshotStoreHeadRecoveryOutcome, SnapshotStoreHeadStateError> {
+    ) -> Result<SnapshotStoreHeadStateIdentity, SnapshotStoreHeadStateError> {
         let guard = lock_state(state_root, libc::LOCK_EX)?;
-        let Some(pending) = read_pending_optional(guard.root.raw(), state_key)? else {
-            return Ok(SnapshotStoreHeadRecoveryOutcome::NoPending);
-        };
         let anchored = read_state_optional(guard.root.raw(), state_key)?
             .ok_or(SnapshotStoreHeadStateError::NotInitialized)?;
         let writer = SnapshotStoreWriteTransaction::begin(store_root)?;
         let actual = writer.inventory_identity(inventory_limits)?;
 
+        let Some(pending) = read_pending_optional(guard.root.raw(), state_key)? else {
+            require_inventory(anchored, actual)?;
+            return Ok(anchored);
+        };
+
         if anchored == pending.previous && actual == pending.previous.inventory {
             clear_pending(guard.root.raw())?;
-            return Ok(SnapshotStoreHeadRecoveryOutcome::ClearedUnchanged { head: anchored });
+            return Ok(anchored);
         }
 
         if anchored == pending.previous && actual == pending.successor.inventory {
             write_state(guard.root.raw(), state_key, pending.successor, true)?;
             clear_pending(guard.root.raw())?;
-            return Ok(SnapshotStoreHeadRecoveryOutcome::AdvancedHead {
-                previous: pending.previous,
-                successor: pending.successor,
-            });
+            return Ok(pending.successor);
         }
 
         if anchored == pending.successor && actual == pending.successor.inventory {
             clear_pending(guard.root.raw())?;
-            return Ok(SnapshotStoreHeadRecoveryOutcome::ClearedCommitted { head: anchored });
+            return Ok(anchored);
         }
 
         Err(SnapshotStoreHeadStateError::PendingStateDiverged {
-            previous: pending.previous,
-            successor: pending.successor,
+            previous: Box::new(pending.previous),
+            successor: Box::new(pending.successor),
             anchored,
             actual,
         })

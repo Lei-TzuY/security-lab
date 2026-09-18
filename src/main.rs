@@ -1,5 +1,7 @@
 mod authority_manifest;
 mod cli_json;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod elf_interpreter;
 mod host_capabilities;
 mod policy_preflight;
 

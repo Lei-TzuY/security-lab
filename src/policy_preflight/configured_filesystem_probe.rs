@@ -32,6 +32,7 @@ pub(super) fn probe(policy: &SandboxPolicy) -> ConfiguredFilesystemProbe {
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod linux_x86_64 {
     use super::ConfiguredFilesystemProbe;
+    use crate::elf_interpreter;
     use security_lab::SandboxPolicy;
     use sha2::{Digest, Sha256};
     use std::ffi::CString;
@@ -254,6 +255,120 @@ mod linux_x86_64 {
             let actual: [u8; 32] = hasher.finalize().into();
             if actual != expected_sha256 {
                 return ConfiguredFilesystemProbe::unavailable("executable_digest_mismatch", None);
+            }
+        }
+
+        if let (Some(interpreter), Some(expected_sha256)) = (
+            &policy.executable_interpreter,
+            policy.executable_interpreter_sha256,
+        ) {
+            let executable_readable = match open_beneath(
+                root.raw(),
+                &policy.executable,
+                (libc::O_RDONLY | libc::O_CLOEXEC) as u64,
+            ) {
+                Ok(fd) => fd,
+                Err(error) => {
+                    return ConfiguredFilesystemProbe::unavailable(
+                        "executable_interpreter_elf_open",
+                        Some(error),
+                    );
+                }
+            };
+            let declared =
+                match elf_interpreter::read_elf64_x86_64_pt_interp(executable_readable.raw()) {
+                    Ok(Some(path)) => path,
+                    Ok(None) => {
+                        return ConfiguredFilesystemProbe::unavailable(
+                            "executable_interpreter_missing",
+                            None,
+                        );
+                    }
+                    Err(_) => {
+                        return ConfiguredFilesystemProbe::unavailable(
+                            "executable_interpreter_elf",
+                            None,
+                        );
+                    }
+                };
+            if declared.as_slice() != interpreter.as_os_str().as_bytes() {
+                return ConfiguredFilesystemProbe::unavailable(
+                    "executable_interpreter_path_mismatch",
+                    None,
+                );
+            }
+
+            let loader = match open_beneath(
+                root.raw(),
+                interpreter,
+                (libc::O_RDONLY | libc::O_CLOEXEC) as u64,
+            ) {
+                Ok(fd) => fd,
+                Err(error) => {
+                    return ConfiguredFilesystemProbe::unavailable(
+                        "executable_interpreter_open",
+                        Some(error),
+                    );
+                }
+            };
+            let mut loader_stat = unsafe { std::mem::zeroed::<libc::stat>() };
+            if unsafe { libc::fstat(loader.raw(), &mut loader_stat) } != 0 {
+                return ConfiguredFilesystemProbe::unavailable(
+                    "executable_interpreter_stat",
+                    Some(errno()),
+                );
+            }
+            if loader_stat.st_mode & libc::S_IFMT != libc::S_IFREG
+                || loader_stat.st_mode & 0o111 == 0
+                || loader_stat.st_size <= 0
+                || loader_stat.st_size as u64 > MAX_EXECUTABLE_DIGEST_BYTES
+            {
+                return ConfiguredFilesystemProbe::unavailable(
+                    "executable_interpreter_shape",
+                    None,
+                );
+            }
+            let mut hasher = Sha256::new();
+            let mut total = 0u64;
+            let mut buffer = [0u8; 64 * 1024];
+            loop {
+                let read = unsafe {
+                    libc::read(
+                        loader.raw(),
+                        buffer.as_mut_ptr().cast::<libc::c_void>(),
+                        buffer.len(),
+                    )
+                };
+                if read == -1 {
+                    let error = errno();
+                    if error == libc::EINTR {
+                        continue;
+                    }
+                    return ConfiguredFilesystemProbe::unavailable(
+                        "executable_interpreter_digest_read",
+                        Some(error),
+                    );
+                }
+                if read == 0 {
+                    break;
+                }
+                total = match total.checked_add(read as u64) {
+                    Some(total) if total <= MAX_EXECUTABLE_DIGEST_BYTES => total,
+                    _ => {
+                        return ConfiguredFilesystemProbe::unavailable(
+                            "executable_interpreter_digest_size",
+                            None,
+                        );
+                    }
+                };
+                hasher.update(&buffer[..read as usize]);
+            }
+            let actual: [u8; 32] = hasher.finalize().into();
+            if actual != expected_sha256 {
+                return ConfiguredFilesystemProbe::unavailable(
+                    "executable_interpreter_digest_mismatch",
+                    None,
+                );
             }
         }
 

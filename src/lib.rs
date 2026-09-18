@@ -5,6 +5,8 @@
 
 mod cancellation;
 mod cow_diff_apply;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod elf_interpreter;
 mod platform;
 pub mod policy;
 pub mod report;

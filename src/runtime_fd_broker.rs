@@ -9,6 +9,7 @@ pub const MAX_RUNTIME_SEALED_SNAPSHOT_BYTES: u64 = 64 * 1024 * 1024;
 pub const MIN_RUNTIME_SEALED_BUNDLE_ITEMS: usize = 2;
 pub const MAX_RUNTIME_SEALED_BUNDLE_ITEMS: usize = 8;
 pub const MAX_RUNTIME_SEALED_BUNDLE_BYTES: u64 = 64 * 1024 * 1024;
+pub const MAX_RUNTIME_REVOCABLE_STREAM_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug)]
 pub enum RuntimeFdBrokerError {
@@ -22,6 +23,9 @@ pub enum RuntimeFdBrokerError {
         max_bytes: u64,
     },
     SnapshotBundleTooLarge {
+        max_bytes: u64,
+    },
+    RuntimeStreamBudgetExceeded {
         max_bytes: u64,
     },
     UnexpectedPeer {
@@ -65,6 +69,10 @@ impl fmt::Display for RuntimeFdBrokerError {
             Self::SnapshotBundleTooLarge { max_bytes } => write!(
                 f,
                 "runtime FD broker sealed snapshot bundle exceeds aggregate byte ceiling of {max_bytes}"
+            ),
+            Self::RuntimeStreamBudgetExceeded { max_bytes } => write!(
+                f,
+                "runtime FD broker stream exceeds total byte ceiling of {max_bytes}"
             ),
             Self::UnexpectedPeer {
                 expected_pid,
@@ -158,6 +166,149 @@ mod imp {
 
         pub fn total_len(&self) -> u64 {
             self.total_len
+        }
+    }
+
+    #[derive(Debug)]
+    pub struct PreparedRevocableByteStream {
+        fd: RawFd,
+    }
+
+    impl Drop for PreparedRevocableByteStream {
+        fn drop(&mut self) {
+            unsafe {
+                libc::close(self.fd);
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum RevocableByteStreamState {
+        Active,
+        Revoked,
+        Failed,
+    }
+
+    #[derive(Debug)]
+    pub struct RevocableByteStreamController {
+        fd: RawFd,
+        max_bytes: u64,
+        sent_bytes: u64,
+        state: RevocableByteStreamState,
+    }
+
+    impl Drop for RevocableByteStreamController {
+        fn drop(&mut self) {
+            unsafe {
+                libc::close(self.fd);
+            }
+        }
+    }
+
+    impl RevocableByteStreamController {
+        pub fn sent_bytes(&self) -> u64 {
+            self.sent_bytes
+        }
+
+        pub fn is_revoked(&self) -> bool {
+            self.state == RevocableByteStreamState::Revoked
+        }
+
+        /// Send bytes while the stream is active.
+        ///
+        /// The complete slice is budget-checked before any byte is sent. Once
+        /// an I/O/protocol failure occurs the controller becomes terminally
+        /// failed so callers never retry an ambiguous partial send.
+        pub fn send_all(&mut self, bytes: &[u8]) -> Result<(), RuntimeFdBrokerError> {
+            if self.state != RevocableByteStreamState::Active {
+                let message = match self.state {
+                    RevocableByteStreamState::Revoked => {
+                        "revocable runtime stream is closed after revocation"
+                    }
+                    RevocableByteStreamState::Failed => {
+                        "revocable runtime stream is closed after an I/O or protocol failure"
+                    }
+                    RevocableByteStreamState::Active => unreachable!(),
+                };
+                return Err(RuntimeFdBrokerError::Protocol(message.to_owned()));
+            }
+
+            let requested = u64::try_from(bytes.len()).map_err(|_| {
+                RuntimeFdBrokerError::RuntimeStreamBudgetExceeded {
+                    max_bytes: self.max_bytes,
+                }
+            })?;
+            let projected = self.sent_bytes.checked_add(requested).ok_or(
+                RuntimeFdBrokerError::RuntimeStreamBudgetExceeded {
+                    max_bytes: self.max_bytes,
+                },
+            )?;
+            if projected > self.max_bytes {
+                return Err(RuntimeFdBrokerError::RuntimeStreamBudgetExceeded {
+                    max_bytes: self.max_bytes,
+                });
+            }
+
+            let mut offset = 0usize;
+            while offset < bytes.len() {
+                let sent = unsafe {
+                    libc::send(
+                        self.fd,
+                        bytes[offset..].as_ptr().cast::<libc::c_void>(),
+                        bytes.len() - offset,
+                        libc::MSG_NOSIGNAL,
+                    )
+                };
+                if sent == -1 {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() == Some(libc::EINTR) {
+                        continue;
+                    }
+                    self.state = RevocableByteStreamState::Failed;
+                    return Err(RuntimeFdBrokerError::io(
+                        "cannot send revocable runtime stream bytes",
+                        error,
+                    ));
+                }
+                if sent == 0 {
+                    self.state = RevocableByteStreamState::Failed;
+                    return Err(RuntimeFdBrokerError::Protocol(
+                        "revocable runtime stream made zero send progress".to_owned(),
+                    ));
+                }
+                offset += sent as usize;
+                self.sent_bytes += sent as u64;
+            }
+            Ok(())
+        }
+
+        /// Stop all future host-to-target byte supply.
+        ///
+        /// Bytes already queued in the UNIX stream remain readable; once they
+        /// drain, the target observes EOF. This does not remotely close or
+        /// invalidate the target's received descriptor.
+        pub fn revoke(&mut self) -> Result<(), RuntimeFdBrokerError> {
+            if self.state != RevocableByteStreamState::Active {
+                let message = match self.state {
+                    RevocableByteStreamState::Revoked => {
+                        "revocable runtime stream may be revoked exactly once"
+                    }
+                    RevocableByteStreamState::Failed => {
+                        "revocable runtime stream is closed after an I/O or protocol failure"
+                    }
+                    RevocableByteStreamState::Active => unreachable!(),
+                };
+                return Err(RuntimeFdBrokerError::Protocol(message.to_owned()));
+            }
+            if unsafe { libc::shutdown(self.fd, libc::SHUT_WR) } == -1 {
+                self.state = RevocableByteStreamState::Failed;
+                return Err(RuntimeFdBrokerError::io(
+                    "cannot revoke future runtime stream bytes",
+                    std::io::Error::last_os_error(),
+                ));
+            }
+            self.state = RevocableByteStreamState::Revoked;
+            Ok(())
         }
     }
 
@@ -337,6 +488,21 @@ mod imp {
         ) -> Result<PreparedSealedSnapshotBundle, RuntimeFdBrokerError> {
             prepare_sealed_snapshot_bundle(grants, max_total_bytes)
         }
+
+        /// Prepare one host-controlled receive-only byte stream for a later
+        /// one-shot runtime grant.
+        ///
+        /// The target endpoint is write-shutdown before transfer. The trusted
+        /// controller retains the peer and can supply at most max_bytes, then
+        /// explicitly revoke all future supply by publishing EOF.
+        pub fn prepare_revocable_byte_stream(
+            max_bytes: u64,
+        ) -> Result<
+            (PreparedRevocableByteStream, RevocableByteStreamController),
+            RuntimeFdBrokerError,
+        > {
+            prepare_revocable_byte_stream(max_bytes)
+        }
     }
 
     impl RuntimeFdSession {
@@ -399,6 +565,16 @@ mod imp {
                 fds[index] = grant.fd;
             }
             self.send_prepared_fds(&fds[..bundle.grants.len()])
+        }
+
+        /// Transfer one prepared receive-only byte stream endpoint. The trusted
+        /// controller remains with the caller and the transfer consumes the same
+        /// one-shot readiness/session transition as every other runtime grant.
+        pub fn send_revocable_byte_stream(
+            &mut self,
+            grant: PreparedRevocableByteStream,
+        ) -> Result<(), RuntimeFdBrokerError> {
+            self.send_prepared_fd(grant.fd)
         }
 
         fn send_prepared_fd(&mut self, fd: RawFd) -> Result<(), RuntimeFdBrokerError> {
@@ -749,6 +925,69 @@ mod imp {
         Ok(readonly)
     }
 
+    fn prepare_revocable_byte_stream(
+        max_bytes: u64,
+    ) -> Result<
+        (PreparedRevocableByteStream, RevocableByteStreamController),
+        RuntimeFdBrokerError,
+    > {
+        if max_bytes == 0 || max_bytes > super::MAX_RUNTIME_REVOCABLE_STREAM_BYTES {
+            return Err(RuntimeFdBrokerError::InvalidConfiguration(format!(
+                "revocable runtime stream max_bytes must be between 1 and {}",
+                super::MAX_RUNTIME_REVOCABLE_STREAM_BYTES
+            )));
+        }
+
+        let mut fds = [-1; 2];
+        if unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+                0,
+                fds.as_mut_ptr(),
+            )
+        } == -1
+        {
+            return Err(RuntimeFdBrokerError::io(
+                "cannot create revocable runtime stream socketpair",
+                std::io::Error::last_os_error(),
+            ));
+        }
+
+        if unsafe { libc::shutdown(fds[0], libc::SHUT_WR) } == -1 {
+            let error = std::io::Error::last_os_error();
+            unsafe {
+                libc::close(fds[0]);
+                libc::close(fds[1]);
+            }
+            return Err(RuntimeFdBrokerError::io(
+                "cannot make runtime stream target endpoint receive-only",
+                error,
+            ));
+        }
+        if unsafe { libc::shutdown(fds[1], libc::SHUT_RD) } == -1 {
+            let error = std::io::Error::last_os_error();
+            unsafe {
+                libc::close(fds[0]);
+                libc::close(fds[1]);
+            }
+            return Err(RuntimeFdBrokerError::io(
+                "cannot make runtime stream controller send-only",
+                error,
+            ));
+        }
+
+        Ok((
+            PreparedRevocableByteStream { fd: fds[0] },
+            RevocableByteStreamController {
+                fd: fds[1],
+                max_bytes,
+                sent_bytes: 0,
+                state: RevocableByteStreamState::Active,
+            },
+        ))
+    }
+
     fn prepare_sealed_snapshot_bundle(
         grants: Vec<PreparedSealedRegularFileSnapshot>,
         max_total_bytes: u64,
@@ -864,6 +1103,34 @@ mod imp {
     #[derive(Debug)]
     pub struct PreparedSealedSnapshotBundle;
 
+    #[derive(Debug)]
+    pub struct PreparedRevocableByteStream;
+
+    #[derive(Debug)]
+    pub struct RevocableByteStreamController;
+
+    impl RevocableByteStreamController {
+        pub fn sent_bytes(&self) -> u64 {
+            0
+        }
+
+        pub fn is_revoked(&self) -> bool {
+            false
+        }
+
+        pub fn send_all(&mut self, _bytes: &[u8]) -> Result<(), RuntimeFdBrokerError> {
+            Err(RuntimeFdBrokerError::UnsupportedPlatform(
+                "revocable runtime byte streams currently require Linux x86_64".to_owned(),
+            ))
+        }
+
+        pub fn revoke(&mut self) -> Result<(), RuntimeFdBrokerError> {
+            Err(RuntimeFdBrokerError::UnsupportedPlatform(
+                "revocable runtime byte streams currently require Linux x86_64".to_owned(),
+            ))
+        }
+    }
+
     impl PreparedSealedSnapshotBundle {
         pub fn item_count(&self) -> usize {
             0
@@ -942,6 +1209,17 @@ mod imp {
                 "sealed runtime FD snapshot bundles currently require Linux x86_64".to_owned(),
             ))
         }
+
+        pub fn prepare_revocable_byte_stream(
+            _max_bytes: u64,
+        ) -> Result<
+            (PreparedRevocableByteStream, RevocableByteStreamController),
+            RuntimeFdBrokerError,
+        > {
+            Err(RuntimeFdBrokerError::UnsupportedPlatform(
+                "revocable runtime byte streams currently require Linux x86_64".to_owned(),
+            ))
+        }
     }
 
     impl RuntimeFdSession {
@@ -977,10 +1255,19 @@ mod imp {
                 "sealed runtime FD snapshot bundles currently require Linux x86_64".to_owned(),
             ))
         }
+
+        pub fn send_revocable_byte_stream(
+            &mut self,
+            _grant: PreparedRevocableByteStream,
+        ) -> Result<(), RuntimeFdBrokerError> {
+            Err(RuntimeFdBrokerError::UnsupportedPlatform(
+                "revocable runtime byte streams currently require Linux x86_64".to_owned(),
+            ))
+        }
     }
 }
 
 pub use imp::{
-    PreparedReadOnlyRegularFile, PreparedSealedRegularFileSnapshot, PreparedSealedSnapshotBundle,
-    RuntimeFdBroker, RuntimeFdSession,
+    PreparedReadOnlyRegularFile, PreparedRevocableByteStream, PreparedSealedRegularFileSnapshot,
+    PreparedSealedSnapshotBundle, RevocableByteStreamController, RuntimeFdBroker, RuntimeFdSession,
 };

@@ -2,8 +2,8 @@
 
 use security_lab::{
     run, ChildOutcome, RuntimeFdBroker, RuntimeFdBrokerError, SandboxPolicy,
-    MAX_RUNTIME_SEALED_BUNDLE_BYTES, MAX_RUNTIME_SEALED_BUNDLE_ITEMS,
-    MAX_RUNTIME_SEALED_SNAPSHOT_BYTES,
+    MAX_RUNTIME_REVOCABLE_STREAM_BYTES, MAX_RUNTIME_SEALED_BUNDLE_BYTES,
+    MAX_RUNTIME_SEALED_BUNDLE_ITEMS, MAX_RUNTIME_SEALED_SNAPSHOT_BYTES,
 };
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
@@ -885,4 +885,200 @@ fn sealed_snapshot_bundle_target_rejects_truncated_control() {
     std::fs::remove_file(&second_path).unwrap();
     std::fs::remove_file(&third_path).unwrap();
     std::fs::remove_dir_all(&root).unwrap();
+}
+
+
+#[test]
+fn revocable_runtime_stream_is_receive_only_bounded_and_revokes_to_eof() {
+    let socket_path = unique_path("runtime-revocable-local.sock");
+    let _ = std::fs::remove_file(&socket_path);
+    let broker = RuntimeFdBroker::bind(&socket_path).expect("bind revocable stream broker");
+    let mut client = UnixStream::connect(broker.path()).expect("connect revocable stream client");
+    let mut session = broker.accept().expect("accept revocable stream client");
+    client
+        .write_all(b"R")
+        .expect("publish revocable stream readiness");
+    session
+        .wait_for_ready(b'R')
+        .expect("consume revocable stream readiness");
+
+    let marker = b"runtime-revocable-stream\n";
+    let (grant, mut controller) =
+        RuntimeFdBroker::prepare_revocable_byte_stream(marker.len() as u64)
+            .expect("prepare revocable byte stream");
+    session
+        .send_revocable_byte_stream(grant)
+        .expect("transfer revocable stream endpoint");
+    let received = receive_one_fd(&client);
+
+    let byte = b"x";
+    assert_eq!(
+        unsafe {
+            libc::send(
+                received.raw(),
+                byte.as_ptr().cast::<libc::c_void>(),
+                byte.len(),
+                libc::MSG_NOSIGNAL,
+            )
+        },
+        -1,
+        "target endpoint unexpectedly retained send authority"
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::EPIPE)
+    );
+
+    let mut over_budget = marker.to_vec();
+    over_budget.push(b'!');
+    assert!(matches!(
+        controller.send_all(&over_budget),
+        Err(RuntimeFdBrokerError::RuntimeStreamBudgetExceeded { max_bytes })
+            if max_bytes == marker.len() as u64
+    ));
+    assert_eq!(controller.sent_bytes(), 0);
+
+    controller
+        .send_all(marker)
+        .expect("send bounded revocable stream marker");
+    assert_eq!(controller.sent_bytes(), marker.len() as u64);
+    assert_eq!(read_exact_fd(received.raw(), marker.len()), marker);
+
+    controller.revoke().expect("revoke future stream bytes");
+    assert!(controller.is_revoked());
+    let mut eof = [0u8; 1];
+    assert_eq!(
+        unsafe {
+            libc::read(
+                received.raw(),
+                eof.as_mut_ptr().cast::<libc::c_void>(),
+                eof.len(),
+            )
+        },
+        0,
+        "target did not observe EOF after queued bytes drained"
+    );
+    assert!(matches!(
+        controller.send_all(b"late"),
+        Err(RuntimeFdBrokerError::Protocol(message)) if message.contains("revocation")
+    ));
+    assert!(matches!(
+        controller.revoke(),
+        Err(RuntimeFdBrokerError::Protocol(message)) if message.contains("exactly once")
+    ));
+
+    let (second_grant, _second_controller) =
+        RuntimeFdBroker::prepare_revocable_byte_stream(16).unwrap();
+    assert!(matches!(
+        session.send_revocable_byte_stream(second_grant),
+        Err(RuntimeFdBrokerError::Protocol(message)) if message.contains("exactly one")
+    ));
+
+    drop(received);
+    drop(session);
+    drop(client);
+    drop(broker);
+}
+
+#[test]
+fn revocable_runtime_stream_rejects_invalid_ceiling_and_poisoned_send_retry() {
+    assert!(matches!(
+        RuntimeFdBroker::prepare_revocable_byte_stream(0),
+        Err(RuntimeFdBrokerError::InvalidConfiguration(_))
+    ));
+    assert!(matches!(
+        RuntimeFdBroker::prepare_revocable_byte_stream(MAX_RUNTIME_REVOCABLE_STREAM_BYTES + 1),
+        Err(RuntimeFdBrokerError::InvalidConfiguration(_))
+    ));
+
+    let socket_path = unique_path("runtime-revocable-failure.sock");
+    let _ = std::fs::remove_file(&socket_path);
+    let broker = RuntimeFdBroker::bind(&socket_path).expect("bind stream failure broker");
+    let mut client = UnixStream::connect(broker.path()).expect("connect stream failure client");
+    let mut session = broker.accept().expect("accept stream failure client");
+    client.write_all(b"R").expect("publish stream failure readiness");
+    session.wait_for_ready(b'R').unwrap();
+
+    let (grant, mut controller) = RuntimeFdBroker::prepare_revocable_byte_stream(64).unwrap();
+    session.send_revocable_byte_stream(grant).unwrap();
+    let received = receive_one_fd(&client);
+    drop(received);
+
+    assert!(matches!(
+        controller.send_all(b"will-fail"),
+        Err(RuntimeFdBrokerError::Io { .. })
+    ));
+    assert!(matches!(
+        controller.send_all(b"retry"),
+        Err(RuntimeFdBrokerError::Protocol(message)) if message.contains("closed after")
+    ));
+    assert!(matches!(
+        controller.revoke(),
+        Err(RuntimeFdBrokerError::Protocol(message)) if message.contains("closed after")
+    ));
+
+    drop(session);
+    drop(client);
+    drop(broker);
+}
+
+#[test]
+fn revocable_runtime_stream_reaches_real_target_and_revokes_future_bytes() {
+    let root = build_probe_root();
+    let socket_path = unique_path("runtime-revocable-sandbox.sock");
+    let _ = std::fs::remove_file(&socket_path);
+    let broker = RuntimeFdBroker::bind(&socket_path).expect("bind sandbox revocable broker");
+    let text = format!(
+        "filesystem.root = {}\n\
+         identity.hostname = security-lab\n\
+         executable = /probe\n\
+         arg = 4\n\
+         working_dir = /work\n\
+         stdio.stdin = closed\n\
+         stdio.stdout = closed\n\
+         stdio.stderr = closed\n\
+         limit.wall_clock_milliseconds = 3000\n\
+         limit.cpu_seconds = 2\n\
+         limit.address_space_bytes = 134217728\n\
+         limit.file_size_bytes = 1048576\n\
+         limit.open_files = 32\n\
+         seccomp.allow = execveat,write,recvmsg,sendto,read,close,exit\n",
+        root.display()
+    );
+    let mut policy: SandboxPolicy = text.parse().expect("parse revocable stream policy");
+    broker
+        .configure_policy(&mut policy, 10)
+        .expect("configure revocable stream broker");
+
+    let marker = b"runtime-revocable-stream\n";
+    let (grant, mut controller) = RuntimeFdBroker::prepare_revocable_byte_stream(4096)
+        .expect("prepare sandbox revocable stream");
+    let runner = thread::spawn(move || run(&policy));
+    let mut session = broker.accept().expect("accept sandbox revocable connection");
+    session
+        .wait_for_ready(b'R')
+        .expect("revocable target must publish post-exec readiness");
+    session
+        .send_revocable_byte_stream(grant)
+        .expect("transfer sandbox revocable stream");
+    controller
+        .send_all(marker)
+        .expect("send sandbox revocable bytes");
+    controller
+        .revoke()
+        .expect("revoke sandbox future byte supply");
+
+    assert_eq!(
+        runner
+            .join()
+            .expect("revocable stream runner panicked")
+            .unwrap(),
+        ChildOutcome::Exited(0)
+    );
+    assert_eq!(controller.sent_bytes(), marker.len() as u64);
+    assert!(controller.is_revoked());
+
+    drop(session);
+    drop(broker);
+    std::fs::remove_dir_all(&root).expect("remove revocable stream sandbox root");
 }

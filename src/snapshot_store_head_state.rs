@@ -605,15 +605,11 @@ fn decode_pending(
         ));
     }
     if successor.inventory.objects
-        != previous
-            .inventory
-            .objects
-            .checked_add(1)
-            .ok_or_else(|| {
-                SnapshotStoreHeadStateError::InvalidState(
-                    "pending predecessor object count is exhausted".to_owned(),
-                )
-            })?
+        != previous.inventory.objects.checked_add(1).ok_or_else(|| {
+            SnapshotStoreHeadStateError::InvalidState(
+                "pending predecessor object count is exhausted".to_owned(),
+            )
+        })?
     {
         return Err(SnapshotStoreHeadStateError::InvalidState(
             "pending successor must add exactly one object".to_owned(),
@@ -942,9 +938,7 @@ mod linux {
 
         if anchored == pending.previous && actual == pending.previous.inventory {
             clear_pending(guard.root.raw())?;
-            return Ok(SnapshotStoreHeadRecoveryOutcome::ClearedUnchanged {
-                head: anchored,
-            });
+            return Ok(SnapshotStoreHeadRecoveryOutcome::ClearedUnchanged { head: anchored });
         }
 
         if anchored == pending.previous && actual == pending.successor.inventory {
@@ -958,9 +952,7 @@ mod linux {
 
         if anchored == pending.successor && actual == pending.successor.inventory {
             clear_pending(guard.root.raw())?;
-            return Ok(SnapshotStoreHeadRecoveryOutcome::ClearedCommitted {
-                head: anchored,
-            });
+            return Ok(SnapshotStoreHeadRecoveryOutcome::ClearedCommitted { head: anchored });
         }
 
         Err(SnapshotStoreHeadStateError::PendingStateDiverged {
@@ -1017,8 +1009,10 @@ mod linux {
             });
         }
         let fd = OwnedFd(fd);
-        let stat =
-            require_regular_single_link(fd.raw(), "validate pending snapshot store head publication")?;
+        let stat = require_regular_single_link(
+            fd.raw(),
+            "validate pending snapshot store head publication",
+        )?;
         if stat.st_size != HEAD_PENDING_BYTES as libc::off_t {
             return Err(SnapshotStoreHeadStateError::InvalidState(format!(
                 "pending state file length {} does not equal {HEAD_PENDING_BYTES}",
@@ -1040,11 +1034,7 @@ mod linux {
             libc::openat(
                 root_fd,
                 name.as_ptr(),
-                libc::O_WRONLY
-                    | libc::O_CREAT
-                    | libc::O_EXCL
-                    | libc::O_CLOEXEC
-                    | libc::O_NOFOLLOW,
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
                 0o600,
             )
         };
@@ -1061,10 +1051,7 @@ mod linux {
             });
         }
         let fd = OwnedFd(fd);
-        require_regular_single_link(
-            fd.raw(),
-            "validate pending snapshot store head publication",
-        )?;
+        require_regular_single_link(fd.raw(), "validate pending snapshot store head publication")?;
         let bytes = encode_pending(pending, state_key);
         if let Err(error) = write_all_pending(fd.raw(), &bytes) {
             unsafe {
@@ -1354,10 +1341,7 @@ mod linux {
         Ok(())
     }
 
-    fn read_exact_pending(
-        fd: RawFd,
-        bytes: &mut [u8],
-    ) -> Result<(), SnapshotStoreHeadStateError> {
+    fn read_exact_pending(fd: RawFd, bytes: &mut [u8]) -> Result<(), SnapshotStoreHeadStateError> {
         let mut offset = 0usize;
         while offset < bytes.len() {
             let read = unsafe {
@@ -1387,10 +1371,7 @@ mod linux {
         Ok(())
     }
 
-    fn write_all_pending(
-        fd: RawFd,
-        bytes: &[u8],
-    ) -> Result<(), SnapshotStoreHeadStateError> {
+    fn write_all_pending(fd: RawFd, bytes: &[u8]) -> Result<(), SnapshotStoreHeadStateError> {
         let mut offset = 0usize;
         while offset < bytes.len() {
             let written = unsafe {

@@ -1,4 +1,5 @@
 use crate::snapshot_archive::SnapshotArchiveLimits;
+use crate::snapshot_identity::SnapshotIdentity;
 use crate::snapshot_signature::{
     SNAPSHOT_ED25519_PUBLIC_KEY_BYTES, SNAPSHOT_ED25519_SIGNATURE_BYTES,
 };
@@ -25,9 +26,9 @@ const HEAD_STATE_MAC_BYTES: usize = 32;
 const HEAD_STATE_BYTES: usize = HEAD_STATE_HEADER_BYTES + HEAD_STATE_MAC_BYTES;
 const HEAD_STATE_FILE: &str = "snapshot-store-head";
 const HEAD_STATE_LOCK: &str = ".snapshot-store-head.lock";
-const HEAD_PENDING_DOMAIN: &[u8] = b"security-lab-snapshot-store-head-pending-v1\0";
-const HEAD_PENDING_MAGIC: [u8; 8] = *b"SLHPND1\0";
-const HEAD_PENDING_HEADER_BYTES: usize = 120;
+const HEAD_PENDING_DOMAIN: &[u8] = b"security-lab-snapshot-store-head-pending-v2\0";
+const HEAD_PENDING_MAGIC: [u8; 8] = *b"SLHPND2\0";
+const HEAD_PENDING_HEADER_BYTES: usize = 176;
 const HEAD_PENDING_MAC_BYTES: usize = 32;
 const HEAD_PENDING_BYTES: usize = HEAD_PENDING_HEADER_BYTES + HEAD_PENDING_MAC_BYTES;
 const HEAD_PENDING_FILE: &str = "snapshot-store-head-pending";
@@ -98,6 +99,8 @@ pub struct SnapshotStoreHeadStateIdentity {
 struct SnapshotStoreHeadPendingIntent {
     previous: SnapshotStoreHeadStateIdentity,
     successor: SnapshotStoreHeadStateIdentity,
+    candidate_identity: SnapshotIdentity,
+    candidate_archive_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -551,6 +554,10 @@ fn encode_pending(
     bytes[0..8].copy_from_slice(&HEAD_PENDING_MAGIC);
     encode_identity_fields(&mut bytes[8..64], intent.previous);
     encode_identity_fields(&mut bytes[64..120], intent.successor);
+    bytes[120..152].copy_from_slice(&intent.candidate_identity.sha256);
+    bytes[152..160].copy_from_slice(&intent.candidate_identity.encoded_bytes.to_le_bytes());
+    bytes[160..168].copy_from_slice(&intent.candidate_identity.nodes.to_le_bytes());
+    bytes[168..176].copy_from_slice(&intent.candidate_archive_bytes.to_le_bytes());
 
     let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(state_key.as_bytes())
         .expect("fixed-size HMAC key is always accepted");
@@ -578,6 +585,26 @@ fn decode_pending(
     }
     let previous = decode_identity_fields(&bytes[8..64])?;
     let successor = decode_identity_fields(&bytes[64..120])?;
+    let mut candidate_sha256 = [0u8; 32];
+    candidate_sha256.copy_from_slice(&bytes[120..152]);
+    let candidate_identity = SnapshotIdentity {
+        sha256: candidate_sha256,
+        encoded_bytes: u64::from_le_bytes(
+            bytes[152..160]
+                .try_into()
+                .expect("fixed pending candidate encoded-byte width"),
+        ),
+        nodes: u64::from_le_bytes(
+            bytes[160..168]
+                .try_into()
+                .expect("fixed pending candidate node-count width"),
+        ),
+    };
+    let candidate_archive_bytes = u64::from_le_bytes(
+        bytes[168..176]
+            .try_into()
+            .expect("fixed pending candidate archive-byte width"),
+    );
     let expected_generation = previous.generation.checked_add(1).ok_or_else(|| {
         SnapshotStoreHeadStateError::InvalidState(
             "pending predecessor generation is exhausted".to_owned(),
@@ -599,14 +626,31 @@ fn decode_pending(
             "pending successor must add exactly one object".to_owned(),
         ));
     }
-    if successor.inventory.archive_bytes <= previous.inventory.archive_bytes {
+    if candidate_archive_bytes == 0 {
         return Err(SnapshotStoreHeadStateError::InvalidState(
-            "pending successor archive bytes must increase".to_owned(),
+            "pending candidate archive bytes must be non-zero".to_owned(),
+        ));
+    }
+    let expected_archive_bytes = previous
+        .inventory
+        .archive_bytes
+        .checked_add(candidate_archive_bytes)
+        .ok_or_else(|| {
+            SnapshotStoreHeadStateError::InvalidState(
+                "pending successor archive-byte accounting overflow".to_owned(),
+            )
+        })?;
+    if successor.inventory.archive_bytes != expected_archive_bytes {
+        return Err(SnapshotStoreHeadStateError::InvalidState(
+            "pending successor archive bytes must equal predecessor plus candidate archive bytes"
+                .to_owned(),
         ));
     }
     Ok(SnapshotStoreHeadPendingIntent {
         previous,
         successor,
+        candidate_identity,
+        candidate_archive_bytes,
     })
 }
 
@@ -824,6 +868,8 @@ mod linux {
         let pending = SnapshotStoreHeadPendingIntent {
             previous,
             successor,
+            candidate_identity,
+            candidate_archive_bytes,
         };
         write_pending(guard.root.raw(), state_key, pending)?;
 
@@ -927,6 +973,19 @@ mod linux {
         }
 
         if anchored == pending.previous && actual == pending.successor.inventory {
+            writer.sync_object_durable(
+                pending.candidate_identity,
+                pending.candidate_archive_bytes,
+            )?;
+            let durable_actual = writer.inventory_identity(inventory_limits)?;
+            if durable_actual != pending.successor.inventory {
+                return Err(SnapshotStoreHeadStateError::PendingStateDiverged {
+                    previous: Box::new(pending.previous),
+                    successor: Box::new(pending.successor),
+                    anchored,
+                    actual: durable_actual,
+                });
+            }
             write_state(guard.root.raw(), state_key, pending.successor, true)?;
             clear_pending(guard.root.raw())?;
             return Ok(pending.successor);

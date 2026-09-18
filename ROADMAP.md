@@ -1205,7 +1205,7 @@ Boundary: 48B narrows only implicit `execveat` authority needed for the initial 
 
 ### Slice 49A — sealed exact `PT_INTERP` loader
 
-**Current verified candidate.** Extends initial-executable content binding to the dynamic ELF loader named by that exact executable rather than trusting a mutable host loader pathname at exec time.
+**Status: complete on `main`.** Extends initial-executable content binding to the dynamic ELF loader named by that exact executable rather than trusting a mutable host loader pathname at exec time.
 
 Acceptance evidence is executable:
 
@@ -1219,9 +1219,25 @@ Acceptance evidence is executable:
 
 Boundary: 49A binds only the initial ELF64 x86_64 `PT_INTERP` loader selected by the already content-bound main image. The expected digest is not signer/provenance evidence. This slice does not bind shared libraries opened by the loader, statically linked images without `PT_INTERP`, later target `execve` or explicitly granted later `execveat`, or provide a process-lifetime executable closure.
 
+### Slice 49B — one sealed path-qualified direct `DT_NEEDED`
+
+**Current verified candidate.** Extends the sealed initial-execution chain to one direct shared object whose pathname is selected by the content-bound main ELF itself, without claiming general dynamic-loader search or a transitive library closure.
+
+Acceptance evidence is executable:
+
+- `executable.needed` / `executable.needed_sha256` are an all-or-nothing restriction that requires both `executable.sha256` and the sealed `PT_INTERP` binding; the dependency path is absolute, not `/`, differs from the main executable/interpreter, rejects dynamic-linker `$` tokens, and cannot overlap private procfs, scratch, or persistent-volume targets;
+- the launcher parses bounded little-endian ELF64 x86_64 `PT_DYNAMIC` metadata from the already content-bound main image, resolves `DT_STRTAB` only through a containing `PT_LOAD`, bounds the dynamic/string tables and direct-needed count, requires a terminating `DT_NULL`, and requires exactly one `DT_NEEDED` string to match the configured path byte-for-byte;
+- the matched object is pinned beneath `filesystem.root`, required to be a regular executable, identity-revalidated while copying, SHA-256 checked under the existing 64 MiB ceiling, and retained as an immutable sealed memfd image;
+- before target execution, the child reuses the sealed-image mount path to copy only those verified bytes into private tmpfs state, clone the file, apply read-only + `nosuid` + `nodev`, and attach it exactly over the declared dependency pathname;
+- configured-filesystem preflight independently validates direct-needed membership, object shape, and digest; static authority manifest/delta surfaces include the direct-needed path+digest restriction;
+- a dynamic PIE fixture containing `DT_NEEDED=/dependency` executes through the sealed main + interpreter + dependency chain and exits 91. A one-bit dependency-digest mismatch and a configured path absent from the sealed main's direct-needed list both fail before target execution; the trusted parent proves the host dependency bytes remain unchanged;
+- the exact candidate retains all prior regressions and has passed stable rustfmt, Clippy with `-D warnings`, the complete stable suite, and the complete Rust 1.74 suite.
+
+Boundary: 49B binds at most one direct **path-qualified** `DT_NEEDED` object from the sealed main executable. It intentionally does not resolve ordinary slashless SONAME dependencies, `DT_RPATH`/`DT_RUNPATH`, `ld.so.cache`, dependency search order, transitive `DT_NEEDED` edges, dynamic-string token expansion, `LD_PRELOAD`, `dlopen`, later exec transitions, or a process-lifetime shared-library closure. The expected digest remains content evidence, not signer/provenance identity.
+
 ### Milestone 49 promotion rule
 
-After 49A integrates, seal single-loader `PT_INTERP` binding. Do not farm alternate loader paths, ELF-header variants, tmpfs sizes, or seal spellings. A stronger execution-integrity phase must bind a materially different dependency such as the loader's shared-library closure or explicitly authorized later execution, or move to another independent authority frontier with executable evidence.
+After 49B integrates, seal this bounded direct-path dependency slice. Do not farm extra direct paths, parser tags, SONAME spellings, or mount aliases. A stronger execution-integrity phase must either model materially broader loader resolution/transitive closure with executable evidence, bind explicitly authorized later execution, or move to another independent authority frontier.
 
 ## Independent host-local IPC frontier — post-launch object transfer
 

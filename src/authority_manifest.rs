@@ -26,6 +26,16 @@ pub(crate) fn to_json(policy: &SandboxPolicy) -> String {
         Some(digest) => push_json_string(&mut output, &sha256_hex(digest)),
         None => output.push_str("null"),
     }
+    output.push_str(",\"executable_needed\":");
+    match &policy.executable_needed {
+        Some(path) => push_path(&mut output, path),
+        None => output.push_str("null"),
+    }
+    output.push_str(",\"executable_needed_sha256\":");
+    match policy.executable_needed_sha256 {
+        Some(digest) => push_json_string(&mut output, &sha256_hex(digest)),
+        None => output.push_str("null"),
+    }
     output.push_str(",\"working_dir\":");
     push_path(&mut output, &policy.working_dir);
     output.push_str(",\"argument_count\":");
@@ -362,6 +372,25 @@ pub(crate) fn to_human(policy: &SandboxPolicy) -> String {
         "executable-interpreter-sha256: {}",
         policy
             .executable_interpreter_sha256
+            .map(sha256_hex)
+            .unwrap_or_else(|| "none".to_owned())
+    )
+    .expect("write to String cannot fail");
+    writeln!(
+        &mut output,
+        "executable-needed: {}",
+        policy
+            .executable_needed
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "none".to_owned())
+    )
+    .expect("write to String cannot fail");
+    writeln!(
+        &mut output,
+        "executable-needed-sha256: {}",
+        policy
+            .executable_needed_sha256
             .map(sha256_hex)
             .unwrap_or_else(|| "none".to_owned())
     )

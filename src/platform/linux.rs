@@ -23,6 +23,7 @@ mod x86_64 {
         TargetSupervisionPhases,
     };
     use crate::elf_interpreter;
+    use crate::elf_needed;
     use crate::policy::{StdioMode, StdioPolicy};
     use crate::{
         CancellationToken, CapturedOutput, ChildOutcome, EnforcementReceipt, PolicyError,
@@ -185,6 +186,13 @@ mod x86_64 {
     const PHASE_INTERPRETER_TARGET_PIN: u32 = 70;
     const PHASE_INTERPRETER_READONLY: u32 = 71;
     const PHASE_INTERPRETER_ATTACH: u32 = 72;
+    const PHASE_NEEDED_TMPFS_CREATE: u32 = 73;
+    const PHASE_NEEDED_TMPFS_MOUNT: u32 = 74;
+    const PHASE_NEEDED_COPY: u32 = 75;
+    const PHASE_NEEDED_CLONE: u32 = 76;
+    const PHASE_NEEDED_TARGET_PIN: u32 = 77;
+    const PHASE_NEEDED_READONLY: u32 = 78;
+    const PHASE_NEEDED_ATTACH: u32 = 79;
 
     const SYS_LANDLOCK_CREATE_RULESET: libc::c_long = 444;
     const SYS_LANDLOCK_ADD_RULE: libc::c_long = 445;
@@ -320,10 +328,40 @@ mod x86_64 {
         access: VolumeAccess,
     }
 
-    struct PreparedInterpreter {
+    struct PreparedSealedMount {
         image_fd: OwnedFd,
         target_relative: CString,
     }
+
+    #[derive(Clone, Copy)]
+    struct SealedMountPhases {
+        tmpfs_create: u32,
+        tmpfs_mount: u32,
+        copy: u32,
+        clone: u32,
+        target_pin: u32,
+        readonly: u32,
+        attach: u32,
+    }
+
+    const INTERPRETER_MOUNT_PHASES: SealedMountPhases = SealedMountPhases {
+        tmpfs_create: PHASE_INTERPRETER_TMPFS_CREATE,
+        tmpfs_mount: PHASE_INTERPRETER_TMPFS_MOUNT,
+        copy: PHASE_INTERPRETER_COPY,
+        clone: PHASE_INTERPRETER_CLONE,
+        target_pin: PHASE_INTERPRETER_TARGET_PIN,
+        readonly: PHASE_INTERPRETER_READONLY,
+        attach: PHASE_INTERPRETER_ATTACH,
+    };
+    const NEEDED_MOUNT_PHASES: SealedMountPhases = SealedMountPhases {
+        tmpfs_create: PHASE_NEEDED_TMPFS_CREATE,
+        tmpfs_mount: PHASE_NEEDED_TMPFS_MOUNT,
+        copy: PHASE_NEEDED_COPY,
+        clone: PHASE_NEEDED_CLONE,
+        target_pin: PHASE_NEEDED_TARGET_PIN,
+        readonly: PHASE_NEEDED_READONLY,
+        attach: PHASE_NEEDED_ATTACH,
+    };
 
     impl CapturePipe {
         fn new(limit: u64) -> Result<Self, SandboxError> {
@@ -1172,7 +1210,8 @@ mod x86_64 {
         cow_root_size: Option<CString>,
         cow_diff_requested: bool,
         executable_fd: OwnedFd,
-        interpreter: Option<PreparedInterpreter>,
+        interpreter: Option<PreparedSealedMount>,
+        dependency: Option<PreparedSealedMount>,
         selected_handles: Vec<PreparedSelectedHandle>,
         selected_storage_floor: RawFd,
         landlock: PreparedLandlock,
@@ -1304,7 +1343,7 @@ mod x86_64 {
                         "executable.interpreter_sha256",
                         "security-lab-interpreter",
                     )?;
-                    Some(PreparedInterpreter {
+                    Some(PreparedSealedMount {
                         image_fd,
                         target_relative: sandbox_relative(path)?,
                     })
@@ -1313,6 +1352,53 @@ mod x86_64 {
                 _ => {
                     return Err(SandboxError::InvalidPolicy(PolicyError::new(
                         "executable.interpreter and executable.interpreter_sha256 must be specified together",
+                    )));
+                }
+            };
+
+            let dependency = match (&policy.executable_needed, policy.executable_needed_sha256) {
+                (Some(path), Some(expected_sha256)) => {
+                    let needed = elf_needed::read_elf64_x86_64_dt_needed(executable_fd.raw())
+                        .map_err(|error| {
+                            SandboxError::SetupFailed(format!(
+                                "cannot parse content-bound executable DT_NEEDED: {error}"
+                            ))
+                        })?;
+                    let matches = needed
+                        .iter()
+                        .filter(|entry| entry.as_slice() == path.as_os_str().as_bytes())
+                        .count();
+                    if matches != 1 {
+                        return Err(SandboxError::SetupFailed(format!(
+                            "content-bound executable must contain exactly one DT_NEEDED entry matching executable.needed {}",
+                            path.display()
+                        )));
+                    }
+                    let pinned = open_beneath_root(
+                        root_fd.raw(),
+                        path,
+                        (libc::O_PATH | libc::O_CLOEXEC) as u64,
+                        "ELF direct dependency",
+                    )?;
+                    validate_executable_fd(pinned.raw(), path)?;
+                    let image_fd = prepare_verified_executable_image(
+                        root_fd.raw(),
+                        path,
+                        pinned,
+                        expected_sha256,
+                        "ELF direct dependency",
+                        "executable.needed_sha256",
+                        "security-lab-needed",
+                    )?;
+                    Some(PreparedSealedMount {
+                        image_fd,
+                        target_relative: sandbox_relative(path)?,
+                    })
+                }
+                (None, None) => None,
+                _ => {
+                    return Err(SandboxError::InvalidPolicy(PolicyError::new(
+                        "executable.needed and executable.needed_sha256 must be specified together",
                     )));
                 }
             };
@@ -1677,6 +1763,7 @@ mod x86_64 {
                 cow_diff_requested: policy.cow_diff_bytes.is_some(),
                 executable_fd,
                 interpreter,
+                dependency,
                 selected_handles,
                 selected_storage_floor,
                 landlock: PreparedLandlock {
@@ -3282,8 +3369,18 @@ mod x86_64 {
         }
 
         if let Some(interpreter) = &prepared.interpreter {
-            install_sealed_interpreter_or_fail(
+            install_sealed_image_or_fail(
                 interpreter,
+                INTERPRETER_MOUNT_PHASES,
+                root_tree_fd,
+                launch_error,
+                seccomp.error_exit_syscall,
+            );
+        }
+        if let Some(dependency) = &prepared.dependency {
+            install_sealed_image_or_fail(
+                dependency,
+                NEEDED_MOUNT_PHASES,
                 root_tree_fd,
                 launch_error,
                 seccomp.error_exit_syscall,
@@ -3473,15 +3570,16 @@ mod x86_64 {
         child_fail(launch_error, PHASE_EXECVEAT, seccomp.error_exit_syscall)
     }
 
-    unsafe fn copy_sealed_interpreter_image_or_fail(
+    unsafe fn copy_sealed_image_or_fail(
         source_fd: RawFd,
         destination_fd: RawFd,
+        copy_phase: u32,
         launch_error: *mut LaunchErrorRecord,
         error_exit_syscall: libc::c_long,
     ) {
         let mut stat = std::mem::zeroed::<libc::stat>();
         if libc::fstat(source_fd, &mut stat) == -1 || stat.st_size <= 0 {
-            child_fail(launch_error, PHASE_INTERPRETER_COPY, error_exit_syscall);
+            child_fail(launch_error, copy_phase, error_exit_syscall);
         }
         let total = stat.st_size as u64;
         let mut offset = 0u64;
@@ -3502,14 +3600,9 @@ mod x86_64 {
             };
             if read <= 0 {
                 if read == 0 {
-                    child_fail_errno(
-                        launch_error,
-                        PHASE_INTERPRETER_COPY,
-                        libc::EIO,
-                        error_exit_syscall,
-                    );
+                    child_fail_errno(launch_error, copy_phase, libc::EIO, error_exit_syscall);
                 }
-                child_fail(launch_error, PHASE_INTERPRETER_COPY, error_exit_syscall);
+                child_fail(launch_error, copy_phase, error_exit_syscall);
             }
             let mut written = 0usize;
             while written < read as usize {
@@ -3525,14 +3618,9 @@ mod x86_64 {
                 }
                 if result <= 0 {
                     if result == 0 {
-                        child_fail_errno(
-                            launch_error,
-                            PHASE_INTERPRETER_COPY,
-                            libc::EIO,
-                            error_exit_syscall,
-                        );
+                        child_fail_errno(launch_error, copy_phase, libc::EIO, error_exit_syscall);
                     }
-                    child_fail(launch_error, PHASE_INTERPRETER_COPY, error_exit_syscall);
+                    child_fail(launch_error, copy_phase, error_exit_syscall);
                 }
                 written += result as usize;
             }
@@ -3540,38 +3628,35 @@ mod x86_64 {
         }
     }
 
-    unsafe fn install_sealed_interpreter_or_fail(
-        interpreter: &PreparedInterpreter,
+    unsafe fn install_sealed_image_or_fail(
+        image: &PreparedSealedMount,
+        phases: SealedMountPhases,
         root_tree_fd: RawFd,
         launch_error: *mut LaunchErrorRecord,
         error_exit_syscall: libc::c_long,
     ) {
         let fsfd = libc::syscall(
             libc::SYS_fsopen,
-            b"tmpfs\0".as_ptr().cast::<libc::c_char>(),
+            b"tmpfs ".as_ptr().cast::<libc::c_char>(),
             FSOPEN_CLOEXEC,
         );
         if fsfd == -1 {
-            child_fail(
-                launch_error,
-                PHASE_INTERPRETER_TMPFS_CREATE,
-                error_exit_syscall,
-            );
+            child_fail(launch_error, phases.tmpfs_create, error_exit_syscall);
         }
         let fsfd = fsfd as RawFd;
         fsconfig_string_or_fail(
             fsfd,
-            b"size\0",
-            b"68157440\0".as_ptr().cast::<libc::c_char>(),
-            PHASE_INTERPRETER_TMPFS_CREATE,
+            b"size ",
+            b"68157440 ".as_ptr().cast::<libc::c_char>(),
+            phases.tmpfs_create,
             launch_error,
             error_exit_syscall,
         );
         fsconfig_string_or_fail(
             fsfd,
-            b"mode\0",
-            b"0700\0".as_ptr().cast::<libc::c_char>(),
-            PHASE_INTERPRETER_TMPFS_CREATE,
+            b"mode ",
+            b"0700 ".as_ptr().cast::<libc::c_char>(),
+            phases.tmpfs_create,
             launch_error,
             error_exit_syscall,
         );
@@ -3584,11 +3669,7 @@ mod x86_64 {
             0,
         ) == -1
         {
-            child_fail(
-                launch_error,
-                PHASE_INTERPRETER_TMPFS_CREATE,
-                error_exit_syscall,
-            );
+            child_fail(launch_error, phases.tmpfs_create, error_exit_syscall);
         }
         let state_mount_fd = libc::syscall(
             libc::SYS_fsmount,
@@ -3597,46 +3678,43 @@ mod x86_64 {
             MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV,
         );
         if state_mount_fd == -1 {
-            child_fail(
-                launch_error,
-                PHASE_INTERPRETER_TMPFS_MOUNT,
-                error_exit_syscall,
-            );
+            child_fail(launch_error, phases.tmpfs_mount, error_exit_syscall);
         }
         let state_mount_fd = state_mount_fd as RawFd;
         close_setup_fd(fsfd);
 
-        let loader_fd = libc::syscall(
+        let image_fd = libc::syscall(
             libc::SYS_openat,
             state_mount_fd,
-            b"loader\0".as_ptr().cast::<libc::c_char>(),
+            b"image ".as_ptr().cast::<libc::c_char>(),
             libc::O_CREAT | libc::O_EXCL | libc::O_WRONLY | libc::O_CLOEXEC,
             0o700,
         );
-        if loader_fd == -1 {
-            child_fail(launch_error, PHASE_INTERPRETER_COPY, error_exit_syscall);
+        if image_fd == -1 {
+            child_fail(launch_error, phases.copy, error_exit_syscall);
         }
-        let loader_fd = loader_fd as RawFd;
-        copy_sealed_interpreter_image_or_fail(
-            interpreter.image_fd.raw(),
-            loader_fd,
+        let image_fd = image_fd as RawFd;
+        copy_sealed_image_or_fail(
+            image.image_fd.raw(),
+            image_fd,
+            phases.copy,
             launch_error,
             error_exit_syscall,
         );
-        if libc::close(loader_fd) == -1 {
-            child_fail(launch_error, PHASE_INTERPRETER_COPY, error_exit_syscall);
+        if libc::close(image_fd) == -1 {
+            child_fail(launch_error, phases.copy, error_exit_syscall);
         }
 
-        let interpreter_tree_fd = libc::syscall(
+        let image_tree_fd = libc::syscall(
             libc::SYS_open_tree,
             state_mount_fd,
-            b"loader\0".as_ptr().cast::<libc::c_char>(),
+            b"image ".as_ptr().cast::<libc::c_char>(),
             OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC,
         );
-        if interpreter_tree_fd == -1 {
-            child_fail(launch_error, PHASE_INTERPRETER_CLONE, error_exit_syscall);
+        if image_tree_fd == -1 {
+            child_fail(launch_error, phases.clone, error_exit_syscall);
         }
-        let interpreter_tree_fd = interpreter_tree_fd as RawFd;
+        let image_tree_fd = image_tree_fd as RawFd;
 
         let target_how = OpenHow {
             flags: (libc::O_PATH | libc::O_CLOEXEC) as u64,
@@ -3649,27 +3727,19 @@ mod x86_64 {
         let target_fd = libc::syscall(
             libc::SYS_openat2,
             root_tree_fd,
-            interpreter.target_relative.as_ptr(),
+            image.target_relative.as_ptr(),
             &target_how as *const OpenHow,
             std::mem::size_of::<OpenHow>(),
         );
         if target_fd == -1 {
-            child_fail(
-                launch_error,
-                PHASE_INTERPRETER_TARGET_PIN,
-                error_exit_syscall,
-            );
+            child_fail(launch_error, phases.target_pin, error_exit_syscall);
         }
         let target_fd = target_fd as RawFd;
         let mut target_stat = std::mem::zeroed::<libc::stat>();
         if libc::fstat(target_fd, &mut target_stat) == -1
             || target_stat.st_mode & libc::S_IFMT != libc::S_IFREG
         {
-            child_fail(
-                launch_error,
-                PHASE_INTERPRETER_TARGET_PIN,
-                error_exit_syscall,
-            );
+            child_fail(launch_error, phases.target_pin, error_exit_syscall);
         }
 
         let mount_attr = MountAttr {
@@ -3680,29 +3750,29 @@ mod x86_64 {
         };
         if libc::syscall(
             libc::SYS_mount_setattr,
-            interpreter_tree_fd,
-            b"\0".as_ptr().cast::<libc::c_char>(),
+            image_tree_fd,
+            b" ".as_ptr().cast::<libc::c_char>(),
             AT_EMPTY_PATH,
             &mount_attr as *const MountAttr,
             std::mem::size_of::<MountAttr>(),
         ) == -1
         {
-            child_fail(launch_error, PHASE_INTERPRETER_READONLY, error_exit_syscall);
+            child_fail(launch_error, phases.readonly, error_exit_syscall);
         }
 
         if libc::syscall(
             libc::SYS_move_mount,
-            interpreter_tree_fd,
-            b"\0".as_ptr().cast::<libc::c_char>(),
+            image_tree_fd,
+            b" ".as_ptr().cast::<libc::c_char>(),
             target_fd,
-            b"\0".as_ptr().cast::<libc::c_char>(),
+            b" ".as_ptr().cast::<libc::c_char>(),
             MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_EMPTY_PATH,
         ) == -1
         {
-            child_fail(launch_error, PHASE_INTERPRETER_ATTACH, error_exit_syscall);
+            child_fail(launch_error, phases.attach, error_exit_syscall);
         }
         close_setup_fd(target_fd);
-        close_setup_fd(interpreter_tree_fd);
+        close_setup_fd(image_tree_fd);
         close_setup_fd(state_mount_fd);
     }
 
@@ -4262,6 +4332,11 @@ mod x86_64 {
                 | PHASE_INTERPRETER_CLONE
                 | PHASE_INTERPRETER_READONLY
                 | PHASE_INTERPRETER_ATTACH
+                | PHASE_NEEDED_TMPFS_CREATE
+                | PHASE_NEEDED_TMPFS_MOUNT
+                | PHASE_NEEDED_CLONE
+                | PHASE_NEEDED_READONLY
+                | PHASE_NEEDED_ATTACH
         ) && matches!(
             record.errno,
             libc::EPERM | libc::EACCES | libc::ENOSYS | libc::ENODEV
@@ -4404,6 +4479,13 @@ mod x86_64 {
             PHASE_INTERPRETER_TARGET_PIN => "sealed ELF interpreter target pin",
             PHASE_INTERPRETER_READONLY => "sealed ELF interpreter mount hardening",
             PHASE_INTERPRETER_ATTACH => "sealed ELF interpreter mount attachment",
+            PHASE_NEEDED_TMPFS_CREATE => "sealed ELF DT_NEEDED tmpfs creation",
+            PHASE_NEEDED_TMPFS_MOUNT => "sealed ELF DT_NEEDED tmpfs mount",
+            PHASE_NEEDED_COPY => "sealed ELF DT_NEEDED private copy",
+            PHASE_NEEDED_CLONE => "sealed ELF DT_NEEDED detached file clone",
+            PHASE_NEEDED_TARGET_PIN => "sealed ELF DT_NEEDED target pin",
+            PHASE_NEEDED_READONLY => "sealed ELF DT_NEEDED mount hardening",
+            PHASE_NEEDED_ATTACH => "sealed ELF DT_NEEDED mount attachment",
             _ => "unknown launch phase",
         };
         format!(

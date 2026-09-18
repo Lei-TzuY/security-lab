@@ -33,13 +33,12 @@ const HEAD_PENDING_HEADER_BYTES: usize = 176;
 const HEAD_PENDING_MAC_BYTES: usize = 32;
 const HEAD_PENDING_BYTES: usize = HEAD_PENDING_HEADER_BYTES + HEAD_PENDING_MAC_BYTES;
 const HEAD_PENDING_FILE: &str = "snapshot-store-head-pending";
-const HEAD_BATCH_PENDING_DOMAIN: &[u8] =
-    b"security-lab-snapshot-store-head-batch-pending-v1\0";
+const HEAD_BATCH_PENDING_DOMAIN: &[u8] = b"security-lab-snapshot-store-head-batch-pending-v1\0";
 const HEAD_BATCH_PENDING_MAGIC: [u8; 8] = *b"SLHBPN1\0";
 const HEAD_BATCH_PENDING_FIXED_BYTES: usize = 128;
 const HEAD_BATCH_PENDING_ENTRY_BYTES: usize = 208;
-const HEAD_BATCH_PENDING_HEADER_BYTES: usize =
-    HEAD_BATCH_PENDING_FIXED_BYTES + SNAPSHOT_STORE_HEAD_MAX_BATCH_ITEMS * HEAD_BATCH_PENDING_ENTRY_BYTES;
+const HEAD_BATCH_PENDING_HEADER_BYTES: usize = HEAD_BATCH_PENDING_FIXED_BYTES
+    + SNAPSHOT_STORE_HEAD_MAX_BATCH_ITEMS * HEAD_BATCH_PENDING_ENTRY_BYTES;
 const HEAD_BATCH_PENDING_MAC_BYTES: usize = 32;
 const HEAD_BATCH_PENDING_BYTES: usize =
     HEAD_BATCH_PENDING_HEADER_BYTES + HEAD_BATCH_PENDING_MAC_BYTES;
@@ -473,9 +472,12 @@ fn validate_batch_request(
             index,
             source: Box::new(source),
         })?;
-        if let Some(first_index) = validated
-            .iter()
-            .position(|existing: &SnapshotStoreHeadValidatedBatchItem| existing.identity == identity)
+        if let Some(first_index) =
+            validated
+                .iter()
+                .position(|existing: &SnapshotStoreHeadValidatedBatchItem| {
+                    existing.identity == identity
+                })
         {
             return Err(SnapshotStoreHeadStateError::InvalidInput(format!(
                 "batch item {index} duplicates canonical identity from item {first_index}"
@@ -486,11 +488,14 @@ fn validate_batch_request(
                 "batch item {index} archive length does not fit u64"
             ))
         })?;
-        staged_archive_bytes = staged_archive_bytes.checked_add(archive_bytes).ok_or_else(|| {
-            SnapshotStoreHeadStateError::InvalidInput(
-                "batch staged archive-byte accounting overflow".to_owned(),
-            )
-        })?;
+        staged_archive_bytes =
+            staged_archive_bytes
+                .checked_add(archive_bytes)
+                .ok_or_else(|| {
+                    SnapshotStoreHeadStateError::InvalidInput(
+                        "batch staged archive-byte accounting overflow".to_owned(),
+                    )
+                })?;
         if staged_archive_bytes > request.inventory_limits.max_total_archive_bytes {
             return Err(SnapshotStoreHeadStateError::InvalidInput(format!(
                 "batch staged archive bytes exceed inventory aggregate budget: limit={} attempted={staged_archive_bytes}",
@@ -1218,17 +1223,16 @@ mod linux {
             .iter()
             .map(|item| (item.identity, item.archive_bytes))
             .collect();
-        let (current, projected, after_each) =
-            projected_snapshot_store_batch_inventory_identity(
-                store_root,
-                request.inventory_limits,
-                &candidates,
-            )
-            .map_err(|source| {
-                SnapshotStoreHeadStateError::Transaction(Box::new(
-                    SnapshotStoreTransactionError::Inventory(source),
-                ))
-            })?;
+        let (current, projected, after_each) = projected_snapshot_store_batch_inventory_identity(
+            store_root,
+            request.inventory_limits,
+            &candidates,
+        )
+        .map_err(|source| {
+            SnapshotStoreHeadStateError::Transaction(Box::new(
+                SnapshotStoreTransactionError::Inventory(source),
+            ))
+        })?;
         require_inventory(previous, current)?;
 
         let mut puts: Vec<Option<crate::snapshot_store::SnapshotStorePutReport>> =
@@ -1281,14 +1285,16 @@ mod linux {
             .iter()
             .zip(validated.iter())
             .zip(after_each.iter())
-            .map(|((item, validated_item), after)| SnapshotStoreHeadBatchPendingEntry {
-                identity: validated_item.identity,
-                archive_bytes: validated_item.archive_bytes,
-                public_key: *item.public_key,
-                signature: *item.expected_signature,
-                preexisting: after.is_none(),
-                after_inventory: *after,
-            })
+            .map(
+                |((item, validated_item), after)| SnapshotStoreHeadBatchPendingEntry {
+                    identity: validated_item.identity,
+                    archive_bytes: validated_item.archive_bytes,
+                    public_key: *item.public_key,
+                    signature: *item.expected_signature,
+                    preexisting: after.is_none(),
+                    after_inventory: *after,
+                },
+            )
             .collect();
         let pending = SnapshotStoreHeadBatchPendingIntent {
             previous,
@@ -1362,9 +1368,15 @@ mod linux {
             (Some(_), Some(_)) => Err(SnapshotStoreHeadStateError::InvalidState(
                 "single-object and batch pending publications coexist".to_owned(),
             )),
-            (Some(pending), None) => {
-                recover_single(guard.root.raw(), state_key, &writer, inventory_limits, anchored, actual, pending)
-            }
+            (Some(pending), None) => recover_single(
+                guard.root.raw(),
+                state_key,
+                &writer,
+                inventory_limits,
+                anchored,
+                actual,
+                pending,
+            ),
             (None, Some(pending)) => recover_batch(
                 guard.root.raw(),
                 state_key,
@@ -1789,7 +1801,8 @@ mod linux {
                 });
             }
             let fd = OwnedFd(fd);
-            let stat = require_regular_single_link(fd.raw(), "validate durable batch recovery stage")?;
+            let stat =
+                require_regular_single_link(fd.raw(), "validate durable batch recovery stage")?;
             if stat.st_size < 0
                 || stat.st_size as u64 != entry.archive_bytes
                 || (stat.st_mode & 0o222) != 0

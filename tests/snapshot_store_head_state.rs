@@ -201,7 +201,8 @@ const BATCH_PENDING_DOMAIN: &[u8] = b"security-lab-snapshot-store-head-batch-pen
 const BATCH_PENDING_MAGIC: [u8; 8] = *b"SLHBPN1\0";
 const BATCH_PENDING_FIXED_BYTES: usize = 128;
 const BATCH_PENDING_ENTRY_BYTES: usize = 208;
-const BATCH_PENDING_HEADER_BYTES: usize = BATCH_PENDING_FIXED_BYTES + 16 * BATCH_PENDING_ENTRY_BYTES;
+const BATCH_PENDING_HEADER_BYTES: usize =
+    BATCH_PENDING_FIXED_BYTES + 16 * BATCH_PENDING_ENTRY_BYTES;
 const BATCH_PENDING_BYTES: usize = BATCH_PENDING_HEADER_BYTES + 32;
 
 fn encode_inventory_fixture(
@@ -990,18 +991,8 @@ fn batch_successor_budget_failure_occurs_before_journal_or_store_mutation() {
     let workspace = TempDir::new("batch-budget-preflight");
     let (store, state) = roots(workspace.path());
     let key = SnapshotStoreHeadStateKey::new([0xAD; 32]);
-    let first = fixture(
-        workspace.path(),
-        "budget-first",
-        b"budget-first\n",
-        0x71,
-    );
-    let second = fixture(
-        workspace.path(),
-        "budget-second",
-        b"budget-second\n",
-        0x72,
-    );
+    let first = fixture(workspace.path(), "budget-first", b"budget-first\n", 0x71);
+    let second = fixture(workspace.path(), "budget-second", b"budget-second\n", 0x72);
     let initial = initialize_snapshot_store_head_state(&state, &key, &store, audit_limits())
         .expect("initialize batch budget head");
 
@@ -1038,8 +1029,18 @@ fn batch_recovery_aborts_staged_predecessor_without_store_mutation() {
     let workspace = TempDir::new("batch-recover-predecessor");
     let (store, state) = roots(workspace.path());
     let key = SnapshotStoreHeadStateKey::new([0xB1; 32]);
-    let first = fixture(workspace.path(), "recover-pre-first", b"recover-pre-first\n", 0x11);
-    let second = fixture(workspace.path(), "recover-pre-second", b"recover-pre-second\n", 0x12);
+    let first = fixture(
+        workspace.path(),
+        "recover-pre-first",
+        b"recover-pre-first\n",
+        0x11,
+    );
+    let second = fixture(
+        workspace.path(),
+        "recover-pre-second",
+        b"recover-pre-second\n",
+        0x12,
+    );
     let previous = initialize_snapshot_store_head_state(&state, &key, &store, audit_limits())
         .expect("initialize batch recovery predecessor");
     let (after, successor) =
@@ -1074,8 +1075,18 @@ fn batch_recovery_completes_exact_partial_durable_prefix() {
     let workspace = TempDir::new("batch-recover-prefix");
     let (store, state) = roots(workspace.path());
     let key = SnapshotStoreHeadStateKey::new([0xB2; 32]);
-    let first = fixture(workspace.path(), "recover-prefix-first", b"recover-prefix-first\n", 0x21);
-    let second = fixture(workspace.path(), "recover-prefix-second", b"recover-prefix-second\n", 0x22);
+    let first = fixture(
+        workspace.path(),
+        "recover-prefix-first",
+        b"recover-prefix-first\n",
+        0x21,
+    );
+    let second = fixture(
+        workspace.path(),
+        "recover-prefix-second",
+        b"recover-prefix-second\n",
+        0x22,
+    );
     let previous = initialize_snapshot_store_head_state(&state, &key, &store, audit_limits())
         .expect("initialize partial-prefix head");
     let (after, successor) =
@@ -1124,9 +1135,24 @@ fn batch_recovery_rejects_unknown_inventory_without_mutating() {
     let workspace = TempDir::new("batch-recover-unknown");
     let (store, state) = roots(workspace.path());
     let key = SnapshotStoreHeadStateKey::new([0xB3; 32]);
-    let first = fixture(workspace.path(), "recover-unknown-first", b"recover-unknown-first\n", 0x31);
-    let second = fixture(workspace.path(), "recover-unknown-second", b"recover-unknown-second\n", 0x32);
-    let outsider = fixture(workspace.path(), "recover-outsider", b"recover-outsider\n", 0x33);
+    let first = fixture(
+        workspace.path(),
+        "recover-unknown-first",
+        b"recover-unknown-first\n",
+        0x31,
+    );
+    let second = fixture(
+        workspace.path(),
+        "recover-unknown-second",
+        b"recover-unknown-second\n",
+        0x32,
+    );
+    let outsider = fixture(
+        workspace.path(),
+        "recover-outsider",
+        b"recover-outsider\n",
+        0x33,
+    );
     let previous = initialize_snapshot_store_head_state(&state, &key, &store, audit_limits())
         .expect("initialize unknown-inventory head");
     let (after, successor) =
@@ -1165,8 +1191,18 @@ fn batch_recovery_validates_all_stages_before_forward_replay() {
     let workspace = TempDir::new("batch-recover-stage-tamper");
     let (store, state) = roots(workspace.path());
     let key = SnapshotStoreHeadStateKey::new([0xB4; 32]);
-    let first = fixture(workspace.path(), "recover-tamper-first", b"recover-tamper-first\n", 0x41);
-    let second = fixture(workspace.path(), "recover-tamper-second", b"recover-tamper-second\n", 0x42);
+    let first = fixture(
+        workspace.path(),
+        "recover-tamper-first",
+        b"recover-tamper-first\n",
+        0x41,
+    );
+    let second = fixture(
+        workspace.path(),
+        "recover-tamper-second",
+        b"recover-tamper-second\n",
+        0x42,
+    );
     let previous = initialize_snapshot_store_head_state(&state, &key, &store, audit_limits())
         .expect("initialize stage-tamper head");
     let (after, successor) =

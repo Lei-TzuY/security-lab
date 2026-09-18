@@ -1,4 +1,5 @@
 use crate::snapshot_archive::SnapshotArchiveLimits;
+use crate::snapshot_identity::SnapshotIdentity;
 use crate::snapshot_signature::{
     SNAPSHOT_ED25519_PUBLIC_KEY_BYTES, SNAPSHOT_ED25519_SIGNATURE_BYTES,
 };
@@ -7,7 +8,9 @@ use crate::snapshot_store_audit::{
     audit_snapshot_store, SnapshotStoreAuditError, SnapshotStoreAuditLimits,
     SnapshotStoreAuditReport,
 };
-use crate::snapshot_store_durable::store_snapshot_archive_ed25519_durable;
+use crate::snapshot_store_durable::{
+    store_snapshot_archive_ed25519_durable, sync_snapshot_store_object_durable,
+};
 use crate::snapshot_store_inventory::{
     snapshot_store_inventory_identity, verify_snapshot_store_inventory_identity,
     SnapshotStoreInventoryError, SnapshotStoreInventoryIdentity,
@@ -254,6 +257,22 @@ impl SnapshotStoreWriteTransaction {
             limits,
         )?)
     }
+
+    pub(crate) fn sync_object_durable(
+        &self,
+        identity: SnapshotIdentity,
+        archive_bytes: u64,
+    ) -> Result<(), SnapshotStoreTransactionError> {
+        Ok(sync_snapshot_store_object_durable(
+            &self.store_root,
+            identity,
+            archive_bytes,
+        )?)
+    }
+
+    /// Re-run the established object/directory/root durability barriers for an
+    /// exact already-published object while this exclusive transaction remains
+    /// held. This does not publish or select a different object.
 
     /// Optimistic guarded durable publication. The complete audited store
     /// inventory is compared with a caller-retained expected identity while the

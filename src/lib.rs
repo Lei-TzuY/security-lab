@@ -59,8 +59,10 @@ pub use snapshot_signature::{
     SNAPSHOT_ED25519_SIGNING_KEY_BYTES,
 };
 pub use snapshot_store::{
-    materialize_snapshot_store_object_ed25519_atomic, snapshot_store_object_path,
-    store_snapshot_archive_ed25519_atomic, SnapshotStoreError, SnapshotStorePutReport,
+    materialize_snapshot_store_object_ed25519_atomic,
+    recover_snapshot_store_stale_temporary_objects, snapshot_store_object_path,
+    store_snapshot_archive_ed25519_atomic, try_recover_snapshot_store_stale_temporary_objects,
+    SnapshotStoreError, SnapshotStorePutReport, SnapshotStoreTempRecoveryReport,
 };
 pub use snapshot_store_audit::{
     audit_snapshot_store, SnapshotStoreAuditError, SnapshotStoreAuditLimits,

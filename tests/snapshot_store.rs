@@ -1,13 +1,16 @@
 #![cfg(target_os = "linux")]
 
 use security_lab::{
-    materialize_snapshot_store_object_ed25519_atomic, serialize_snapshot_archive,
+    materialize_snapshot_store_object_ed25519_atomic,
+    recover_snapshot_store_stale_temporary_objects, serialize_snapshot_archive,
     sign_snapshot_ed25519, snapshot_store_object_path, store_snapshot_archive_ed25519_atomic,
-    store_snapshot_archive_ed25519_durable, SnapshotArchiveLimits, SnapshotIdentityLimits,
-    SnapshotStoreError,
+    store_snapshot_archive_ed25519_durable, try_recover_snapshot_store_stale_temporary_objects,
+    SnapshotArchiveLimits, SnapshotIdentityLimits, SnapshotStoreError,
 };
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::fs::OpenOptions;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{symlink, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command};
@@ -62,6 +65,132 @@ fn create_source(workspace: &Path) -> PathBuf {
     fs::write(source.join("payload"), b"frozen-original\n").expect("write source payload");
     fs::write(source.join("nested/child"), b"nested\n").expect("write nested payload");
     source
+}
+
+#[test]
+fn stale_temporary_object_recovery_is_bounded_and_preserves_non_temp_entries() {
+    let workspace = TempDir::new("stale-temp-recovery");
+    let source = create_source(workspace.path());
+    let store = workspace.path().join("store");
+    fs::create_dir(&store).expect("create store root");
+    let archive = serialize_snapshot_archive(&source, archive_limits()).expect("serialize archive");
+    let evidence = sign_snapshot_ed25519(&source, &[0x7a; 32], identity_limits())
+        .expect("sign canonical source identity");
+    let stored = store_snapshot_archive_ed25519_atomic(
+        &store,
+        &archive.bytes,
+        &evidence.public_key,
+        &evidence.signature,
+        archive_limits(),
+    )
+    .expect("seed canonical snapshot object");
+
+    let objects = store.join("objects");
+    let stale = objects.join(".tmp-4242-0");
+    let unrelated = objects.join("operator-note");
+    fs::write(&stale, b"crash residue").expect("write stale temp fixture");
+    fs::write(&unrelated, b"preserve me").expect("write unrelated entry");
+
+    let report = recover_snapshot_store_stale_temporary_objects(&store, 16)
+        .expect("recover stale temporary object");
+    assert_eq!(report.entries_examined, 3);
+    assert_eq!(report.removed_temporary_objects, 1);
+    assert!(!stale.exists());
+    assert!(
+        unrelated.exists(),
+        "recovery must not become broad garbage collection"
+    );
+    assert!(
+        snapshot_store_object_path(&store, stored.identity).exists(),
+        "canonical content-addressed object must remain untouched"
+    );
+}
+
+#[test]
+fn temporary_object_recovery_budget_fails_before_deletion() {
+    let workspace = TempDir::new("stale-temp-budget");
+    let store = workspace.path().join("store");
+    let objects = store.join("objects");
+    fs::create_dir(&store).expect("create store root");
+    fs::create_dir(&objects).expect("create objects directory");
+    let first = objects.join(".tmp-7-0");
+    let second = objects.join(".tmp-7-1");
+    fs::write(&first, b"first").expect("write first stale temp");
+    fs::write(&second, b"second").expect("write second stale temp");
+
+    match recover_snapshot_store_stale_temporary_objects(&store, 1)
+        .expect_err("entry budget must fail closed")
+    {
+        SnapshotStoreError::RecoveryBudgetExceeded {
+            limit: 1,
+            attempted: 2,
+        } => {}
+        other => panic!("unexpected recovery budget result: {other}"),
+    }
+    assert!(
+        first.exists() && second.exists(),
+        "budget failure must not partially clean"
+    );
+}
+
+#[test]
+fn temporary_object_recovery_rejects_unsafe_reserved_entry_before_deletion() {
+    let workspace = TempDir::new("stale-temp-unsafe");
+    let store = workspace.path().join("store");
+    let objects = store.join("objects");
+    fs::create_dir(&store).expect("create store root");
+    fs::create_dir(&objects).expect("create objects directory");
+    let safe = objects.join(".tmp-8-0");
+    let unsafe_entry = objects.join(".tmp-8-1");
+    fs::write(&safe, b"safe stale temp").expect("write safe stale temp");
+    symlink("missing-target", &unsafe_entry).expect("create reserved-name symlink");
+
+    match recover_snapshot_store_stale_temporary_objects(&store, 16)
+        .expect_err("reserved-name symlink must fail closed")
+    {
+        SnapshotStoreError::UnsafeTemporaryObject { name, .. } => {
+            assert_eq!(name, ".tmp-8-1");
+        }
+        other => panic!("unexpected unsafe temporary-object result: {other}"),
+    }
+    assert!(
+        safe.exists() && fs::symlink_metadata(&unsafe_entry).is_ok(),
+        "unsafe preflight must preserve every candidate as evidence"
+    );
+}
+
+#[test]
+fn nonblocking_temporary_object_recovery_reports_live_coordination_lock() {
+    let workspace = TempDir::new("stale-temp-lock");
+    let store = workspace.path().join("store");
+    fs::create_dir(&store).expect("create store root");
+    let lock_path = store.join(".snapshot-store-temp-recovery.lock");
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .expect("open temporary-object recovery lock fixture");
+    assert_eq!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) },
+        0,
+        "hold publisher-form shared recovery lock"
+    );
+
+    assert!(matches!(
+        try_recover_snapshot_store_stale_temporary_objects(&store, 16),
+        Err(SnapshotStoreError::RecoveryLockContended)
+    ));
+
+    assert_eq!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) },
+        0,
+        "release recovery lock fixture"
+    );
+    let report = try_recover_snapshot_store_stale_temporary_objects(&store, 16)
+        .expect("recovery succeeds once live publisher lock is released");
+    assert_eq!(report.removed_temporary_objects, 0);
 }
 
 #[test]

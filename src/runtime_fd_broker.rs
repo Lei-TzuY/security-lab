@@ -5,6 +5,8 @@ use std::fs::File;
 use std::io;
 use std::path::Path;
 
+pub const MAX_RUNTIME_SEALED_SNAPSHOT_BYTES: u64 = 64 * 1024 * 1024;
+
 #[derive(Debug)]
 pub enum RuntimeFdBrokerError {
     UnsupportedPlatform(String),
@@ -13,6 +15,7 @@ pub enum RuntimeFdBrokerError {
     SourceNotRegular,
     SourceNotReadable,
     SourcePathOnly,
+    SourceSnapshotTooLarge { max_bytes: u64 },
     UnexpectedPeer {
         expected_pid: i32,
         expected_uid: u32,
@@ -47,6 +50,10 @@ impl fmt::Display for RuntimeFdBrokerError {
             Self::SourcePathOnly => {
                 f.write_str("runtime FD broker does not accept O_PATH-only sources")
             }
+            Self::SourceSnapshotTooLarge { max_bytes } => write!(
+                f,
+                "runtime FD broker source exceeds sealed snapshot byte ceiling of {max_bytes}"
+            ),
             Self::UnexpectedPeer {
                 expected_pid,
                 expected_uid,
@@ -86,6 +93,8 @@ mod imp {
     use std::path::{Component, PathBuf};
 
     const MAX_UNIX_PATH_BYTES: usize = 107;
+    const MFD_CLOEXEC: libc::c_uint = 0x0001;
+    const MFD_ALLOW_SEALING: libc::c_uint = 0x0002;
 
     #[derive(Debug)]
     pub struct PreparedReadOnlyRegularFile {
@@ -93,6 +102,30 @@ mod imp {
     }
 
     impl Drop for PreparedReadOnlyRegularFile {
+        fn drop(&mut self) {
+            unsafe {
+                libc::close(self.fd);
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    pub struct PreparedSealedRegularFileSnapshot {
+        fd: RawFd,
+        len: u64,
+    }
+
+    impl PreparedSealedRegularFileSnapshot {
+        pub fn len(&self) -> u64 {
+            self.len
+        }
+
+        pub fn is_empty(&self) -> bool {
+            self.len == 0
+        }
+    }
+
+    impl Drop for PreparedSealedRegularFileSnapshot {
         fn drop(&mut self) {
             unsafe {
                 libc::close(self.fd);
@@ -250,6 +283,20 @@ mod imp {
         ) -> Result<PreparedReadOnlyRegularFile, RuntimeFdBrokerError> {
             prepare_readonly_regular_file(source)
         }
+
+        /// Copy one readable regular file into a bounded sealed memfd snapshot.
+        ///
+        /// The completed snapshot freezes the copied bytes and length with
+        /// F_SEAL_WRITE/GROW/SHRINK/SEAL, then reopens the sealed object as a
+        /// separate O_RDONLY|O_CLOEXEC description for the one-shot runtime
+        /// grant protocol. This does not claim an atomic point-in-time read
+        /// against a hostile writer mutating the source while the copy runs.
+        pub fn prepare_sealed_regular_file_snapshot(
+            source: &File,
+            max_bytes: u64,
+        ) -> Result<PreparedSealedRegularFileSnapshot, RuntimeFdBrokerError> {
+            prepare_sealed_regular_file_snapshot(source, max_bytes)
+        }
     }
 
     impl RuntimeFdSession {
@@ -283,14 +330,24 @@ mod imp {
         }
 
         /// Transfer exactly one previously prepared read-only regular-file grant.
-        /// A session cannot transfer before the exact readiness byte has been
-        /// consumed and cannot successfully transfer a second descriptor.
-        /// The one-byte `F` payload makes a zero-length ancillary-only send
-        /// impossible and matches the bounded receive protocol used by the lab.
         pub fn send_readonly_regular_file(
             &mut self,
             grant: PreparedReadOnlyRegularFile,
         ) -> Result<(), RuntimeFdBrokerError> {
+            self.send_prepared_fd(grant.fd)
+        }
+
+        /// Transfer exactly one previously prepared sealed regular-file snapshot.
+        /// This shares the same one-shot session state as the ordinary read-only
+        /// regular-file grant; the two grant kinds cannot be combined on one session.
+        pub fn send_sealed_regular_file_snapshot(
+            &mut self,
+            grant: PreparedSealedRegularFileSnapshot,
+        ) -> Result<(), RuntimeFdBrokerError> {
+            self.send_prepared_fd(grant.fd)
+        }
+
+        fn send_prepared_fd(&mut self, fd: RawFd) -> Result<(), RuntimeFdBrokerError> {
             if self.state != RuntimeFdSessionState::Ready {
                 let message = match self.state {
                     RuntimeFdSessionState::AwaitingReady => {
@@ -307,7 +364,7 @@ mod imp {
                 return Err(RuntimeFdBrokerError::Protocol(message.to_owned()));
             }
 
-            match send_one_fd(self.stream.as_raw_fd(), grant.fd) {
+            match send_one_fd(self.stream.as_raw_fd(), fd) {
                 Ok(()) => {
                     self.state = RuntimeFdSessionState::GrantSent;
                     Ok(())
@@ -446,6 +503,195 @@ mod imp {
         Ok(reopened)
     }
 
+    fn prepare_sealed_regular_file_snapshot(
+        source: &File,
+        max_bytes: u64,
+    ) -> Result<PreparedSealedRegularFileSnapshot, RuntimeFdBrokerError> {
+        if max_bytes == 0 || max_bytes > super::MAX_RUNTIME_SEALED_SNAPSHOT_BYTES {
+            return Err(RuntimeFdBrokerError::InvalidConfiguration(format!(
+                "sealed runtime snapshot max_bytes must be between 1 and {}",
+                super::MAX_RUNTIME_SEALED_SNAPSHOT_BYTES
+            )));
+        }
+
+        let readable = prepare_readonly_regular_file(source)?;
+        let name = CString::new("security-lab-runtime-snapshot")
+            .expect("static runtime snapshot memfd name contains no NUL");
+        let raw_memfd = unsafe {
+            libc::syscall(
+                libc::SYS_memfd_create,
+                name.as_ptr(),
+                MFD_CLOEXEC | MFD_ALLOW_SEALING,
+            )
+        };
+        if raw_memfd == -1 {
+            let error = std::io::Error::last_os_error();
+            return if matches!(
+                error.raw_os_error(),
+                Some(libc::ENOSYS) | Some(libc::EINVAL) | Some(libc::EPERM) | Some(libc::EACCES)
+            ) {
+                Err(RuntimeFdBrokerError::UnsupportedPlatform(format!(
+                    "sealed runtime FD snapshots require memfd sealing support: {error}"
+                )))
+            } else {
+                Err(RuntimeFdBrokerError::io(
+                    "cannot create sealed runtime FD snapshot memfd",
+                    error,
+                ))
+            };
+        }
+        let mut memfd = PreparedSealedRegularFileSnapshot {
+            fd: raw_memfd as RawFd,
+            len: 0,
+        };
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let read = unsafe {
+                libc::read(
+                    readable.fd,
+                    buffer.as_mut_ptr().cast::<libc::c_void>(),
+                    buffer.len(),
+                )
+            };
+            if read == -1 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                return Err(RuntimeFdBrokerError::io(
+                    "cannot read runtime FD source for sealed snapshot",
+                    error,
+                ));
+            }
+            if read == 0 {
+                break;
+            }
+            let count = read as usize;
+            let new_len = memfd.len.checked_add(count as u64).ok_or_else(|| {
+                RuntimeFdBrokerError::Protocol(
+                    "sealed runtime snapshot byte count overflow".to_owned(),
+                )
+            })?;
+            if new_len > max_bytes {
+                return Err(RuntimeFdBrokerError::SourceSnapshotTooLarge { max_bytes });
+            }
+            let mut offset = 0usize;
+            while offset < count {
+                let written = unsafe {
+                    libc::write(
+                        memfd.fd,
+                        buffer[offset..count].as_ptr().cast::<libc::c_void>(),
+                        count - offset,
+                    )
+                };
+                if written == -1 {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() == Some(libc::EINTR) {
+                        continue;
+                    }
+                    return Err(RuntimeFdBrokerError::io(
+                        "cannot populate sealed runtime FD snapshot",
+                        error,
+                    ));
+                }
+                if written == 0 {
+                    return Err(RuntimeFdBrokerError::Protocol(
+                        "sealed runtime snapshot write made no progress".to_owned(),
+                    ));
+                }
+                offset += written as usize;
+            }
+            memfd.len = new_len;
+        }
+
+        if unsafe { libc::fchmod(memfd.fd, 0o400) } == -1 {
+            return Err(RuntimeFdBrokerError::io(
+                "cannot set sealed runtime FD snapshot mode",
+                std::io::Error::last_os_error(),
+            ));
+        }
+        let required_seals =
+            libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
+        if unsafe { libc::fcntl(memfd.fd, libc::F_ADD_SEALS, required_seals) } == -1 {
+            return Err(RuntimeFdBrokerError::io(
+                "cannot seal runtime FD snapshot",
+                std::io::Error::last_os_error(),
+            ));
+        }
+        let observed = unsafe { libc::fcntl(memfd.fd, libc::F_GET_SEALS) };
+        if observed == -1 {
+            return Err(RuntimeFdBrokerError::io(
+                "cannot inspect runtime FD snapshot seals",
+                std::io::Error::last_os_error(),
+            ));
+        }
+        if observed & required_seals != required_seals {
+            return Err(RuntimeFdBrokerError::Protocol(
+                "sealed runtime FD snapshot is missing required immutable seals".to_owned(),
+            ));
+        }
+
+        let proc_path = CString::new(format!("/proc/self/fd/{}", memfd.fd))
+            .expect("numeric runtime snapshot procfd path contains no NUL");
+        let readonly =
+            unsafe { libc::open(proc_path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+        if readonly == -1 {
+            return Err(RuntimeFdBrokerError::io(
+                "cannot reopen sealed runtime FD snapshot read-only",
+                std::io::Error::last_os_error(),
+            ));
+        }
+        let readonly = PreparedSealedRegularFileSnapshot {
+            fd: readonly,
+            len: memfd.len,
+        };
+
+        let mut original_stat = unsafe { std::mem::zeroed::<libc::stat>() };
+        let mut readonly_stat = unsafe { std::mem::zeroed::<libc::stat>() };
+        if unsafe { libc::fstat(memfd.fd, &mut original_stat) } == -1
+            || unsafe { libc::fstat(readonly.fd, &mut readonly_stat) } == -1
+        {
+            return Err(RuntimeFdBrokerError::io(
+                "cannot revalidate sealed runtime FD snapshot identity",
+                std::io::Error::last_os_error(),
+            ));
+        }
+        if original_stat.st_dev != readonly_stat.st_dev
+            || original_stat.st_ino != readonly_stat.st_ino
+        {
+            return Err(RuntimeFdBrokerError::Protocol(
+                "read-only reopen changed sealed runtime FD snapshot identity".to_owned(),
+            ));
+        }
+        let flags = unsafe { libc::fcntl(readonly.fd, libc::F_GETFL) };
+        if flags == -1 {
+            return Err(RuntimeFdBrokerError::io(
+                "cannot inspect sealed runtime FD snapshot access mode",
+                std::io::Error::last_os_error(),
+            ));
+        }
+        if flags & libc::O_PATH != 0 || flags & libc::O_ACCMODE != libc::O_RDONLY {
+            return Err(RuntimeFdBrokerError::Protocol(
+                "sealed runtime FD snapshot did not reopen as O_RDONLY".to_owned(),
+            ));
+        }
+        let reopened_seals = unsafe { libc::fcntl(readonly.fd, libc::F_GET_SEALS) };
+        if reopened_seals == -1 {
+            return Err(RuntimeFdBrokerError::io(
+                "cannot verify seals after runtime FD snapshot reopen",
+                std::io::Error::last_os_error(),
+            ));
+        }
+        if reopened_seals & required_seals != required_seals {
+            return Err(RuntimeFdBrokerError::Protocol(
+                "read-only runtime FD snapshot lost required seals".to_owned(),
+            ));
+        }
+
+        drop(memfd);
+        Ok(readonly)
+    }
+
     #[repr(C, align(8))]
     struct OneFdControl([u8; 24]);
 
@@ -506,6 +752,19 @@ mod imp {
     pub struct PreparedReadOnlyRegularFile;
 
     #[derive(Debug)]
+    pub struct PreparedSealedRegularFileSnapshot;
+
+    impl PreparedSealedRegularFileSnapshot {
+        pub fn len(&self) -> u64 {
+            0
+        }
+
+        pub fn is_empty(&self) -> bool {
+            true
+        }
+    }
+
+    #[derive(Debug)]
     pub struct RuntimeFdBroker;
 
     #[derive(Debug)]
@@ -545,6 +804,15 @@ mod imp {
                 "runtime FD mediation currently requires Linux x86_64".to_owned(),
             ))
         }
+
+        pub fn prepare_sealed_regular_file_snapshot(
+            _source: &File,
+            _max_bytes: u64,
+        ) -> Result<PreparedSealedRegularFileSnapshot, RuntimeFdBrokerError> {
+            Err(RuntimeFdBrokerError::UnsupportedPlatform(
+                "sealed runtime FD snapshots currently require Linux x86_64".to_owned(),
+            ))
+        }
     }
 
     impl RuntimeFdSession {
@@ -562,7 +830,19 @@ mod imp {
                 "runtime FD mediation currently requires Linux x86_64".to_owned(),
             ))
         }
+
+        pub fn send_sealed_regular_file_snapshot(
+            &mut self,
+            _grant: PreparedSealedRegularFileSnapshot,
+        ) -> Result<(), RuntimeFdBrokerError> {
+            Err(RuntimeFdBrokerError::UnsupportedPlatform(
+                "sealed runtime FD snapshots currently require Linux x86_64".to_owned(),
+            ))
+        }
     }
 }
 
-pub use imp::{PreparedReadOnlyRegularFile, RuntimeFdBroker, RuntimeFdSession};
+pub use imp::{
+    PreparedReadOnlyRegularFile, PreparedSealedRegularFileSnapshot, RuntimeFdBroker,
+    RuntimeFdSession,
+};

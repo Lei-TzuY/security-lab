@@ -1,6 +1,9 @@
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 
-use security_lab::{run, ChildOutcome, RuntimeFdBroker, RuntimeFdBrokerError, SandboxPolicy};
+use security_lab::{
+    run, ChildOutcome, RuntimeFdBroker, RuntimeFdBrokerError, SandboxPolicy,
+    MAX_RUNTIME_SEALED_SNAPSHOT_BYTES,
+};
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -361,4 +364,179 @@ fn broker_configuration_is_fail_closed_and_non_overwriting() {
 
     drop(broker);
     std::fs::remove_dir_all(&root).expect("remove broker policy root");
+}
+
+
+#[test]
+fn sealed_runtime_snapshot_freezes_bounded_bytes_after_preparation() {
+    let socket_path = unique_path("runtime-sealed-local.sock");
+    let file_path = unique_path("runtime-sealed-source");
+    let _ = std::fs::remove_file(&socket_path);
+    let _ = std::fs::remove_file(&file_path);
+    let frozen = b"runtime-fd-handoff-ok\n";
+    let mutated = b"host-mutated-after-snapshot\n";
+    std::fs::write(&file_path, frozen).expect("seed sealed runtime source");
+
+    let broker = RuntimeFdBroker::bind(&socket_path).expect("bind sealed runtime broker");
+    let mut client = UnixStream::connect(broker.path()).expect("connect sealed runtime client");
+    let mut session = broker.accept().expect("accept sealed runtime client");
+    let source = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&file_path)
+        .expect("open sealed runtime source");
+
+    assert!(matches!(
+        RuntimeFdBroker::prepare_sealed_regular_file_snapshot(&source, 0),
+        Err(RuntimeFdBrokerError::InvalidConfiguration(_))
+    ));
+    assert!(matches!(
+        RuntimeFdBroker::prepare_sealed_regular_file_snapshot(
+            &source,
+            MAX_RUNTIME_SEALED_SNAPSHOT_BYTES + 1,
+        ),
+        Err(RuntimeFdBrokerError::InvalidConfiguration(_))
+    ));
+    assert!(matches!(
+        RuntimeFdBroker::prepare_sealed_regular_file_snapshot(&source, 4),
+        Err(RuntimeFdBrokerError::SourceSnapshotTooLarge { max_bytes: 4 })
+    ));
+
+    let grant = RuntimeFdBroker::prepare_sealed_regular_file_snapshot(&source, 4096)
+        .expect("prepare sealed runtime snapshot");
+    assert_eq!(grant.len(), frozen.len() as u64);
+    assert!(!grant.is_empty());
+    assert_eq!(
+        unsafe { libc::lseek(source.as_raw_fd(), 0, libc::SEEK_CUR) },
+        0,
+        "sealed preparation must not share caller offset"
+    );
+
+    std::fs::write(&file_path, mutated).expect("mutate host source after sealed preparation");
+    assert_eq!(
+        std::fs::read(&file_path).expect("read mutated host source"),
+        mutated
+    );
+
+    client
+        .write_all(b"R")
+        .expect("publish sealed runtime readiness");
+    session
+        .wait_for_ready(b'R')
+        .expect("consume sealed runtime readiness");
+    session
+        .send_sealed_regular_file_snapshot(grant)
+        .expect("send sealed runtime snapshot");
+    let received = receive_one_fd(&client);
+
+    let flags = unsafe { libc::fcntl(received.raw(), libc::F_GETFL) };
+    assert!(flags >= 0, "inspect sealed snapshot flags");
+    assert_eq!(flags & libc::O_ACCMODE, libc::O_RDONLY);
+    let seals = unsafe { libc::fcntl(received.raw(), libc::F_GET_SEALS) };
+    assert!(seals >= 0, "inspect sealed snapshot seals");
+    let required =
+        libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
+    assert_eq!(seals & required, required);
+    let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
+    assert_eq!(unsafe { libc::fstat(received.raw(), &mut stat) }, 0);
+    assert_eq!(stat.st_mode & 0o777, 0o400);
+
+    assert_eq!(
+        unsafe { libc::write(received.raw(), b"x".as_ptr().cast::<libc::c_void>(), 1) },
+        -1
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::EBADF)
+    );
+    assert_eq!(read_exact_fd(received.raw(), frozen.len()), frozen);
+    assert_eq!(
+        unsafe { libc::lseek(source.as_raw_fd(), 0, libc::SEEK_CUR) },
+        0,
+        "sealed target read must not share caller offset"
+    );
+
+    drop(received);
+    drop(session);
+    drop(client);
+    drop(broker);
+    std::fs::remove_file(&file_path).expect("remove sealed runtime source");
+}
+
+#[test]
+fn sealed_runtime_snapshot_reaches_real_target_with_frozen_preparation_bytes() {
+    let root = build_probe_root();
+    let socket_path = unique_path("runtime-sealed-sandbox.sock");
+    let marker_path = unique_path("runtime-sealed-marker");
+    let _ = std::fs::remove_file(&socket_path);
+    let _ = std::fs::remove_file(&marker_path);
+    let frozen = b"runtime-fd-handoff-ok\n";
+    let mutated = b"host-mutated-after-snapshot\n";
+    std::fs::write(&marker_path, frozen).expect("seed sealed runtime marker");
+
+    let broker = RuntimeFdBroker::bind(&socket_path).expect("bind sealed runtime broker");
+    let marker_argument = marker_path.to_string_lossy();
+    let text = format!(
+        "filesystem.root = {}\n\
+         identity.hostname = security-lab\n\
+         executable = /probe\n\
+         arg = 0\n\
+         arg = {}\n\
+         working_dir = /work\n\
+         stdio.stdin = closed\n\
+         stdio.stdout = closed\n\
+         stdio.stderr = closed\n\
+         limit.wall_clock_milliseconds = 3000\n\
+         limit.cpu_seconds = 2\n\
+         limit.address_space_bytes = 134217728\n\
+         limit.file_size_bytes = 1048576\n\
+         limit.open_files = 32\n\
+         seccomp.allow = execveat,write,recvmsg,read,close,openat,exit\n",
+        root.display(),
+        marker_argument
+    );
+    let mut policy: SandboxPolicy = text.parse().expect("parse sealed runtime policy");
+    broker
+        .configure_policy(&mut policy, 10)
+        .expect("configure sealed runtime broker");
+
+    let source = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&marker_path)
+        .expect("open sealed runtime marker");
+    let grant = RuntimeFdBroker::prepare_sealed_regular_file_snapshot(&source, 4096)
+        .expect("prepare sealed runtime marker snapshot");
+    std::fs::write(&marker_path, mutated).expect("mutate host marker after preparation");
+
+    let runner = thread::spawn(move || run(&policy));
+    let mut session = broker
+        .accept()
+        .expect("accept launcher sealed broker connection");
+    session
+        .wait_for_ready(b'R')
+        .expect("target must publish post-exec readiness");
+    session
+        .send_sealed_regular_file_snapshot(grant)
+        .expect("send sealed runtime grant");
+
+    let outcome = runner
+        .join()
+        .expect("sealed runtime runner panicked")
+        .expect("sealed runtime sandbox failed");
+    assert_eq!(outcome, ChildOutcome::Exited(0));
+    assert_eq!(
+        std::fs::read(&marker_path).expect("read mutated host marker"),
+        mutated
+    );
+    assert_eq!(
+        unsafe { libc::lseek(source.as_raw_fd(), 0, libc::SEEK_CUR) },
+        0,
+        "sealed sandbox read must not share caller source offset"
+    );
+
+    drop(session);
+    drop(broker);
+    std::fs::remove_file(&marker_path).expect("remove sealed runtime marker");
+    std::fs::remove_dir_all(&root).expect("remove sealed runtime root");
 }

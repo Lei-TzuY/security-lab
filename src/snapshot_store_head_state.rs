@@ -8,7 +8,8 @@ use crate::snapshot_store::{
 };
 use crate::snapshot_store_audit::SnapshotStoreAuditLimits;
 use crate::snapshot_store_inventory::{
-    projected_snapshot_store_inventory_identity, SnapshotStoreInventoryIdentity,
+    projected_snapshot_store_batch_inventory_identity, projected_snapshot_store_inventory_identity,
+    SnapshotStoreInventoryIdentity,
 };
 use crate::snapshot_store_transaction::{
     SnapshotStoreReadTransaction, SnapshotStoreTransactionError, SnapshotStoreWriteTransaction,
@@ -32,6 +33,17 @@ const HEAD_PENDING_HEADER_BYTES: usize = 176;
 const HEAD_PENDING_MAC_BYTES: usize = 32;
 const HEAD_PENDING_BYTES: usize = HEAD_PENDING_HEADER_BYTES + HEAD_PENDING_MAC_BYTES;
 const HEAD_PENDING_FILE: &str = "snapshot-store-head-pending";
+const HEAD_BATCH_PENDING_DOMAIN: &[u8] = b"security-lab-snapshot-store-head-batch-pending-v1\0";
+const HEAD_BATCH_PENDING_MAGIC: [u8; 8] = *b"SLHBPN1\0";
+const HEAD_BATCH_PENDING_FIXED_BYTES: usize = 128;
+const HEAD_BATCH_PENDING_ENTRY_BYTES: usize = 208;
+const HEAD_BATCH_PENDING_HEADER_BYTES: usize = HEAD_BATCH_PENDING_FIXED_BYTES
+    + SNAPSHOT_STORE_HEAD_MAX_BATCH_ITEMS * HEAD_BATCH_PENDING_ENTRY_BYTES;
+const HEAD_BATCH_PENDING_MAC_BYTES: usize = 32;
+const HEAD_BATCH_PENDING_BYTES: usize =
+    HEAD_BATCH_PENDING_HEADER_BYTES + HEAD_BATCH_PENDING_MAC_BYTES;
+const HEAD_BATCH_PENDING_FILE: &str = "snapshot-store-head-batch-pending";
+const HEAD_BATCH_STAGE_PREFIX: &str = "snapshot-store-head-batch-stage-";
 pub const SNAPSHOT_STORE_HEAD_STATE_KEY_BYTES: usize = 32;
 pub const SNAPSHOT_STORE_HEAD_MAX_BATCH_ITEMS: usize = 16;
 
@@ -52,14 +64,14 @@ impl SnapshotStoreHeadStateKey {
         &self.0
     }
 
-    /// Recover an authenticated pending single-object publication and return
-    /// the exact head identity after convergence.
+    /// Recover an authenticated pending publication and return the exact head
+    /// identity after convergence.
     ///
-    /// Recovery never accepts an arbitrary observed store inventory as the new
-    /// head. The pending HMAC record commits to one exact predecessor and one
-    /// exact successor. Only predecessor/predecessor,
-    /// predecessor/successor, or successor/successor can converge; every other
-    /// combination remains pending and fails closed.
+    /// Single-object recovery accepts only the exact predecessor or successor.
+    /// Batch recovery additionally accepts only authenticated intermediate
+    /// inventories committed by the batch journal, validates every durable
+    /// staged archive before replay, and then converges to the exact successor.
+    /// Arbitrary observed store inventories are never promoted to head state.
     pub fn recover_pending_publication(
         &self,
         state_root: &Path,
@@ -101,6 +113,29 @@ struct SnapshotStoreHeadPendingIntent {
     successor: SnapshotStoreHeadStateIdentity,
     candidate_identity: SnapshotIdentity,
     candidate_archive_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SnapshotStoreHeadValidatedBatchItem {
+    identity: SnapshotIdentity,
+    archive_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SnapshotStoreHeadBatchPendingEntry {
+    identity: SnapshotIdentity,
+    archive_bytes: u64,
+    public_key: [u8; SNAPSHOT_ED25519_PUBLIC_KEY_BYTES],
+    signature: [u8; SNAPSHOT_ED25519_SIGNATURE_BYTES],
+    preexisting: bool,
+    after_inventory: Option<SnapshotStoreInventoryIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SnapshotStoreHeadBatchPendingIntent {
+    previous: SnapshotStoreHeadStateIdentity,
+    successor: SnapshotStoreHeadStateIdentity,
+    entries: Vec<SnapshotStoreHeadBatchPendingEntry>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -395,14 +430,14 @@ pub fn store_snapshot_archives_ed25519_durable_with_head_state(
     request: SnapshotStoreHeadBatchPublishRequest<'_>,
 ) -> Result<SnapshotStoreHeadBatchPutReport, SnapshotStoreHeadStateError> {
     validate_roots(state_root, store_root)?;
-    validate_batch_request(&request)?;
+    let validated = validate_batch_request(&request)?;
     #[cfg(target_os = "linux")]
     {
-        linux::store_batch(state_root, state_key, store_root, request)
+        linux::store_batch(state_root, state_key, store_root, request, &validated)
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (state_root, state_key, store_root, request);
+        let _ = (state_root, state_key, store_root, request, validated);
         Err(SnapshotStoreHeadStateError::UnsupportedPlatform(
             "authenticated durable store-head batch publication currently requires Linux flock, fsync, and cooperative snapshot-store transactions"
                 .to_owned(),
@@ -412,7 +447,7 @@ pub fn store_snapshot_archives_ed25519_durable_with_head_state(
 
 fn validate_batch_request(
     request: &SnapshotStoreHeadBatchPublishRequest<'_>,
-) -> Result<(), SnapshotStoreHeadStateError> {
+) -> Result<Vec<SnapshotStoreHeadValidatedBatchItem>, SnapshotStoreHeadStateError> {
     if request.items.is_empty() {
         return Err(SnapshotStoreHeadStateError::InvalidInput(
             "batch publication requires at least one item".to_owned(),
@@ -424,7 +459,8 @@ fn validate_batch_request(
         )));
     }
 
-    let mut identities = Vec::with_capacity(request.items.len());
+    let mut validated = Vec::with_capacity(request.items.len());
+    let mut staged_archive_bytes = 0u64;
     for (index, item) in request.items.iter().enumerate() {
         let identity = validate_snapshot_archive_ed25519(
             item.archive,
@@ -436,14 +472,42 @@ fn validate_batch_request(
             index,
             source: Box::new(source),
         })?;
-        if let Some(first_index) = identities.iter().position(|existing| *existing == identity) {
+        if let Some(first_index) =
+            validated
+                .iter()
+                .position(|existing: &SnapshotStoreHeadValidatedBatchItem| {
+                    existing.identity == identity
+                })
+        {
             return Err(SnapshotStoreHeadStateError::InvalidInput(format!(
                 "batch item {index} duplicates canonical identity from item {first_index}"
             )));
         }
-        identities.push(identity);
+        let archive_bytes = u64::try_from(item.archive.len()).map_err(|_| {
+            SnapshotStoreHeadStateError::InvalidInput(format!(
+                "batch item {index} archive length does not fit u64"
+            ))
+        })?;
+        staged_archive_bytes =
+            staged_archive_bytes
+                .checked_add(archive_bytes)
+                .ok_or_else(|| {
+                    SnapshotStoreHeadStateError::InvalidInput(
+                        "batch staged archive-byte accounting overflow".to_owned(),
+                    )
+                })?;
+        if staged_archive_bytes > request.inventory_limits.max_total_archive_bytes {
+            return Err(SnapshotStoreHeadStateError::InvalidInput(format!(
+                "batch staged archive bytes exceed inventory aggregate budget: limit={} attempted={staged_archive_bytes}",
+                request.inventory_limits.max_total_archive_bytes
+            )));
+        }
+        validated.push(SnapshotStoreHeadValidatedBatchItem {
+            identity,
+            archive_bytes,
+        });
     }
-    Ok(())
+    Ok(validated)
 }
 
 fn validate_roots(state_root: &Path, store_root: &Path) -> Result<(), SnapshotStoreHeadStateError> {
@@ -654,6 +718,241 @@ fn decode_pending(
     })
 }
 
+fn encode_batch_pending(
+    intent: &SnapshotStoreHeadBatchPendingIntent,
+    state_key: &SnapshotStoreHeadStateKey,
+) -> [u8; HEAD_BATCH_PENDING_BYTES] {
+    debug_assert!(!intent.entries.is_empty());
+    debug_assert!(intent.entries.len() <= SNAPSHOT_STORE_HEAD_MAX_BATCH_ITEMS);
+    let mut bytes = [0u8; HEAD_BATCH_PENDING_BYTES];
+    bytes[0..8].copy_from_slice(&HEAD_BATCH_PENDING_MAGIC);
+    encode_identity_fields(&mut bytes[8..64], intent.previous);
+    encode_identity_fields(&mut bytes[64..120], intent.successor);
+    bytes[120..128].copy_from_slice(&(intent.entries.len() as u64).to_le_bytes());
+
+    for (index, entry) in intent.entries.iter().enumerate() {
+        let offset = HEAD_BATCH_PENDING_FIXED_BYTES + index * HEAD_BATCH_PENDING_ENTRY_BYTES;
+        let slot = &mut bytes[offset..offset + HEAD_BATCH_PENDING_ENTRY_BYTES];
+        slot[0..32].copy_from_slice(&entry.identity.sha256);
+        slot[32..40].copy_from_slice(&entry.identity.encoded_bytes.to_le_bytes());
+        slot[40..48].copy_from_slice(&entry.identity.nodes.to_le_bytes());
+        slot[48..56].copy_from_slice(&entry.archive_bytes.to_le_bytes());
+        slot[56..88].copy_from_slice(&entry.public_key);
+        slot[88..152].copy_from_slice(&entry.signature);
+        slot[152] = u8::from(entry.preexisting);
+        if let Some(after) = entry.after_inventory {
+            encode_inventory_fields(&mut slot[160..208], after);
+        }
+    }
+
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(state_key.as_bytes())
+        .expect("fixed-size HMAC key is always accepted");
+    mac.update(HEAD_BATCH_PENDING_DOMAIN);
+    mac.update(&bytes[..HEAD_BATCH_PENDING_HEADER_BYTES]);
+    bytes[HEAD_BATCH_PENDING_HEADER_BYTES..].copy_from_slice(&mac.finalize().into_bytes());
+    bytes
+}
+
+fn decode_batch_pending(
+    bytes: &[u8; HEAD_BATCH_PENDING_BYTES],
+    state_key: &SnapshotStoreHeadStateKey,
+) -> Result<SnapshotStoreHeadBatchPendingIntent, SnapshotStoreHeadStateError> {
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(state_key.as_bytes())
+        .expect("fixed-size HMAC key is always accepted");
+    mac.update(HEAD_BATCH_PENDING_DOMAIN);
+    mac.update(&bytes[..HEAD_BATCH_PENDING_HEADER_BYTES]);
+    mac.verify_slice(&bytes[HEAD_BATCH_PENDING_HEADER_BYTES..])
+        .map_err(|_| SnapshotStoreHeadStateError::AuthenticationFailed)?;
+
+    if bytes[0..8] != HEAD_BATCH_PENDING_MAGIC {
+        return Err(SnapshotStoreHeadStateError::InvalidState(
+            "unexpected batch pending store-head magic/version".to_owned(),
+        ));
+    }
+    let previous = decode_identity_fields(&bytes[8..64])?;
+    let successor = decode_identity_fields(&bytes[64..120])?;
+    let count_u64 = u64::from_le_bytes(
+        bytes[120..128]
+            .try_into()
+            .expect("fixed batch pending item-count width"),
+    );
+    let count = usize::try_from(count_u64).map_err(|_| {
+        SnapshotStoreHeadStateError::InvalidState(
+            "batch pending item count does not fit usize".to_owned(),
+        )
+    })?;
+    if count == 0 || count > SNAPSHOT_STORE_HEAD_MAX_BATCH_ITEMS {
+        return Err(SnapshotStoreHeadStateError::InvalidState(format!(
+            "batch pending item count must be between 1 and {SNAPSHOT_STORE_HEAD_MAX_BATCH_ITEMS}"
+        )));
+    }
+    let expected_generation = previous.generation.checked_add(1).ok_or_else(|| {
+        SnapshotStoreHeadStateError::InvalidState(
+            "batch pending predecessor generation is exhausted".to_owned(),
+        )
+    })?;
+    if successor.generation != expected_generation {
+        return Err(SnapshotStoreHeadStateError::InvalidState(
+            "batch pending successor generation must advance exactly once".to_owned(),
+        ));
+    }
+
+    let mut entries = Vec::with_capacity(count);
+    let mut expected_objects = previous.inventory.objects;
+    let mut expected_archive_bytes = previous.inventory.archive_bytes;
+    let mut last_after = None;
+    for index in 0..count {
+        let offset = HEAD_BATCH_PENDING_FIXED_BYTES + index * HEAD_BATCH_PENDING_ENTRY_BYTES;
+        let slot = &bytes[offset..offset + HEAD_BATCH_PENDING_ENTRY_BYTES];
+        let mut sha256 = [0u8; 32];
+        sha256.copy_from_slice(&slot[0..32]);
+        let identity = SnapshotIdentity {
+            sha256,
+            encoded_bytes: u64::from_le_bytes(
+                slot[32..40]
+                    .try_into()
+                    .expect("fixed batch pending encoded-byte width"),
+            ),
+            nodes: u64::from_le_bytes(
+                slot[40..48]
+                    .try_into()
+                    .expect("fixed batch pending node-count width"),
+            ),
+        };
+        let archive_bytes = u64::from_le_bytes(
+            slot[48..56]
+                .try_into()
+                .expect("fixed batch pending archive-byte width"),
+        );
+        if identity.encoded_bytes == 0 || identity.nodes == 0 || archive_bytes == 0 {
+            return Err(SnapshotStoreHeadStateError::InvalidState(format!(
+                "batch pending item {index} has zero identity/archive accounting"
+            )));
+        }
+        if entries
+            .iter()
+            .any(|existing: &SnapshotStoreHeadBatchPendingEntry| existing.identity == identity)
+        {
+            return Err(SnapshotStoreHeadStateError::InvalidState(format!(
+                "batch pending item {index} duplicates an earlier canonical identity"
+            )));
+        }
+        let mut public_key = [0u8; SNAPSHOT_ED25519_PUBLIC_KEY_BYTES];
+        public_key.copy_from_slice(&slot[56..88]);
+        let mut signature = [0u8; SNAPSHOT_ED25519_SIGNATURE_BYTES];
+        signature.copy_from_slice(&slot[88..152]);
+        let preexisting = match slot[152] {
+            0 => false,
+            1 => true,
+            _ => {
+                return Err(SnapshotStoreHeadStateError::InvalidState(format!(
+                    "batch pending item {index} has invalid preexisting flag"
+                )))
+            }
+        };
+        if slot[153..160].iter().any(|byte| *byte != 0) {
+            return Err(SnapshotStoreHeadStateError::InvalidState(format!(
+                "batch pending item {index} has non-zero reserved bytes"
+            )));
+        }
+        let after_inventory = if preexisting {
+            if slot[160..208].iter().any(|byte| *byte != 0) {
+                return Err(SnapshotStoreHeadStateError::InvalidState(format!(
+                    "batch pending preexisting item {index} must not carry an intermediate inventory"
+                )));
+            }
+            None
+        } else {
+            expected_objects = expected_objects.checked_add(1).ok_or_else(|| {
+                SnapshotStoreHeadStateError::InvalidState(
+                    "batch pending predecessor object count is exhausted".to_owned(),
+                )
+            })?;
+            expected_archive_bytes = expected_archive_bytes
+                .checked_add(archive_bytes)
+                .ok_or_else(|| {
+                    SnapshotStoreHeadStateError::InvalidState(
+                        "batch pending successor archive-byte accounting overflow".to_owned(),
+                    )
+                })?;
+            let after = decode_inventory_fields(&slot[160..208])?;
+            if after.objects != expected_objects || after.archive_bytes != expected_archive_bytes {
+                return Err(SnapshotStoreHeadStateError::InvalidState(format!(
+                    "batch pending item {index} intermediate inventory counters are inconsistent"
+                )));
+            }
+            last_after = Some(after);
+            Some(after)
+        };
+        entries.push(SnapshotStoreHeadBatchPendingEntry {
+            identity,
+            archive_bytes,
+            public_key,
+            signature,
+            preexisting,
+            after_inventory,
+        });
+    }
+
+    let used = HEAD_BATCH_PENDING_FIXED_BYTES + count * HEAD_BATCH_PENDING_ENTRY_BYTES;
+    if bytes[used..HEAD_BATCH_PENDING_HEADER_BYTES]
+        .iter()
+        .any(|byte| *byte != 0)
+    {
+        return Err(SnapshotStoreHeadStateError::InvalidState(
+            "unused batch pending entry bytes must be zero".to_owned(),
+        ));
+    }
+    let final_after = last_after.ok_or_else(|| {
+        SnapshotStoreHeadStateError::InvalidState(
+            "batch pending intent must contain at least one new object".to_owned(),
+        )
+    })?;
+    if final_after != successor.inventory {
+        return Err(SnapshotStoreHeadStateError::InvalidState(
+            "batch pending final intermediate inventory must equal successor".to_owned(),
+        ));
+    }
+
+    Ok(SnapshotStoreHeadBatchPendingIntent {
+        previous,
+        successor,
+        entries,
+    })
+}
+
+fn encode_inventory_fields(bytes: &mut [u8], identity: SnapshotStoreInventoryIdentity) {
+    debug_assert_eq!(bytes.len(), 48);
+    bytes[0..32].copy_from_slice(&identity.sha256);
+    bytes[32..40].copy_from_slice(&identity.objects.to_le_bytes());
+    bytes[40..48].copy_from_slice(&identity.archive_bytes.to_le_bytes());
+}
+
+fn decode_inventory_fields(
+    bytes: &[u8],
+) -> Result<SnapshotStoreInventoryIdentity, SnapshotStoreHeadStateError> {
+    if bytes.len() != 48 {
+        return Err(SnapshotStoreHeadStateError::InvalidState(
+            "invalid batch pending inventory width".to_owned(),
+        ));
+    }
+    let mut sha256 = [0u8; 32];
+    sha256.copy_from_slice(&bytes[0..32]);
+    Ok(SnapshotStoreInventoryIdentity {
+        sha256,
+        objects: u64::from_le_bytes(
+            bytes[32..40]
+                .try_into()
+                .expect("fixed batch pending inventory object-count width"),
+        ),
+        archive_bytes: u64::from_le_bytes(
+            bytes[40..48]
+                .try_into()
+                .expect("fixed batch pending inventory archive-byte width"),
+        ),
+    })
+}
+
 fn encode_identity_fields(bytes: &mut [u8], identity: SnapshotStoreHeadStateIdentity) {
     debug_assert_eq!(bytes.len(), 56);
     bytes[0..8].copy_from_slice(&identity.generation.to_le_bytes());
@@ -705,13 +1004,17 @@ fn decode_identity_fields(
 #[cfg(target_os = "linux")]
 mod linux {
     use super::{
-        decode_pending, decode_state, encode_pending, encode_state,
+        decode_batch_pending, decode_pending, decode_state, encode_batch_pending, encode_pending,
+        encode_state, projected_snapshot_store_batch_inventory_identity,
         projected_snapshot_store_inventory_identity, validate_snapshot_archive_ed25519,
-        SnapshotStoreAuditLimits, SnapshotStoreHeadBatchPublishRequest,
+        SnapshotStoreAuditLimits, SnapshotStoreHeadBatchPendingEntry,
+        SnapshotStoreHeadBatchPendingIntent, SnapshotStoreHeadBatchPublishRequest,
         SnapshotStoreHeadBatchPutReport, SnapshotStoreHeadPendingIntent,
         SnapshotStoreHeadPublishRequest, SnapshotStoreHeadPutReport, SnapshotStoreHeadStateError,
-        SnapshotStoreHeadStateIdentity, SnapshotStoreHeadStateKey, SnapshotStoreInventoryIdentity,
+        SnapshotStoreHeadStateIdentity, SnapshotStoreHeadStateKey,
+        SnapshotStoreHeadValidatedBatchItem, SnapshotStoreInventoryIdentity,
         SnapshotStoreReadTransaction, SnapshotStoreTransactionError, SnapshotStoreWriteTransaction,
+        HEAD_BATCH_PENDING_BYTES, HEAD_BATCH_PENDING_FILE, HEAD_BATCH_STAGE_PREFIX,
         HEAD_PENDING_BYTES, HEAD_PENDING_FILE, HEAD_STATE_BYTES, HEAD_STATE_FILE, HEAD_STATE_LOCK,
     };
     use std::ffi::CString;
@@ -903,6 +1206,7 @@ mod linux {
         state_key: &SnapshotStoreHeadStateKey,
         store_root: &Path,
         request: SnapshotStoreHeadBatchPublishRequest<'_>,
+        validated: &[SnapshotStoreHeadValidatedBatchItem],
     ) -> Result<SnapshotStoreHeadBatchPutReport, SnapshotStoreHeadStateError> {
         let guard = lock_state(state_root, libc::LOCK_EX)?;
         require_no_pending(guard.root.raw(), state_key)?;
@@ -915,36 +1219,132 @@ mod linux {
         }
 
         let writer = SnapshotStoreWriteTransaction::begin(store_root)?;
-        let actual = writer.inventory_identity(request.inventory_limits)?;
-        require_inventory(previous, actual)?;
+        let candidates: Vec<_> = validated
+            .iter()
+            .map(|item| (item.identity, item.archive_bytes))
+            .collect();
+        let (current, projected, after_each) = projected_snapshot_store_batch_inventory_identity(
+            store_root,
+            request.inventory_limits,
+            &candidates,
+        )
+        .map_err(|source| {
+            SnapshotStoreHeadStateError::Transaction(Box::new(
+                SnapshotStoreTransactionError::Inventory(source),
+            ))
+        })?;
+        require_inventory(previous, current)?;
 
-        let mut puts = Vec::with_capacity(request.items.len());
-        let mut inserted_any = false;
-        for item in request.items {
+        let mut puts: Vec<Option<crate::snapshot_store::SnapshotStorePutReport>> =
+            vec![None; request.items.len()];
+        for (index, ((item, validated_item), after)) in request
+            .items
+            .iter()
+            .zip(validated.iter())
+            .zip(after_each.iter())
+            .enumerate()
+        {
+            if after.is_none() {
+                let put = writer.store_ed25519_durable(
+                    item.archive,
+                    item.public_key,
+                    item.expected_signature,
+                    item.archive_limits,
+                )?;
+                if put.inserted
+                    || put.identity != validated_item.identity
+                    || put.archive_bytes != validated_item.archive_bytes
+                {
+                    let actual = writer.inventory_identity(request.inventory_limits)?;
+                    return Err(SnapshotStoreHeadStateError::StoreDiverged {
+                        anchored: previous,
+                        actual,
+                    });
+                }
+                puts[index] = Some(put);
+            }
+        }
+
+        if projected == current {
+            return Ok(SnapshotStoreHeadBatchPutReport {
+                puts: puts
+                    .into_iter()
+                    .map(|put| put.expect("all-deduplicated batch preflights every item"))
+                    .collect(),
+                previous,
+                successor: previous,
+            });
+        }
+
+        let successor = SnapshotStoreHeadStateIdentity {
+            generation: previous.generation + 1,
+            inventory: projected,
+        };
+        let entries = request
+            .items
+            .iter()
+            .zip(validated.iter())
+            .zip(after_each.iter())
+            .map(
+                |((item, validated_item), after)| SnapshotStoreHeadBatchPendingEntry {
+                    identity: validated_item.identity,
+                    archive_bytes: validated_item.archive_bytes,
+                    public_key: *item.public_key,
+                    signature: *item.expected_signature,
+                    preexisting: after.is_none(),
+                    after_inventory: *after,
+                },
+            )
+            .collect();
+        let pending = SnapshotStoreHeadBatchPendingIntent {
+            previous,
+            successor,
+            entries,
+        };
+        write_batch_pending(guard.root.raw(), state_key, &pending)?;
+        write_batch_stages(guard.root.raw(), &request)?;
+
+        for (index, ((item, validated_item), after)) in request
+            .items
+            .iter()
+            .zip(validated.iter())
+            .zip(after_each.iter())
+            .enumerate()
+        {
+            let Some(expected_after) = after else {
+                continue;
+            };
             let put = writer.store_ed25519_durable(
                 item.archive,
                 item.public_key,
                 item.expected_signature,
                 item.archive_limits,
             )?;
-            inserted_any |= put.inserted;
-            puts.push(put);
+            if put.identity != validated_item.identity
+                || put.archive_bytes != validated_item.archive_bytes
+            {
+                let actual = writer.inventory_identity(request.inventory_limits)?;
+                return Err(batch_pending_diverged(&pending, previous, actual));
+            }
+            puts[index] = Some(put);
+            let actual = writer.inventory_identity(request.inventory_limits)?;
+            if actual != *expected_after {
+                return Err(batch_pending_diverged(&pending, previous, actual));
+            }
         }
 
-        let successor = if inserted_any {
-            let inventory = writer.inventory_identity(request.inventory_limits)?;
-            let successor = SnapshotStoreHeadStateIdentity {
-                generation: previous.generation + 1,
-                inventory,
-            };
-            write_state(guard.root.raw(), state_key, successor, true)?;
-            successor
-        } else {
-            previous
-        };
+        let actual = writer.inventory_identity(request.inventory_limits)?;
+        if actual != successor.inventory {
+            return Err(batch_pending_diverged(&pending, previous, actual));
+        }
+        write_state(guard.root.raw(), state_key, successor, true)?;
+        clear_batch_recovery_files(guard.root.raw(), pending.entries.len())?;
 
         Ok(SnapshotStoreHeadBatchPutReport {
-            puts,
+            puts: puts
+                .into_iter()
+                .map(|put| put.expect("every batch item has a publication report"))
+                .collect(),
             previous,
             successor,
         })
@@ -961,14 +1361,49 @@ mod linux {
             .ok_or(SnapshotStoreHeadStateError::NotInitialized)?;
         let writer = SnapshotStoreWriteTransaction::begin(store_root)?;
         let actual = writer.inventory_identity(inventory_limits)?;
+        let single = read_pending_optional(guard.root.raw(), state_key)?;
+        let batch = read_batch_pending_optional(guard.root.raw(), state_key)?;
 
-        let Some(pending) = read_pending_optional(guard.root.raw(), state_key)? else {
-            require_inventory(anchored, actual)?;
-            return Ok(anchored);
-        };
+        match (single, batch) {
+            (Some(_), Some(_)) => Err(SnapshotStoreHeadStateError::InvalidState(
+                "single-object and batch pending publications coexist".to_owned(),
+            )),
+            (Some(pending), None) => recover_single(
+                guard.root.raw(),
+                state_key,
+                &writer,
+                inventory_limits,
+                anchored,
+                actual,
+                pending,
+            ),
+            (None, Some(pending)) => recover_batch(
+                guard.root.raw(),
+                state_key,
+                &writer,
+                inventory_limits,
+                anchored,
+                actual,
+                pending,
+            ),
+            (None, None) => {
+                require_inventory(anchored, actual)?;
+                Ok(anchored)
+            }
+        }
+    }
 
+    fn recover_single(
+        root_fd: RawFd,
+        state_key: &SnapshotStoreHeadStateKey,
+        writer: &SnapshotStoreWriteTransaction,
+        inventory_limits: SnapshotStoreAuditLimits,
+        anchored: SnapshotStoreHeadStateIdentity,
+        actual: SnapshotStoreInventoryIdentity,
+        pending: SnapshotStoreHeadPendingIntent,
+    ) -> Result<SnapshotStoreHeadStateIdentity, SnapshotStoreHeadStateError> {
         if anchored == pending.previous && actual == pending.previous.inventory {
-            clear_pending(guard.root.raw())?;
+            clear_pending(root_fd)?;
             return Ok(anchored);
         }
 
@@ -984,13 +1419,13 @@ mod linux {
                     actual: durable_actual,
                 });
             }
-            write_state(guard.root.raw(), state_key, pending.successor, true)?;
-            clear_pending(guard.root.raw())?;
+            write_state(root_fd, state_key, pending.successor, true)?;
+            clear_pending(root_fd)?;
             return Ok(pending.successor);
         }
 
         if anchored == pending.successor && actual == pending.successor.inventory {
-            clear_pending(guard.root.raw())?;
+            clear_pending(root_fd)?;
             return Ok(anchored);
         }
 
@@ -1000,6 +1435,106 @@ mod linux {
             anchored,
             actual,
         })
+    }
+
+    fn recover_batch(
+        root_fd: RawFd,
+        state_key: &SnapshotStoreHeadStateKey,
+        writer: &SnapshotStoreWriteTransaction,
+        inventory_limits: SnapshotStoreAuditLimits,
+        anchored: SnapshotStoreHeadStateIdentity,
+        actual: SnapshotStoreInventoryIdentity,
+        pending: SnapshotStoreHeadBatchPendingIntent,
+    ) -> Result<SnapshotStoreHeadStateIdentity, SnapshotStoreHeadStateError> {
+        if anchored == pending.previous && actual == pending.previous.inventory {
+            clear_batch_recovery_files(root_fd, pending.entries.len())?;
+            return Ok(anchored);
+        }
+
+        if anchored == pending.successor && actual == pending.successor.inventory {
+            clear_batch_recovery_files(root_fd, pending.entries.len())?;
+            return Ok(anchored);
+        }
+
+        if anchored != pending.previous {
+            return Err(batch_pending_diverged(&pending, anchored, actual));
+        }
+
+        let mut observed_new = None;
+        let mut new_count = 0usize;
+        for entry in &pending.entries {
+            if let Some(after) = entry.after_inventory {
+                new_count += 1;
+                if after == actual {
+                    observed_new = Some(new_count);
+                }
+            }
+        }
+        let Some(observed_new) = observed_new else {
+            return Err(batch_pending_diverged(&pending, anchored, actual));
+        };
+
+        let staged = read_and_validate_batch_stages(root_fd, &pending, inventory_limits)?;
+        let mut replay_new = 0usize;
+        for (index, (entry, archive)) in pending.entries.iter().zip(staged.iter()).enumerate() {
+            let put = writer.store_ed25519_durable(
+                archive,
+                &entry.public_key,
+                &entry.signature,
+                inventory_limits.archive,
+            )?;
+            if put.identity != entry.identity || put.archive_bytes != entry.archive_bytes {
+                let actual = writer.inventory_identity(inventory_limits)?;
+                return Err(batch_pending_diverged(&pending, anchored, actual));
+            }
+            if entry.preexisting {
+                if put.inserted {
+                    let actual = writer.inventory_identity(inventory_limits)?;
+                    return Err(batch_pending_diverged(&pending, anchored, actual));
+                }
+                continue;
+            }
+
+            replay_new += 1;
+            if replay_new <= observed_new {
+                if put.inserted {
+                    let actual = writer.inventory_identity(inventory_limits)?;
+                    return Err(batch_pending_diverged(&pending, anchored, actual));
+                }
+                continue;
+            }
+
+            let expected_after = entry.after_inventory.ok_or_else(|| {
+                SnapshotStoreHeadStateError::InvalidState(format!(
+                    "batch pending item {index} lost its intermediate inventory"
+                ))
+            })?;
+            let actual = writer.inventory_identity(inventory_limits)?;
+            if actual != expected_after {
+                return Err(batch_pending_diverged(&pending, anchored, actual));
+            }
+        }
+
+        let durable_actual = writer.inventory_identity(inventory_limits)?;
+        if durable_actual != pending.successor.inventory {
+            return Err(batch_pending_diverged(&pending, anchored, durable_actual));
+        }
+        write_state(root_fd, state_key, pending.successor, true)?;
+        clear_batch_recovery_files(root_fd, pending.entries.len())?;
+        Ok(pending.successor)
+    }
+
+    fn batch_pending_diverged(
+        pending: &SnapshotStoreHeadBatchPendingIntent,
+        anchored: SnapshotStoreHeadStateIdentity,
+        actual: SnapshotStoreInventoryIdentity,
+    ) -> SnapshotStoreHeadStateError {
+        SnapshotStoreHeadStateError::PendingStateDiverged {
+            previous: Box::new(pending.previous),
+            successor: Box::new(pending.successor),
+            anchored,
+            actual,
+        }
     }
 
     fn require_inventory(
@@ -1016,13 +1551,22 @@ mod linux {
         root_fd: RawFd,
         state_key: &SnapshotStoreHeadStateKey,
     ) -> Result<(), SnapshotStoreHeadStateError> {
-        if let Some(pending) = read_pending_optional(root_fd, state_key)? {
-            return Err(SnapshotStoreHeadStateError::RecoveryRequired {
+        let single = read_pending_optional(root_fd, state_key)?;
+        let batch = read_batch_pending_optional(root_fd, state_key)?;
+        match (single, batch) {
+            (Some(_), Some(_)) => Err(SnapshotStoreHeadStateError::InvalidState(
+                "single-object and batch pending publications coexist".to_owned(),
+            )),
+            (Some(pending), None) => Err(SnapshotStoreHeadStateError::RecoveryRequired {
                 previous: pending.previous,
                 successor: pending.successor,
-            });
+            }),
+            (None, Some(pending)) => Err(SnapshotStoreHeadStateError::RecoveryRequired {
+                previous: pending.previous,
+                successor: pending.successor,
+            }),
+            (None, None) => Ok(()),
         }
-        Ok(())
     }
 
     fn read_pending_optional(
@@ -1061,6 +1605,292 @@ mod linux {
         let mut bytes = [0u8; HEAD_PENDING_BYTES];
         read_exact_pending(fd.raw(), &mut bytes)?;
         Ok(Some(decode_pending(&bytes, state_key)?))
+    }
+
+    fn read_batch_pending_optional(
+        root_fd: RawFd,
+        state_key: &SnapshotStoreHeadStateKey,
+    ) -> Result<Option<SnapshotStoreHeadBatchPendingIntent>, SnapshotStoreHeadStateError> {
+        let name =
+            CString::new(HEAD_BATCH_PENDING_FILE).expect("fixed batch pending filename has no NUL");
+        let fd = unsafe {
+            libc::openat(
+                root_fd,
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if fd < 0 {
+            let source = std::io::Error::last_os_error();
+            if source.raw_os_error() == Some(libc::ENOENT) {
+                return Ok(None);
+            }
+            return Err(SnapshotStoreHeadStateError::Io {
+                phase: "open batch pending snapshot store head publication",
+                source,
+            });
+        }
+        let fd = OwnedFd(fd);
+        let stat = require_regular_single_link(
+            fd.raw(),
+            "validate batch pending snapshot store head publication",
+        )?;
+        if stat.st_size != HEAD_BATCH_PENDING_BYTES as libc::off_t {
+            return Err(SnapshotStoreHeadStateError::InvalidState(format!(
+                "batch pending state file length {} does not equal {HEAD_BATCH_PENDING_BYTES}",
+                stat.st_size
+            )));
+        }
+        let mut bytes = [0u8; HEAD_BATCH_PENDING_BYTES];
+        read_exact_named(
+            fd.raw(),
+            &mut bytes,
+            "read batch pending snapshot store head publication",
+            "batch pending snapshot store head publication ended early",
+        )?;
+        Ok(Some(decode_batch_pending(&bytes, state_key)?))
+    }
+
+    fn write_batch_pending(
+        root_fd: RawFd,
+        state_key: &SnapshotStoreHeadStateKey,
+        pending: &SnapshotStoreHeadBatchPendingIntent,
+    ) -> Result<(), SnapshotStoreHeadStateError> {
+        let name =
+            CString::new(HEAD_BATCH_PENDING_FILE).expect("fixed batch pending filename has no NUL");
+        let fd = unsafe {
+            libc::openat(
+                root_fd,
+                name.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                0o600,
+            )
+        };
+        if fd < 0 {
+            let source = std::io::Error::last_os_error();
+            if source.raw_os_error() == Some(libc::EEXIST) {
+                return Err(SnapshotStoreHeadStateError::InvalidState(
+                    "batch pending store-head publication appeared while state lock was held"
+                        .to_owned(),
+                ));
+            }
+            return Err(SnapshotStoreHeadStateError::Io {
+                phase: "create batch pending snapshot store head publication",
+                source,
+            });
+        }
+        let fd = OwnedFd(fd);
+        require_regular_single_link(
+            fd.raw(),
+            "validate batch pending snapshot store head publication",
+        )?;
+        let bytes = encode_batch_pending(pending, state_key);
+        write_all_named(
+            fd.raw(),
+            &bytes,
+            "write batch pending snapshot store head publication",
+            "batch pending snapshot store head publication write made no progress",
+        )?;
+        if unsafe { libc::fsync(fd.raw()) } != 0 {
+            return Err(SnapshotStoreHeadStateError::Io {
+                phase: "fsync batch pending snapshot store head publication",
+                source: std::io::Error::last_os_error(),
+            });
+        }
+        drop(fd);
+        if unsafe { libc::fsync(root_fd) } != 0 {
+            return Err(SnapshotStoreHeadStateError::Io {
+                phase: "fsync head-state directory after batch pending publication",
+                source: std::io::Error::last_os_error(),
+            });
+        }
+        Ok(())
+    }
+
+    fn batch_stage_name(index: usize) -> CString {
+        CString::new(format!("{HEAD_BATCH_STAGE_PREFIX}{index:02}"))
+            .expect("fixed batch stage filename has no NUL")
+    }
+
+    fn write_batch_stages(
+        root_fd: RawFd,
+        request: &SnapshotStoreHeadBatchPublishRequest<'_>,
+    ) -> Result<(), SnapshotStoreHeadStateError> {
+        for (index, item) in request.items.iter().enumerate() {
+            let name = batch_stage_name(index);
+            let fd = unsafe {
+                libc::openat(
+                    root_fd,
+                    name.as_ptr(),
+                    libc::O_WRONLY
+                        | libc::O_CREAT
+                        | libc::O_EXCL
+                        | libc::O_CLOEXEC
+                        | libc::O_NOFOLLOW,
+                    0o600,
+                )
+            };
+            if fd < 0 {
+                return Err(SnapshotStoreHeadStateError::Io {
+                    phase: "create durable batch recovery stage",
+                    source: std::io::Error::last_os_error(),
+                });
+            }
+            let fd = OwnedFd(fd);
+            require_regular_single_link(fd.raw(), "validate durable batch recovery stage")?;
+            write_all_named(
+                fd.raw(),
+                item.archive,
+                "write durable batch recovery stage",
+                "durable batch recovery stage write made no progress",
+            )?;
+            if unsafe { libc::fchmod(fd.raw(), 0o400) } != 0 {
+                return Err(SnapshotStoreHeadStateError::Io {
+                    phase: "seal durable batch recovery stage read-only",
+                    source: std::io::Error::last_os_error(),
+                });
+            }
+            if unsafe { libc::fsync(fd.raw()) } != 0 {
+                return Err(SnapshotStoreHeadStateError::Io {
+                    phase: "fsync durable batch recovery stage",
+                    source: std::io::Error::last_os_error(),
+                });
+            }
+        }
+        if unsafe { libc::fsync(root_fd) } != 0 {
+            return Err(SnapshotStoreHeadStateError::Io {
+                phase: "fsync head-state directory after batch recovery staging",
+                source: std::io::Error::last_os_error(),
+            });
+        }
+        Ok(())
+    }
+
+    fn read_and_validate_batch_stages(
+        root_fd: RawFd,
+        pending: &SnapshotStoreHeadBatchPendingIntent,
+        inventory_limits: SnapshotStoreAuditLimits,
+    ) -> Result<Vec<Vec<u8>>, SnapshotStoreHeadStateError> {
+        let mut total = 0u64;
+        let mut staged = Vec::with_capacity(pending.entries.len());
+        for (index, entry) in pending.entries.iter().enumerate() {
+            total = total.checked_add(entry.archive_bytes).ok_or_else(|| {
+                SnapshotStoreHeadStateError::InvalidState(
+                    "batch staged archive-byte accounting overflow".to_owned(),
+                )
+            })?;
+            if total > inventory_limits.max_total_archive_bytes
+                || entry.archive_bytes > inventory_limits.archive.max_archive_bytes
+            {
+                return Err(SnapshotStoreHeadStateError::InvalidState(format!(
+                    "batch pending item {index} exceeds recovery archive-byte budgets"
+                )));
+            }
+            let name = batch_stage_name(index);
+            let fd = unsafe {
+                libc::openat(
+                    root_fd,
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+                )
+            };
+            if fd < 0 {
+                return Err(SnapshotStoreHeadStateError::Io {
+                    phase: "open durable batch recovery stage",
+                    source: std::io::Error::last_os_error(),
+                });
+            }
+            let fd = OwnedFd(fd);
+            let stat =
+                require_regular_single_link(fd.raw(), "validate durable batch recovery stage")?;
+            if stat.st_size < 0
+                || stat.st_size as u64 != entry.archive_bytes
+                || (stat.st_mode & 0o222) != 0
+            {
+                return Err(SnapshotStoreHeadStateError::InvalidState(format!(
+                    "batch recovery stage {index} has unexpected shape, writability, or length"
+                )));
+            }
+            let size = usize::try_from(entry.archive_bytes).map_err(|_| {
+                SnapshotStoreHeadStateError::InvalidState(format!(
+                    "batch recovery stage {index} length does not fit usize"
+                ))
+            })?;
+            let mut archive = Vec::new();
+            archive.try_reserve_exact(size).map_err(|_| {
+                SnapshotStoreHeadStateError::InvalidState(format!(
+                    "batch recovery stage {index} allocation failed"
+                ))
+            })?;
+            archive.resize(size, 0);
+            read_exact_named(
+                fd.raw(),
+                &mut archive,
+                "read durable batch recovery stage",
+                "durable batch recovery stage ended early",
+            )?;
+            let identity = validate_snapshot_archive_ed25519(
+                &archive,
+                &entry.public_key,
+                &entry.signature,
+                inventory_limits.archive,
+            )
+            .map_err(|source| {
+                SnapshotStoreHeadStateError::Transaction(Box::new(
+                    SnapshotStoreTransactionError::Store(source),
+                ))
+            })?;
+            if identity != entry.identity {
+                return Err(SnapshotStoreHeadStateError::InvalidState(format!(
+                    "batch recovery stage {index} canonical identity changed"
+                )));
+            }
+            staged.push(archive);
+        }
+        Ok(staged)
+    }
+
+    fn clear_batch_recovery_files(
+        root_fd: RawFd,
+        count: usize,
+    ) -> Result<(), SnapshotStoreHeadStateError> {
+        for index in 0..count {
+            let name = batch_stage_name(index);
+            if unsafe { libc::unlinkat(root_fd, name.as_ptr(), 0) } != 0 {
+                let source = std::io::Error::last_os_error();
+                if source.raw_os_error() != Some(libc::ENOENT) {
+                    return Err(SnapshotStoreHeadStateError::Io {
+                        phase: "remove completed batch recovery stage",
+                        source,
+                    });
+                }
+            }
+        }
+        if unsafe { libc::fsync(root_fd) } != 0 {
+            return Err(SnapshotStoreHeadStateError::Io {
+                phase: "fsync head-state directory after batch stage removal",
+                source: std::io::Error::last_os_error(),
+            });
+        }
+
+        let name =
+            CString::new(HEAD_BATCH_PENDING_FILE).expect("fixed batch pending filename has no NUL");
+        if unsafe { libc::unlinkat(root_fd, name.as_ptr(), 0) } != 0 {
+            let source = std::io::Error::last_os_error();
+            if source.raw_os_error() != Some(libc::ENOENT) {
+                return Err(SnapshotStoreHeadStateError::Io {
+                    phase: "remove completed batch pending publication",
+                    source,
+                });
+            }
+        }
+        if unsafe { libc::fsync(root_fd) } != 0 {
+            return Err(SnapshotStoreHeadStateError::Io {
+                phase: "fsync head-state directory after batch pending removal",
+                source: std::io::Error::last_os_error(),
+            });
+        }
+        Ok(())
     }
 
     fn write_pending(
@@ -1376,6 +2206,70 @@ mod linux {
                 ));
             }
             offset += read as usize;
+        }
+        Ok(())
+    }
+
+    fn read_exact_named(
+        fd: RawFd,
+        bytes: &mut [u8],
+        phase: &'static str,
+        eof_message: &'static str,
+    ) -> Result<(), SnapshotStoreHeadStateError> {
+        let mut offset = 0usize;
+        while offset < bytes.len() {
+            let read = unsafe {
+                libc::read(
+                    fd,
+                    bytes[offset..].as_mut_ptr().cast::<libc::c_void>(),
+                    bytes.len() - offset,
+                )
+            };
+            if read < 0 {
+                let source = std::io::Error::last_os_error();
+                if source.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                return Err(SnapshotStoreHeadStateError::Io { phase, source });
+            }
+            if read == 0 {
+                return Err(SnapshotStoreHeadStateError::InvalidState(
+                    eof_message.to_owned(),
+                ));
+            }
+            offset += read as usize;
+        }
+        Ok(())
+    }
+
+    fn write_all_named(
+        fd: RawFd,
+        bytes: &[u8],
+        phase: &'static str,
+        zero_message: &'static str,
+    ) -> Result<(), SnapshotStoreHeadStateError> {
+        let mut offset = 0usize;
+        while offset < bytes.len() {
+            let written = unsafe {
+                libc::write(
+                    fd,
+                    bytes[offset..].as_ptr().cast::<libc::c_void>(),
+                    bytes.len() - offset,
+                )
+            };
+            if written < 0 {
+                let source = std::io::Error::last_os_error();
+                if source.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                return Err(SnapshotStoreHeadStateError::Io { phase, source });
+            }
+            if written == 0 {
+                return Err(SnapshotStoreHeadStateError::InvalidState(
+                    zero_message.to_owned(),
+                ));
+            }
+            offset += written as usize;
         }
         Ok(())
     }

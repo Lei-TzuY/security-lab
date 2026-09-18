@@ -1305,17 +1305,16 @@ mod x86_64 {
                 .map_or(FIRST_NON_STDIO_FD as RawFd, |target_fd| {
                     target_fd as RawFd + 1
                 });
-            let executable_storage_floor =
-                if policy.seccomp.allowed_syscalls.contains("execveat") {
-                    selected_storage_floor
-                } else {
-                    if policy.limits.open_files >= i32::MAX as u64 {
-                        return Err(SandboxError::InvalidPolicy(PolicyError::new(
-                            "limit.open_files is too large for one-shot bootstrap exec isolation",
-                        )));
-                    }
-                    selected_storage_floor.max(policy.limits.open_files as RawFd)
-                };
+            let executable_storage_floor = if policy.seccomp.allowed_syscalls.contains("execveat") {
+                selected_storage_floor
+            } else {
+                if policy.limits.open_files >= i32::MAX as u64 {
+                    return Err(SandboxError::InvalidPolicy(PolicyError::new(
+                        "limit.open_files is too large for one-shot bootstrap exec isolation",
+                    )));
+                }
+                selected_storage_floor.max(policy.limits.open_files as RawFd)
+            };
             let executable_fd = move_owned_fd_to_selected_storage(
                 executable_fd,
                 executable_storage_floor,
@@ -2226,12 +2225,7 @@ mod x86_64 {
         // number and falls through to normal policy matching; because this
         // helper is installed only when execveat is absent from seccomp.allow,
         // that path ultimately receives the default EPERM.
-        filter.push(jump(
-            BPF_JMP_JEQ_K,
-            libc::SYS_execveat as u32,
-            0,
-            10,
-        ));
+        filter.push(jump(BPF_JMP_JEQ_K, libc::SYS_execveat as u32, 0, 10));
         filter.extend([
             stmt(BPF_LD_W_ABS, fd_offset),
             jump(BPF_JMP_JEQ_K, bootstrap_exec_fd as u32, 0, 7),

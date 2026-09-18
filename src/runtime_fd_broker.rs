@@ -809,8 +809,8 @@ mod imp {
         let mut control = FdControl([0; 48]);
         let header = control.0.as_mut_ptr().cast::<libc::cmsghdr>();
         unsafe {
-            (*header).cmsg_len = std::mem::size_of::<libc::cmsghdr>()
-                + source_fds.len() * std::mem::size_of::<RawFd>();
+            (*header).cmsg_len =
+                std::mem::size_of::<libc::cmsghdr>() + std::mem::size_of_val(source_fds);
             (*header).cmsg_level = libc::SOL_SOCKET;
             (*header).cmsg_type = libc::SCM_RIGHTS;
             let data = control

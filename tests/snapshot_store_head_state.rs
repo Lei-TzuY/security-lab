@@ -15,6 +15,7 @@ use security_lab::{
 };
 use sha2::Sha256;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command};
@@ -194,6 +195,118 @@ fn projected_successor_fixture(
         generation: previous.generation + 1,
         inventory,
     }
+}
+
+const BATCH_PENDING_DOMAIN: &[u8] = b"security-lab-snapshot-store-head-batch-pending-v1\0";
+const BATCH_PENDING_MAGIC: [u8; 8] = *b"SLHBPN1\0";
+const BATCH_PENDING_FIXED_BYTES: usize = 128;
+const BATCH_PENDING_ENTRY_BYTES: usize = 208;
+const BATCH_PENDING_HEADER_BYTES: usize = BATCH_PENDING_FIXED_BYTES + 16 * BATCH_PENDING_ENTRY_BYTES;
+const BATCH_PENDING_BYTES: usize = BATCH_PENDING_HEADER_BYTES + 32;
+
+fn encode_inventory_fixture(
+    bytes: &mut [u8],
+    inventory: security_lab::SnapshotStoreInventoryIdentity,
+) {
+    assert_eq!(bytes.len(), 48);
+    bytes[0..32].copy_from_slice(&inventory.sha256);
+    bytes[32..40].copy_from_slice(&inventory.objects.to_le_bytes());
+    bytes[40..48].copy_from_slice(&inventory.archive_bytes.to_le_bytes());
+}
+
+fn batch_pending_path(state: &Path) -> PathBuf {
+    state.join("snapshot-store-head-batch-pending")
+}
+
+fn batch_stage_path(state: &Path, index: usize) -> PathBuf {
+    state.join(format!("snapshot-store-head-batch-stage-{index:02}"))
+}
+
+fn projected_batch_successor_fixture(
+    workspace: &Path,
+    previous: SnapshotStoreHeadStateIdentity,
+    fixtures: &[&Fixture],
+) -> (
+    Vec<security_lab::SnapshotStoreInventoryIdentity>,
+    SnapshotStoreHeadStateIdentity,
+) {
+    let mirror = workspace.join("batch-projection-store");
+    fs::create_dir(&mirror).expect("create batch projection mirror store");
+    let mut after = Vec::new();
+    for fixture in fixtures {
+        store_snapshot_archive_ed25519_durable(
+            &mirror,
+            &fixture.archive,
+            &fixture.public_key,
+            &fixture.signature,
+            archive_limits(),
+        )
+        .expect("publish fixture into batch projection mirror");
+        after.push(
+            snapshot_store_inventory_identity(&mirror, audit_limits())
+                .expect("audit batch projection mirror"),
+        );
+    }
+    let successor = SnapshotStoreHeadStateIdentity {
+        generation: previous.generation + 1,
+        inventory: *after.last().expect("batch projection must be non-empty"),
+    };
+    (after, successor)
+}
+
+fn write_batch_recovery_fixture(
+    state: &Path,
+    key: &SnapshotStoreHeadStateKey,
+    previous: SnapshotStoreHeadStateIdentity,
+    successor: SnapshotStoreHeadStateIdentity,
+    fixtures: &[&Fixture],
+    after: &[security_lab::SnapshotStoreInventoryIdentity],
+) {
+    assert_eq!(fixtures.len(), after.len());
+    let mut bytes = [0u8; BATCH_PENDING_BYTES];
+    bytes[0..8].copy_from_slice(&BATCH_PENDING_MAGIC);
+    encode_pending_identity(&mut bytes[8..64], previous);
+    encode_pending_identity(&mut bytes[64..120], successor);
+    bytes[120..128].copy_from_slice(&(fixtures.len() as u64).to_le_bytes());
+    for (index, (fixture, inventory)) in fixtures.iter().zip(after.iter()).enumerate() {
+        let offset = BATCH_PENDING_FIXED_BYTES + index * BATCH_PENDING_ENTRY_BYTES;
+        let slot = &mut bytes[offset..offset + BATCH_PENDING_ENTRY_BYTES];
+        slot[0..32].copy_from_slice(&fixture.identity.sha256);
+        slot[32..40].copy_from_slice(&fixture.identity.encoded_bytes.to_le_bytes());
+        slot[40..48].copy_from_slice(&fixture.identity.nodes.to_le_bytes());
+        slot[48..56].copy_from_slice(&(fixture.archive.len() as u64).to_le_bytes());
+        slot[56..88].copy_from_slice(&fixture.public_key);
+        slot[88..152].copy_from_slice(&fixture.signature);
+        slot[152] = 0;
+        encode_inventory_fixture(&mut slot[160..208], *inventory);
+    }
+    let mut mac =
+        <Hmac<Sha256> as Mac>::new_from_slice(key.as_bytes()).expect("fixed HMAC key is valid");
+    mac.update(BATCH_PENDING_DOMAIN);
+    mac.update(&bytes[..BATCH_PENDING_HEADER_BYTES]);
+    bytes[BATCH_PENDING_HEADER_BYTES..].copy_from_slice(&mac.finalize().into_bytes());
+
+    let pending = batch_pending_path(state);
+    fs::write(&pending, bytes).expect("write authenticated batch pending fixture");
+    fs::File::open(&pending)
+        .expect("open batch pending fixture")
+        .sync_all()
+        .expect("sync batch pending fixture");
+
+    for (index, fixture) in fixtures.iter().enumerate() {
+        let path = batch_stage_path(state, index);
+        fs::write(&path, &fixture.archive).expect("write batch recovery stage fixture");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o400))
+            .expect("seal batch recovery stage fixture");
+        fs::File::open(&path)
+            .expect("open batch recovery stage fixture")
+            .sync_all()
+            .expect("sync batch recovery stage fixture");
+    }
+    fs::File::open(state)
+        .expect("open head-state directory")
+        .sync_all()
+        .expect("sync head-state directory after batch fixture");
 }
 
 #[test]
@@ -756,6 +869,14 @@ fn batch_publication_advances_one_generation_for_two_objects_and_dedups_as_a_uni
             .expect("verify batch successor"),
         committed.successor
     );
+    assert!(
+        !batch_pending_path(&state).exists(),
+        "successful batch must clear its recovery journal"
+    );
+    assert!(
+        !batch_stage_path(&state, 0).exists() && !batch_stage_path(&state, 1).exists(),
+        "successful batch must clear durable recovery stages"
+    );
 
     let dedup_items = [batch_item(&first), batch_item(&second)];
     let dedup = store_snapshot_archives_ed25519_durable_with_head_state(
@@ -865,24 +986,24 @@ fn batch_rejects_duplicate_identity_before_store_mutation() {
 }
 
 #[test]
-fn batch_post_store_failure_leaves_detectable_head_divergence() {
-    let workspace = TempDir::new("batch-post-store-failure");
+fn batch_successor_budget_failure_occurs_before_journal_or_store_mutation() {
+    let workspace = TempDir::new("batch-budget-preflight");
     let (store, state) = roots(workspace.path());
     let key = SnapshotStoreHeadStateKey::new([0xAD; 32]);
     let first = fixture(
         workspace.path(),
-        "post-store-first",
-        b"post-store-first\n",
+        "budget-first",
+        b"budget-first\n",
         0x71,
     );
     let second = fixture(
         workspace.path(),
-        "post-store-second",
-        b"post-store-second\n",
+        "budget-second",
+        b"budget-second\n",
         0x72,
     );
     let initial = initialize_snapshot_store_head_state(&state, &key, &store, audit_limits())
-        .expect("initialize post-store failure head");
+        .expect("initialize batch budget head");
 
     let mut successor_limits = audit_limits();
     successor_limits.max_total_archive_bytes = first.archive.len() as u64;
@@ -898,29 +1019,196 @@ fn batch_post_store_failure_leaves_detectable_head_divergence() {
             },
         )
         .is_err(),
-        "successor inventory budget should fail after durable object publication"
+        "successor inventory budget should fail before durable batch staging or publication"
     );
 
-    assert!(
-        snapshot_store_object_path(&store, first.identity).exists(),
-        "first object should remain durably published after later failure"
-    );
-    assert!(
-        snapshot_store_object_path(&store, second.identity).exists(),
-        "second object should remain durably published before successor audit failure"
-    );
+    assert!(!snapshot_store_object_path(&store, first.identity).exists());
+    assert!(!snapshot_store_object_path(&store, second.identity).exists());
+    assert!(!batch_pending_path(&state).exists());
+    assert!(!batch_stage_path(&state, 0).exists());
     assert_eq!(
-        load_snapshot_store_head_state(&state, &key).expect("load unchanged head after failure"),
-        initial,
-        "failed batch must not advance authenticated head"
+        verify_snapshot_store_head_state(&state, &key, &store, audit_limits())
+            .expect("verify unchanged head after batch budget rejection"),
+        initial
+    );
+}
+
+#[test]
+fn batch_recovery_aborts_staged_predecessor_without_store_mutation() {
+    let workspace = TempDir::new("batch-recover-predecessor");
+    let (store, state) = roots(workspace.path());
+    let key = SnapshotStoreHeadStateKey::new([0xB1; 32]);
+    let first = fixture(workspace.path(), "recover-pre-first", b"recover-pre-first\n", 0x11);
+    let second = fixture(workspace.path(), "recover-pre-second", b"recover-pre-second\n", 0x12);
+    let previous = initialize_snapshot_store_head_state(&state, &key, &store, audit_limits())
+        .expect("initialize batch recovery predecessor");
+    let (after, successor) =
+        projected_batch_successor_fixture(workspace.path(), previous, &[&first, &second]);
+    write_batch_recovery_fixture(
+        &state,
+        &key,
+        previous,
+        successor,
+        &[&first, &second],
+        &after,
     );
 
-    match verify_snapshot_store_head_state(&state, &key, &store, audit_limits()) {
-        Err(SnapshotStoreHeadStateError::StoreDiverged { anchored, actual }) => {
-            assert_eq!(anchored, initial);
-            assert_eq!(actual.objects, 2);
-        }
-        Err(other) => panic!("unexpected post-store divergence result: {other}"),
-        Ok(_) => panic!("unanchored durable batch advancement was not detected"),
-    }
+    assert!(matches!(
+        load_snapshot_store_head_state(&state, &key),
+        Err(SnapshotStoreHeadStateError::RecoveryRequired { .. })
+    ));
+    assert_eq!(
+        key.recover_pending_publication(&state, &store, audit_limits())
+            .expect("abort staged predecessor batch"),
+        previous
+    );
+    assert!(!snapshot_store_object_path(&store, first.identity).exists());
+    assert!(!snapshot_store_object_path(&store, second.identity).exists());
+    assert!(!batch_pending_path(&state).exists());
+    assert!(!batch_stage_path(&state, 0).exists());
+    assert!(!batch_stage_path(&state, 1).exists());
+}
+
+#[test]
+fn batch_recovery_completes_exact_partial_durable_prefix() {
+    let workspace = TempDir::new("batch-recover-prefix");
+    let (store, state) = roots(workspace.path());
+    let key = SnapshotStoreHeadStateKey::new([0xB2; 32]);
+    let first = fixture(workspace.path(), "recover-prefix-first", b"recover-prefix-first\n", 0x21);
+    let second = fixture(workspace.path(), "recover-prefix-second", b"recover-prefix-second\n", 0x22);
+    let previous = initialize_snapshot_store_head_state(&state, &key, &store, audit_limits())
+        .expect("initialize partial-prefix head");
+    let (after, successor) =
+        projected_batch_successor_fixture(workspace.path(), previous, &[&first, &second]);
+    write_batch_recovery_fixture(
+        &state,
+        &key,
+        previous,
+        successor,
+        &[&first, &second],
+        &after,
+    );
+    store_snapshot_archive_ed25519_durable(
+        &store,
+        &first.archive,
+        &first.public_key,
+        &first.signature,
+        archive_limits(),
+    )
+    .expect("simulate first durable batch member before crash");
+    assert_eq!(
+        snapshot_store_inventory_identity(&store, audit_limits())
+            .expect("audit partial batch prefix"),
+        after[0]
+    );
+
+    assert_eq!(
+        key.recover_pending_publication(&state, &store, audit_limits())
+            .expect("recover exact partial batch prefix"),
+        successor
+    );
+    assert!(snapshot_store_object_path(&store, first.identity).exists());
+    assert!(snapshot_store_object_path(&store, second.identity).exists());
+    assert_eq!(
+        verify_snapshot_store_head_state(&state, &key, &store, audit_limits())
+            .expect("verify recovered batch successor"),
+        successor
+    );
+    assert!(!batch_pending_path(&state).exists());
+    assert!(!batch_stage_path(&state, 0).exists());
+    assert!(!batch_stage_path(&state, 1).exists());
+}
+
+#[test]
+fn batch_recovery_rejects_unknown_inventory_without_mutating() {
+    let workspace = TempDir::new("batch-recover-unknown");
+    let (store, state) = roots(workspace.path());
+    let key = SnapshotStoreHeadStateKey::new([0xB3; 32]);
+    let first = fixture(workspace.path(), "recover-unknown-first", b"recover-unknown-first\n", 0x31);
+    let second = fixture(workspace.path(), "recover-unknown-second", b"recover-unknown-second\n", 0x32);
+    let outsider = fixture(workspace.path(), "recover-outsider", b"recover-outsider\n", 0x33);
+    let previous = initialize_snapshot_store_head_state(&state, &key, &store, audit_limits())
+        .expect("initialize unknown-inventory head");
+    let (after, successor) =
+        projected_batch_successor_fixture(workspace.path(), previous, &[&first, &second]);
+    write_batch_recovery_fixture(
+        &state,
+        &key,
+        previous,
+        successor,
+        &[&first, &second],
+        &after,
+    );
+    store_snapshot_archive_ed25519_durable(
+        &store,
+        &outsider.archive,
+        &outsider.public_key,
+        &outsider.signature,
+        archive_limits(),
+    )
+    .expect("publish unrelated unknown store state");
+
+    assert!(matches!(
+        key.recover_pending_publication(&state, &store, audit_limits()),
+        Err(SnapshotStoreHeadStateError::PendingStateDiverged { .. })
+    ));
+    assert!(snapshot_store_object_path(&store, outsider.identity).exists());
+    assert!(!snapshot_store_object_path(&store, first.identity).exists());
+    assert!(!snapshot_store_object_path(&store, second.identity).exists());
+    assert!(batch_pending_path(&state).exists());
+    assert!(batch_stage_path(&state, 0).exists());
+    assert!(batch_stage_path(&state, 1).exists());
+}
+
+#[test]
+fn batch_recovery_validates_all_stages_before_forward_replay() {
+    let workspace = TempDir::new("batch-recover-stage-tamper");
+    let (store, state) = roots(workspace.path());
+    let key = SnapshotStoreHeadStateKey::new([0xB4; 32]);
+    let first = fixture(workspace.path(), "recover-tamper-first", b"recover-tamper-first\n", 0x41);
+    let second = fixture(workspace.path(), "recover-tamper-second", b"recover-tamper-second\n", 0x42);
+    let previous = initialize_snapshot_store_head_state(&state, &key, &store, audit_limits())
+        .expect("initialize stage-tamper head");
+    let (after, successor) =
+        projected_batch_successor_fixture(workspace.path(), previous, &[&first, &second]);
+    write_batch_recovery_fixture(
+        &state,
+        &key,
+        previous,
+        successor,
+        &[&first, &second],
+        &after,
+    );
+    store_snapshot_archive_ed25519_durable(
+        &store,
+        &first.archive,
+        &first.public_key,
+        &first.signature,
+        archive_limits(),
+    )
+    .expect("simulate first durable member before staged tamper");
+
+    let second_stage = batch_stage_path(&state, 1);
+    fs::set_permissions(&second_stage, fs::Permissions::from_mode(0o600))
+        .expect("make staged fixture writable for corruption");
+    let mut tampered = second.archive.clone();
+    let last = tampered.len() - 1;
+    tampered[last] ^= 0x80;
+    fs::write(&second_stage, tampered).expect("tamper second recovery stage");
+    fs::set_permissions(&second_stage, fs::Permissions::from_mode(0o400))
+        .expect("reseal tampered recovery stage");
+
+    assert!(
+        key.recover_pending_publication(&state, &store, audit_limits())
+            .is_err(),
+        "tampered staged archive must fail before forward replay"
+    );
+    assert!(snapshot_store_object_path(&store, first.identity).exists());
+    assert!(
+        !snapshot_store_object_path(&store, second.identity).exists(),
+        "recovery mutated the store before validating every staged archive"
+    );
+    assert!(batch_pending_path(&state).exists());
+    assert!(batch_stage_path(&state, 0).exists());
+    assert!(batch_stage_path(&state, 1).exists());
 }

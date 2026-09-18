@@ -22,7 +22,7 @@ replace_one(
 }
 
 #[derive(Debug)]
-pub enum SnapshotStoreError {'''.replace("\\\`", "\`"),
+pub enum SnapshotStoreError {''',
     r'''pub struct SnapshotStorePutReport {
     pub identity: SnapshotIdentity,
     pub archive_bytes: u64,
@@ -42,7 +42,7 @@ pub struct SnapshotStoreTempRecoveryReport {
 }
 
 #[derive(Debug)]
-pub enum SnapshotStoreError {'''.replace("\\\`", "\`"),
+pub enum SnapshotStoreError {''',
     "snapshot store recovery report",
 )
 

@@ -22,6 +22,7 @@
 #   e write one brokered host-IPv4 UDP datagram while fresh target UDP stays isolated
 #   b exchange bytes over a brokered host pathname AF_UNIX stream; direct host path stays hidden
 #   0 receive one post-launch SCM_RIGHTS fd over that broker and prove its host pathname stays hidden
+#   3 receive an ordered two-FD sealed snapshot bundle and reject truncated ancillary control
 #   1 prove launcher bootstrap execveat is one-shot when target execveat is not granted
 #   2 prove an explicit target execveat grant still permits a later exec
 #   q accept one connection through a launcher-brokered host-loopback TCP listening fd
@@ -95,6 +96,8 @@ _start:
     je .brokered_host_unix
     cmp $48, %al
     je .brokered_host_unix_scm_rights
+    cmp $51, %al
+    je .brokered_host_unix_scm_rights_bundle
     cmp $49, %al
     je .bootstrap_execveat_one_shot
     cmp $50, %al
@@ -1102,6 +1105,169 @@ _start:
     mov %r13, %rdi
     syscall
     jmp .fail45
+
+.brokered_host_unix_scm_rights_bundle:
+    # argv[2]/argv[3] are the two original trusted host source pathnames.
+    mov 24(%rsp), %r13
+    mov 32(%rsp), %r14
+    test %r13, %r13
+    je .fail29
+    test %r14, %r14
+    je .fail29
+    sub $192, %rsp
+    mov $-1, %r12
+    mov $-1, %r15
+
+    # One readiness byte gates the entire ordered bundle.
+    movb $82, 185(%rsp)
+    mov $1, %eax
+    mov $10, %edi
+    lea 185(%rsp), %rsi
+    mov $1, %edx
+    syscall
+    cmp $1, %rax
+    jne .brokered_host_unix_bundle_fail
+
+    # Receive exactly two descriptors. cmsghdr=16, two ints => LEN/SPACE=24.
+    xor %eax, %eax
+    mov %rax, 0(%rsp)
+    mov %rax, 8(%rsp)
+    lea 64(%rsp), %rax
+    mov %rax, 16(%rsp)
+    movq $1, 24(%rsp)
+    lea 80(%rsp), %rax
+    mov %rax, 32(%rsp)
+    movq $24, 40(%rsp)
+    movq $0, 48(%rsp)
+    lea 184(%rsp), %rax
+    mov %rax, 64(%rsp)
+    movq $1, 72(%rsp)
+    movq $0, 80(%rsp)
+    movq $0, 88(%rsp)
+    movq $0, 96(%rsp)
+
+    mov $47, %eax
+    mov $10, %edi
+    mov %rsp, %rsi
+    mov $0x40000000, %edx
+    syscall
+    cmp $1, %rax
+    jne .brokered_host_unix_bundle_fail
+    cmpb $66, 184(%rsp)
+    jne .brokered_host_unix_bundle_fail
+    testl $8, 48(%rsp)
+    jne .brokered_host_unix_bundle_fail
+    cmpq $24, 80(%rsp)
+    jne .brokered_host_unix_bundle_fail
+    cmpl $1, 88(%rsp)
+    jne .brokered_host_unix_bundle_fail
+    cmpl $1, 92(%rsp)
+    jne .brokered_host_unix_bundle_fail
+    mov 96(%rsp), %r12d
+    mov 100(%rsp), %r15d
+    test %r12d, %r12d
+    js .brokered_host_unix_bundle_fail
+    test %r15d, %r15d
+    js .brokered_host_unix_bundle_fail
+
+    # Both transferred snapshots must be read-only despite write being allowed
+    # for the readiness byte.
+    mov $1, %eax
+    mov %r12d, %edi
+    lea runtime_bundle_first(%rip), %rsi
+    mov $1, %edx
+    syscall
+    cmp $-9, %rax
+    jne .brokered_host_unix_bundle_fail
+    mov $1, %eax
+    mov %r15d, %edi
+    lea runtime_bundle_second(%rip), %rsi
+    mov $1, %edx
+    syscall
+    cmp $-9, %rax
+    jne .brokered_host_unix_bundle_fail
+
+    xor %eax, %eax
+    mov %r12d, %edi
+    lea 112(%rsp), %rsi
+    mov $runtime_bundle_first_len, %edx
+    syscall
+    cmp $runtime_bundle_first_len, %rax
+    jne .brokered_host_unix_bundle_fail
+    lea 112(%rsp), %rsi
+    lea runtime_bundle_first(%rip), %rdi
+    mov $runtime_bundle_first_len, %ecx
+    repe cmpsb
+    jne .brokered_host_unix_bundle_fail
+
+    xor %eax, %eax
+    mov %r15d, %edi
+    lea 136(%rsp), %rsi
+    mov $runtime_bundle_second_len, %edx
+    syscall
+    cmp $runtime_bundle_second_len, %rax
+    jne .brokered_host_unix_bundle_fail
+    lea 136(%rsp), %rsi
+    lea runtime_bundle_second(%rip), %rdi
+    mov $runtime_bundle_second_len, %ecx
+    repe cmpsb
+    jne .brokered_host_unix_bundle_fail
+
+    mov $3, %eax
+    mov %r12d, %edi
+    syscall
+    test %rax, %rax
+    js .brokered_host_unix_bundle_fail
+    mov $-1, %r12
+    mov $3, %eax
+    mov %r15d, %edi
+    syscall
+    test %rax, %rax
+    js .brokered_host_unix_bundle_fail
+    mov $-1, %r15
+
+    # Neither original host pathname becomes reachable through the chroot.
+    mov $257, %eax
+    mov $-100, %edi
+    mov %r13, %rsi
+    xor %edx, %edx
+    xor %r10d, %r10d
+    syscall
+    cmp $-2, %rax
+    jne .brokered_host_unix_bundle_fail
+    mov $257, %eax
+    mov $-100, %edi
+    mov %r14, %rsi
+    xor %edx, %edx
+    xor %r10d, %r10d
+    syscall
+    cmp $-2, %rax
+    jne .brokered_host_unix_bundle_fail
+
+    mov $3, %eax
+    mov $10, %edi
+    syscall
+    test %rax, %rax
+    js .brokered_host_unix_bundle_fail
+    add $192, %rsp
+    xor %edi, %edi
+    jmp .exit
+
+.brokered_host_unix_bundle_fail:
+    test %r12d, %r12d
+    js .brokered_host_unix_bundle_close_second
+    mov $3, %eax
+    mov %r12d, %edi
+    syscall
+.brokered_host_unix_bundle_close_second:
+    test %r15d, %r15d
+    js .brokered_host_unix_bundle_restore
+    mov $3, %eax
+    mov %r15d, %edi
+    syscall
+.brokered_host_unix_bundle_restore:
+    add $192, %rsp
+    jmp .fail29
 
 .brokered_host_unix_scm_rights:
     # argv[2] is the original trusted host pathname for the transferred file.
@@ -3004,6 +3170,12 @@ brokered_host_unix_message:
 runtime_fd_handoff_marker:
     .ascii "runtime-fd-handoff-ok\n"
 .set runtime_fd_handoff_marker_len, . - runtime_fd_handoff_marker
+runtime_bundle_first:
+    .ascii "runtime-bundle-first\n"
+.set runtime_bundle_first_len, . - runtime_bundle_first
+runtime_bundle_second:
+    .ascii "runtime-bundle-second\n"
+.set runtime_bundle_second_len, . - runtime_bundle_second
 brokered_host_unix_reply:
     .ascii "host-unix-reply"
 .set brokered_host_unix_reply_len, . - brokered_host_unix_reply

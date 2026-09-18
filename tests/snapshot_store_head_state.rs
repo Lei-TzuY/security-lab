@@ -897,6 +897,86 @@ fn batch_publication_advances_one_generation_for_two_objects_and_dedups_as_a_uni
 }
 
 #[test]
+fn batch_mixes_preexisting_and_new_members_under_one_recoverable_transition() {
+    let workspace = TempDir::new("batch-mixed");
+    let (store, state) = roots(workspace.path());
+    let key = SnapshotStoreHeadStateKey::new([0x7B; 32]);
+    let first = fixture(workspace.path(), "mixed-first", b"mixed-first\n", 0x35);
+    let second = fixture(workspace.path(), "mixed-second", b"mixed-second\n", 0x36);
+
+    initialize_snapshot_store_head_state(&state, &key, &store, audit_limits())
+        .expect("initialize mixed batch head");
+    let first_commit = store_snapshot_archive_ed25519_durable_with_head_state(
+        &state,
+        &key,
+        &store,
+        publish_request(&first),
+    )
+    .expect("publish preexisting mixed-batch member");
+
+    let items = [batch_item(&first), batch_item(&second)];
+    let committed = store_snapshot_archives_ed25519_durable_with_head_state(
+        &state,
+        &key,
+        &store,
+        SnapshotStoreHeadBatchPublishRequest {
+            inventory_limits: audit_limits(),
+            items: &items,
+        },
+    )
+    .expect("publish mixed dedup/new batch");
+    assert_eq!(committed.previous, first_commit.successor);
+    assert_eq!(committed.successor.generation, first_commit.successor.generation + 1);
+    assert_eq!(committed.successor.inventory.objects, 2);
+    assert!(!committed.puts[0].inserted);
+    assert!(committed.puts[1].inserted);
+    assert_eq!(
+        verify_snapshot_store_head_state(&state, &key, &store, audit_limits())
+            .expect("verify mixed batch successor"),
+        committed.successor
+    );
+    assert!(!batch_pending_path(&state).exists());
+    assert!(!batch_stage_path(&state, 0).exists());
+    assert!(!batch_stage_path(&state, 1).exists());
+}
+
+#[test]
+fn batch_pending_authentication_tamper_fails_closed_before_store_mutation() {
+    let workspace = TempDir::new("batch-pending-auth");
+    let (store, state) = roots(workspace.path());
+    let key = SnapshotStoreHeadStateKey::new([0x7C; 32]);
+    let first = fixture(workspace.path(), "batch-auth-first", b"batch-auth-first\n", 0x37);
+    let second = fixture(workspace.path(), "batch-auth-second", b"batch-auth-second\n", 0x38);
+    let previous = initialize_snapshot_store_head_state(&state, &key, &store, audit_limits())
+        .expect("initialize batch auth head");
+    let (after, successor) =
+        projected_batch_successor_fixture(workspace.path(), previous, &[&first, &second]);
+    write_batch_recovery_fixture(
+        &state,
+        &key,
+        previous,
+        successor,
+        &[&first, &second],
+        &after,
+    );
+
+    let pending = batch_pending_path(&state);
+    let mut bytes = fs::read(&pending).expect("read batch pending fixture");
+    bytes[160] ^= 0x01;
+    fs::write(&pending, bytes).expect("tamper batch pending fixture");
+
+    assert!(matches!(
+        key.recover_pending_publication(&state, &store, audit_limits()),
+        Err(SnapshotStoreHeadStateError::AuthenticationFailed)
+    ));
+    assert!(!snapshot_store_object_path(&store, first.identity).exists());
+    assert!(!snapshot_store_object_path(&store, second.identity).exists());
+    assert!(batch_pending_path(&state).exists());
+    assert!(batch_stage_path(&state, 0).exists());
+    assert!(batch_stage_path(&state, 1).exists());
+}
+
+#[test]
 fn batch_prevalidates_every_item_before_first_object_publication() {
     let workspace = TempDir::new("batch-preflight");
     let (store, state) = roots(workspace.path());

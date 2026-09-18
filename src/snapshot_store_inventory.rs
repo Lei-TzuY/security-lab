@@ -128,6 +128,15 @@ pub fn snapshot_store_inventory_identity(
     Ok(hash_inventory(report, &records))
 }
 
+/// Project the exact audited inventory that would result from adding one
+/// canonical object without mutating the store.
+///
+/// If the candidate identity is already present, the projected successor is
+/// identical to the current inventory; the eventual store path must still
+/// perform its byte-for-byte deduplication check. Otherwise the same canonical
+/// record ordering, hash domain, and inventory budgets used by the full audit
+/// are applied to the synthetic one-object successor.
+
 pub(crate) fn projected_snapshot_store_inventory_identity(
     store_root: &Path,
     limits: SnapshotStoreAuditLimits,
@@ -233,15 +242,6 @@ pub(crate) fn projected_snapshot_store_inventory_identity(
     );
     Ok((current, successor))
 }
-
-/// Project the exact audited inventory that would result from adding one
-/// canonical object without mutating the store.
-///
-/// If the candidate identity is already present, the projected successor is
-/// identical to the current inventory; the eventual store path must still
-/// perform its byte-for-byte deduplication check. Otherwise the same canonical
-/// record ordering, hash domain, and inventory budgets used by the full audit
-/// are applied to the synthetic one-object successor.
 
 /// Recompute the bounded audited inventory and require exact equality with a
 /// caller-retained expected identity.

@@ -190,30 +190,44 @@ _start:
     syscall
     test %rax, %rax
     js .fail
-
     mov %rax, %r12
 
-    # F_GET_SEALS must show immutable memfd seals through /loader.
-    mov $72, %rax
+    # The private copied loader mount deliberately has mode 0700, while the
+    # host fixture inode is 0555. This proves the target path is the overlay.
+    sub $144, %rsp
+    mov $5, %rax
     mov %r12, %rdi
-    mov $1034, %rsi
-    xor %rdx, %rdx
+    mov %rsp, %rsi
     syscall
     test %rax, %rax
-    js .fail_close
-    mov %rax, %r13
-    and $15, %r13
-    cmp $15, %r13
-    jne .fail_close
+    js .fail_close_stack
+    mov 24(%rsp), %eax
+    and $511, %eax
+    cmp $448, %eax
+    jne .fail_close_stack
+    add $144, %rsp
 
     mov $3, %rax
     mov %r12, %rdi
     syscall
 
+    # The target owns write permission by mode, so EROFS proves the mount
+    # itself (not mode bits) enforces immutability.
+    mov $257, %rax
+    mov $-100, %rdi
+    lea loader_path(%rip), %rsi
+    mov $1, %rdx
+    xor %r10, %r10
+    syscall
+    cmp $-30, %rax
+    jne .fail
+
     mov $60, %rax
     mov $73, %rdi
     syscall
 
+.fail_close_stack:
+    add $144, %rsp
 .fail_close:
     mov $3, %rax
     mov %r12, %rdi
@@ -660,7 +674,7 @@ replace_one(
 replace_one(
     "src/platform/linux.rs",
     "    const PHASE_COW_DIFF_EXPORT: u32 = 65;\n",
-    "    const PHASE_COW_DIFF_EXPORT: u32 = 65;\n    const PHASE_INTERPRETER_CLONE: u32 = 66;\n    const PHASE_INTERPRETER_TARGET_PIN: u32 = 67;\n    const PHASE_INTERPRETER_READONLY: u32 = 68;\n    const PHASE_INTERPRETER_ATTACH: u32 = 69;\n",
+    "    const PHASE_COW_DIFF_EXPORT: u32 = 65;\n    const PHASE_INTERPRETER_TMPFS_CREATE: u32 = 66;\n    const PHASE_INTERPRETER_TMPFS_MOUNT: u32 = 67;\n    const PHASE_INTERPRETER_COPY: u32 = 68;\n    const PHASE_INTERPRETER_CLONE: u32 = 69;\n    const PHASE_INTERPRETER_TARGET_PIN: u32 = 70;\n    const PHASE_INTERPRETER_READONLY: u32 = 71;\n    const PHASE_INTERPRETER_ATTACH: u32 = 72;\n",
     "interpreter phases",
 )
 replace_one(
@@ -852,17 +866,165 @@ replace_one(
 )
 install_marker = '''    unsafe fn install_volume_or_fail(
         volume: &PreparedVolume,'''
-install_fn = r'''    unsafe fn install_sealed_interpreter_or_fail(
+install_fn = r'''    unsafe fn copy_sealed_interpreter_image_or_fail(
+        source_fd: RawFd,
+        destination_fd: RawFd,
+        launch_error: *mut LaunchErrorRecord,
+        error_exit_syscall: libc::c_long,
+    ) {
+        let mut stat = std::mem::zeroed::<libc::stat>();
+        if libc::fstat(source_fd, &mut stat) == -1 || stat.st_size <= 0 {
+            child_fail(launch_error, PHASE_INTERPRETER_COPY, error_exit_syscall);
+        }
+        let total = stat.st_size as u64;
+        let mut offset = 0u64;
+        let mut buffer = [0u8; 16 * 1024];
+        while offset < total {
+            let wanted = std::cmp::min(buffer.len() as u64, total - offset) as usize;
+            let read = loop {
+                let result = libc::pread(
+                    source_fd,
+                    buffer.as_mut_ptr().cast::<libc::c_void>(),
+                    wanted,
+                    offset as libc::off_t,
+                );
+                if result == -1 && *libc::__errno_location() == libc::EINTR {
+                    continue;
+                }
+                break result;
+            };
+            if read <= 0 {
+                if read == 0 {
+                    child_fail_errno(
+                        launch_error,
+                        PHASE_INTERPRETER_COPY,
+                        libc::EIO,
+                        error_exit_syscall,
+                    );
+                }
+                child_fail(launch_error, PHASE_INTERPRETER_COPY, error_exit_syscall);
+            }
+            let mut written = 0usize;
+            while written < read as usize {
+                let result = libc::write(
+                    destination_fd,
+                    buffer[written..read as usize]
+                        .as_ptr()
+                        .cast::<libc::c_void>(),
+                    read as usize - written,
+                );
+                if result == -1 && *libc::__errno_location() == libc::EINTR {
+                    continue;
+                }
+                if result <= 0 {
+                    if result == 0 {
+                        child_fail_errno(
+                            launch_error,
+                            PHASE_INTERPRETER_COPY,
+                            libc::EIO,
+                            error_exit_syscall,
+                        );
+                    }
+                    child_fail(launch_error, PHASE_INTERPRETER_COPY, error_exit_syscall);
+                }
+                written += result as usize;
+            }
+            offset += read as u64;
+        }
+    }
+
+    unsafe fn install_sealed_interpreter_or_fail(
         interpreter: &PreparedInterpreter,
         root_tree_fd: RawFd,
         launch_error: *mut LaunchErrorRecord,
         error_exit_syscall: libc::c_long,
     ) {
+        let fsfd = libc::syscall(
+            libc::SYS_fsopen,
+            b"tmpfs\0".as_ptr().cast::<libc::c_char>(),
+            FSOPEN_CLOEXEC,
+        );
+        if fsfd == -1 {
+            child_fail(
+                launch_error,
+                PHASE_INTERPRETER_TMPFS_CREATE,
+                error_exit_syscall,
+            );
+        }
+        let fsfd = fsfd as RawFd;
+        fsconfig_string_or_fail(
+            fsfd,
+            b"size\0",
+            b"68157440\0".as_ptr().cast::<libc::c_char>(),
+            PHASE_INTERPRETER_TMPFS_CREATE,
+            launch_error,
+            error_exit_syscall,
+        );
+        fsconfig_string_or_fail(
+            fsfd,
+            b"mode\0",
+            b"0700\0".as_ptr().cast::<libc::c_char>(),
+            PHASE_INTERPRETER_TMPFS_CREATE,
+            launch_error,
+            error_exit_syscall,
+        );
+        if libc::syscall(
+            libc::SYS_fsconfig,
+            fsfd,
+            FSCONFIG_CMD_CREATE,
+            ptr::null::<libc::c_char>(),
+            ptr::null::<libc::c_char>(),
+            0,
+        ) == -1
+        {
+            child_fail(
+                launch_error,
+                PHASE_INTERPRETER_TMPFS_CREATE,
+                error_exit_syscall,
+            );
+        }
+        let state_mount_fd = libc::syscall(
+            libc::SYS_fsmount,
+            fsfd,
+            FSMOUNT_CLOEXEC,
+            MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV,
+        );
+        if state_mount_fd == -1 {
+            child_fail(
+                launch_error,
+                PHASE_INTERPRETER_TMPFS_MOUNT,
+                error_exit_syscall,
+            );
+        }
+        let state_mount_fd = state_mount_fd as RawFd;
+        close_setup_fd(fsfd);
+
+        let loader_fd = libc::syscall(
+            libc::SYS_openat,
+            state_mount_fd,
+            b"loader\0".as_ptr().cast::<libc::c_char>(),
+            libc::O_CREAT | libc::O_EXCL | libc::O_WRONLY | libc::O_CLOEXEC,
+            0o700,
+        );
+        if loader_fd == -1 {
+            child_fail(launch_error, PHASE_INTERPRETER_COPY, error_exit_syscall);
+        }
+        let loader_fd = loader_fd as RawFd;
+        copy_sealed_interpreter_image_or_fail(
+            interpreter.image_fd.raw(),
+            loader_fd,
+            launch_error,
+            error_exit_syscall,
+        );
+        if libc::close(loader_fd) == -1 {
+            child_fail(launch_error, PHASE_INTERPRETER_COPY, error_exit_syscall);
+        }
+
         let interpreter_tree_fd = libc::syscall(
             libc::SYS_open_tree,
-            interpreter.image_fd.raw(),
-            b"\0".as_ptr().cast::<libc::c_char>(),
-            AT_EMPTY_PATH | OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC,
+            state_mount_fd,
+            b"loader\0".as_ptr().cast::<libc::c_char>(),
+            OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC,
         );
         if interpreter_tree_fd == -1 {
             child_fail(launch_error, PHASE_INTERPRETER_CLONE, error_exit_syscall);
@@ -940,17 +1102,31 @@ install_fn = r'''    unsafe fn install_sealed_interpreter_or_fail(
                 error_exit_syscall,
             );
         }
-        if libc::close(target_fd) == -1 || libc::close(interpreter_tree_fd) == -1 {
-            child_fail(
-                launch_error,
-                PHASE_INTERPRETER_ATTACH,
-                error_exit_syscall,
-            );
-        }
+        close_setup_fd(target_fd);
+        close_setup_fd(interpreter_tree_fd);
+        close_setup_fd(state_mount_fd);
     }
 
 '''
 replace_one("src/platform/linux.rs", install_marker, install_fn + install_marker, "interpreter install helper")
+
+# Treat interpreter mount construction as a mandatory mount boundary when requested.
+p = Path("src/platform/linux.rs")
+t = p.read_text()
+old = '''                | PHASE_COW_ROOT_ATTACH
+        ) && matches!('''
+new = '''                | PHASE_COW_ROOT_ATTACH
+                | PHASE_INTERPRETER_TMPFS_CREATE
+                | PHASE_INTERPRETER_TMPFS_MOUNT
+                | PHASE_INTERPRETER_CLONE
+                | PHASE_INTERPRETER_READONLY
+                | PHASE_INTERPRETER_ATTACH
+        ) && matches!('''
+if old not in t:
+    raise SystemExit("mount-boundary availability anchor missing")
+t = t.replace(old, new, 1)
+p.write_text(t)
+
 # Phase labels near existing COW labels.
 p=Path("src/platform/linux.rs"); text=p.read_text()
 phase_anchor='''            PHASE_COW_DIFF_EXPORT => "bounded copy-on-write diff export",'''
@@ -959,7 +1135,10 @@ if phase_anchor not in text:
 text=text.replace(
     phase_anchor,
     phase_anchor + '''
-            PHASE_INTERPRETER_CLONE => "sealed ELF interpreter detached mount clone",
+            PHASE_INTERPRETER_TMPFS_CREATE => "sealed ELF interpreter tmpfs creation",
+            PHASE_INTERPRETER_TMPFS_MOUNT => "sealed ELF interpreter tmpfs mount",
+            PHASE_INTERPRETER_COPY => "sealed ELF interpreter private copy",
+            PHASE_INTERPRETER_CLONE => "sealed ELF interpreter detached file clone",
             PHASE_INTERPRETER_TARGET_PIN => "sealed ELF interpreter target pin",
             PHASE_INTERPRETER_READONLY => "sealed ELF interpreter mount hardening",
             PHASE_INTERPRETER_ATTACH => "sealed ELF interpreter mount attachment",''',
@@ -1068,7 +1247,6 @@ fn sealed_pt_interp_executes_through_immutable_loader_mount() {
             "pread64",
             "access",
             "madvise",
-            "fcntl",
             "exit",
             "exit_group",
         ],

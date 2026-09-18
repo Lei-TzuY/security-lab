@@ -973,10 +973,8 @@ mod linux {
         }
 
         if anchored == pending.previous && actual == pending.successor.inventory {
-            writer.sync_object_durable(
-                pending.candidate_identity,
-                pending.candidate_archive_bytes,
-            )?;
+            writer
+                .sync_object_durable(pending.candidate_identity, pending.candidate_archive_bytes)?;
             let durable_actual = writer.inventory_identity(inventory_limits)?;
             if durable_actual != pending.successor.inventory {
                 return Err(SnapshotStoreHeadStateError::PendingStateDiverged {

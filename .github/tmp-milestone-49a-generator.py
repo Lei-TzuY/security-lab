@@ -1093,3 +1093,19 @@ replace_one("tests/sandbox.rs", test_anchor, new_tests + test_anchor, "interpret
 # The CLI-side modules contain only parser-created SandboxPolicy values, so no
 # additional literals need fields. Rust compilation will catch any missed literal.
 
+
+# Normalize interpolated diagnostics introduced by the generalized sealed-image helper.
+p = Path("src/platform/linux.rs")
+t = p.read_text()
+pairs = [
+    ('SandboxError::SetupFailed("{image_label} identity changed before sealed content copy".to_owned())', 'SandboxError::SetupFailed(format!("{image_label} identity changed before sealed content copy"))'),
+    ('SandboxError::SetupFailed("sealed {image_label} byte count overflow".to_owned())', 'SandboxError::SetupFailed(format!("sealed {image_label} byte count overflow"))'),
+    ('SandboxError::SetupFailed("{image_label} image is empty".to_owned())', 'SandboxError::SetupFailed(format!("{image_label} image is empty"))'),
+    ('SandboxError::SetupFailed("{image_label} SHA-256 does not match {policy_field} policy".to_owned())', 'SandboxError::SetupFailed(format!("{image_label} SHA-256 does not match {policy_field} policy"))'),
+    ('SandboxError::SetupFailed("verified {image_label} memfd is missing required immutable seals".to_owned())', 'SandboxError::SetupFailed(format!("verified {image_label} memfd is missing required immutable seals"))'),
+]
+for old, new in pairs:
+    if old not in t:
+        raise SystemExit(f"formatted sealed-image message missing: {old}")
+    t = t.replace(old, new, 1)
+p.write_text(t)

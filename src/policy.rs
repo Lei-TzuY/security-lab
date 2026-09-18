@@ -1,0 +1,3186 @@
+use std::collections::{BTreeMap, BTreeSet};
+use std::error::Error;
+use std::fmt;
+use std::net::Ipv4Addr;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Component, Path, PathBuf};
+use std::str::FromStr;
+
+const MAX_ARGS: usize = 64;
+const MAX_ARG_BYTES: usize = 4096;
+const MAX_ENV: usize = 64;
+const MAX_ENV_VALUE_BYTES: usize = 8192;
+const MAX_HOSTNAME_BYTES: usize = 63;
+const MAX_SYSCALLS: usize = 128;
+const MAX_SECCOMP_ARG_RULES: usize = 64;
+const MAX_SELECTED_HANDLES: usize = 16;
+const MAX_LANDLOCK_READ_EXECUTE_PATHS: usize = 32;
+const MAX_LANDLOCK_FILE_MUTATE_PATHS: usize = 32;
+const MAX_LANDLOCK_PATH_TOPOLOGY_MUTATE_PATHS: usize = 32;
+const MAX_LANDLOCK_DEVICE_IOCTL_PATHS: usize = 32;
+const MAX_LANDLOCK_TCP_PORTS: usize = 32;
+const MIN_SELECTED_TARGET_FD: u32 = 3;
+const MAX_SELECTED_TARGET_FD: u32 = 63;
+const MIN_SCRATCH_BYTES: u64 = 4096;
+const MAX_SCRATCH_BYTES: u64 = 1024 * 1024 * 1024;
+const MIN_COW_ROOT_BYTES: u64 = 4096;
+const MAX_COW_ROOT_BYTES: u64 = 1024 * 1024 * 1024;
+const MIN_COW_DIFF_BYTES: u64 = 64;
+const MAX_COW_DIFF_BYTES: u64 = 16 * 1024 * 1024;
+const MIN_CAPTURE_BYTES: u64 = 1;
+const MAX_CAPTURE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_STDOUT_TOTAL_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_TIME_OFFSET_SECONDS: u64 = 365 * 24 * 60 * 60;
+const MIN_WALL_CLOCK_MILLISECONDS: u64 = 1;
+const MAX_WALL_CLOCK_MILLISECONDS: u64 = 24 * 60 * 60 * 1000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResourceLimits {
+    pub cpu_seconds: u64,
+    pub address_space_bytes: u64,
+    pub file_size_bytes: u64,
+    pub open_files: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StdioMode {
+    Inherit,
+    Closed,
+    Redirect,
+    Capture,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StdioPolicy {
+    pub stdin: StdioMode,
+    pub stdout: StdioMode,
+    pub stderr: StdioMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SeccompArgRule {
+    /// Bits of the selected 64-bit syscall argument that participate in the
+    /// equality test. Zero masks are invalid because they constrain nothing.
+    pub mask: u64,
+    /// Expected value after masking. Bits outside `mask` must be zero.
+    pub value: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SeccompArgRangeRule {
+    /// Inclusive unsigned lower bound for the selected raw 64-bit argument.
+    pub minimum: u64,
+    /// Inclusive unsigned upper bound for the selected raw 64-bit argument.
+    pub maximum: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeccompPolicy {
+    /// Syscall names allowed by the policy. Every other syscall is denied with
+    /// `EPERM` by the Linux x86_64 enforcement layer.
+    pub allowed_syscalls: BTreeSet<String>,
+    /// Optional masked-equality constraints keyed by syscall name and argument
+    /// index (0 through 5). Rules only narrow syscalls already in the allowlist.
+    pub argument_rules: BTreeMap<String, BTreeMap<u8, SeccompArgRule>>,
+    /// Optional inclusive unsigned 64-bit ranges keyed by syscall and argument
+    /// index. Range rules compose conjunctively with masked-equality rules.
+    pub argument_range_rules: BTreeMap<String, BTreeMap<u8, SeccompArgRangeRule>>,
+    /// Optional forbidden masked bit patterns keyed by syscall and argument index.
+    /// A matching pattern is denied; non-matching values continue through the
+    /// remaining conjunctive seccomp constraints for that already-allowed syscall.
+    pub argument_forbidden_mask_rules: BTreeMap<String, BTreeMap<u8, SeccompArgRule>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxPolicy {
+    /// Host path pinned as the sandbox filesystem root before fork.
+    pub root_dir: PathBuf,
+    /// Optional byte ceiling for a private tmpfs upper/work backing an
+    /// ephemeral OverlayFS copy-on-write view of `root_dir`.
+    pub cow_root_bytes: Option<u64>,
+    /// Optional complete post-run export ceiling for the private COW upper tree.
+    /// Valid only when `cow_root_bytes` is also configured.
+    pub cow_diff_bytes: Option<u64>,
+    /// Launcher-owned hostname installed inside the sandbox UTS namespace.
+    pub hostname: String,
+    /// Absolute path interpreted inside `root_dir`.
+    pub executable: PathBuf,
+    /// Optional exact SHA-256 for the bytes of the initial executable image.
+    /// When present, Linux execution uses a verified sealed memfd copy rather
+    /// than executing the mutable host inode directly.
+    pub executable_sha256: Option<[u8; 32]>,
+    pub args: Vec<String>,
+    pub environment: BTreeMap<String, String>,
+    /// Absolute path interpreted inside `root_dir`.
+    pub working_dir: PathBuf,
+    /// Optional Landlock read/execute allowlist. When non-empty, only these
+    /// sandbox paths may be read or executed after trusted setup completes.
+    pub landlock_read_execute: Vec<PathBuf>,
+    /// Optional Landlock regular-file mutation allowlist. Each path names a
+    /// directory within an already-writable scratch or persistent-volume surface.
+    pub landlock_file_mutate: Vec<PathBuf>,
+    /// Optional Landlock directory/symlink/reparent mutation augmentation. Each
+    /// entry must exactly match an existing `landlock_file_mutate` directory.
+    pub landlock_path_topology_mutate: Vec<PathBuf>,
+    /// Optional Landlock device-ioctl allowlist. Each entry names a character
+    /// or block device in the final mounted sandbox tree. When non-empty,
+    /// ioctl on newly opened devices is denied unless covered by one entry.
+    pub landlock_device_ioctl: Vec<PathBuf>,
+    /// Optional Landlock TCP port envelopes for target-created sockets. These
+    /// rules restrict bind/connect syscalls without granting those syscalls.
+    pub landlock_tcp_bind_ports: Vec<u16>,
+    pub landlock_tcp_connect_ports: Vec<u16>,
+    /// Whether the direct target enters a Landlock abstract-UNIX-socket scope.
+    /// This attenuates connect authority toward abstract sockets outside the
+    /// same or a nested Landlock domain without granting connect itself.
+    pub landlock_scope_abstract_unix_socket: bool,
+    /// Whether the direct target enters a Landlock signal scope. This attenuates
+    /// signal authority toward processes outside the same or a nested domain.
+    pub landlock_scope_signal: bool,
+    /// Whether the launcher activates `lo` inside the isolated network namespace.
+    /// This does not attach the namespace to any host or external network.
+    pub loopback_enabled: bool,
+    /// Whether launcher-owned namespace PID 1 mounts a fresh procfs at `/proc`
+    /// after entering the sandbox PID namespace and before the direct target exists.
+    pub procfs_enabled: bool,
+    /// Optional launcher-brokered TCP connection to host 127.0.0.1. The port
+    /// and target descriptor must be specified together.
+    pub host_loopback_tcp_port: Option<u16>,
+    pub host_loopback_tcp_target_fd: Option<u32>,
+    /// Optional launcher-brokered TCP connection to one exact numeric host IPv4
+    /// endpoint. Address, port, and target descriptor are all-or-nothing.
+    pub host_ipv4_tcp_address: Option<Ipv4Addr>,
+    pub host_ipv4_tcp_port: Option<u16>,
+    pub host_ipv4_tcp_target_fd: Option<u32>,
+    /// Optional launcher-brokered connected UDP socket to one exact numeric host
+    /// IPv4 endpoint. Address, port, and target descriptor are all-or-nothing.
+    pub host_ipv4_udp_address: Option<Ipv4Addr>,
+    pub host_ipv4_udp_port: Option<u16>,
+    pub host_ipv4_udp_target_fd: Option<u32>,
+    /// Optional launcher-brokered connected filesystem-path AF_UNIX stream.
+    /// Host pathname and target descriptor are all-or-nothing.
+    pub host_unix_stream_path: Option<PathBuf>,
+    pub host_unix_stream_target_fd: Option<u32>,
+    /// Optional exact peer UID/GID required on the connected host AF_UNIX stream.
+    /// The pair only narrows an already-declared host-UNIX broker.
+    pub host_unix_stream_peer_uid: Option<u32>,
+    pub host_unix_stream_peer_gid: Option<u32>,
+    /// Optional launcher-brokered TCP listener bound only to host 127.0.0.1.
+    /// The port and target descriptor must be specified together.
+    pub host_loopback_tcp_listen_port: Option<u16>,
+    pub host_loopback_tcp_listen_target_fd: Option<u32>,
+    /// Optional trusted host directory exposed read-only at exactly one
+    /// declared sandbox mountpoint. Source and target must be specified together.
+    pub readonly_volume_source: Option<PathBuf>,
+    pub readonly_volume_target: Option<PathBuf>,
+    /// Optional trusted host directory deliberately exposed writable at one
+    /// declared sandbox mountpoint. This grants host mutation authority.
+    pub writable_volume_source: Option<PathBuf>,
+    pub writable_volume_target: Option<PathBuf>,
+    /// Optional absolute path inside `root_dir` replaced by a private writable
+    /// tmpfs after the root mount tree has been made recursively read-only.
+    pub scratch_dir: Option<PathBuf>,
+    /// Maximum byte size of the private tmpfs. Must be present exactly when
+    /// `scratch_dir` is present.
+    pub scratch_bytes: Option<u64>,
+    /// Explicit disposition for descriptors 0, 1, and 2.
+    pub stdio: StdioPolicy,
+    /// Explicit non-stdio descriptor capabilities keyed by target descriptor.
+    /// Each value is an already-open descriptor in the launcher process that
+    /// is pinned before fork and remapped only into the direct target.
+    pub selected_handles: BTreeMap<u32, u32>,
+    /// Sandbox path used only when stdout disposition is `Redirect`. The path
+    /// must be strictly beneath the declared private scratch directory.
+    pub stdout_redirect: Option<PathBuf>,
+    /// Maximum number of stdout bytes retained by the parent when stdout is
+    /// `Capture`. Excess output is drained and discarded rather than retained.
+    pub stdout_capture_bytes: Option<u64>,
+    /// Optional total number of stdout bytes the launcher may observe before
+    /// requesting launcher-owned process-tree termination. This is distinct
+    /// from the retained capture-memory ceiling.
+    pub stdout_total_bytes: Option<u64>,
+    /// Optional nonnegative CLOCK_MONOTONIC/CLOCK_BOOTTIME offsets installed
+    /// for descendants in a dedicated Linux time namespace. The pair is
+    /// all-or-nothing and at least one offset must be non-zero.
+    pub time_monotonic_offset_seconds: Option<u64>,
+    pub time_boottime_offset_seconds: Option<u64>,
+    /// Optional launcher-owned wall-clock deadline measured from PID 1
+    /// beginning supervision of the direct target.
+    pub wall_clock_milliseconds: Option<u64>,
+    pub limits: ResourceLimits,
+    pub seccomp: SeccompPolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyError {
+    line: Option<usize>,
+    message: String,
+}
+
+impl PolicyError {
+    fn at(line: usize, message: impl Into<String>) -> Self {
+        Self {
+            line: Some(line),
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn new(message: impl Into<String>) -> Self {
+        Self {
+            line: None,
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for PolicyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(line) = self.line {
+            write!(f, "line {line}: {}", self.message)
+        } else {
+            f.write_str(&self.message)
+        }
+    }
+}
+
+impl Error for PolicyError {}
+
+impl SandboxPolicy {
+    pub fn validate(&self) -> Result<(), PolicyError> {
+        validate_absolute_path("filesystem.root", &self.root_dir)?;
+        validate_hostname(&self.hostname)?;
+        validate_absolute_path("executable", &self.executable)?;
+        validate_absolute_path("working_dir", &self.working_dir)?;
+
+        if let Some(bytes) = self.cow_root_bytes {
+            if !(MIN_COW_ROOT_BYTES..=MAX_COW_ROOT_BYTES).contains(&bytes) {
+                return Err(PolicyError::new(format!(
+                    "filesystem.cow_root_bytes must be between {MIN_COW_ROOT_BYTES} and {MAX_COW_ROOT_BYTES}"
+                )));
+            }
+        }
+        if let Some(bytes) = self.cow_diff_bytes {
+            if self.cow_root_bytes.is_none() {
+                return Err(PolicyError::new(
+                    "filesystem.cow_diff_bytes requires filesystem.cow_root_bytes",
+                ));
+            }
+            if !(MIN_COW_DIFF_BYTES..=MAX_COW_DIFF_BYTES).contains(&bytes) {
+                return Err(PolicyError::new(format!(
+                    "filesystem.cow_diff_bytes must be between {MIN_COW_DIFF_BYTES} and {MAX_COW_DIFF_BYTES}"
+                )));
+            }
+        }
+
+        if self.procfs_enabled {
+            let proc_path = Path::new("/proc");
+            if self.executable.starts_with(proc_path) || self.working_dir.starts_with(proc_path) {
+                return Err(PolicyError::new(
+                    "filesystem.proc must not hide the executable or working_dir",
+                ));
+            }
+            for (path, label) in [
+                (&self.scratch_dir, "filesystem.scratch"),
+                (&self.readonly_volume_target, "volume.readonly_target"),
+                (&self.writable_volume_target, "volume.writable_target"),
+            ] {
+                if let Some(path) = path {
+                    if path.starts_with(proc_path) || proc_path.starts_with(path) {
+                        return Err(PolicyError::new(format!(
+                            "filesystem.proc must not overlap {label}"
+                        )));
+                    }
+                }
+            }
+        }
+
+        if self.landlock_read_execute.len() > MAX_LANDLOCK_READ_EXECUTE_PATHS {
+            return Err(PolicyError::new(format!(
+                "too many landlock.read_execute paths: {} > {MAX_LANDLOCK_READ_EXECUTE_PATHS}",
+                self.landlock_read_execute.len()
+            )));
+        }
+        if !self.landlock_read_execute.is_empty() {
+            let mut seen = BTreeSet::new();
+            let mut executable_covered = false;
+            for path in &self.landlock_read_execute {
+                validate_absolute_path("landlock.read_execute", path)?;
+                if path == Path::new("/") {
+                    return Err(PolicyError::new(
+                        "landlock.read_execute must not grant the entire sandbox root",
+                    ));
+                }
+                if !seen.insert(path.clone()) {
+                    return Err(PolicyError::new(format!(
+                        "duplicate landlock.read_execute path: {}",
+                        path.display()
+                    )));
+                }
+                if self.executable.starts_with(path) {
+                    executable_covered = true;
+                }
+            }
+            if !executable_covered {
+                return Err(PolicyError::new(
+                    "landlock.read_execute must cover the initial executable",
+                ));
+            }
+        }
+
+        if self.landlock_file_mutate.len() > MAX_LANDLOCK_FILE_MUTATE_PATHS {
+            return Err(PolicyError::new(format!(
+                "too many landlock.file_mutate paths: {} > {MAX_LANDLOCK_FILE_MUTATE_PATHS}",
+                self.landlock_file_mutate.len()
+            )));
+        }
+        if !self.landlock_file_mutate.is_empty() {
+            let mut seen = BTreeSet::new();
+            for path in &self.landlock_file_mutate {
+                validate_absolute_path("landlock.file_mutate", path)?;
+                if path == Path::new("/") {
+                    return Err(PolicyError::new(
+                        "landlock.file_mutate must not grant the entire sandbox root",
+                    ));
+                }
+                if !seen.insert(path.clone()) {
+                    return Err(PolicyError::new(format!(
+                        "duplicate landlock.file_mutate path: {}",
+                        path.display()
+                    )));
+                }
+                let in_scratch = self.scratch_dir.as_ref() == Some(path);
+                let in_writable_volume = self
+                    .writable_volume_target
+                    .as_ref()
+                    .is_some_and(|target| path.starts_with(target));
+                if !in_scratch && !in_writable_volume {
+                    return Err(PolicyError::new(
+                        "landlock.file_mutate must be within filesystem.scratch or volume.writable_target",
+                    ));
+                }
+            }
+        }
+
+        if self.landlock_path_topology_mutate.len() > MAX_LANDLOCK_PATH_TOPOLOGY_MUTATE_PATHS {
+            return Err(PolicyError::new(format!(
+                "too many landlock.path_topology_mutate paths: {} > {MAX_LANDLOCK_PATH_TOPOLOGY_MUTATE_PATHS}",
+                self.landlock_path_topology_mutate.len()
+            )));
+        }
+        if !self.landlock_path_topology_mutate.is_empty() {
+            let mut seen = BTreeSet::new();
+            for path in &self.landlock_path_topology_mutate {
+                validate_absolute_path("landlock.path_topology_mutate", path)?;
+                if path == Path::new("/") {
+                    return Err(PolicyError::new(
+                        "landlock.path_topology_mutate must not grant the entire sandbox root",
+                    ));
+                }
+                if !seen.insert(path.clone()) {
+                    return Err(PolicyError::new(format!(
+                        "duplicate landlock.path_topology_mutate path: {}",
+                        path.display()
+                    )));
+                }
+                if !self
+                    .landlock_file_mutate
+                    .iter()
+                    .any(|mutable| mutable == path)
+                {
+                    return Err(PolicyError::new(
+                        "landlock.path_topology_mutate must exactly match a landlock.file_mutate path",
+                    ));
+                }
+            }
+        }
+
+        if self.landlock_device_ioctl.len() > MAX_LANDLOCK_DEVICE_IOCTL_PATHS {
+            return Err(PolicyError::new(format!(
+                "too many landlock.device_ioctl paths: {} > {MAX_LANDLOCK_DEVICE_IOCTL_PATHS}",
+                self.landlock_device_ioctl.len()
+            )));
+        }
+        if !self.landlock_device_ioctl.is_empty() {
+            let mut seen = BTreeSet::new();
+            for path in &self.landlock_device_ioctl {
+                validate_absolute_path("landlock.device_ioctl", path)?;
+                if path == Path::new("/") {
+                    return Err(PolicyError::new(
+                        "landlock.device_ioctl must not grant the entire sandbox root",
+                    ));
+                }
+                if !seen.insert(path.clone()) {
+                    return Err(PolicyError::new(format!(
+                        "duplicate landlock.device_ioctl path: {}",
+                        path.display()
+                    )));
+                }
+            }
+        }
+
+        validate_landlock_tcp_ports("landlock.tcp_bind_port", &self.landlock_tcp_bind_ports)?;
+        validate_landlock_tcp_ports(
+            "landlock.tcp_connect_port",
+            &self.landlock_tcp_connect_ports,
+        )?;
+
+        match (
+            self.host_loopback_tcp_port,
+            self.host_loopback_tcp_target_fd,
+        ) {
+            (None, None) => {}
+            (Some(port), Some(target_fd)) => {
+                if port == 0 {
+                    return Err(PolicyError::new(
+                        "network.host_loopback_tcp_port must be between 1 and 65535",
+                    ));
+                }
+                if !(MIN_SELECTED_TARGET_FD..=MAX_SELECTED_TARGET_FD).contains(&target_fd) {
+                    return Err(PolicyError::new(format!(
+                        "network.host_loopback_tcp_target_fd must be between {MIN_SELECTED_TARGET_FD} and {MAX_SELECTED_TARGET_FD}: {target_fd}"
+                    )));
+                }
+                if u64::from(target_fd) >= self.limits.open_files {
+                    return Err(PolicyError::new(format!(
+                        "network.host_loopback_tcp_target_fd {target_fd} must be below limit.open_files {}",
+                        self.limits.open_files
+                    )));
+                }
+                if self.selected_handles.contains_key(&target_fd) {
+                    return Err(PolicyError::new(format!(
+                        "network host-loopback target fd {target_fd} collides with a selected handle target"
+                    )));
+                }
+            }
+            _ => {
+                return Err(PolicyError::new(
+                    "network.host_loopback_tcp_port and network.host_loopback_tcp_target_fd must be specified together",
+                ));
+            }
+        }
+
+        match (
+            self.host_ipv4_tcp_address,
+            self.host_ipv4_tcp_port,
+            self.host_ipv4_tcp_target_fd,
+        ) {
+            (None, None, None) => {}
+            (Some(address), Some(port), Some(target_fd)) => {
+                let octets = address.octets();
+                if octets[0] == 0 || octets[0] >= 224 {
+                    return Err(PolicyError::new(
+                        "network.host_ipv4_tcp_address must be a unicast IPv4 address",
+                    ));
+                }
+                if port == 0 {
+                    return Err(PolicyError::new(
+                        "network.host_ipv4_tcp_port must be between 1 and 65535",
+                    ));
+                }
+                if !(MIN_SELECTED_TARGET_FD..=MAX_SELECTED_TARGET_FD).contains(&target_fd) {
+                    return Err(PolicyError::new(format!(
+                        "network.host_ipv4_tcp_target_fd must be between {MIN_SELECTED_TARGET_FD} and {MAX_SELECTED_TARGET_FD}: {target_fd}"
+                    )));
+                }
+                if u64::from(target_fd) >= self.limits.open_files {
+                    return Err(PolicyError::new(format!(
+                        "network.host_ipv4_tcp_target_fd {target_fd} must be below limit.open_files {}",
+                        self.limits.open_files
+                    )));
+                }
+                if self.selected_handles.contains_key(&target_fd) {
+                    return Err(PolicyError::new(format!(
+                        "network host-IPv4 target fd {target_fd} collides with a selected handle target"
+                    )));
+                }
+                if self.host_loopback_tcp_target_fd == Some(target_fd) {
+                    return Err(PolicyError::new(format!(
+                        "network host-IPv4 target fd {target_fd} collides with the brokered host-loopback connection target"
+                    )));
+                }
+                if self.host_loopback_tcp_listen_target_fd == Some(target_fd) {
+                    return Err(PolicyError::new(format!(
+                        "network host-IPv4 target fd {target_fd} collides with the brokered host-loopback listener target"
+                    )));
+                }
+            }
+            _ => {
+                return Err(PolicyError::new(
+                    "network.host_ipv4_tcp_address, network.host_ipv4_tcp_port, and network.host_ipv4_tcp_target_fd must be specified together",
+                ));
+            }
+        }
+
+        match (
+            self.host_ipv4_udp_address,
+            self.host_ipv4_udp_port,
+            self.host_ipv4_udp_target_fd,
+        ) {
+            (None, None, None) => {}
+            (Some(address), Some(port), Some(target_fd)) => {
+                let octets = address.octets();
+                if octets[0] == 0 || octets[0] >= 224 {
+                    return Err(PolicyError::new(
+                        "network.host_ipv4_udp_address must be a unicast IPv4 address",
+                    ));
+                }
+                if port == 0 {
+                    return Err(PolicyError::new(
+                        "network.host_ipv4_udp_port must be between 1 and 65535",
+                    ));
+                }
+                if !(MIN_SELECTED_TARGET_FD..=MAX_SELECTED_TARGET_FD).contains(&target_fd) {
+                    return Err(PolicyError::new(format!(
+                        "network.host_ipv4_udp_target_fd must be between {MIN_SELECTED_TARGET_FD} and {MAX_SELECTED_TARGET_FD}: {target_fd}"
+                    )));
+                }
+                if u64::from(target_fd) >= self.limits.open_files {
+                    return Err(PolicyError::new(format!(
+                        "network.host_ipv4_udp_target_fd {target_fd} must be below limit.open_files {}",
+                        self.limits.open_files
+                    )));
+                }
+                if self.selected_handles.contains_key(&target_fd) {
+                    return Err(PolicyError::new(format!(
+                        "network host-IPv4 UDP target fd {target_fd} collides with a selected handle target"
+                    )));
+                }
+                if self.host_loopback_tcp_target_fd == Some(target_fd) {
+                    return Err(PolicyError::new(format!(
+                        "network host-IPv4 UDP target fd {target_fd} collides with the brokered host-loopback TCP connection target"
+                    )));
+                }
+                if self.host_ipv4_tcp_target_fd == Some(target_fd) {
+                    return Err(PolicyError::new(format!(
+                        "network host-IPv4 UDP target fd {target_fd} collides with the brokered host-IPv4 TCP connection target"
+                    )));
+                }
+                if self.host_loopback_tcp_listen_target_fd == Some(target_fd) {
+                    return Err(PolicyError::new(format!(
+                        "network host-IPv4 UDP target fd {target_fd} collides with the brokered host-loopback TCP listener target"
+                    )));
+                }
+            }
+            _ => {
+                return Err(PolicyError::new(
+                    "network.host_ipv4_udp_address, network.host_ipv4_udp_port, and network.host_ipv4_udp_target_fd must be specified together",
+                ));
+            }
+        }
+
+        match (&self.host_unix_stream_path, self.host_unix_stream_target_fd) {
+            (None, None) => {}
+            (Some(path), Some(target_fd)) => {
+                validate_unix_socket_path("ipc.host_unix_stream_path", path)?;
+                if path.starts_with(&self.root_dir) || self.root_dir.starts_with(path) {
+                    return Err(PolicyError::new(
+                        "ipc.host_unix_stream_path must not overlap filesystem.root",
+                    ));
+                }
+                if !(MIN_SELECTED_TARGET_FD..=MAX_SELECTED_TARGET_FD).contains(&target_fd) {
+                    return Err(PolicyError::new(format!(
+                        "ipc.host_unix_stream_target_fd must be between {MIN_SELECTED_TARGET_FD} and {MAX_SELECTED_TARGET_FD}: {target_fd}"
+                    )));
+                }
+                if u64::from(target_fd) >= self.limits.open_files {
+                    return Err(PolicyError::new(format!(
+                        "ipc.host_unix_stream_target_fd {target_fd} must be below limit.open_files {}",
+                        self.limits.open_files
+                    )));
+                }
+                if self.selected_handles.contains_key(&target_fd) {
+                    return Err(PolicyError::new(format!(
+                        "IPC host-UNIX stream target fd {target_fd} collides with a selected handle target"
+                    )));
+                }
+                for (label, existing) in [
+                    (
+                        "host-loopback TCP connection",
+                        self.host_loopback_tcp_target_fd,
+                    ),
+                    ("host-IPv4 TCP connection", self.host_ipv4_tcp_target_fd),
+                    ("host-IPv4 UDP connection", self.host_ipv4_udp_target_fd),
+                    (
+                        "host-loopback TCP listener",
+                        self.host_loopback_tcp_listen_target_fd,
+                    ),
+                ] {
+                    if existing == Some(target_fd) {
+                        return Err(PolicyError::new(format!(
+                            "IPC host-UNIX stream target fd {target_fd} collides with the brokered {label} target"
+                        )));
+                    }
+                }
+            }
+            _ => {
+                return Err(PolicyError::new(
+                    "ipc.host_unix_stream_path and ipc.host_unix_stream_target_fd must be specified together",
+                ));
+            }
+        }
+
+        match (
+            self.host_unix_stream_peer_uid,
+            self.host_unix_stream_peer_gid,
+        ) {
+            (None, None) => {}
+            (Some(_), Some(_)) => {
+                if self.host_unix_stream_path.is_none() || self.host_unix_stream_target_fd.is_none()
+                {
+                    return Err(PolicyError::new(
+                        "ipc.host_unix_stream_peer_uid and ipc.host_unix_stream_peer_gid require a brokered host-UNIX stream endpoint",
+                    ));
+                }
+            }
+            _ => {
+                return Err(PolicyError::new(
+                    "ipc.host_unix_stream_peer_uid and ipc.host_unix_stream_peer_gid must be specified together",
+                ));
+            }
+        }
+
+        match (
+            self.host_loopback_tcp_listen_port,
+            self.host_loopback_tcp_listen_target_fd,
+        ) {
+            (None, None) => {}
+            (Some(port), Some(target_fd)) => {
+                if port == 0 {
+                    return Err(PolicyError::new(
+                        "network.host_loopback_tcp_listen_port must be between 1 and 65535",
+                    ));
+                }
+                if !(MIN_SELECTED_TARGET_FD..=MAX_SELECTED_TARGET_FD).contains(&target_fd) {
+                    return Err(PolicyError::new(format!(
+                        "network.host_loopback_tcp_listen_target_fd must be between {MIN_SELECTED_TARGET_FD} and {MAX_SELECTED_TARGET_FD}: {target_fd}"
+                    )));
+                }
+                if u64::from(target_fd) >= self.limits.open_files {
+                    return Err(PolicyError::new(format!(
+                        "network.host_loopback_tcp_listen_target_fd {target_fd} must be below limit.open_files {}",
+                        self.limits.open_files
+                    )));
+                }
+                if self.selected_handles.contains_key(&target_fd) {
+                    return Err(PolicyError::new(format!(
+                        "network host-loopback listener target fd {target_fd} collides with a selected handle target"
+                    )));
+                }
+                if self.host_loopback_tcp_target_fd == Some(target_fd) {
+                    return Err(PolicyError::new(format!(
+                        "network host-loopback listener target fd {target_fd} collides with the brokered connection target"
+                    )));
+                }
+            }
+            _ => {
+                return Err(PolicyError::new(
+                    "network.host_loopback_tcp_listen_port and network.host_loopback_tcp_listen_target_fd must be specified together",
+                ));
+            }
+        }
+
+        match (&self.readonly_volume_source, &self.readonly_volume_target) {
+            (None, None) => {}
+            (Some(source), Some(target)) => {
+                validate_absolute_path("volume.readonly_source", source)?;
+                validate_absolute_path("volume.readonly_target", target)?;
+                if source.starts_with(&self.root_dir) || self.root_dir.starts_with(source) {
+                    return Err(PolicyError::new(
+                        "volume.readonly_source must not overlap filesystem.root",
+                    ));
+                }
+                if target == Path::new("/") {
+                    return Err(PolicyError::new(
+                        "volume.readonly_target must not replace the sandbox root",
+                    ));
+                }
+                if self.executable.starts_with(target) || self.working_dir.starts_with(target) {
+                    return Err(PolicyError::new(
+                        "volume.readonly_target must not contain the executable or working_dir",
+                    ));
+                }
+                if let Some(scratch) = &self.scratch_dir {
+                    if target.starts_with(scratch) || scratch.starts_with(target) {
+                        return Err(PolicyError::new(
+                            "volume.readonly_target must not overlap filesystem.scratch",
+                        ));
+                    }
+                }
+            }
+            _ => {
+                return Err(PolicyError::new(
+                    "volume.readonly_source and volume.readonly_target must be specified together",
+                ));
+            }
+        }
+
+        match (&self.writable_volume_source, &self.writable_volume_target) {
+            (None, None) => {}
+            (Some(source), Some(target)) => {
+                validate_absolute_path("volume.writable_source", source)?;
+                validate_absolute_path("volume.writable_target", target)?;
+                if source.starts_with(&self.root_dir) || self.root_dir.starts_with(source) {
+                    return Err(PolicyError::new(
+                        "volume.writable_source must not overlap filesystem.root",
+                    ));
+                }
+                if target == Path::new("/") {
+                    return Err(PolicyError::new(
+                        "volume.writable_target must not replace the sandbox root",
+                    ));
+                }
+                if self.executable.starts_with(target) || self.working_dir.starts_with(target) {
+                    return Err(PolicyError::new(
+                        "volume.writable_target must not contain the executable or working_dir",
+                    ));
+                }
+                if let Some(scratch) = &self.scratch_dir {
+                    if target.starts_with(scratch) || scratch.starts_with(target) {
+                        return Err(PolicyError::new(
+                            "volume.writable_target must not overlap filesystem.scratch",
+                        ));
+                    }
+                }
+            }
+            _ => {
+                return Err(PolicyError::new(
+                    "volume.writable_source and volume.writable_target must be specified together",
+                ));
+            }
+        }
+
+        if let (
+            Some(readonly_source),
+            Some(readonly_target),
+            Some(writable_source),
+            Some(writable_target),
+        ) = (
+            &self.readonly_volume_source,
+            &self.readonly_volume_target,
+            &self.writable_volume_source,
+            &self.writable_volume_target,
+        ) {
+            if readonly_target.starts_with(writable_target)
+                || writable_target.starts_with(readonly_target)
+            {
+                return Err(PolicyError::new(
+                    "read-only and writable volume targets must not overlap",
+                ));
+            }
+            if readonly_source.starts_with(writable_source)
+                || writable_source.starts_with(readonly_source)
+            {
+                return Err(PolicyError::new(
+                    "read-only and writable volume sources must not overlap",
+                ));
+            }
+        }
+
+        match (&self.scratch_dir, self.scratch_bytes) {
+            (None, None) => {}
+            (Some(path), Some(bytes)) => {
+                validate_absolute_path("filesystem.scratch", path)?;
+                if path == Path::new("/") {
+                    return Err(PolicyError::new(
+                        "filesystem.scratch must not replace the sandbox root",
+                    ));
+                }
+                if !(MIN_SCRATCH_BYTES..=MAX_SCRATCH_BYTES).contains(&bytes) {
+                    return Err(PolicyError::new(format!(
+                        "filesystem.scratch_bytes must be between {MIN_SCRATCH_BYTES} and {MAX_SCRATCH_BYTES}"
+                    )));
+                }
+                if self.executable.starts_with(path) || self.working_dir.starts_with(path) {
+                    return Err(PolicyError::new(
+                        "filesystem.scratch must not contain the executable or working_dir",
+                    ));
+                }
+            }
+            _ => {
+                return Err(PolicyError::new(
+                    "filesystem.scratch and filesystem.scratch_bytes must be specified together",
+                ));
+            }
+        }
+
+        if matches!(self.stdio.stdin, StdioMode::Redirect | StdioMode::Capture)
+            || matches!(self.stdio.stderr, StdioMode::Redirect | StdioMode::Capture)
+        {
+            return Err(PolicyError::new(
+                "redirect and capture are currently supported only for stdio.stdout",
+            ));
+        }
+
+        if self.stdio.stdout != StdioMode::Capture && self.stdout_total_bytes.is_some() {
+            return Err(PolicyError::new(
+                "limit.stdout_total_bytes is only valid when stdio.stdout = capture",
+            ));
+        }
+
+        match self.stdio.stdout {
+            StdioMode::Redirect => {
+                if self.stdout_capture_bytes.is_some() {
+                    return Err(PolicyError::new(
+                        "stdio.stdout_capture_bytes is only valid when stdio.stdout = capture",
+                    ));
+                }
+                let path = self.stdout_redirect.as_ref().ok_or_else(|| {
+                    PolicyError::new("stdio.stdout = redirect requires stdio.stdout_path")
+                })?;
+                validate_absolute_path("stdio.stdout_path", path)?;
+                let scratch = self.scratch_dir.as_ref().ok_or_else(|| {
+                    PolicyError::new(
+                        "stdio.stdout = redirect requires a declared filesystem.scratch",
+                    )
+                })?;
+                if path == scratch || !path.starts_with(scratch) {
+                    return Err(PolicyError::new(
+                        "stdio.stdout_path must be strictly beneath filesystem.scratch",
+                    ));
+                }
+            }
+            StdioMode::Capture => {
+                if self.stdout_redirect.is_some() {
+                    return Err(PolicyError::new(
+                        "stdio.stdout_path is only valid when stdio.stdout = redirect",
+                    ));
+                }
+                let bytes = self.stdout_capture_bytes.ok_or_else(|| {
+                    PolicyError::new("stdio.stdout = capture requires stdio.stdout_capture_bytes")
+                })?;
+                if !(MIN_CAPTURE_BYTES..=MAX_CAPTURE_BYTES).contains(&bytes) {
+                    return Err(PolicyError::new(format!(
+                        "stdio.stdout_capture_bytes must be between {MIN_CAPTURE_BYTES} and {MAX_CAPTURE_BYTES}"
+                    )));
+                }
+                if let Some(total_bytes) = self.stdout_total_bytes {
+                    if !(MIN_CAPTURE_BYTES..=MAX_STDOUT_TOTAL_BYTES).contains(&total_bytes) {
+                        return Err(PolicyError::new(format!(
+                            "limit.stdout_total_bytes must be between {MIN_CAPTURE_BYTES} and {MAX_STDOUT_TOTAL_BYTES}"
+                        )));
+                    }
+                    if bytes > total_bytes {
+                        return Err(PolicyError::new(
+                            "stdio.stdout_capture_bytes must not exceed limit.stdout_total_bytes",
+                        ));
+                    }
+                }
+            }
+            StdioMode::Inherit | StdioMode::Closed => {
+                if self.stdout_redirect.is_some() {
+                    return Err(PolicyError::new(
+                        "stdio.stdout_path is only valid when stdio.stdout = redirect",
+                    ));
+                }
+                if self.stdout_capture_bytes.is_some() {
+                    return Err(PolicyError::new(
+                        "stdio.stdout_capture_bytes is only valid when stdio.stdout = capture",
+                    ));
+                }
+            }
+        }
+
+        match (
+            self.time_monotonic_offset_seconds,
+            self.time_boottime_offset_seconds,
+        ) {
+            (None, None) => {}
+            (Some(monotonic), Some(boottime)) => {
+                if monotonic > MAX_TIME_OFFSET_SECONDS || boottime > MAX_TIME_OFFSET_SECONDS {
+                    return Err(PolicyError::new(format!(
+                        "time namespace offsets must be between 0 and {MAX_TIME_OFFSET_SECONDS} seconds"
+                    )));
+                }
+                if monotonic == 0 && boottime == 0 {
+                    return Err(PolicyError::new(
+                        "time namespace offsets must not both be zero",
+                    ));
+                }
+            }
+            _ => {
+                return Err(PolicyError::new(
+                    "time.monotonic_offset_seconds and time.boottime_offset_seconds must be specified together",
+                ));
+            }
+        }
+
+        if let Some(milliseconds) = self.wall_clock_milliseconds {
+            if !(MIN_WALL_CLOCK_MILLISECONDS..=MAX_WALL_CLOCK_MILLISECONDS).contains(&milliseconds)
+            {
+                return Err(PolicyError::new(format!(
+                    "limit.wall_clock_milliseconds must be between {MIN_WALL_CLOCK_MILLISECONDS} and {MAX_WALL_CLOCK_MILLISECONDS}"
+                )));
+            }
+        }
+
+        if self.args.len() > MAX_ARGS {
+            return Err(PolicyError::new(format!(
+                "too many arguments: {} > {MAX_ARGS}",
+                self.args.len()
+            )));
+        }
+        for arg in &self.args {
+            if arg.as_bytes().contains(&0) {
+                return Err(PolicyError::new("arguments must not contain NUL bytes"));
+            }
+            if arg.len() > MAX_ARG_BYTES {
+                return Err(PolicyError::new(format!(
+                    "argument exceeds {MAX_ARG_BYTES} bytes"
+                )));
+            }
+        }
+
+        if self.environment.len() > MAX_ENV {
+            return Err(PolicyError::new(format!(
+                "too many environment variables: {} > {MAX_ENV}",
+                self.environment.len()
+            )));
+        }
+        for (key, value) in &self.environment {
+            if !valid_env_key(key) {
+                return Err(PolicyError::new(format!(
+                    "invalid environment variable name: {key:?}"
+                )));
+            }
+            if value.as_bytes().contains(&0) {
+                return Err(PolicyError::new(format!(
+                    "environment variable {key:?} contains a NUL byte"
+                )));
+            }
+            if value.len() > MAX_ENV_VALUE_BYTES {
+                return Err(PolicyError::new(format!(
+                    "environment variable {key:?} exceeds {MAX_ENV_VALUE_BYTES} bytes"
+                )));
+            }
+        }
+
+        if self.limits.cpu_seconds == 0
+            || self.limits.address_space_bytes == 0
+            || self.limits.file_size_bytes == 0
+            || self.limits.open_files < 3
+        {
+            return Err(PolicyError::new(
+                "resource limits must be non-zero and open_files must be at least 3",
+            ));
+        }
+
+        if self.selected_handles.len() > MAX_SELECTED_HANDLES {
+            return Err(PolicyError::new(format!(
+                "too many selected handles: {} > {MAX_SELECTED_HANDLES}",
+                self.selected_handles.len()
+            )));
+        }
+        for (target_fd, source_fd) in &self.selected_handles {
+            if !(MIN_SELECTED_TARGET_FD..=MAX_SELECTED_TARGET_FD).contains(target_fd) {
+                return Err(PolicyError::new(format!(
+                    "selected handle target fd must be between {MIN_SELECTED_TARGET_FD} and {MAX_SELECTED_TARGET_FD}: {target_fd}"
+                )));
+            }
+            if u64::from(*target_fd) >= self.limits.open_files {
+                return Err(PolicyError::new(format!(
+                    "selected handle target fd {target_fd} must be below limit.open_files {}",
+                    self.limits.open_files
+                )));
+            }
+            if *source_fd > i32::MAX as u32 {
+                return Err(PolicyError::new(format!(
+                    "selected handle source fd exceeds the Linux descriptor range: {source_fd}"
+                )));
+            }
+        }
+
+        if self.seccomp.allowed_syscalls.is_empty() {
+            return Err(PolicyError::new("seccomp allowlist must not be empty"));
+        }
+        if self.seccomp.allowed_syscalls.len() > MAX_SYSCALLS {
+            return Err(PolicyError::new(format!(
+                "too many seccomp syscalls: {} > {MAX_SYSCALLS}",
+                self.seccomp.allowed_syscalls.len()
+            )));
+        }
+        for name in &self.seccomp.allowed_syscalls {
+            if !valid_syscall_name(name) {
+                return Err(PolicyError::new(format!(
+                    "invalid syscall name syntax: {name:?}"
+                )));
+            }
+        }
+
+        let masked_rule_count = self
+            .seccomp
+            .argument_rules
+            .values()
+            .map(BTreeMap::len)
+            .sum::<usize>();
+        let range_rule_count = self
+            .seccomp
+            .argument_range_rules
+            .values()
+            .map(BTreeMap::len)
+            .sum::<usize>();
+        let forbidden_mask_rule_count = self
+            .seccomp
+            .argument_forbidden_mask_rules
+            .values()
+            .map(BTreeMap::len)
+            .sum::<usize>();
+        let argument_rule_count = masked_rule_count + range_rule_count + forbidden_mask_rule_count;
+        if argument_rule_count > MAX_SECCOMP_ARG_RULES {
+            return Err(PolicyError::new(format!(
+                "too many seccomp argument rules: {argument_rule_count} > {MAX_SECCOMP_ARG_RULES}"
+            )));
+        }
+        for (syscall, rules) in &self.seccomp.argument_rules {
+            if !valid_syscall_name(syscall) {
+                return Err(PolicyError::new(format!(
+                    "invalid seccomp argument-rule syscall name: {syscall:?}"
+                )));
+            }
+            if !self.seccomp.allowed_syscalls.contains(syscall) {
+                return Err(PolicyError::new(format!(
+                    "seccomp argument rule for {syscall} requires that syscall in seccomp.allow"
+                )));
+            }
+            if matches!(syscall.as_str(), "execveat" | "exit" | "exit_group") {
+                return Err(PolicyError::new(format!(
+                    "seccomp argument rules may not constrain launcher-critical syscall {syscall}"
+                )));
+            }
+            for (argument_index, rule) in rules {
+                if *argument_index > 5 {
+                    return Err(PolicyError::new(format!(
+                        "seccomp argument index for {syscall} must be between 0 and 5"
+                    )));
+                }
+                if rule.mask == 0 {
+                    return Err(PolicyError::new(format!(
+                        "seccomp argument mask for {syscall}.{argument_index} must not be zero"
+                    )));
+                }
+                if rule.value & !rule.mask != 0 {
+                    return Err(PolicyError::new(format!(
+                        "seccomp argument value for {syscall}.{argument_index} sets bits outside its mask"
+                    )));
+                }
+            }
+        }
+        for (syscall, rules) in &self.seccomp.argument_forbidden_mask_rules {
+            if !valid_syscall_name(syscall) {
+                return Err(PolicyError::new(format!(
+                    "invalid seccomp forbidden-mask syscall name: {syscall:?}"
+                )));
+            }
+            if !self.seccomp.allowed_syscalls.contains(syscall) {
+                return Err(PolicyError::new(format!(
+                    "seccomp forbidden-mask rule for {syscall} requires that syscall in seccomp.allow"
+                )));
+            }
+            if matches!(syscall.as_str(), "execveat" | "exit" | "exit_group") {
+                return Err(PolicyError::new(format!(
+                    "seccomp forbidden-mask rules may not constrain launcher-critical syscall {syscall}"
+                )));
+            }
+            for (argument_index, rule) in rules {
+                if *argument_index > 5 {
+                    return Err(PolicyError::new(format!(
+                        "seccomp forbidden-mask argument index for {syscall} must be between 0 and 5"
+                    )));
+                }
+                if rule.mask == 0 {
+                    return Err(PolicyError::new(format!(
+                        "seccomp forbidden-mask for {syscall}.{argument_index} must not be zero"
+                    )));
+                }
+                if rule.value & !rule.mask != 0 {
+                    return Err(PolicyError::new(format!(
+                        "seccomp forbidden-mask value for {syscall}.{argument_index} sets bits outside its mask"
+                    )));
+                }
+            }
+        }
+        for (syscall, rules) in &self.seccomp.argument_range_rules {
+            if !valid_syscall_name(syscall) {
+                return Err(PolicyError::new(format!(
+                    "invalid seccomp range-rule syscall name: {syscall:?}"
+                )));
+            }
+            if !self.seccomp.allowed_syscalls.contains(syscall) {
+                return Err(PolicyError::new(format!(
+                    "seccomp range rule for {syscall} requires that syscall in seccomp.allow"
+                )));
+            }
+            if matches!(syscall.as_str(), "execveat" | "exit" | "exit_group") {
+                return Err(PolicyError::new(format!(
+                    "seccomp range rules may not constrain launcher-critical syscall {syscall}"
+                )));
+            }
+            for (argument_index, rule) in rules {
+                if *argument_index > 5 {
+                    return Err(PolicyError::new(format!(
+                        "seccomp range argument index for {syscall} must be between 0 and 5"
+                    )));
+                }
+                if rule.minimum > rule.maximum {
+                    return Err(PolicyError::new(format!(
+                        "seccomp range minimum for {syscall}.{argument_index} must not exceed its maximum"
+                    )));
+                }
+                if rule.minimum == 0 && rule.maximum == u64::MAX {
+                    return Err(PolicyError::new(format!(
+                        "seccomp range for {syscall}.{argument_index} must narrow at least one value"
+                    )));
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl FromStr for SandboxPolicy {
+    type Err = PolicyError;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        let mut root_dir = None;
+        let mut cow_root_bytes = None;
+        let mut cow_diff_bytes = None;
+        let mut hostname = None;
+        let mut executable = None;
+        let mut executable_sha256 = None;
+        let mut args = Vec::new();
+        let mut environment = BTreeMap::new();
+        let mut working_dir = None;
+        let mut landlock_read_execute = Vec::new();
+        let mut landlock_file_mutate = Vec::new();
+        let mut landlock_path_topology_mutate = Vec::new();
+        let mut landlock_device_ioctl = Vec::new();
+        let mut landlock_tcp_bind_ports = Vec::new();
+        let mut landlock_tcp_connect_ports = Vec::new();
+        let mut landlock_scope_abstract_unix_socket = None;
+        let mut landlock_scope_signal = None;
+        let mut loopback_enabled = None;
+        let mut procfs_enabled = None;
+        let mut host_loopback_tcp_port = None;
+        let mut host_loopback_tcp_target_fd = None;
+        let mut host_ipv4_tcp_address = None;
+        let mut host_ipv4_tcp_port = None;
+        let mut host_ipv4_tcp_target_fd = None;
+        let mut host_ipv4_udp_address = None;
+        let mut host_ipv4_udp_port = None;
+        let mut host_ipv4_udp_target_fd = None;
+        let mut host_unix_stream_path = None;
+        let mut host_unix_stream_target_fd = None;
+        let mut host_unix_stream_peer_uid = None;
+        let mut host_unix_stream_peer_gid = None;
+        let mut host_loopback_tcp_listen_port = None;
+        let mut host_loopback_tcp_listen_target_fd = None;
+        let mut readonly_volume_source = None;
+        let mut readonly_volume_target = None;
+        let mut writable_volume_source = None;
+        let mut writable_volume_target = None;
+        let mut scratch_dir = None;
+        let mut scratch_bytes = None;
+        let mut stdin = None;
+        let mut stdout = None;
+        let mut stderr = None;
+        let mut selected_handles = BTreeMap::new();
+        let mut stdout_redirect = None;
+        let mut stdout_capture_bytes = None;
+        let mut stdout_total_bytes = None;
+        let mut time_monotonic_offset_seconds = None;
+        let mut time_boottime_offset_seconds = None;
+        let mut wall_clock_milliseconds = None;
+        let mut cpu_seconds = None;
+        let mut address_space_bytes = None;
+        let mut file_size_bytes = None;
+        let mut open_files = None;
+        let mut seccomp_allow = None;
+        let mut seccomp_argument_rules: BTreeMap<String, BTreeMap<u8, SeccompArgRule>> =
+            BTreeMap::new();
+        let mut seccomp_argument_range_rules: BTreeMap<String, BTreeMap<u8, SeccompArgRangeRule>> =
+            BTreeMap::new();
+        let mut seccomp_argument_forbidden_mask_rules: BTreeMap<
+            String,
+            BTreeMap<u8, SeccompArgRule>,
+        > = BTreeMap::new();
+
+        for (index, raw_line) in input.lines().enumerate() {
+            let line_no = index + 1;
+            let line = raw_line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+
+            let (raw_key, raw_value) = line
+                .split_once('=')
+                .ok_or_else(|| PolicyError::at(line_no, "expected key = value"))?;
+            let key = raw_key.trim();
+            let value = raw_value.trim();
+
+            match key {
+                "filesystem.root" => set_once(&mut root_dir, value.to_owned(), line_no, key)?,
+                "filesystem.cow_root_bytes" => set_once(
+                    &mut cow_root_bytes,
+                    parse_u64(value, line_no, key)?,
+                    line_no,
+                    key,
+                )?,
+                "filesystem.cow_diff_bytes" => set_once(
+                    &mut cow_diff_bytes,
+                    parse_u64(value, line_no, key)?,
+                    line_no,
+                    key,
+                )?,
+                "identity.hostname" => set_once(&mut hostname, value.to_owned(), line_no, key)?,
+                "landlock.tcp_bind_port" => {
+                    landlock_tcp_bind_ports.push(parse_tcp_port(value, line_no, key)?)
+                }
+                "landlock.tcp_connect_port" => {
+                    landlock_tcp_connect_ports.push(parse_tcp_port(value, line_no, key)?)
+                }
+                "landlock.scope_abstract_unix_socket" => set_once(
+                    &mut landlock_scope_abstract_unix_socket,
+                    parse_enabled_disabled(value, line_no, key)?,
+                    line_no,
+                    key,
+                )?,
+                "landlock.scope_signal" => set_once(
+                    &mut landlock_scope_signal,
+                    parse_enabled_disabled(value, line_no, key)?,
+                    line_no,
+                    key,
+                )?,
+                "network.loopback" => set_once(
+                    &mut loopback_enabled,
+                    parse_enabled_disabled(value, line_no, key)?,
+                    line_no,
+                    key,
+                )?,
+                "filesystem.proc" => set_once(
+                    &mut procfs_enabled,
+                    parse_enabled_disabled(value, line_no, key)?,
+                    line_no,
+                    key,
+                )?,
+                "network.host_loopback_tcp_port" => set_once(
+                    &mut host_loopback_tcp_port,
+                    parse_tcp_port(value, line_no, key)?,
+                    line_no,
+                    key,
+                )?,
+                "network.host_loopback_tcp_target_fd" => set_once(
+                    &mut host_loopback_tcp_target_fd,
+                    value.parse::<u32>().map_err(|_| {
+                        PolicyError::at(line_no, format!("{key} must be an unsigned integer"))
+                    })?,
+                    line_no,
+                    key,
+                )?,
+                "network.host_ipv4_tcp_address" => set_once(
+                    &mut host_ipv4_tcp_address,
+                    parse_ipv4_address(value, line_no, key)?,
+                    line_no,
+                    key,
+                )?,
+                "network.host_ipv4_tcp_port" => set_once(
+                    &mut host_ipv4_tcp_port,
+                    parse_tcp_port(value, line_no, key)?,
+                    line_no,
+                    key,
+                )?,
+                "network.host_ipv4_tcp_target_fd" => set_once(
+                    &mut host_ipv4_tcp_target_fd,
+                    value.parse::<u32>().map_err(|_| {
+                        PolicyError::at(line_no, format!("{key} must be an unsigned integer"))
+                    })?,
+                    line_no,
+                    key,
+                )?,
+                "network.host_ipv4_udp_address" => set_once(
+                    &mut host_ipv4_udp_address,
+                    parse_ipv4_address(value, line_no, key)?,
+                    line_no,
+                    key,
+                )?,
+                "network.host_ipv4_udp_port" => set_once(
+                    &mut host_ipv4_udp_port,
+                    parse_tcp_port(value, line_no, key)?,
+                    line_no,
+                    key,
+                )?,
+                "network.host_ipv4_udp_target_fd" => set_once(
+                    &mut host_ipv4_udp_target_fd,
+                    value.parse::<u32>().map_err(|_| {
+                        PolicyError::at(line_no, format!("{key} must be an unsigned integer"))
+                    })?,
+                    line_no,
+                    key,
+                )?,
+                "ipc.host_unix_stream_path" => {
+                    set_once(&mut host_unix_stream_path, value.to_owned(), line_no, key)?
+                }
+                "ipc.host_unix_stream_target_fd" => set_once(
+                    &mut host_unix_stream_target_fd,
+                    value.parse::<u32>().map_err(|_| {
+                        PolicyError::at(line_no, format!("{key} must be an unsigned integer"))
+                    })?,
+                    line_no,
+                    key,
+                )?,
+                "ipc.host_unix_stream_peer_uid" => set_once(
+                    &mut host_unix_stream_peer_uid,
+                    value.parse::<u32>().map_err(|_| {
+                        PolicyError::at(line_no, format!("{key} must be an unsigned integer"))
+                    })?,
+                    line_no,
+                    key,
+                )?,
+                "ipc.host_unix_stream_peer_gid" => set_once(
+                    &mut host_unix_stream_peer_gid,
+                    value.parse::<u32>().map_err(|_| {
+                        PolicyError::at(line_no, format!("{key} must be an unsigned integer"))
+                    })?,
+                    line_no,
+                    key,
+                )?,
+                "network.host_loopback_tcp_listen_port" => set_once(
+                    &mut host_loopback_tcp_listen_port,
+                    parse_tcp_port(value, line_no, key)?,
+                    line_no,
+                    key,
+                )?,
+                "network.host_loopback_tcp_listen_target_fd" => set_once(
+                    &mut host_loopback_tcp_listen_target_fd,
+                    value.parse::<u32>().map_err(|_| {
+                        PolicyError::at(line_no, format!("{key} must be an unsigned integer"))
+                    })?,
+                    line_no,
+                    key,
+                )?,
+                "volume.readonly_source" => {
+                    set_once(&mut readonly_volume_source, value.to_owned(), line_no, key)?
+                }
+                "volume.readonly_target" => {
+                    set_once(&mut readonly_volume_target, value.to_owned(), line_no, key)?
+                }
+                "volume.writable_source" => {
+                    set_once(&mut writable_volume_source, value.to_owned(), line_no, key)?
+                }
+                "volume.writable_target" => {
+                    set_once(&mut writable_volume_target, value.to_owned(), line_no, key)?
+                }
+                "filesystem.scratch" => set_once(&mut scratch_dir, value.to_owned(), line_no, key)?,
+                "filesystem.scratch_bytes" => set_once(
+                    &mut scratch_bytes,
+                    parse_u64(value, line_no, key)?,
+                    line_no,
+                    key,
+                )?,
+                "executable" => set_once(&mut executable, value.to_owned(), line_no, key)?,
+                "executable.sha256" => set_once(
+                    &mut executable_sha256,
+                    parse_sha256(value, line_no, key)?,
+                    line_no,
+                    key,
+                )?,
+                "arg" => args.push(value.to_owned()),
+                "working_dir" => set_once(&mut working_dir, value.to_owned(), line_no, key)?,
+                "landlock.read_execute" => landlock_read_execute.push(value.to_owned()),
+                "landlock.file_mutate" => landlock_file_mutate.push(value.to_owned()),
+                "landlock.path_topology_mutate" => {
+                    landlock_path_topology_mutate.push(value.to_owned())
+                }
+                "landlock.device_ioctl" => landlock_device_ioctl.push(value.to_owned()),
+                "stdio.stdin" => set_once(
+                    &mut stdin,
+                    parse_stdio_mode(value, line_no, key)?,
+                    line_no,
+                    key,
+                )?,
+                "stdio.stdout" => set_once(
+                    &mut stdout,
+                    parse_stdio_mode(value, line_no, key)?,
+                    line_no,
+                    key,
+                )?,
+                "stdio.stderr" => set_once(
+                    &mut stderr,
+                    parse_stdio_mode(value, line_no, key)?,
+                    line_no,
+                    key,
+                )?,
+                "stdio.stdout_path" => {
+                    set_once(&mut stdout_redirect, value.to_owned(), line_no, key)?
+                }
+                "stdio.stdout_capture_bytes" => set_once(
+                    &mut stdout_capture_bytes,
+                    parse_u64(value, line_no, key)?,
+                    line_no,
+                    key,
+                )?,
+                "limit.stdout_total_bytes" => set_once(
+                    &mut stdout_total_bytes,
+                    parse_u64(value, line_no, key)?,
+                    line_no,
+                    key,
+                )?,
+                "time.monotonic_offset_seconds" => set_once(
+                    &mut time_monotonic_offset_seconds,
+                    parse_u64(value, line_no, key)?,
+                    line_no,
+                    key,
+                )?,
+                "time.boottime_offset_seconds" => set_once(
+                    &mut time_boottime_offset_seconds,
+                    parse_u64(value, line_no, key)?,
+                    line_no,
+                    key,
+                )?,
+                "limit.wall_clock_milliseconds" => set_once(
+                    &mut wall_clock_milliseconds,
+                    parse_u64(value, line_no, key)?,
+                    line_no,
+                    key,
+                )?,
+                "limit.cpu_seconds" => set_once(
+                    &mut cpu_seconds,
+                    parse_u64(value, line_no, key)?,
+                    line_no,
+                    key,
+                )?,
+                "limit.address_space_bytes" => set_once(
+                    &mut address_space_bytes,
+                    parse_u64(value, line_no, key)?,
+                    line_no,
+                    key,
+                )?,
+                "limit.file_size_bytes" => set_once(
+                    &mut file_size_bytes,
+                    parse_u64(value, line_no, key)?,
+                    line_no,
+                    key,
+                )?,
+                "limit.open_files" => set_once(
+                    &mut open_files,
+                    parse_u64(value, line_no, key)?,
+                    line_no,
+                    key,
+                )?,
+                _ if key.starts_with("handle.") => {
+                    let target_text = key.strip_prefix("handle.").expect("prefix checked above");
+                    let target_fd = target_text.parse::<u32>().map_err(|_| {
+                        PolicyError::at(line_no, "selected handle key must be handle.<target_fd>")
+                    })?;
+                    let source_fd = value.parse::<u32>().map_err(|_| {
+                        PolicyError::at(
+                            line_no,
+                            "selected handle source fd must be an unsigned integer",
+                        )
+                    })?;
+                    if selected_handles.insert(target_fd, source_fd).is_some() {
+                        return Err(PolicyError::at(
+                            line_no,
+                            format!("duplicate selected handle target fd: {target_fd}"),
+                        ));
+                    }
+                }
+                "seccomp.allow" => {
+                    if seccomp_allow.is_some() {
+                        return Err(PolicyError::at(line_no, "duplicate seccomp.allow"));
+                    }
+                    let mut names = BTreeSet::new();
+                    for name in value.split(',').map(str::trim) {
+                        if name.is_empty() {
+                            return Err(PolicyError::at(
+                                line_no,
+                                "seccomp.allow contains an empty syscall name",
+                            ));
+                        }
+                        if !names.insert(name.to_owned()) {
+                            return Err(PolicyError::at(
+                                line_no,
+                                format!("duplicate syscall in seccomp.allow: {name}"),
+                            ));
+                        }
+                    }
+                    seccomp_allow = Some(names);
+                }
+                _ if key.starts_with("seccomp.deny_mask.") => {
+                    let spec = key
+                        .strip_prefix("seccomp.deny_mask.")
+                        .expect("prefix checked above");
+                    let (syscall, index_text) = spec.rsplit_once('.').ok_or_else(|| {
+                        PolicyError::at(
+                            line_no,
+                            "seccomp forbidden-mask key must be seccomp.deny_mask.<syscall>.<0..5>",
+                        )
+                    })?;
+                    if !valid_syscall_name(syscall) {
+                        return Err(PolicyError::at(
+                            line_no,
+                            format!("invalid seccomp forbidden-mask syscall name: {syscall:?}"),
+                        ));
+                    }
+                    let argument_index = index_text.parse::<u8>().map_err(|_| {
+                        PolicyError::at(
+                            line_no,
+                            "seccomp forbidden-mask argument index must be between 0 and 5",
+                        )
+                    })?;
+                    if argument_index > 5 {
+                        return Err(PolicyError::at(
+                            line_no,
+                            "seccomp forbidden-mask argument index must be between 0 and 5",
+                        ));
+                    }
+                    let rule = parse_seccomp_arg_rule(value, line_no, key)?;
+                    let syscall_rules = seccomp_argument_forbidden_mask_rules
+                        .entry(syscall.to_owned())
+                        .or_default();
+                    if syscall_rules.insert(argument_index, rule).is_some() {
+                        return Err(PolicyError::at(
+                            line_no,
+                            format!(
+                                "duplicate seccomp forbidden-mask rule: {syscall}.{argument_index}"
+                            ),
+                        ));
+                    }
+                }
+                _ if key.starts_with("seccomp.range.") => {
+                    let spec = key
+                        .strip_prefix("seccomp.range.")
+                        .expect("prefix checked above");
+                    let (syscall, index_text) = spec.rsplit_once('.').ok_or_else(|| {
+                        PolicyError::at(
+                            line_no,
+                            "seccomp range key must be seccomp.range.<syscall>.<0..5>",
+                        )
+                    })?;
+                    if !valid_syscall_name(syscall) {
+                        return Err(PolicyError::at(
+                            line_no,
+                            format!("invalid seccomp range-rule syscall name: {syscall:?}"),
+                        ));
+                    }
+                    let argument_index = index_text.parse::<u8>().map_err(|_| {
+                        PolicyError::at(
+                            line_no,
+                            "seccomp range argument index must be between 0 and 5",
+                        )
+                    })?;
+                    if argument_index > 5 {
+                        return Err(PolicyError::at(
+                            line_no,
+                            "seccomp range argument index must be between 0 and 5",
+                        ));
+                    }
+                    let rule = parse_seccomp_arg_range_rule(value, line_no, key)?;
+                    let syscall_rules = seccomp_argument_range_rules
+                        .entry(syscall.to_owned())
+                        .or_default();
+                    if syscall_rules.insert(argument_index, rule).is_some() {
+                        return Err(PolicyError::at(
+                            line_no,
+                            format!("duplicate seccomp range rule: {syscall}.{argument_index}"),
+                        ));
+                    }
+                }
+                _ if key.starts_with("seccomp.arg.") => {
+                    let spec = key
+                        .strip_prefix("seccomp.arg.")
+                        .expect("prefix checked above");
+                    let (syscall, index_text) = spec.rsplit_once('.').ok_or_else(|| {
+                        PolicyError::at(
+                            line_no,
+                            "seccomp argument key must be seccomp.arg.<syscall>.<0..5>",
+                        )
+                    })?;
+                    if !valid_syscall_name(syscall) {
+                        return Err(PolicyError::at(
+                            line_no,
+                            format!("invalid seccomp argument-rule syscall name: {syscall:?}"),
+                        ));
+                    }
+                    let argument_index = index_text.parse::<u8>().map_err(|_| {
+                        PolicyError::at(line_no, "seccomp argument index must be between 0 and 5")
+                    })?;
+                    if argument_index > 5 {
+                        return Err(PolicyError::at(
+                            line_no,
+                            "seccomp argument index must be between 0 and 5",
+                        ));
+                    }
+                    let rule = parse_seccomp_arg_rule(value, line_no, key)?;
+                    let syscall_rules = seccomp_argument_rules
+                        .entry(syscall.to_owned())
+                        .or_default();
+                    if syscall_rules.insert(argument_index, rule).is_some() {
+                        return Err(PolicyError::at(
+                            line_no,
+                            format!("duplicate seccomp argument rule: {syscall}.{argument_index}"),
+                        ));
+                    }
+                }
+                _ => {
+                    let Some(env_key) = key.strip_prefix("env.") else {
+                        return Err(PolicyError::at(
+                            line_no,
+                            format!("unknown policy key: {key}"),
+                        ));
+                    };
+                    if !valid_env_key(env_key) {
+                        return Err(PolicyError::at(
+                            line_no,
+                            format!("invalid environment variable name: {env_key:?}"),
+                        ));
+                    }
+                    if environment
+                        .insert(env_key.to_owned(), value.to_owned())
+                        .is_some()
+                    {
+                        return Err(PolicyError::at(
+                            line_no,
+                            format!("duplicate environment variable: {env_key}"),
+                        ));
+                    }
+                }
+            }
+        }
+
+        let policy = Self {
+            root_dir: PathBuf::from(required(root_dir, "filesystem.root")?),
+            cow_root_bytes,
+            cow_diff_bytes,
+            hostname: required(hostname, "identity.hostname")?,
+            executable: PathBuf::from(required(executable, "executable")?),
+            executable_sha256,
+            args,
+            environment,
+            working_dir: PathBuf::from(required(working_dir, "working_dir")?),
+            landlock_read_execute: landlock_read_execute
+                .into_iter()
+                .map(PathBuf::from)
+                .collect(),
+            landlock_file_mutate: landlock_file_mutate
+                .into_iter()
+                .map(PathBuf::from)
+                .collect(),
+            landlock_path_topology_mutate: landlock_path_topology_mutate
+                .into_iter()
+                .map(PathBuf::from)
+                .collect(),
+            landlock_device_ioctl: landlock_device_ioctl
+                .into_iter()
+                .map(PathBuf::from)
+                .collect(),
+            landlock_tcp_bind_ports,
+            landlock_tcp_connect_ports,
+            landlock_scope_abstract_unix_socket: landlock_scope_abstract_unix_socket
+                .unwrap_or(false),
+            landlock_scope_signal: landlock_scope_signal.unwrap_or(false),
+            loopback_enabled: loopback_enabled.unwrap_or(false),
+            procfs_enabled: procfs_enabled.unwrap_or(false),
+            host_loopback_tcp_port,
+            host_loopback_tcp_target_fd,
+            host_ipv4_tcp_address,
+            host_ipv4_tcp_port,
+            host_ipv4_tcp_target_fd,
+            host_ipv4_udp_address,
+            host_ipv4_udp_port,
+            host_ipv4_udp_target_fd,
+            host_unix_stream_path: host_unix_stream_path.map(PathBuf::from),
+            host_unix_stream_target_fd,
+            host_unix_stream_peer_uid,
+            host_unix_stream_peer_gid,
+            host_loopback_tcp_listen_port,
+            host_loopback_tcp_listen_target_fd,
+            readonly_volume_source: readonly_volume_source.map(PathBuf::from),
+            readonly_volume_target: readonly_volume_target.map(PathBuf::from),
+            writable_volume_source: writable_volume_source.map(PathBuf::from),
+            writable_volume_target: writable_volume_target.map(PathBuf::from),
+            scratch_dir: scratch_dir.map(PathBuf::from),
+            scratch_bytes,
+            stdio: StdioPolicy {
+                stdin: required(stdin, "stdio.stdin")?,
+                stdout: required(stdout, "stdio.stdout")?,
+                stderr: required(stderr, "stdio.stderr")?,
+            },
+            selected_handles,
+            stdout_redirect: stdout_redirect.map(PathBuf::from),
+            stdout_capture_bytes,
+            stdout_total_bytes,
+            time_monotonic_offset_seconds,
+            time_boottime_offset_seconds,
+            wall_clock_milliseconds,
+            limits: ResourceLimits {
+                cpu_seconds: required(cpu_seconds, "limit.cpu_seconds")?,
+                address_space_bytes: required(address_space_bytes, "limit.address_space_bytes")?,
+                file_size_bytes: required(file_size_bytes, "limit.file_size_bytes")?,
+                open_files: required(open_files, "limit.open_files")?,
+            },
+            seccomp: SeccompPolicy {
+                allowed_syscalls: required(seccomp_allow, "seccomp.allow")?,
+                argument_rules: seccomp_argument_rules,
+                argument_range_rules: seccomp_argument_range_rules,
+                argument_forbidden_mask_rules: seccomp_argument_forbidden_mask_rules,
+            },
+        };
+        policy.validate()?;
+        Ok(policy)
+    }
+}
+
+fn set_once<T>(
+    target: &mut Option<T>,
+    value: T,
+    line: usize,
+    key: &str,
+) -> Result<(), PolicyError> {
+    if target.replace(value).is_some() {
+        Err(PolicyError::at(line, format!("duplicate key: {key}")))
+    } else {
+        Ok(())
+    }
+}
+
+fn required<T>(value: Option<T>, key: &str) -> Result<T, PolicyError> {
+    value.ok_or_else(|| PolicyError::new(format!("missing required key: {key}")))
+}
+
+fn parse_u64(value: &str, line: usize, key: &str) -> Result<u64, PolicyError> {
+    value
+        .parse::<u64>()
+        .map_err(|_| PolicyError::at(line, format!("{key} must be an unsigned integer")))
+}
+
+fn parse_seccomp_arg_rule(
+    value: &str,
+    line: usize,
+    key: &str,
+) -> Result<SeccompArgRule, PolicyError> {
+    let (mask, expected) = value.split_once(':').ok_or_else(|| {
+        PolicyError::at(line, format!("{key} must be formatted as <mask>:<value>"))
+    })?;
+    Ok(SeccompArgRule {
+        mask: parse_u64_literal(mask.trim(), line, key)?,
+        value: parse_u64_literal(expected.trim(), line, key)?,
+    })
+}
+
+fn parse_seccomp_arg_range_rule(
+    value: &str,
+    line: usize,
+    key: &str,
+) -> Result<SeccompArgRangeRule, PolicyError> {
+    let (minimum, maximum) = value
+        .split_once(':')
+        .ok_or_else(|| PolicyError::at(line, format!("{key} must be formatted as <min>:<max>")))?;
+    Ok(SeccompArgRangeRule {
+        minimum: parse_u64_literal(minimum.trim(), line, key)?,
+        maximum: parse_u64_literal(maximum.trim(), line, key)?,
+    })
+}
+
+fn parse_u64_literal(value: &str, line: usize, key: &str) -> Result<u64, PolicyError> {
+    if let Some(hex) = value.strip_prefix("0x") {
+        if hex.is_empty() {
+            return Err(PolicyError::at(
+                line,
+                format!("{key} contains an empty hexadecimal integer"),
+            ));
+        }
+        u64::from_str_radix(hex, 16)
+            .map_err(|_| PolicyError::at(line, format!("{key} contains an invalid integer")))
+    } else {
+        value
+            .parse::<u64>()
+            .map_err(|_| PolicyError::at(line, format!("{key} contains an invalid integer")))
+    }
+}
+
+fn parse_enabled_disabled(value: &str, line: usize, key: &str) -> Result<bool, PolicyError> {
+    match value {
+        "enabled" => Ok(true),
+        "disabled" => Ok(false),
+        _ => Err(PolicyError::at(
+            line,
+            format!("{key} must be enabled or disabled"),
+        )),
+    }
+}
+
+fn parse_ipv4_address(value: &str, line: usize, key: &str) -> Result<Ipv4Addr, PolicyError> {
+    let address = value
+        .parse::<Ipv4Addr>()
+        .map_err(|_| PolicyError::at(line, format!("{key} must be a numeric IPv4 address")))?;
+    let octets = address.octets();
+    if octets[0] == 0 || octets[0] >= 224 {
+        return Err(PolicyError::at(
+            line,
+            format!("{key} must be a unicast IPv4 address"),
+        ));
+    }
+    Ok(address)
+}
+
+fn parse_tcp_port(value: &str, line: usize, key: &str) -> Result<u16, PolicyError> {
+    let port = parse_u64(value, line, key)?;
+    if !(1..=u16::MAX as u64).contains(&port) {
+        return Err(PolicyError::at(
+            line,
+            format!("{key} must be between 1 and 65535"),
+        ));
+    }
+    Ok(port as u16)
+}
+
+fn validate_landlock_tcp_ports(label: &str, ports: &[u16]) -> Result<(), PolicyError> {
+    if ports.len() > MAX_LANDLOCK_TCP_PORTS {
+        return Err(PolicyError::new(format!(
+            "too many {label} entries: {} > {MAX_LANDLOCK_TCP_PORTS}",
+            ports.len()
+        )));
+    }
+    let mut seen = BTreeSet::new();
+    for port in ports {
+        if *port == 0 {
+            return Err(PolicyError::new(format!(
+                "{label} must be between 1 and 65535"
+            )));
+        }
+        if !seen.insert(*port) {
+            return Err(PolicyError::new(format!("duplicate {label}: {port}")));
+        }
+    }
+    Ok(())
+}
+
+fn parse_sha256(value: &str, line_no: usize, key: &str) -> Result<[u8; 32], PolicyError> {
+    if value.len() != 64 || !value.is_ascii() {
+        return Err(PolicyError::at(
+            line_no,
+            format!("{key} must be exactly 64 hexadecimal characters"),
+        ));
+    }
+    let nibble = |byte: u8| -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        }
+    };
+    let bytes = value.as_bytes();
+    let mut digest = [0u8; 32];
+    for index in 0..32 {
+        let high = nibble(bytes[index * 2]).ok_or_else(|| {
+            PolicyError::at(
+                line_no,
+                format!("{key} must contain only hexadecimal characters"),
+            )
+        })?;
+        let low = nibble(bytes[index * 2 + 1]).ok_or_else(|| {
+            PolicyError::at(
+                line_no,
+                format!("{key} must contain only hexadecimal characters"),
+            )
+        })?;
+        digest[index] = (high << 4) | low;
+    }
+    Ok(digest)
+}
+
+fn parse_stdio_mode(value: &str, line: usize, key: &str) -> Result<StdioMode, PolicyError> {
+    match value {
+        "inherit" => Ok(StdioMode::Inherit),
+        "closed" => Ok(StdioMode::Closed),
+        "redirect" => Ok(StdioMode::Redirect),
+        "capture" => Ok(StdioMode::Capture),
+        _ => Err(PolicyError::at(
+            line,
+            format!("{key} must be inherit, closed, redirect, or capture"),
+        )),
+    }
+}
+
+fn validate_unix_socket_path(label: &str, path: &Path) -> Result<(), PolicyError> {
+    validate_absolute_path(label, path)?;
+    #[cfg(unix)]
+    let path_bytes = path.as_os_str().as_bytes();
+    #[cfg(not(unix))]
+    let path_bytes = path.as_os_str().to_string_lossy().as_bytes();
+    if path_bytes.len() >= 108 {
+        return Err(PolicyError::new(format!(
+            "{label} must fit Linux sockaddr_un.sun_path (at most 107 pathname bytes)"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_absolute_path(label: &str, path: &Path) -> Result<(), PolicyError> {
+    if !path.is_absolute() {
+        return Err(PolicyError::new(format!(
+            "{label} must be an absolute path"
+        )));
+    }
+    if path.as_os_str().as_encoded_bytes().contains(&0) {
+        return Err(PolicyError::new(format!(
+            "{label} must not contain NUL bytes"
+        )));
+    }
+    if path
+        .components()
+        .any(|component| component == Component::ParentDir)
+    {
+        return Err(PolicyError::new(format!(
+            "{label} must not contain '..' components"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_hostname(hostname: &str) -> Result<(), PolicyError> {
+    let bytes = hostname.as_bytes();
+    if bytes.is_empty() || bytes.len() > MAX_HOSTNAME_BYTES {
+        return Err(PolicyError::new(format!(
+            "identity.hostname must contain between 1 and {MAX_HOSTNAME_BYTES} bytes"
+        )));
+    }
+    if !bytes
+        .iter()
+        .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-' || *byte == b'.')
+    {
+        return Err(PolicyError::new(
+            "identity.hostname may contain only ASCII letters, digits, '-' and '.'",
+        ));
+    }
+    if matches!(bytes.first(), Some(b'-' | b'.')) || matches!(bytes.last(), Some(b'-' | b'.')) {
+        return Err(PolicyError::new(
+            "identity.hostname must start and end with an ASCII letter or digit",
+        ));
+    }
+    Ok(())
+}
+
+fn valid_syscall_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+fn valid_env_key(key: &str) -> bool {
+    let mut bytes = key.bytes();
+    matches!(bytes.next(), Some(b'A'..=b'Z' | b'a'..=b'z' | b'_'))
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const VALID: &str = r#"
+        filesystem.root = /
+        identity.hostname = security-lab
+        filesystem.scratch = /scratch
+        filesystem.scratch_bytes = 16777216
+        executable = /bin/echo
+        arg = hello
+        env.LANG = C
+        working_dir = /tmp
+        stdio.stdin = closed
+        stdio.stdout = inherit
+        stdio.stderr = inherit
+        limit.cpu_seconds = 1
+        limit.address_space_bytes = 268435456
+        limit.file_size_bytes = 1048576
+        limit.open_files = 32
+        seccomp.allow = execveat,read,write,exit_group
+    "#;
+
+    fn volume_valid() -> String {
+        VALID.replace("filesystem.root = /", "filesystem.root = /sandbox/root")
+    }
+
+    #[test]
+    fn parses_executable_sha256_and_rejects_malformed_digest() {
+        let hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let text = format!("{VALID}\nexecutable.sha256 = {hex}");
+        let policy: SandboxPolicy = text.parse().unwrap();
+        let expected = [
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab,
+            0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67,
+            0x89, 0xab, 0xcd, 0xef,
+        ];
+        assert_eq!(policy.executable_sha256, Some(expected));
+
+        let short = format!("{VALID}\nexecutable.sha256 = deadbeef");
+        assert!(short.parse::<SandboxPolicy>().is_err());
+        let bad = format!("{VALID}\nexecutable.sha256 = {}g", "0".repeat(63));
+        assert!(bad.parse::<SandboxPolicy>().is_err());
+    }
+
+    #[test]
+    fn parses_complete_policy() {
+        let policy: SandboxPolicy = VALID.parse().unwrap();
+        assert_eq!(policy.root_dir, PathBuf::from("/"));
+        assert_eq!(policy.cow_root_bytes, None);
+        assert_eq!(policy.cow_diff_bytes, None);
+        assert_eq!(policy.hostname, "security-lab");
+        assert_eq!(policy.executable_sha256, None);
+        assert!(!policy.loopback_enabled);
+        assert!(!policy.procfs_enabled);
+        assert_eq!(policy.host_loopback_tcp_port, None);
+        assert_eq!(policy.host_loopback_tcp_target_fd, None);
+        assert_eq!(policy.host_ipv4_tcp_address, None);
+        assert_eq!(policy.host_ipv4_tcp_port, None);
+        assert_eq!(policy.host_ipv4_tcp_target_fd, None);
+        assert_eq!(policy.host_ipv4_udp_address, None);
+        assert_eq!(policy.host_ipv4_udp_port, None);
+        assert_eq!(policy.host_ipv4_udp_target_fd, None);
+        assert_eq!(policy.host_unix_stream_path, None);
+        assert_eq!(policy.host_unix_stream_target_fd, None);
+        assert_eq!(policy.host_unix_stream_peer_uid, None);
+        assert_eq!(policy.host_unix_stream_peer_gid, None);
+        assert!(policy.landlock_read_execute.is_empty());
+        assert!(policy.landlock_file_mutate.is_empty());
+        assert!(policy.landlock_device_ioctl.is_empty());
+        assert!(policy.landlock_tcp_bind_ports.is_empty());
+        assert!(policy.landlock_tcp_connect_ports.is_empty());
+        assert!(!policy.landlock_scope_abstract_unix_socket);
+        assert!(!policy.landlock_scope_signal);
+        assert_eq!(policy.readonly_volume_source, None);
+        assert_eq!(policy.readonly_volume_target, None);
+        assert_eq!(policy.writable_volume_source, None);
+        assert_eq!(policy.writable_volume_target, None);
+        assert_eq!(policy.scratch_dir, Some(PathBuf::from("/scratch")));
+        assert_eq!(policy.scratch_bytes, Some(16 * 1024 * 1024));
+        assert_eq!(policy.executable, PathBuf::from("/bin/echo"));
+        assert_eq!(policy.args, ["hello"]);
+        assert_eq!(policy.stdio.stdin, StdioMode::Closed);
+        assert_eq!(policy.stdio.stdout, StdioMode::Inherit);
+        assert_eq!(policy.stdio.stderr, StdioMode::Inherit);
+        assert!(policy.selected_handles.is_empty());
+        assert_eq!(policy.stdout_redirect, None);
+        assert_eq!(policy.stdout_capture_bytes, None);
+        assert_eq!(policy.stdout_total_bytes, None);
+        assert_eq!(policy.time_monotonic_offset_seconds, None);
+        assert_eq!(policy.time_boottime_offset_seconds, None);
+        assert_eq!(policy.wall_clock_milliseconds, None);
+        assert_eq!(
+            policy.environment.get("LANG").map(String::as_str),
+            Some("C")
+        );
+        assert!(policy.seccomp.allowed_syscalls.contains("execveat"));
+        assert!(policy.seccomp.argument_rules.is_empty());
+    }
+
+    #[test]
+    fn parses_time_namespace_offsets() {
+        let text = format!(
+            "{VALID}\ntime.monotonic_offset_seconds = 3600\ntime.boottime_offset_seconds = 7200"
+        );
+        let policy: SandboxPolicy = text.parse().unwrap();
+        assert_eq!(policy.time_monotonic_offset_seconds, Some(3600));
+        assert_eq!(policy.time_boottime_offset_seconds, Some(7200));
+    }
+
+    #[test]
+    fn rejects_incomplete_noop_or_oversized_time_namespace_offsets() {
+        for invalid in [
+            format!("{VALID}\ntime.monotonic_offset_seconds = 3600"),
+            format!("{VALID}\ntime.boottime_offset_seconds = 7200"),
+            format!("{VALID}\ntime.monotonic_offset_seconds = 0\ntime.boottime_offset_seconds = 0"),
+            format!(
+                "{VALID}\ntime.monotonic_offset_seconds = {}\ntime.boottime_offset_seconds = 0",
+                MAX_TIME_OFFSET_SECONDS + 1
+            ),
+        ] {
+            assert!(invalid.parse::<SandboxPolicy>().is_err());
+        }
+    }
+
+    #[test]
+    fn parses_landlock_read_execute_paths() {
+        let text =
+            format!("{VALID}\nlandlock.read_execute = /bin\nlandlock.read_execute = /usr/share");
+        let policy: SandboxPolicy = text.parse().unwrap();
+        assert_eq!(
+            policy.landlock_read_execute,
+            [PathBuf::from("/bin"), PathBuf::from("/usr/share")]
+        );
+    }
+
+    #[test]
+    fn rejects_unsafe_landlock_read_execute_paths() {
+        let root = format!("{VALID}\nlandlock.read_execute = /");
+        assert!(root.parse::<SandboxPolicy>().is_err());
+
+        let relative = format!("{VALID}\nlandlock.read_execute = bin");
+        assert!(relative.parse::<SandboxPolicy>().is_err());
+
+        let duplicate =
+            format!("{VALID}\nlandlock.read_execute = /bin\nlandlock.read_execute = /bin");
+        assert!(duplicate.parse::<SandboxPolicy>().is_err());
+
+        let misses_executable = format!("{VALID}\nlandlock.read_execute = /tmp");
+        let error = misses_executable.parse::<SandboxPolicy>().unwrap_err();
+        assert!(error.to_string().contains("cover the initial executable"));
+    }
+
+    #[test]
+    fn parses_landlock_tcp_port_rules() {
+        let allowed = format!("{VALID}\nlandlock.tcp_bind_port = 42421\nlandlock.tcp_bind_port = 42423\nlandlock.tcp_connect_port = 42421");
+        let policy: SandboxPolicy = allowed.parse().unwrap();
+        assert_eq!(policy.landlock_tcp_bind_ports, [42421, 42423]);
+        assert_eq!(policy.landlock_tcp_connect_ports, [42421]);
+
+        for key in ["landlock.tcp_bind_port", "landlock.tcp_connect_port"] {
+            let zero = format!("{VALID}\n{key} = 0");
+            assert!(zero.parse::<SandboxPolicy>().is_err());
+
+            let duplicate = format!("{VALID}\n{key} = 42421\n{key} = 42421");
+            assert!(duplicate.parse::<SandboxPolicy>().is_err());
+
+            let mut oversized = VALID.to_owned();
+            for port in 1..=33 {
+                oversized.push_str(&format!("\n{key} = {}", 43000 + port));
+            }
+            assert!(oversized.parse::<SandboxPolicy>().is_err());
+        }
+    }
+
+    #[test]
+    fn parses_landlock_file_mutation_paths() {
+        let scratch: SandboxPolicy = format!("{VALID}\nlandlock.file_mutate = /scratch")
+            .parse()
+            .unwrap();
+        assert_eq!(scratch.landlock_file_mutate, [PathBuf::from("/scratch")]);
+
+        let base = volume_valid();
+        let persistent: SandboxPolicy = format!(
+            "{base}\nvolume.writable_source = /srv/state\nvolume.writable_target = /persist\nlandlock.file_mutate = /persist/allowed"
+        )
+        .parse()
+        .unwrap();
+        assert_eq!(
+            persistent.landlock_file_mutate,
+            [PathBuf::from("/persist/allowed")]
+        );
+    }
+
+    #[test]
+    fn rejects_unsafe_landlock_file_mutation_paths() {
+        let root = format!("{VALID}\nlandlock.file_mutate = /");
+        assert!(root.parse::<SandboxPolicy>().is_err());
+
+        let relative = format!("{VALID}\nlandlock.file_mutate = scratch");
+        assert!(relative.parse::<SandboxPolicy>().is_err());
+
+        let duplicate =
+            format!("{VALID}\nlandlock.file_mutate = /scratch\nlandlock.file_mutate = /scratch");
+        assert!(duplicate.parse::<SandboxPolicy>().is_err());
+
+        let undeclared_surface = format!("{VALID}\nlandlock.file_mutate = /tmp");
+        let error = undeclared_surface.parse::<SandboxPolicy>().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("must be within filesystem.scratch or volume.writable_target"));
+
+        let scratch_subdir = format!("{VALID}\nlandlock.file_mutate = /scratch/subdir");
+        assert!(scratch_subdir.parse::<SandboxPolicy>().is_err());
+    }
+
+    #[test]
+    fn parses_landlock_path_topology_mutation_paths() {
+        let policy: SandboxPolicy = format!(
+            "{VALID}\nlandlock.file_mutate = /scratch\nlandlock.path_topology_mutate = /scratch"
+        )
+        .parse()
+        .unwrap();
+        assert_eq!(
+            policy.landlock_path_topology_mutate,
+            [PathBuf::from("/scratch")]
+        );
+    }
+
+    #[test]
+    fn rejects_unanchored_or_unsafe_landlock_path_topology_mutation() {
+        for invalid in [
+            format!("{VALID}\nlandlock.path_topology_mutate = /scratch"),
+            format!("{VALID}\nlandlock.file_mutate = /scratch\nlandlock.path_topology_mutate = /"),
+            format!("{VALID}\nlandlock.file_mutate = /scratch\nlandlock.path_topology_mutate = scratch"),
+            format!("{VALID}\nlandlock.file_mutate = /scratch\nlandlock.path_topology_mutate = /scratch/subdir"),
+            format!("{VALID}\nlandlock.file_mutate = /scratch\nlandlock.path_topology_mutate = /scratch\nlandlock.path_topology_mutate = /scratch"),
+        ] {
+            assert!(invalid.parse::<SandboxPolicy>().is_err());
+        }
+
+        let mut oversized = VALID.to_owned();
+        for index in 0..=MAX_LANDLOCK_PATH_TOPOLOGY_MUTATE_PATHS {
+            oversized.push_str(&format!("\nlandlock.file_mutate = /persist/path-{index}"));
+            oversized.push_str(&format!(
+                "\nlandlock.path_topology_mutate = /persist/path-{index}"
+            ));
+        }
+        oversized
+            .push_str("\nvolume.writable_source = /srv/state\nvolume.writable_target = /persist");
+        assert!(oversized.parse::<SandboxPolicy>().is_err());
+    }
+
+    #[test]
+    fn parses_and_rejects_landlock_device_ioctl_paths() {
+        let allowed: SandboxPolicy = format!(
+            "{VALID}\nlandlock.device_ioctl = /devices/urandom\nlandlock.device_ioctl = /devices/random"
+        )
+        .parse()
+        .unwrap();
+        assert_eq!(
+            allowed.landlock_device_ioctl,
+            [
+                PathBuf::from("/devices/urandom"),
+                PathBuf::from("/devices/random")
+            ]
+        );
+
+        for invalid in [
+            format!("{VALID}\nlandlock.device_ioctl = /"),
+            format!("{VALID}\nlandlock.device_ioctl = devices/urandom"),
+            format!("{VALID}\nlandlock.device_ioctl = /devices/urandom\nlandlock.device_ioctl = /devices/urandom"),
+        ] {
+            assert!(invalid.parse::<SandboxPolicy>().is_err());
+        }
+
+        let mut oversized = VALID.to_owned();
+        for index in 0..=MAX_LANDLOCK_DEVICE_IOCTL_PATHS {
+            oversized.push_str(&format!(
+                "\nlandlock.device_ioctl = /devices/device-{index}"
+            ));
+        }
+        assert!(oversized.parse::<SandboxPolicy>().is_err());
+    }
+
+    #[test]
+    fn parses_landlock_abstract_unix_scope_mode() {
+        let enabled: SandboxPolicy =
+            format!("{VALID}\nlandlock.scope_abstract_unix_socket = enabled")
+                .parse()
+                .unwrap();
+        assert!(enabled.landlock_scope_abstract_unix_socket);
+
+        let disabled: SandboxPolicy =
+            format!("{VALID}\nlandlock.scope_abstract_unix_socket = disabled")
+                .parse()
+                .unwrap();
+        assert!(!disabled.landlock_scope_abstract_unix_socket);
+
+        let invalid = format!("{VALID}\nlandlock.scope_abstract_unix_socket = yes");
+        assert!(invalid.parse::<SandboxPolicy>().is_err());
+
+        let duplicate = format!(
+            "{VALID}\nlandlock.scope_abstract_unix_socket = enabled\nlandlock.scope_abstract_unix_socket = disabled"
+        );
+        assert!(duplicate.parse::<SandboxPolicy>().is_err());
+
+        let combined: SandboxPolicy = format!(
+            "{VALID}\nlandlock.scope_abstract_unix_socket = enabled\nlandlock.scope_signal = enabled"
+        )
+        .parse()
+        .unwrap();
+        assert!(combined.landlock_scope_abstract_unix_socket);
+        assert!(combined.landlock_scope_signal);
+    }
+
+    #[test]
+    fn parses_landlock_signal_scope_mode() {
+        let enabled: SandboxPolicy = format!("{VALID}\nlandlock.scope_signal = enabled")
+            .parse()
+            .unwrap();
+        assert!(enabled.landlock_scope_signal);
+
+        let disabled: SandboxPolicy = format!("{VALID}\nlandlock.scope_signal = disabled")
+            .parse()
+            .unwrap();
+        assert!(!disabled.landlock_scope_signal);
+
+        let invalid = format!("{VALID}\nlandlock.scope_signal = yes");
+        assert!(invalid.parse::<SandboxPolicy>().is_err());
+
+        let duplicate =
+            format!("{VALID}\nlandlock.scope_signal = enabled\nlandlock.scope_signal = disabled");
+        assert!(duplicate.parse::<SandboxPolicy>().is_err());
+    }
+
+    #[test]
+    fn parses_loopback_networking_mode() {
+        let enabled: SandboxPolicy = format!("{VALID}\nnetwork.loopback = enabled")
+            .parse()
+            .unwrap();
+        assert!(enabled.loopback_enabled);
+
+        let disabled: SandboxPolicy = format!("{VALID}\nnetwork.loopback = disabled")
+            .parse()
+            .unwrap();
+        assert!(!disabled.loopback_enabled);
+    }
+
+    #[test]
+    fn rejects_invalid_or_duplicate_loopback_networking_mode() {
+        let invalid = format!("{VALID}\nnetwork.loopback = host");
+        let error = invalid.parse::<SandboxPolicy>().unwrap_err();
+        assert!(error.to_string().contains("must be enabled or disabled"));
+
+        let duplicate = format!("{VALID}\nnetwork.loopback = enabled\nnetwork.loopback = disabled");
+        assert!(duplicate.parse::<SandboxPolicy>().is_err());
+    }
+
+    #[test]
+    fn parses_private_procfs_mode() {
+        let enabled: SandboxPolicy = format!("{VALID}\nfilesystem.proc = enabled")
+            .parse()
+            .unwrap();
+        assert!(enabled.procfs_enabled);
+
+        let disabled: SandboxPolicy = format!("{VALID}\nfilesystem.proc = disabled")
+            .parse()
+            .unwrap();
+        assert!(!disabled.procfs_enabled);
+    }
+
+    #[test]
+    fn rejects_invalid_duplicate_or_overlapping_private_procfs() {
+        let invalid = format!("{VALID}\nfilesystem.proc = host");
+        assert!(invalid.parse::<SandboxPolicy>().is_err());
+
+        let duplicate = format!("{VALID}\nfilesystem.proc = enabled\nfilesystem.proc = disabled");
+        assert!(duplicate.parse::<SandboxPolicy>().is_err());
+
+        let hides_cwd = VALID.replace("working_dir = /tmp", "working_dir = /proc/self");
+        let hides_cwd = format!("{hides_cwd}\nfilesystem.proc = enabled");
+        assert!(hides_cwd.parse::<SandboxPolicy>().is_err());
+
+        let overlaps_scratch = VALID.replace(
+            "filesystem.scratch = /scratch",
+            "filesystem.scratch = /proc",
+        );
+        let overlaps_scratch = format!("{overlaps_scratch}\nfilesystem.proc = enabled");
+        assert!(overlaps_scratch.parse::<SandboxPolicy>().is_err());
+    }
+
+    #[test]
+    fn parses_brokered_host_loopback_tcp_endpoint() {
+        let text = format!(
+            "{VALID}\nnetwork.host_loopback_tcp_port = 8080\nnetwork.host_loopback_tcp_target_fd = 10"
+        );
+        let policy: SandboxPolicy = text.parse().unwrap();
+        assert_eq!(policy.host_loopback_tcp_port, Some(8080));
+        assert_eq!(policy.host_loopback_tcp_target_fd, Some(10));
+    }
+
+    #[test]
+    fn rejects_incomplete_or_unsafe_brokered_host_loopback_tcp_endpoint() {
+        let incomplete = format!("{VALID}\nnetwork.host_loopback_tcp_port = 8080");
+        assert!(incomplete.parse::<SandboxPolicy>().is_err());
+
+        let zero_port = format!(
+            "{VALID}\nnetwork.host_loopback_tcp_port = 0\nnetwork.host_loopback_tcp_target_fd = 10"
+        );
+        assert!(zero_port.parse::<SandboxPolicy>().is_err());
+
+        let oversized_port = format!(
+            "{VALID}\nnetwork.host_loopback_tcp_port = 65536\nnetwork.host_loopback_tcp_target_fd = 10"
+        );
+        assert!(oversized_port.parse::<SandboxPolicy>().is_err());
+
+        let stdio_target = format!(
+            "{VALID}\nnetwork.host_loopback_tcp_port = 8080\nnetwork.host_loopback_tcp_target_fd = 2"
+        );
+        assert!(stdio_target.parse::<SandboxPolicy>().is_err());
+
+        let rlimit_target = format!(
+            "{VALID}\nnetwork.host_loopback_tcp_port = 8080\nnetwork.host_loopback_tcp_target_fd = 32"
+        );
+        assert!(rlimit_target.parse::<SandboxPolicy>().is_err());
+
+        let collision = format!(
+            "{VALID}\nhandle.10 = 0\nnetwork.host_loopback_tcp_port = 8080\nnetwork.host_loopback_tcp_target_fd = 10"
+        );
+        let error = collision.parse::<SandboxPolicy>().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("collides with a selected handle target"));
+    }
+
+    #[test]
+    fn parses_brokered_host_ipv4_tcp_endpoint() {
+        let text = format!(
+            "{VALID}\nnetwork.host_ipv4_tcp_address = 127.0.0.2\nnetwork.host_ipv4_tcp_port = 8080\nnetwork.host_ipv4_tcp_target_fd = 12"
+        );
+        let policy: SandboxPolicy = text.parse().unwrap();
+        assert_eq!(
+            policy.host_ipv4_tcp_address,
+            Some(Ipv4Addr::new(127, 0, 0, 2))
+        );
+        assert_eq!(policy.host_ipv4_tcp_port, Some(8080));
+        assert_eq!(policy.host_ipv4_tcp_target_fd, Some(12));
+    }
+
+    #[test]
+    fn rejects_incomplete_or_unsafe_brokered_host_ipv4_tcp_endpoint() {
+        let incomplete = format!(
+            "{VALID}\nnetwork.host_ipv4_tcp_address = 127.0.0.2\nnetwork.host_ipv4_tcp_port = 8080"
+        );
+        assert!(incomplete.parse::<SandboxPolicy>().is_err());
+
+        for address in [
+            "example.com",
+            "0.0.0.0",
+            "0.1.2.3",
+            "224.0.0.1",
+            "255.255.255.255",
+        ] {
+            let text = format!(
+                "{VALID}\nnetwork.host_ipv4_tcp_address = {address}\nnetwork.host_ipv4_tcp_port = 8080\nnetwork.host_ipv4_tcp_target_fd = 12"
+            );
+            assert!(
+                text.parse::<SandboxPolicy>().is_err(),
+                "accepted unsafe address {address}"
+            );
+        }
+
+        let collision = format!(
+            "{VALID}\nhandle.12 = 0\nnetwork.host_ipv4_tcp_address = 127.0.0.2\nnetwork.host_ipv4_tcp_port = 8080\nnetwork.host_ipv4_tcp_target_fd = 12"
+        );
+        let error = collision.parse::<SandboxPolicy>().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("collides with a selected handle target"));
+
+        let legacy_collision = format!(
+            "{VALID}\nnetwork.host_loopback_tcp_port = 8080\nnetwork.host_loopback_tcp_target_fd = 12\nnetwork.host_ipv4_tcp_address = 127.0.0.2\nnetwork.host_ipv4_tcp_port = 8080\nnetwork.host_ipv4_tcp_target_fd = 12"
+        );
+        let error = legacy_collision.parse::<SandboxPolicy>().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("collides with the brokered host-loopback connection target"));
+    }
+
+    #[test]
+    fn parses_brokered_host_ipv4_udp_endpoint() {
+        let text = format!(
+            "{VALID}\nnetwork.host_ipv4_udp_address = 127.0.0.2\nnetwork.host_ipv4_udp_port = 5353\nnetwork.host_ipv4_udp_target_fd = 13"
+        );
+        let policy: SandboxPolicy = text.parse().unwrap();
+        assert_eq!(
+            policy.host_ipv4_udp_address,
+            Some(Ipv4Addr::new(127, 0, 0, 2))
+        );
+        assert_eq!(policy.host_ipv4_udp_port, Some(5353));
+        assert_eq!(policy.host_ipv4_udp_target_fd, Some(13));
+    }
+
+    #[test]
+    fn rejects_incomplete_or_unsafe_brokered_host_ipv4_udp_endpoint() {
+        let incomplete = format!(
+            "{VALID}\nnetwork.host_ipv4_udp_address = 127.0.0.2\nnetwork.host_ipv4_udp_port = 5353"
+        );
+        assert!(incomplete.parse::<SandboxPolicy>().is_err());
+
+        for address in ["example.com", "0.0.0.0", "224.0.0.1", "255.255.255.255"] {
+            let text = format!(
+                "{VALID}\nnetwork.host_ipv4_udp_address = {address}\nnetwork.host_ipv4_udp_port = 5353\nnetwork.host_ipv4_udp_target_fd = 13"
+            );
+            assert!(
+                text.parse::<SandboxPolicy>().is_err(),
+                "accepted unsafe UDP address {address}"
+            );
+        }
+
+        let selected_collision = format!(
+            "{VALID}\nhandle.13 = 0\nnetwork.host_ipv4_udp_address = 127.0.0.2\nnetwork.host_ipv4_udp_port = 5353\nnetwork.host_ipv4_udp_target_fd = 13"
+        );
+        assert!(selected_collision.parse::<SandboxPolicy>().is_err());
+
+        let tcp_collision = format!(
+            "{VALID}\nnetwork.host_ipv4_tcp_address = 127.0.0.2\nnetwork.host_ipv4_tcp_port = 8080\nnetwork.host_ipv4_tcp_target_fd = 13\nnetwork.host_ipv4_udp_address = 127.0.0.2\nnetwork.host_ipv4_udp_port = 5353\nnetwork.host_ipv4_udp_target_fd = 13"
+        );
+        let error = tcp_collision.parse::<SandboxPolicy>().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("collides with the brokered host-IPv4 TCP connection target"));
+    }
+
+    #[test]
+    fn parses_brokered_host_loopback_tcp_listener() {
+        let text = format!(
+            "{VALID}\nnetwork.host_loopback_tcp_listen_port = 9090\nnetwork.host_loopback_tcp_listen_target_fd = 11"
+        );
+        let policy: SandboxPolicy = text.parse().unwrap();
+        assert_eq!(policy.host_loopback_tcp_listen_port, Some(9090));
+        assert_eq!(policy.host_loopback_tcp_listen_target_fd, Some(11));
+    }
+
+    #[test]
+    fn rejects_incomplete_or_colliding_brokered_host_loopback_tcp_listener() {
+        let incomplete = format!("{VALID}\nnetwork.host_loopback_tcp_listen_port = 9090");
+        assert!(incomplete.parse::<SandboxPolicy>().is_err());
+
+        let collision = format!(
+            "{VALID}\nhandle.11 = 0\nnetwork.host_loopback_tcp_listen_port = 9090\nnetwork.host_loopback_tcp_listen_target_fd = 11"
+        );
+        let error = collision.parse::<SandboxPolicy>().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("collides with a selected handle target"));
+
+        let broker_collision = format!(
+            "{VALID}\nnetwork.host_loopback_tcp_port = 8080\nnetwork.host_loopback_tcp_target_fd = 11\nnetwork.host_loopback_tcp_listen_port = 9090\nnetwork.host_loopback_tcp_listen_target_fd = 11"
+        );
+        let error = broker_collision.parse::<SandboxPolicy>().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("collides with the brokered connection target"));
+    }
+
+    #[test]
+    fn parses_brokered_host_unix_stream_endpoint() {
+        let base = volume_valid();
+        let text = format!(
+            "{base}\nipc.host_unix_stream_path = /run/security-lab.sock\nipc.host_unix_stream_target_fd = 14"
+        );
+        let policy: SandboxPolicy = text.parse().unwrap();
+        assert_eq!(
+            policy.host_unix_stream_path,
+            Some(PathBuf::from("/run/security-lab.sock"))
+        );
+        assert_eq!(policy.host_unix_stream_target_fd, Some(14));
+    }
+
+    #[test]
+    fn parses_brokered_host_unix_peer_credentials() {
+        let base = volume_valid();
+        let text = format!(
+            "{base}\nipc.host_unix_stream_path = /run/security-lab.sock\nipc.host_unix_stream_target_fd = 14\nipc.host_unix_stream_peer_uid = 1000\nipc.host_unix_stream_peer_gid = 1001"
+        );
+        let policy: SandboxPolicy = text.parse().unwrap();
+        assert_eq!(policy.host_unix_stream_peer_uid, Some(1000));
+        assert_eq!(policy.host_unix_stream_peer_gid, Some(1001));
+    }
+
+    #[test]
+    fn rejects_incomplete_or_detached_host_unix_peer_credentials() {
+        let base = volume_valid();
+        let incomplete = format!(
+            "{base}\nipc.host_unix_stream_path = /run/security-lab.sock\nipc.host_unix_stream_target_fd = 14\nipc.host_unix_stream_peer_uid = 1000"
+        );
+        let error = incomplete.parse::<SandboxPolicy>().unwrap_err();
+        assert!(error.to_string().contains("must be specified together"));
+
+        let detached = format!(
+            "{base}\nipc.host_unix_stream_peer_uid = 1000\nipc.host_unix_stream_peer_gid = 1001"
+        );
+        let error = detached.parse::<SandboxPolicy>().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("require a brokered host-UNIX stream endpoint"));
+    }
+
+    #[test]
+    fn rejects_incomplete_unsafe_or_colliding_host_unix_stream_endpoint() {
+        let base = volume_valid();
+        let incomplete = format!("{base}\nipc.host_unix_stream_path = /run/security-lab.sock");
+        assert!(incomplete.parse::<SandboxPolicy>().is_err());
+
+        let relative = format!(
+            "{base}\nipc.host_unix_stream_path = run/security-lab.sock\nipc.host_unix_stream_target_fd = 14"
+        );
+        assert!(relative.parse::<SandboxPolicy>().is_err());
+
+        let inside_root = format!(
+            "{base}\nipc.host_unix_stream_path = /sandbox/root/run/service.sock\nipc.host_unix_stream_target_fd = 14"
+        );
+        let error = inside_root.parse::<SandboxPolicy>().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("must not overlap filesystem.root"));
+
+        let too_long = format!("/run/{}", "x".repeat(108));
+        let oversized = format!(
+            "{base}\nipc.host_unix_stream_path = {too_long}\nipc.host_unix_stream_target_fd = 14"
+        );
+        assert!(oversized.parse::<SandboxPolicy>().is_err());
+
+        let stdio_target = format!(
+            "{base}\nipc.host_unix_stream_path = /run/security-lab.sock\nipc.host_unix_stream_target_fd = 2"
+        );
+        assert!(stdio_target.parse::<SandboxPolicy>().is_err());
+
+        let selected_collision = format!(
+            "{base}\nhandle.14 = 0\nipc.host_unix_stream_path = /run/security-lab.sock\nipc.host_unix_stream_target_fd = 14"
+        );
+        assert!(selected_collision.parse::<SandboxPolicy>().is_err());
+
+        let broker_collision = format!(
+            "{base}\nnetwork.host_ipv4_tcp_address = 127.0.0.2\nnetwork.host_ipv4_tcp_port = 8080\nnetwork.host_ipv4_tcp_target_fd = 14\nipc.host_unix_stream_path = /run/security-lab.sock\nipc.host_unix_stream_target_fd = 14"
+        );
+        let error = broker_collision.parse::<SandboxPolicy>().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("collides with the brokered host-IPv4 TCP connection target"));
+    }
+
+    #[test]
+    fn parses_bounded_copy_on_write_root() {
+        let policy: SandboxPolicy = format!("{VALID}\nfilesystem.cow_root_bytes = 16777216")
+            .parse()
+            .unwrap();
+        assert_eq!(policy.cow_root_bytes, Some(16 * 1024 * 1024));
+
+        let too_small = format!(
+            "{VALID}\nfilesystem.cow_root_bytes = {}",
+            MIN_COW_ROOT_BYTES - 1
+        );
+        assert!(too_small.parse::<SandboxPolicy>().is_err());
+
+        let too_large = format!(
+            "{VALID}\nfilesystem.cow_root_bytes = {}",
+            MAX_COW_ROOT_BYTES + 1
+        );
+        assert!(too_large.parse::<SandboxPolicy>().is_err());
+
+        let duplicate =
+            format!("{VALID}\nfilesystem.cow_root_bytes = 4096\nfilesystem.cow_root_bytes = 8192");
+        assert!(duplicate.parse::<SandboxPolicy>().is_err());
+    }
+
+    #[test]
+    fn parses_bounded_copy_on_write_diff_export() {
+        let policy: SandboxPolicy = format!(
+            "{VALID}\nfilesystem.cow_root_bytes = 16777216\nfilesystem.cow_diff_bytes = 4096"
+        )
+        .parse()
+        .unwrap();
+        assert_eq!(policy.cow_diff_bytes, Some(4096));
+
+        let without_cow = format!("{VALID}\nfilesystem.cow_diff_bytes = 4096");
+        assert!(without_cow.parse::<SandboxPolicy>().is_err());
+
+        let too_small = format!(
+            "{VALID}\nfilesystem.cow_root_bytes = 16777216\nfilesystem.cow_diff_bytes = {}",
+            MIN_COW_DIFF_BYTES - 1
+        );
+        assert!(too_small.parse::<SandboxPolicy>().is_err());
+    }
+
+    #[test]
+    fn parses_readonly_volume_pair() {
+        let base = volume_valid();
+        let text =
+            format!("{base}\nvolume.readonly_source = /srv/data\nvolume.readonly_target = /data");
+        let policy: SandboxPolicy = text.parse().unwrap();
+        assert_eq!(
+            policy.readonly_volume_source,
+            Some(PathBuf::from("/srv/data"))
+        );
+        assert_eq!(policy.readonly_volume_target, Some(PathBuf::from("/data")));
+    }
+
+    #[test]
+    fn rejects_incomplete_or_unsafe_readonly_volume() {
+        let base = volume_valid();
+        let incomplete = format!("{base}\nvolume.readonly_source = /srv/data");
+        assert!(incomplete.parse::<SandboxPolicy>().is_err());
+
+        let root_target =
+            format!("{base}\nvolume.readonly_source = /srv/data\nvolume.readonly_target = /");
+        assert!(root_target.parse::<SandboxPolicy>().is_err());
+
+        let relative_source =
+            format!("{base}\nvolume.readonly_source = relative\nvolume.readonly_target = /data");
+        assert!(relative_source.parse::<SandboxPolicy>().is_err());
+
+        let hides_cwd =
+            format!("{base}\nvolume.readonly_source = /srv/data\nvolume.readonly_target = /tmp");
+        assert!(hides_cwd.parse::<SandboxPolicy>().is_err());
+
+        let overlaps_scratch = format!(
+            "{base}\nvolume.readonly_source = /srv/data\nvolume.readonly_target = /scratch/data"
+        );
+        assert!(overlaps_scratch.parse::<SandboxPolicy>().is_err());
+
+        let source_inside_root = format!(
+            "{base}\nvolume.readonly_source = /sandbox/root/source\nvolume.readonly_target = /data"
+        );
+        let err = source_inside_root.parse::<SandboxPolicy>().unwrap_err();
+        assert!(err.to_string().contains("must not overlap filesystem.root"));
+
+        let source_contains_root =
+            format!("{base}\nvolume.readonly_source = /sandbox\nvolume.readonly_target = /data");
+        let err = source_contains_root.parse::<SandboxPolicy>().unwrap_err();
+        assert!(err.to_string().contains("must not overlap filesystem.root"));
+    }
+
+    #[test]
+    fn parses_writable_volume_pair() {
+        let base = volume_valid();
+        let text = format!(
+            "{base}\nvolume.writable_source = /srv/state\nvolume.writable_target = /persist"
+        );
+        let policy: SandboxPolicy = text.parse().unwrap();
+        assert_eq!(
+            policy.writable_volume_source,
+            Some(PathBuf::from("/srv/state"))
+        );
+        assert_eq!(
+            policy.writable_volume_target,
+            Some(PathBuf::from("/persist"))
+        );
+    }
+
+    #[test]
+    fn rejects_incomplete_or_unsafe_writable_volume() {
+        let base = volume_valid();
+        let incomplete = format!("{base}\nvolume.writable_source = /srv/state");
+        assert!(incomplete.parse::<SandboxPolicy>().is_err());
+
+        let host_root =
+            format!("{base}\nvolume.writable_source = /\nvolume.writable_target = /persist");
+        assert!(host_root.parse::<SandboxPolicy>().is_err());
+
+        let root_target =
+            format!("{base}\nvolume.writable_source = /srv/state\nvolume.writable_target = /");
+        assert!(root_target.parse::<SandboxPolicy>().is_err());
+
+        let hides_cwd =
+            format!("{base}\nvolume.writable_source = /srv/state\nvolume.writable_target = /tmp");
+        assert!(hides_cwd.parse::<SandboxPolicy>().is_err());
+
+        let overlaps_scratch = format!(
+            "{base}\nvolume.writable_source = /srv/state\nvolume.writable_target = /scratch/state"
+        );
+        assert!(overlaps_scratch.parse::<SandboxPolicy>().is_err());
+
+        let overlaps_readonly_target = format!(
+            "{base}\nvolume.readonly_source = /srv/data\nvolume.readonly_target = /data\nvolume.writable_source = /srv/state\nvolume.writable_target = /data/state"
+        );
+        assert!(overlaps_readonly_target.parse::<SandboxPolicy>().is_err());
+
+        let overlaps_readonly_source = format!(
+            "{base}\nvolume.readonly_source = /srv/data\nvolume.readonly_target = /data\nvolume.writable_source = /srv/data/state\nvolume.writable_target = /persist"
+        );
+        assert!(overlaps_readonly_source.parse::<SandboxPolicy>().is_err());
+
+        let source_inside_root = format!(
+            "{base}\nvolume.writable_source = /sandbox/root/state\nvolume.writable_target = /persist"
+        );
+        let err = source_inside_root.parse::<SandboxPolicy>().unwrap_err();
+        assert!(err.to_string().contains("must not overlap filesystem.root"));
+
+        let source_contains_root =
+            format!("{base}\nvolume.writable_source = /sandbox\nvolume.writable_target = /persist");
+        let err = source_contains_root.parse::<SandboxPolicy>().unwrap_err();
+        assert!(err.to_string().contains("must not overlap filesystem.root"));
+    }
+
+    #[test]
+    fn parses_stdout_redirect_inside_scratch() {
+        let text = VALID.replace(
+            "stdio.stdout = inherit",
+            "stdio.stdout = redirect\n        stdio.stdout_path = /scratch/stdout.log",
+        );
+        let policy: SandboxPolicy = text.parse().unwrap();
+        assert_eq!(policy.stdio.stdout, StdioMode::Redirect);
+        assert_eq!(
+            policy.stdout_redirect,
+            Some(PathBuf::from("/scratch/stdout.log"))
+        );
+    }
+
+    #[test]
+    fn parses_bounded_stdout_capture() {
+        let text = VALID.replace(
+            "stdio.stdout = inherit",
+            "stdio.stdout = capture\n        stdio.stdout_capture_bytes = 4096",
+        );
+        let policy: SandboxPolicy = text.parse().unwrap();
+        assert_eq!(policy.stdio.stdout, StdioMode::Capture);
+        assert_eq!(policy.stdout_capture_bytes, Some(4096));
+    }
+
+    #[test]
+    fn parses_and_bounds_stdout_total_budget() {
+        let text = VALID.replace(
+            "stdio.stdout = inherit",
+            "stdio.stdout = capture\n        stdio.stdout_capture_bytes = 1024\n        limit.stdout_total_bytes = 65536",
+        );
+        let policy: SandboxPolicy = text.parse().unwrap();
+        assert_eq!(policy.stdout_capture_bytes, Some(1024));
+        assert_eq!(policy.stdout_total_bytes, Some(65536));
+
+        let wrong_mode = format!("{VALID}\nlimit.stdout_total_bytes = 4096");
+        assert!(wrong_mode.parse::<SandboxPolicy>().is_err());
+
+        let zero = VALID.replace(
+            "stdio.stdout = inherit",
+            "stdio.stdout = capture\n        stdio.stdout_capture_bytes = 1\n        limit.stdout_total_bytes = 0",
+        );
+        assert!(zero.parse::<SandboxPolicy>().is_err());
+
+        let retained_exceeds_total = VALID.replace(
+            "stdio.stdout = inherit",
+            "stdio.stdout = capture\n        stdio.stdout_capture_bytes = 4096\n        limit.stdout_total_bytes = 1024",
+        );
+        assert!(retained_exceeds_total.parse::<SandboxPolicy>().is_err());
+
+        let oversized = VALID.replace(
+            "stdio.stdout = inherit",
+            &format!(
+                "stdio.stdout = capture\n        stdio.stdout_capture_bytes = 1\n        limit.stdout_total_bytes = {}",
+                MAX_STDOUT_TOTAL_BYTES + 1
+            ),
+        );
+        assert!(oversized.parse::<SandboxPolicy>().is_err());
+    }
+
+    #[test]
+    fn parses_wall_clock_deadline() {
+        let text = format!("{VALID}\nlimit.wall_clock_milliseconds = 1500");
+        let policy: SandboxPolicy = text.parse().unwrap();
+        assert_eq!(policy.wall_clock_milliseconds, Some(1500));
+    }
+
+    #[test]
+    fn rejects_zero_wall_clock_deadline() {
+        let text = format!("{VALID}\nlimit.wall_clock_milliseconds = 0");
+        assert!(text.parse::<SandboxPolicy>().is_err());
+    }
+
+    #[test]
+    fn rejects_oversized_wall_clock_deadline() {
+        let text = format!(
+            "{VALID}\nlimit.wall_clock_milliseconds = {}",
+            MAX_WALL_CLOCK_MILLISECONDS + 1
+        );
+        assert!(text.parse::<SandboxPolicy>().is_err());
+    }
+
+    #[test]
+    fn rejects_duplicate_wall_clock_deadline() {
+        let text = format!(
+            "{VALID}\nlimit.wall_clock_milliseconds = 1000\nlimit.wall_clock_milliseconds = 2000"
+        );
+        assert!(text.parse::<SandboxPolicy>().is_err());
+    }
+
+    #[test]
+    fn rejects_redirect_path_outside_scratch() {
+        let text = VALID.replace(
+            "stdio.stdout = inherit",
+            "stdio.stdout = redirect\n        stdio.stdout_path = /tmp/stdout.log",
+        );
+        assert!(text.parse::<SandboxPolicy>().is_err());
+    }
+
+    #[test]
+    fn rejects_redirect_without_path() {
+        let text = VALID.replace("stdio.stdout = inherit", "stdio.stdout = redirect");
+        assert!(text.parse::<SandboxPolicy>().is_err());
+    }
+
+    #[test]
+    fn rejects_capture_without_limit() {
+        let text = VALID.replace("stdio.stdout = inherit", "stdio.stdout = capture");
+        assert!(text.parse::<SandboxPolicy>().is_err());
+    }
+
+    #[test]
+    fn rejects_zero_capture_limit() {
+        let text = VALID.replace(
+            "stdio.stdout = inherit",
+            "stdio.stdout = capture\n        stdio.stdout_capture_bytes = 0",
+        );
+        assert!(text.parse::<SandboxPolicy>().is_err());
+    }
+
+    #[test]
+    fn rejects_redirect_or_capture_on_stdin() {
+        let redirected = VALID.replace("stdio.stdin = closed", "stdio.stdin = redirect");
+        assert!(redirected.parse::<SandboxPolicy>().is_err());
+        let captured = VALID.replace("stdio.stdin = closed", "stdio.stdin = capture");
+        assert!(captured.parse::<SandboxPolicy>().is_err());
+    }
+
+    #[test]
+    fn rejects_unknown_key() {
+        let err = format!("{VALID}\nallow_everything = true").parse::<SandboxPolicy>();
+        assert!(err.unwrap_err().to_string().contains("unknown policy key"));
+    }
+
+    #[test]
+    fn rejects_missing_security_field() {
+        let text = VALID.replace("filesystem.root = /", "");
+        assert!(text.parse::<SandboxPolicy>().is_err());
+    }
+
+    #[test]
+    fn rejects_missing_hostname() {
+        let text = VALID.replace("identity.hostname = security-lab\n", "");
+        let err = text.parse::<SandboxPolicy>().unwrap_err();
+        assert!(err.to_string().contains("identity.hostname"));
+    }
+
+    #[test]
+    fn rejects_invalid_hostname() {
+        for hostname in ["-bad", "bad_underscore", "bad.", ""] {
+            let text = VALID.replace(
+                "identity.hostname = security-lab",
+                &format!("identity.hostname = {hostname}"),
+            );
+            assert!(
+                text.parse::<SandboxPolicy>().is_err(),
+                "accepted {hostname:?}"
+            );
+        }
+        let oversized = "a".repeat(MAX_HOSTNAME_BYTES + 1);
+        let text = VALID.replace(
+            "identity.hostname = security-lab",
+            &format!("identity.hostname = {oversized}"),
+        );
+        assert!(text.parse::<SandboxPolicy>().is_err());
+    }
+
+    #[test]
+    fn rejects_duplicate_hostname() {
+        let text = format!("{VALID}\nidentity.hostname = duplicate");
+        assert!(text.parse::<SandboxPolicy>().is_err());
+    }
+
+    #[test]
+    fn rejects_missing_stdio_disposition() {
+        let text = VALID.replace("stdio.stderr = inherit\n", "");
+        let err = text.parse::<SandboxPolicy>().unwrap_err();
+        assert!(err.to_string().contains("stdio.stderr"));
+    }
+
+    #[test]
+    fn rejects_unknown_stdio_disposition() {
+        let text = VALID.replace("stdio.stdin = closed", "stdio.stdin = magic");
+        let err = text.parse::<SandboxPolicy>().unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("inherit, closed, redirect, or capture"));
+    }
+
+    #[test]
+    fn rejects_relative_root() {
+        let text = VALID.replace("filesystem.root = /", "filesystem.root = sandbox-root");
+        assert!(text.parse::<SandboxPolicy>().is_err());
+    }
+
+    #[test]
+    fn rejects_relative_executable() {
+        let text = VALID.replace("/bin/echo", "bin/echo");
+        assert!(text.parse::<SandboxPolicy>().is_err());
+    }
+
+    #[test]
+    fn rejects_incomplete_scratch_policy() {
+        let text = VALID.replace("filesystem.scratch_bytes = 16777216\n", "");
+        assert!(text.parse::<SandboxPolicy>().is_err());
+    }
+
+    #[test]
+    fn rejects_scratch_overlapping_working_directory() {
+        let text = VALID.replace("filesystem.scratch = /scratch", "filesystem.scratch = /tmp");
+        assert!(text.parse::<SandboxPolicy>().is_err());
+    }
+
+    #[test]
+    fn parses_seccomp_argument_range_rule_syntax() {
+        let text = VALID.replace(
+            "seccomp.allow = execveat,read,write,exit_group",
+            "seccomp.allow = execveat,lseek,exit_group\n        seccomp.range.lseek.1 = 0x00000000fffffff0:0x0000000100000010",
+        );
+        let policy: SandboxPolicy = text.parse().unwrap();
+        let rule = policy
+            .seccomp
+            .argument_range_rules
+            .get("lseek")
+            .and_then(|rules| rules.get(&1))
+            .copied()
+            .expect("lseek argument range rule");
+        assert_eq!(rule.minimum, 0x0000_0000_ffff_fff0);
+        assert_eq!(rule.maximum, 0x0000_0001_0000_0010);
+    }
+
+    #[test]
+    fn rejects_invalid_or_duplicate_seccomp_argument_range_rule() {
+        for rule in [
+            "seccomp.range.lseek.6 = 1:2",
+            "seccomp.range.lseek.1 = 2:1",
+            "seccomp.range.lseek.1 = 0:18446744073709551615",
+            "seccomp.range.lseek.1 = not-a-range",
+        ] {
+            let text = VALID.replace(
+                "seccomp.allow = execveat,read,write,exit_group",
+                &format!("seccomp.allow = execveat,lseek,exit_group\n        {rule}"),
+            );
+            assert!(text.parse::<SandboxPolicy>().is_err(), "accepted {rule}");
+        }
+
+        let duplicate = VALID.replace(
+            "seccomp.allow = execveat,read,write,exit_group",
+            "seccomp.allow = execveat,lseek,exit_group\n        seccomp.range.lseek.1 = 1:2\n        seccomp.range.lseek.1 = 1:2",
+        );
+        assert!(duplicate.parse::<SandboxPolicy>().is_err());
+
+        let unallowed = format!("{VALID}\nseccomp.range.lseek.1 = 1:2");
+        assert!(unallowed.parse::<SandboxPolicy>().is_err());
+
+        let critical = format!("{VALID}\nseccomp.range.execveat.0 = 1:2");
+        assert!(critical.parse::<SandboxPolicy>().is_err());
+    }
+
+    #[test]
+    fn parses_and_rejects_forbidden_seccomp_mask_rule() {
+        let text = VALID.replace(
+            "seccomp.allow = execveat,read,write,exit_group",
+            "seccomp.allow = execveat,mmap,exit_group
+        seccomp.deny_mask.mmap.2 = 0x6:0x6",
+        );
+        let policy: SandboxPolicy = text.parse().unwrap();
+        let rule = policy
+            .seccomp
+            .argument_forbidden_mask_rules
+            .get("mmap")
+            .and_then(|rules| rules.get(&2))
+            .copied()
+            .expect("parsed mmap protection forbidden mask");
+        assert_eq!(
+            rule,
+            SeccompArgRule {
+                mask: 0x6,
+                value: 0x6
+            }
+        );
+
+        for invalid in [
+            "seccomp.deny_mask.mmap.2 = 0:0",
+            "seccomp.deny_mask.mmap.2 = 0x2:0x4",
+            "seccomp.deny_mask.read.6 = 1:1",
+            "seccomp.deny_mask.execveat.0 = 1:1",
+        ] {
+            let text = VALID.replace(
+                "seccomp.allow = execveat,read,write,exit_group",
+                &format!("seccomp.allow = execveat,mmap,read,write,exit_group\n        {invalid}"),
+            );
+            assert!(text.parse::<SandboxPolicy>().is_err(), "accepted {invalid}");
+        }
+    }
+
+    #[test]
+    fn parses_masked_seccomp_argument_rule() {
+        let text = VALID.replace(
+            "seccomp.allow = execveat,read,write,exit_group",
+            "seccomp.allow = execveat,lseek,exit_group\n        seccomp.arg.lseek.1 = 0xffffffff0000000f:0x0000000100000008",
+        );
+        let policy: SandboxPolicy = text.parse().unwrap();
+        let rule = policy
+            .seccomp
+            .argument_rules
+            .get("lseek")
+            .and_then(|rules| rules.get(&1))
+            .copied()
+            .expect("lseek argument rule");
+        assert_eq!(rule.mask, 0xffff_ffff_0000_000f);
+        assert_eq!(rule.value, 0x0000_0001_0000_0008);
+    }
+
+    #[test]
+    fn rejects_duplicate_seccomp_argument_rule() {
+        let text = VALID.replace(
+            "seccomp.allow = execveat,read,write,exit_group",
+            "seccomp.allow = execveat,lseek,exit_group\n        seccomp.arg.lseek.1 = 0xff:0x08\n        seccomp.arg.lseek.1 = 0xff:0x08",
+        );
+        assert!(text.parse::<SandboxPolicy>().is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_seccomp_argument_rule_shape() {
+        for rule in [
+            "seccomp.arg.lseek.6 = 0xff:0x08",
+            "seccomp.arg.lseek.1 = 0:0",
+            "seccomp.arg.lseek.1 = 0x0f:0x10",
+        ] {
+            let text = VALID.replace(
+                "seccomp.allow = execveat,read,write,exit_group",
+                &format!("seccomp.allow = execveat,lseek,exit_group\n        {rule}"),
+            );
+            assert!(text.parse::<SandboxPolicy>().is_err(), "accepted {rule}");
+        }
+    }
+
+    #[test]
+    fn rejects_argument_rule_for_unallowed_or_launcher_critical_syscall() {
+        let unallowed = format!("{VALID}\nseccomp.arg.lseek.1 = 0xff:0x08");
+        assert!(unallowed.parse::<SandboxPolicy>().is_err());
+
+        let exec_rule = format!("{VALID}\nseccomp.arg.execveat.0 = 0xff:0x00");
+        assert!(exec_rule.parse::<SandboxPolicy>().is_err());
+
+        let exit_rule = VALID.replace(
+            "seccomp.allow = execveat,read,write,exit_group",
+            "seccomp.allow = execveat,read,write,exit\n        seccomp.arg.exit.0 = 0xff:0x00",
+        );
+        assert!(exit_rule.parse::<SandboxPolicy>().is_err());
+    }
+
+    #[test]
+    fn parses_selected_handle_mapping() {
+        let text = format!("{VALID}\nhandle.9 = 200");
+        let policy: SandboxPolicy = text.parse().unwrap();
+        assert_eq!(policy.selected_handles.get(&9), Some(&200));
+    }
+
+    #[test]
+    fn rejects_duplicate_selected_handle_target() {
+        let text = format!("{VALID}\nhandle.9 = 200\nhandle.9 = 201");
+        assert!(text.parse::<SandboxPolicy>().is_err());
+    }
+
+    #[test]
+    fn rejects_selected_handle_target_outside_owned_range_or_rlimit() {
+        for mapping in ["handle.2 = 200", "handle.64 = 200", "handle.32 = 200"] {
+            let text = format!("{VALID}\n{mapping}");
+            assert!(
+                text.parse::<SandboxPolicy>().is_err(),
+                "accepted invalid mapping {mapping}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_selected_handle_source_outside_linux_fd_range() {
+        let text = format!("{VALID}\nhandle.9 = {}", u32::MAX);
+        assert!(text.parse::<SandboxPolicy>().is_err());
+    }
+
+    #[test]
+    fn rejects_too_many_selected_handles() {
+        let mut text = VALID.to_owned();
+        for target_fd in 3..20 {
+            text.push_str(&format!("\nhandle.{target_fd} = 200"));
+        }
+        assert!(text.parse::<SandboxPolicy>().is_err());
+    }
+
+    #[test]
+    fn rejects_duplicate_syscall() {
+        let text = VALID.replace(
+            "execveat,read,write,exit_group",
+            "execveat,read,read,exit_group",
+        );
+        assert!(text.parse::<SandboxPolicy>().is_err());
+    }
+}

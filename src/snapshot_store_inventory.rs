@@ -242,6 +242,132 @@ pub(crate) fn projected_snapshot_store_inventory_identity(
     Ok((current, successor))
 }
 
+/// Project the exact audited inventories produced by an ordered bounded batch
+/// without mutating the store.
+///
+/// The returned vector has one slot per candidate. `None` means that canonical
+/// identity already exists in the current store; `Some(identity)` records the
+/// exact inventory immediately after inserting that new candidate in request
+/// order. The final identity is therefore reproducible both by the normal batch
+/// publisher and by crash recovery without accepting an arbitrary observed
+/// inventory as authoritative.
+pub(crate) fn projected_snapshot_store_batch_inventory_identity(
+    store_root: &Path,
+    limits: SnapshotStoreAuditLimits,
+    candidates: &[(SnapshotIdentity, u64)],
+) -> Result<
+    (
+        SnapshotStoreInventoryIdentity,
+        SnapshotStoreInventoryIdentity,
+        Vec<Option<SnapshotStoreInventoryIdentity>>,
+    ),
+    SnapshotStoreInventoryError,
+> {
+    let mut records = Vec::new();
+    let mut allocation_failure = None;
+    let mut report =
+        audit_snapshot_store_objects(store_root, limits, |identity, archive_bytes| {
+            if allocation_failure.is_some() {
+                return;
+            }
+            let attempted_entries = u64::try_from(records.len())
+                .unwrap_or(u64::MAX)
+                .saturating_add(1);
+            if records.try_reserve(1).is_err() {
+                allocation_failure = Some(attempted_entries);
+                return;
+            }
+            records.push(InventoryRecord {
+                identity,
+                archive_bytes,
+            });
+        })?;
+
+    if let Some(attempted_entries) = allocation_failure {
+        return Err(SnapshotStoreInventoryError::AllocationFailed { attempted_entries });
+    }
+
+    records.sort_unstable_by(compare_records);
+    let current = hash_inventory(report, &records);
+    let mut after_each = Vec::new();
+    if after_each.try_reserve(candidates.len()).is_err() {
+        return Err(SnapshotStoreInventoryError::AllocationFailed {
+            attempted_entries: u64::try_from(candidates.len()).unwrap_or(u64::MAX),
+        });
+    }
+
+    for &(candidate_identity, candidate_archive_bytes) in candidates {
+        if records
+            .iter()
+            .any(|record| record.identity == candidate_identity)
+        {
+            after_each.push(None);
+            continue;
+        }
+
+        let attempted_objects =
+            report
+                .objects
+                .checked_add(1)
+                .ok_or(SnapshotStoreAuditError::BudgetExceeded {
+                    resource: "entry",
+                    limit: limits.max_entries,
+                    attempted: u64::MAX,
+                })?;
+        if attempted_objects > limits.max_entries {
+            return Err(SnapshotStoreAuditError::BudgetExceeded {
+                resource: "entry",
+                limit: limits.max_entries,
+                attempted: attempted_objects,
+            }
+            .into());
+        }
+        if candidate_archive_bytes > limits.archive.max_archive_bytes {
+            return Err(SnapshotStoreAuditError::BudgetExceeded {
+                resource: "per-object byte",
+                limit: limits.archive.max_archive_bytes,
+                attempted: candidate_archive_bytes,
+            }
+            .into());
+        }
+        let attempted_archive_bytes = report
+            .archive_bytes
+            .checked_add(candidate_archive_bytes)
+            .ok_or(SnapshotStoreAuditError::BudgetExceeded {
+                resource: "aggregate byte",
+                limit: limits.max_total_archive_bytes,
+                attempted: u64::MAX,
+            })?;
+        if attempted_archive_bytes > limits.max_total_archive_bytes {
+            return Err(SnapshotStoreAuditError::BudgetExceeded {
+                resource: "aggregate byte",
+                limit: limits.max_total_archive_bytes,
+                attempted: attempted_archive_bytes,
+            }
+            .into());
+        }
+
+        if records.try_reserve(1).is_err() {
+            return Err(SnapshotStoreInventoryError::AllocationFailed {
+                attempted_entries: attempted_objects,
+            });
+        }
+        records.push(InventoryRecord {
+            identity: candidate_identity,
+            archive_bytes: candidate_archive_bytes,
+        });
+        records.sort_unstable_by(compare_records);
+        report = SnapshotStoreAuditReport {
+            objects: attempted_objects,
+            archive_bytes: attempted_archive_bytes,
+        };
+        after_each.push(Some(hash_inventory(report, &records)));
+    }
+
+    let successor = hash_inventory(report, &records);
+    Ok((current, successor, after_each))
+}
+
 /// Recompute the bounded audited inventory and require exact equality with a
 /// caller-retained expected identity.
 ///

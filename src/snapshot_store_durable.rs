@@ -24,6 +24,13 @@ use std::path::Path;
 /// `fsync` contract. This does not add a journal, garbage collection, stale-temp
 /// scavenging, remote replication, or protection against a hostile privileged
 /// writer controlling the store root.
+/// Re-run the exact local durability barriers for one already-published object.
+///
+/// This is intentionally narrower than publication: callers must already know
+/// the canonical object identity and archive-file length. The helper reopens
+/// that exact content-addressed object, revalidates its regular/read-only shape
+/// and length, then requires the existing object -> objects-directory ->
+/// store-root fsync sequence before returning success.
 pub(crate) fn sync_snapshot_store_object_durable(
     store_root: &Path,
     identity: SnapshotIdentity,
@@ -48,14 +55,6 @@ pub(crate) fn sync_snapshot_store_object_durable(
         ))
     }
 }
-
-/// Re-run the exact local durability barriers for one already-published object.
-///
-/// This is intentionally narrower than publication: callers must already know
-/// the canonical object identity and archive-file length. The helper reopens
-/// that exact content-addressed object, revalidates its regular/read-only shape
-/// and length, then requires the existing object -> objects-directory ->
-/// store-root fsync sequence before returning success.
 
 pub fn store_snapshot_archive_ed25519_durable(
     store_root: &Path,

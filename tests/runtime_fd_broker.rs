@@ -3,6 +3,7 @@
 use security_lab::{run, ChildOutcome, RuntimeFdBroker, RuntimeFdBrokerError, SandboxPolicy};
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::net::UnixStream;
@@ -120,7 +121,7 @@ fn broker_attenuates_rw_regular_file_to_readonly_independent_description() {
     std::fs::create_dir(&directory_path).expect("create broker directory source");
 
     let broker = RuntimeFdBroker::bind(&socket_path).expect("bind runtime FD broker");
-    let client = UnixStream::connect(broker.path()).expect("connect local broker client");
+    let mut client = UnixStream::connect(broker.path()).expect("connect local broker client");
     let mut session = broker.accept().expect("accept local broker client");
 
     let source = OpenOptions::new()
@@ -128,6 +129,24 @@ fn broker_attenuates_rw_regular_file_to_readonly_independent_description() {
         .write(true)
         .open(&file_path)
         .expect("open read-write broker source");
+    let premature_grant = RuntimeFdBroker::prepare_readonly_regular_file(&source)
+        .expect("prepare pre-readiness grant");
+    assert!(matches!(
+        session.send_readonly_regular_file(premature_grant),
+        Err(RuntimeFdBrokerError::Protocol(message)) if message.contains("readiness")
+    ));
+
+    client
+        .write_all(b"R")
+        .expect("publish local broker readiness");
+    session
+        .wait_for_ready(b'R')
+        .expect("consume exact local broker readiness");
+    assert!(matches!(
+        session.wait_for_ready(b'R'),
+        Err(RuntimeFdBrokerError::Protocol(message)) if message.contains("exactly once")
+    ));
+
     let grant = RuntimeFdBroker::prepare_readonly_regular_file(&source)
         .expect("attenuate read-write regular file");
     assert_eq!(
@@ -169,6 +188,13 @@ fn broker_attenuates_rw_regular_file_to_readonly_independent_description() {
         0,
         "target-side read description must not share caller source offset"
     );
+
+    let second_grant = RuntimeFdBroker::prepare_readonly_regular_file(&source)
+        .expect("prepare second grant");
+    assert!(matches!(
+        session.send_readonly_regular_file(second_grant),
+        Err(RuntimeFdBrokerError::Protocol(message)) if message.contains("exactly one")
+    ));
 
     let write_only = OpenOptions::new()
         .write(true)

@@ -125,9 +125,18 @@ mod imp {
         }
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum RuntimeFdSessionState {
+        AwaitingReady,
+        Ready,
+        GrantSent,
+        Failed,
+    }
+
     #[derive(Debug)]
     pub struct RuntimeFdSession {
         stream: UnixStream,
+        state: RuntimeFdSessionState,
     }
 
     impl RuntimeFdBroker {
@@ -219,7 +228,10 @@ mod imp {
                     actual_gid: gid,
                 });
             }
-            Ok(RuntimeFdSession { stream })
+            Ok(RuntimeFdSession {
+                stream,
+                state: RuntimeFdSessionState::AwaitingReady,
+            })
         }
 
         /// Pin one regular-file source as a separate read-only open file
@@ -244,27 +256,67 @@ mod imp {
         /// Wait for one exact target-defined readiness byte. Tests use this to
         /// prove a grant is sent only after the untrusted image has executed.
         pub fn wait_for_ready(&mut self, expected: u8) -> Result<(), RuntimeFdBrokerError> {
+            if self.state != RuntimeFdSessionState::AwaitingReady {
+                return Err(RuntimeFdBrokerError::Protocol(
+                    "runtime FD broker readiness may be consumed exactly once before the grant"
+                        .to_owned(),
+                ));
+            }
+
             let mut byte = [0u8; 1];
-            self.stream.read_exact(&mut byte).map_err(|error| {
-                RuntimeFdBrokerError::io("cannot read runtime FD broker readiness", error)
-            })?;
+            if let Err(error) = self.stream.read_exact(&mut byte) {
+                self.state = RuntimeFdSessionState::Failed;
+                return Err(RuntimeFdBrokerError::io(
+                    "cannot read runtime FD broker readiness",
+                    error,
+                ));
+            }
             if byte[0] != expected {
+                self.state = RuntimeFdSessionState::Failed;
                 return Err(RuntimeFdBrokerError::Protocol(format!(
                     "expected readiness byte 0x{expected:02x}, got 0x{:02x}",
                     byte[0]
                 )));
             }
+            self.state = RuntimeFdSessionState::Ready;
             Ok(())
         }
 
         /// Transfer exactly one previously prepared read-only regular-file grant.
+        /// A session cannot transfer before the exact readiness byte has been
+        /// consumed and cannot successfully transfer a second descriptor.
         /// The one-byte `F` payload makes a zero-length ancillary-only send
         /// impossible and matches the bounded receive protocol used by the lab.
         pub fn send_readonly_regular_file(
             &mut self,
             grant: PreparedReadOnlyRegularFile,
         ) -> Result<(), RuntimeFdBrokerError> {
-            send_one_fd(self.stream.as_raw_fd(), grant.fd)
+            if self.state != RuntimeFdSessionState::Ready {
+                let message = match self.state {
+                    RuntimeFdSessionState::AwaitingReady => {
+                        "runtime FD broker grant requires the target readiness handshake first"
+                    }
+                    RuntimeFdSessionState::GrantSent => {
+                        "runtime FD broker session permits exactly one successful grant"
+                    }
+                    RuntimeFdSessionState::Failed => {
+                        "runtime FD broker session is closed after a protocol or I/O failure"
+                    }
+                    RuntimeFdSessionState::Ready => unreachable!(),
+                };
+                return Err(RuntimeFdBrokerError::Protocol(message.to_owned()));
+            }
+
+            match send_one_fd(self.stream.as_raw_fd(), grant.fd) {
+                Ok(()) => {
+                    self.state = RuntimeFdSessionState::GrantSent;
+                    Ok(())
+                }
+                Err(error) => {
+                    self.state = RuntimeFdSessionState::Failed;
+                    Err(error)
+                }
+            }
         }
     }
 

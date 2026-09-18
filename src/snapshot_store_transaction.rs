@@ -258,6 +258,9 @@ impl SnapshotStoreWriteTransaction {
         )?)
     }
 
+    /// Re-run the established object/directory/root durability barriers for an
+    /// exact already-published object while this exclusive transaction remains
+    /// held. This does not publish or select a different object.
     pub(crate) fn sync_object_durable(
         &self,
         identity: SnapshotIdentity,
@@ -269,10 +272,6 @@ impl SnapshotStoreWriteTransaction {
             archive_bytes,
         )?)
     }
-
-    /// Re-run the established object/directory/root durability barriers for an
-    /// exact already-published object while this exclusive transaction remains
-    /// held. This does not publish or select a different object.
 
     /// Optimistic guarded durable publication. The complete audited store
     /// inventory is compared with a caller-retained expected identity while the

@@ -11,6 +11,11 @@ pub(crate) fn to_json(policy: &SandboxPolicy) -> String {
     push_json_string(&mut output, &policy.hostname);
     output.push_str(",\"executable\":");
     push_path(&mut output, &policy.executable);
+    output.push_str(",\"executable_sha256\":");
+    match policy.executable_sha256 {
+        Some(digest) => push_json_string(&mut output, &sha256_hex(digest)),
+        None => output.push_str("null"),
+    }
     output.push_str(",\"working_dir\":");
     push_path(&mut output, &policy.working_dir);
     output.push_str(",\"argument_count\":");
@@ -323,6 +328,15 @@ pub(crate) fn to_human(policy: &SandboxPolicy) -> String {
     .expect("write to String cannot fail");
     writeln!(&mut output, "executable: {}", policy.executable.display())
         .expect("write to String cannot fail");
+    writeln!(
+        &mut output,
+        "executable-sha256: {}",
+        policy
+            .executable_sha256
+            .map(sha256_hex)
+            .unwrap_or_else(|| "none".to_owned())
+    )
+    .expect("write to String cannot fail");
     writeln!(&mut output, "working-dir: {}", policy.working_dir.display())
         .expect("write to String cannot fail");
     writeln!(&mut output, "hostname: {}", policy.hostname).expect("write to String cannot fail");
@@ -525,6 +539,16 @@ fn push_hex_u64(output: &mut String, value: u64) {
     output.push('"');
     write!(output, "0x{value:016x}").expect("write to String cannot fail");
     output.push('"');
+}
+
+fn sha256_hex(digest: [u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(64);
+    for byte in digest {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
 }
 
 fn push_bool(output: &mut String, value: bool) {

@@ -115,6 +115,11 @@ pub struct SandboxPolicy {
     /// and its interpreter request are both content-bound.
     pub executable_interpreter: Option<PathBuf>,
     pub executable_interpreter_sha256: Option<[u8; 32]>,
+    /// Optional one direct absolute path-qualified DT_NEEDED dependency plus
+    /// exact SHA-256. Valid only when both the main executable and PT_INTERP
+    /// loader are content-bound, so the dependency is selected by sealed code.
+    pub executable_needed: Option<PathBuf>,
+    pub executable_needed_sha256: Option<[u8; 32]>,
     pub args: Vec<String>,
     pub environment: BTreeMap<String, String>,
     /// Absolute path interpreted inside `root_dir`.
@@ -309,6 +314,67 @@ impl SandboxPolicy {
             _ => {
                 return Err(PolicyError::new(
                     "executable.interpreter and executable.interpreter_sha256 must be specified together",
+                ));
+            }
+        }
+
+        match (&self.executable_needed, self.executable_needed_sha256) {
+            (None, None) => {}
+            (Some(path), Some(_)) => {
+                validate_absolute_path("executable.needed", path)?;
+                if self.executable_sha256.is_none()
+                    || self.executable_interpreter.is_none()
+                    || self.executable_interpreter_sha256.is_none()
+                {
+                    return Err(PolicyError::new(
+                        "executable.needed requires content-bound executable.sha256 and executable.interpreter binding",
+                    ));
+                }
+                if path == Path::new("/") {
+                    return Err(PolicyError::new(
+                        "executable.needed must not replace the sandbox root",
+                    ));
+                }
+                if path == &self.executable || self.executable_interpreter.as_ref() == Some(path) {
+                    return Err(PolicyError::new(
+                        "executable.needed must differ from executable and executable.interpreter",
+                    ));
+                }
+                #[cfg(unix)]
+                if path.as_os_str().as_bytes().contains(&b'$') {
+                    return Err(PolicyError::new(
+                        "executable.needed must not contain dynamic-linker $ tokens",
+                    ));
+                }
+                let overlaps = |other: &Path| path.starts_with(other) || other.starts_with(path);
+                if self.procfs_enabled && overlaps(Path::new("/proc")) {
+                    return Err(PolicyError::new(
+                        "executable.needed must not overlap filesystem.proc",
+                    ));
+                }
+                for (other, label) in [
+                    (self.scratch_dir.as_deref(), "filesystem.scratch"),
+                    (
+                        self.readonly_volume_target.as_deref(),
+                        "volume.readonly_target",
+                    ),
+                    (
+                        self.writable_volume_target.as_deref(),
+                        "volume.writable_target",
+                    ),
+                ] {
+                    if let Some(other) = other {
+                        if overlaps(other) {
+                            return Err(PolicyError::new(format!(
+                                "executable.needed must not overlap {label}"
+                            )));
+                        }
+                    }
+                }
+            }
+            _ => {
+                return Err(PolicyError::new(
+                    "executable.needed and executable.needed_sha256 must be specified together",
                 ));
             }
         }
@@ -1210,6 +1276,8 @@ impl FromStr for SandboxPolicy {
         let mut executable_sha256 = None;
         let mut executable_interpreter = None;
         let mut executable_interpreter_sha256 = None;
+        let mut executable_needed = None;
+        let mut executable_needed_sha256 = None;
         let mut args = Vec::new();
         let mut environment = BTreeMap::new();
         let mut working_dir = None;
@@ -1451,6 +1519,15 @@ impl FromStr for SandboxPolicy {
                 }
                 "executable.interpreter_sha256" => set_once(
                     &mut executable_interpreter_sha256,
+                    parse_sha256(value, line_no, key)?,
+                    line_no,
+                    key,
+                )?,
+                "executable.needed" => {
+                    set_once(&mut executable_needed, value.to_owned(), line_no, key)?
+                }
+                "executable.needed_sha256" => set_once(
+                    &mut executable_needed_sha256,
                     parse_sha256(value, line_no, key)?,
                     line_no,
                     key,
@@ -1728,6 +1805,8 @@ impl FromStr for SandboxPolicy {
             executable_sha256,
             executable_interpreter: executable_interpreter.map(PathBuf::from),
             executable_interpreter_sha256,
+            executable_needed: executable_needed.map(PathBuf::from),
+            executable_needed_sha256,
             args,
             environment,
             working_dir: PathBuf::from(required(working_dir, "working_dir")?),
@@ -2887,6 +2966,32 @@ mod tests {
             format!("{base}\nvolume.writable_source = /sandbox\nvolume.writable_target = /persist");
         let err = source_contains_root.parse::<SandboxPolicy>().unwrap_err();
         assert!(err.to_string().contains("must not overlap filesystem.root"));
+    }
+
+    #[test]
+    fn direct_needed_binding_requires_sealed_main_and_interpreter() {
+        let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let complete = format!(
+            "{VALID}\nexecutable.sha256 = {digest}\nexecutable.interpreter = /loader\nexecutable.interpreter_sha256 = {digest}\nexecutable.needed = /dependency\nexecutable.needed_sha256 = {digest}"
+        );
+        let policy: SandboxPolicy = complete.parse().unwrap();
+        assert_eq!(policy.executable_needed, Some(PathBuf::from("/dependency")));
+        assert_eq!(policy.executable_needed_sha256, policy.executable_sha256);
+
+        let no_interpreter = format!(
+            "{VALID}\nexecutable.sha256 = {digest}\nexecutable.needed = /dependency\nexecutable.needed_sha256 = {digest}"
+        );
+        assert!(no_interpreter.parse::<SandboxPolicy>().is_err());
+
+        let tokenized = format!(
+            "{VALID}\nexecutable.sha256 = {digest}\nexecutable.interpreter = /loader\nexecutable.interpreter_sha256 = {digest}\nexecutable.needed = /lib/$LIB/dependency\nexecutable.needed_sha256 = {digest}"
+        );
+        assert!(tokenized.parse::<SandboxPolicy>().is_err());
+
+        let incomplete = format!(
+            "{VALID}\nexecutable.sha256 = {digest}\nexecutable.interpreter = /loader\nexecutable.interpreter_sha256 = {digest}\nexecutable.needed = /dependency"
+        );
+        assert!(incomplete.parse::<SandboxPolicy>().is_err());
     }
 
     #[test]

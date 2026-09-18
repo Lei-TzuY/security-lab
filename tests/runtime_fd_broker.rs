@@ -189,8 +189,8 @@ fn broker_attenuates_rw_regular_file_to_readonly_independent_description() {
         "target-side read description must not share caller source offset"
     );
 
-    let second_grant = RuntimeFdBroker::prepare_readonly_regular_file(&source)
-        .expect("prepare second grant");
+    let second_grant =
+        RuntimeFdBroker::prepare_readonly_regular_file(&source).expect("prepare second grant");
     assert!(matches!(
         session.send_readonly_regular_file(second_grant),
         Err(RuntimeFdBrokerError::Protocol(message)) if message.contains("exactly one")

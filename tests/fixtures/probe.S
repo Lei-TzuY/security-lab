@@ -1168,6 +1168,17 @@ _start:
     test %r12d, %r12d
     js .brokered_host_unix_scm_rights_fail
 
+    # A launcher-mediated grant must be read-only in the actual sandbox target.
+    # write(2) is explicitly granted for the readiness byte, so exact EBADF here
+    # proves this received open-file-description does not carry write access.
+    mov $1, %eax
+    mov %r12d, %edi
+    lea runtime_fd_handoff_marker(%rip), %rsi
+    mov $1, %edx
+    syscall
+    cmp $-9, %rax
+    jne .brokered_host_unix_scm_rights_fail
+
     # The handed-off descriptor must carry the exact file object capability.
     mov $0, %eax
     mov %r12d, %edi

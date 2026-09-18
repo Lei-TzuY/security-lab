@@ -887,7 +887,6 @@ fn sealed_snapshot_bundle_target_rejects_truncated_control() {
     std::fs::remove_dir_all(&root).unwrap();
 }
 
-
 #[test]
 fn revocable_runtime_stream_is_receive_only_bounded_and_revokes_to_eof() {
     let socket_path = unique_path("runtime-revocable-local.sock");
@@ -996,7 +995,9 @@ fn revocable_runtime_stream_rejects_invalid_ceiling_and_poisoned_send_retry() {
     let broker = RuntimeFdBroker::bind(&socket_path).expect("bind stream failure broker");
     let mut client = UnixStream::connect(broker.path()).expect("connect stream failure client");
     let mut session = broker.accept().expect("accept stream failure client");
-    client.write_all(b"R").expect("publish stream failure readiness");
+    client
+        .write_all(b"R")
+        .expect("publish stream failure readiness");
     session.wait_for_ready(b'R').unwrap();
 
     let (grant, mut controller) = RuntimeFdBroker::prepare_revocable_byte_stream(64).unwrap();
@@ -1042,7 +1043,7 @@ fn revocable_runtime_stream_reaches_real_target_and_revokes_future_bytes() {
          limit.address_space_bytes = 134217728\n\
          limit.file_size_bytes = 1048576\n\
          limit.open_files = 32\n\
-         seccomp.allow = execveat,write,recvmsg,sendto,read,close,exit\n",
+         seccomp.allow = execveat,write,recvmsg,sendmsg,read,close,exit\n",
         root.display()
     );
     let mut policy: SandboxPolicy = text.parse().expect("parse revocable stream policy");
@@ -1054,7 +1055,9 @@ fn revocable_runtime_stream_reaches_real_target_and_revokes_future_bytes() {
     let (grant, mut controller) = RuntimeFdBroker::prepare_revocable_byte_stream(4096)
         .expect("prepare sandbox revocable stream");
     let runner = thread::spawn(move || run(&policy));
-    let mut session = broker.accept().expect("accept sandbox revocable connection");
+    let mut session = broker
+        .accept()
+        .expect("accept sandbox revocable connection");
     session
         .wait_for_ready(b'R')
         .expect("revocable target must publish post-exec readiness");

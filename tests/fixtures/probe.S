@@ -1326,15 +1326,18 @@ _start:
     test %r12d, %r12d
     js .brokered_revocable_runtime_stream_fail
 
-    # The target endpoint was SHUT_WR before transfer. sendto with MSG_NOSIGNAL
-    # must fail with exact EPIPE even though seccomp allows this negative probe.
-    mov $44, %eax
+    # The target endpoint was SHUT_WR before transfer. Reuse the already-built
+    # msghdr without ancillary data and require sendmsg(MSG_NOSIGNAL) to return
+    # exact EPIPE even though seccomp explicitly allows this negative probe.
+    movq $0, 32(%rsp)
+    movq $0, 40(%rsp)
+    lea runtime_revocable_stream(%rip), %rax
+    mov %rax, 64(%rsp)
+    movq $1, 72(%rsp)
+    mov $46, %eax
     mov %r12d, %edi
-    lea runtime_revocable_stream(%rip), %rsi
-    mov $1, %edx
-    mov $0x4000, %r10d
-    xor %r8d, %r8d
-    xor %r9d, %r9d
+    mov %rsp, %rsi
+    mov $0x4000, %edx
     syscall
     cmp $-32, %rax
     jne .brokered_revocable_runtime_stream_fail

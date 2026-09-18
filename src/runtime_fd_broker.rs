@@ -927,10 +927,8 @@ mod imp {
 
     fn prepare_revocable_byte_stream(
         max_bytes: u64,
-    ) -> Result<
-        (PreparedRevocableByteStream, RevocableByteStreamController),
-        RuntimeFdBrokerError,
-    > {
+    ) -> Result<(PreparedRevocableByteStream, RevocableByteStreamController), RuntimeFdBrokerError>
+    {
         if max_bytes == 0 || max_bytes > super::MAX_RUNTIME_REVOCABLE_STREAM_BYTES {
             return Err(RuntimeFdBrokerError::InvalidConfiguration(format!(
                 "revocable runtime stream max_bytes must be between 1 and {}",

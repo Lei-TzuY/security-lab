@@ -232,20 +232,22 @@ pub(crate) fn read_elf64_x86_64_dt_needed(
                 }
                 needed_offsets.push(value);
             }
-            DT_STRTAB => {
-                if strtab_vaddr.replace(value).is_some() {
+            DT_STRTAB => match strtab_vaddr {
+                Some(_) => {
                     return Err(ElfNeededError(
                         "ELF image contains multiple DT_STRTAB entries".to_owned(),
                     ));
                 }
-            }
-            DT_STRSZ => {
-                if strtab_size.replace(value).is_some() {
+                None => strtab_vaddr = Some(value),
+            },
+            DT_STRSZ => match strtab_size {
+                Some(_) => {
                     return Err(ElfNeededError(
                         "ELF image contains multiple DT_STRSZ entries".to_owned(),
                     ));
                 }
-            }
+                None => strtab_size = Some(value),
+            },
             _ => {}
         }
     }

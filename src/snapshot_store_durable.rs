@@ -1,4 +1,5 @@
 use crate::snapshot_archive::SnapshotArchiveLimits;
+use crate::snapshot_identity::SnapshotIdentity;
 use crate::snapshot_signature::{
     SNAPSHOT_ED25519_PUBLIC_KEY_BYTES, SNAPSHOT_ED25519_SIGNATURE_BYTES,
 };
@@ -23,6 +24,38 @@ use std::path::Path;
 /// `fsync` contract. This does not add a journal, garbage collection, stale-temp
 /// scavenging, remote replication, or protection against a hostile privileged
 /// writer controlling the store root.
+/// Re-run the exact local durability barriers for one already-published object.
+///
+/// This is intentionally narrower than publication: callers must already know
+/// the canonical object identity and archive-file length. The helper reopens
+/// that exact content-addressed object, revalidates its regular/read-only shape
+/// and length, then requires the existing object -> objects-directory ->
+/// store-root fsync sequence before returning success.
+pub(crate) fn sync_snapshot_store_object_durable(
+    store_root: &Path,
+    identity: SnapshotIdentity,
+    archive_bytes: u64,
+) -> Result<(), SnapshotStoreError> {
+    let report = SnapshotStorePutReport {
+        identity,
+        archive_bytes,
+        inserted: false,
+    };
+
+    #[cfg(target_os = "linux")]
+    {
+        linux::sync_committed_object(store_root, report)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (store_root, report);
+        Err(SnapshotStoreError::UnsupportedPlatform(
+            "durable content-addressed snapshot recovery currently requires Linux fsync and fd-relative filesystem operations"
+                .to_owned(),
+        ))
+    }
+}
+
 pub fn store_snapshot_archive_ed25519_durable(
     store_root: &Path,
     archive: &[u8],

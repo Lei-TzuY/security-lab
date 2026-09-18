@@ -1,17 +1,23 @@
 #![cfg(target_os = "linux")]
 
+use hmac::{Hmac, Mac};
 use security_lab::{
     initialize_snapshot_store_head_state, load_snapshot_store_head_state,
     serialize_snapshot_archive, sign_snapshot_ed25519, snapshot_store_head_state_path,
-    snapshot_store_object_path, store_snapshot_archive_ed25519_durable_with_head_state,
+    snapshot_store_inventory_identity, snapshot_store_object_path,
+    store_snapshot_archive_ed25519_atomic, store_snapshot_archive_ed25519_durable,
+    store_snapshot_archive_ed25519_durable_with_head_state,
     store_snapshot_archives_ed25519_durable_with_head_state, verify_snapshot_store_head_state,
     SnapshotArchiveLimits, SnapshotIdentity, SnapshotIdentityLimits, SnapshotStoreAuditLimits,
-    SnapshotStoreHeadBatchItem, SnapshotStoreHeadBatchPublishRequest,
-    SnapshotStoreHeadPublishRequest, SnapshotStoreHeadStateError, SnapshotStoreHeadStateKey,
+    SnapshotStoreError, SnapshotStoreHeadBatchItem, SnapshotStoreHeadBatchPublishRequest,
+    SnapshotStoreHeadPublishRequest, SnapshotStoreHeadStateError, SnapshotStoreHeadStateIdentity,
+    SnapshotStoreHeadStateKey, SnapshotStoreTransactionError,
 };
+use sha2::Sha256;
 use std::fs;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process;
+use std::process::{self, Command};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
@@ -111,6 +117,82 @@ fn batch_item(fixture: &Fixture) -> SnapshotStoreHeadBatchItem<'_> {
         public_key: &fixture.public_key,
         expected_signature: &fixture.signature,
         archive_limits: archive_limits(),
+    }
+}
+
+const PENDING_DOMAIN: &[u8] = b"security-lab-snapshot-store-head-pending-v2\0";
+const PENDING_MAGIC: [u8; 8] = *b"SLHPND2\0";
+const PENDING_HEADER_BYTES: usize = 176;
+const PENDING_BYTES: usize = 208;
+
+fn encode_pending_identity(bytes: &mut [u8], identity: SnapshotStoreHeadStateIdentity) {
+    assert_eq!(bytes.len(), 56);
+    bytes[0..8].copy_from_slice(&identity.generation.to_le_bytes());
+    bytes[8..40].copy_from_slice(&identity.inventory.sha256);
+    bytes[40..48].copy_from_slice(&identity.inventory.objects.to_le_bytes());
+    bytes[48..56].copy_from_slice(&identity.inventory.archive_bytes.to_le_bytes());
+}
+
+fn pending_bytes(
+    key: &SnapshotStoreHeadStateKey,
+    previous: SnapshotStoreHeadStateIdentity,
+    successor: SnapshotStoreHeadStateIdentity,
+    candidate: &Fixture,
+) -> [u8; PENDING_BYTES] {
+    let mut bytes = [0u8; PENDING_BYTES];
+    bytes[0..8].copy_from_slice(&PENDING_MAGIC);
+    encode_pending_identity(&mut bytes[8..64], previous);
+    encode_pending_identity(&mut bytes[64..120], successor);
+    bytes[120..152].copy_from_slice(&candidate.identity.sha256);
+    bytes[152..160].copy_from_slice(&candidate.identity.encoded_bytes.to_le_bytes());
+    bytes[160..168].copy_from_slice(&candidate.identity.nodes.to_le_bytes());
+    bytes[168..176].copy_from_slice(&(candidate.archive.len() as u64).to_le_bytes());
+    let mut mac =
+        <Hmac<Sha256> as Mac>::new_from_slice(key.as_bytes()).expect("fixed HMAC key is valid");
+    mac.update(PENDING_DOMAIN);
+    mac.update(&bytes[..PENDING_HEADER_BYTES]);
+    bytes[PENDING_HEADER_BYTES..].copy_from_slice(&mac.finalize().into_bytes());
+    bytes
+}
+
+fn pending_path(state: &Path) -> PathBuf {
+    state.join("snapshot-store-head-pending")
+}
+
+fn write_pending_fixture(
+    state: &Path,
+    key: &SnapshotStoreHeadStateKey,
+    previous: SnapshotStoreHeadStateIdentity,
+    successor: SnapshotStoreHeadStateIdentity,
+    candidate: &Fixture,
+) {
+    fs::write(
+        pending_path(state),
+        pending_bytes(key, previous, successor, candidate),
+    )
+    .expect("write authenticated pending fixture");
+}
+
+fn projected_successor_fixture(
+    workspace: &Path,
+    previous: SnapshotStoreHeadStateIdentity,
+    fixture: &Fixture,
+) -> SnapshotStoreHeadStateIdentity {
+    let mirror = workspace.join("projection-store");
+    fs::create_dir(&mirror).expect("create projection mirror store");
+    store_snapshot_archive_ed25519_durable(
+        &mirror,
+        &fixture.archive,
+        &fixture.public_key,
+        &fixture.signature,
+        archive_limits(),
+    )
+    .expect("publish fixture into independent projection mirror");
+    let inventory =
+        snapshot_store_inventory_identity(&mirror, audit_limits()).expect("audit mirror inventory");
+    SnapshotStoreHeadStateIdentity {
+        generation: previous.generation + 1,
+        inventory,
     }
 }
 
@@ -271,6 +353,373 @@ fn configured_state_and_store_roots_must_be_disjoint() {
         initialize_snapshot_store_head_state(&outer_state, &key, &nested_store, audit_limits(),),
         Err(SnapshotStoreHeadStateError::InvalidInput(_))
     ));
+}
+
+#[test]
+fn recovery_clears_pre_store_intent_without_advancing_head() {
+    let workspace = TempDir::new("recover-before-store");
+    let (store, state) = roots(workspace.path());
+    let key = SnapshotStoreHeadStateKey::new([0x11; 32]);
+    let candidate = fixture(
+        workspace.path(),
+        "recover-before-store",
+        b"before-store\n",
+        0x11,
+    );
+    let previous = initialize_snapshot_store_head_state(&state, &key, &store, audit_limits())
+        .expect("initialize recovery predecessor");
+    let successor = projected_successor_fixture(workspace.path(), previous, &candidate);
+    write_pending_fixture(&state, &key, previous, successor, &candidate);
+
+    match load_snapshot_store_head_state(&state, &key) {
+        Err(SnapshotStoreHeadStateError::RecoveryRequired {
+            previous: observed_previous,
+            successor: observed_successor,
+        }) => {
+            assert_eq!(observed_previous, previous);
+            assert_eq!(observed_successor, successor);
+        }
+        Err(other) => panic!("unexpected pending load result: {other}"),
+        Ok(_) => panic!("pending publication was ignored"),
+    }
+
+    assert_eq!(
+        key.recover_pending_publication(&state, &store, audit_limits())
+            .expect("recover untouched predecessor"),
+        previous
+    );
+    assert!(!pending_path(&state).exists());
+    assert_eq!(
+        verify_snapshot_store_head_state(&state, &key, &store, audit_limits())
+            .expect("verify predecessor after recovery"),
+        previous
+    );
+}
+
+#[test]
+fn recovery_advances_head_for_exact_durable_successor() {
+    let workspace = TempDir::new("recover-after-store");
+    let (store, state) = roots(workspace.path());
+    let key = SnapshotStoreHeadStateKey::new([0x22; 32]);
+    let candidate = fixture(
+        workspace.path(),
+        "recover-after-store",
+        b"after-store\n",
+        0x22,
+    );
+    let previous = initialize_snapshot_store_head_state(&state, &key, &store, audit_limits())
+        .expect("initialize recovery predecessor");
+    let successor = projected_successor_fixture(workspace.path(), previous, &candidate);
+    write_pending_fixture(&state, &key, previous, successor, &candidate);
+
+    let put = store_snapshot_archive_ed25519_durable(
+        &store,
+        &candidate.archive,
+        &candidate.public_key,
+        &candidate.signature,
+        archive_limits(),
+    )
+    .expect("simulate durable object publication before head update");
+    assert!(put.inserted);
+
+    assert!(matches!(
+        load_snapshot_store_head_state(&state, &key),
+        Err(SnapshotStoreHeadStateError::RecoveryRequired { .. })
+    ));
+    assert_eq!(
+        key.recover_pending_publication(&state, &store, audit_limits())
+            .expect("recover exact durable successor"),
+        successor
+    );
+    assert!(!pending_path(&state).exists());
+    assert_eq!(
+        verify_snapshot_store_head_state(&state, &key, &store, audit_limits())
+            .expect("verify recovered successor"),
+        successor
+    );
+}
+
+#[test]
+fn recovery_clears_leftover_intent_after_head_commit() {
+    let workspace = TempDir::new("recover-after-head");
+    let (store, state) = roots(workspace.path());
+    let key = SnapshotStoreHeadStateKey::new([0x33; 32]);
+    let candidate = fixture(
+        workspace.path(),
+        "recover-after-head",
+        b"after-head\n",
+        0x33,
+    );
+    let previous = initialize_snapshot_store_head_state(&state, &key, &store, audit_limits())
+        .expect("initialize recovery predecessor");
+    let committed = store_snapshot_archive_ed25519_durable_with_head_state(
+        &state,
+        &key,
+        &store,
+        publish_request(&candidate),
+    )
+    .expect("commit exact successor before simulating leftover intent");
+    assert_eq!(committed.previous, previous);
+    write_pending_fixture(&state, &key, previous, committed.successor, &candidate);
+
+    assert_eq!(
+        key.recover_pending_publication(&state, &store, audit_limits())
+            .expect("clear post-head pending intent"),
+        committed.successor
+    );
+    assert!(!pending_path(&state).exists());
+    assert_eq!(
+        load_snapshot_store_head_state(&state, &key).expect("load committed successor"),
+        committed.successor
+    );
+}
+
+#[test]
+fn recovery_keeps_pending_intent_on_unknown_store_state() {
+    let workspace = TempDir::new("recover-diverged");
+    let (store, state) = roots(workspace.path());
+    let key = SnapshotStoreHeadStateKey::new([0x44; 32]);
+    let expected = fixture(workspace.path(), "recover-expected", b"expected\n", 0x44);
+    let unexpected = fixture(
+        workspace.path(),
+        "recover-unexpected",
+        b"unexpected\n",
+        0x45,
+    );
+    let previous = initialize_snapshot_store_head_state(&state, &key, &store, audit_limits())
+        .expect("initialize recovery predecessor");
+    let successor = projected_successor_fixture(workspace.path(), previous, &expected);
+    write_pending_fixture(&state, &key, previous, successor, &expected);
+
+    store_snapshot_archive_ed25519_durable(
+        &store,
+        &unexpected.archive,
+        &unexpected.public_key,
+        &unexpected.signature,
+        archive_limits(),
+    )
+    .expect("publish unexpected durable store state");
+
+    match key.recover_pending_publication(&state, &store, audit_limits()) {
+        Err(SnapshotStoreHeadStateError::PendingStateDiverged {
+            previous: observed_previous,
+            successor: observed_successor,
+            anchored,
+            actual,
+        }) => {
+            assert_eq!(*observed_previous, previous);
+            assert_eq!(*observed_successor, successor);
+            assert_eq!(anchored, previous);
+            assert_ne!(actual, previous.inventory);
+            assert_ne!(actual, successor.inventory);
+        }
+        Err(other) => panic!("unexpected divergent recovery result: {other}"),
+        Ok(_) => panic!("unknown durable store state was accepted"),
+    }
+    assert!(
+        pending_path(&state).exists(),
+        "divergent recovery must preserve authenticated pending evidence"
+    );
+    assert!(matches!(
+        load_snapshot_store_head_state(&state, &key),
+        Err(SnapshotStoreHeadStateError::RecoveryRequired { .. })
+    ));
+}
+
+#[test]
+fn pending_intent_authentication_fails_closed() {
+    let workspace = TempDir::new("recover-authentication");
+    let (store, state) = roots(workspace.path());
+    let key = SnapshotStoreHeadStateKey::new([0x55; 32]);
+    let wrong_key = SnapshotStoreHeadStateKey::new([0x56; 32]);
+    let candidate = fixture(
+        workspace.path(),
+        "recover-authentication",
+        b"pending-auth\n",
+        0x55,
+    );
+    let previous = initialize_snapshot_store_head_state(&state, &key, &store, audit_limits())
+        .expect("initialize recovery predecessor");
+    let successor = projected_successor_fixture(workspace.path(), previous, &candidate);
+    write_pending_fixture(&state, &key, previous, successor, &candidate);
+
+    assert!(matches!(
+        wrong_key.recover_pending_publication(&state, &store, audit_limits()),
+        Err(SnapshotStoreHeadStateError::AuthenticationFailed)
+    ));
+    assert!(pending_path(&state).exists());
+
+    let path = pending_path(&state);
+    let mut bytes = fs::read(&path).expect("read pending fixture");
+    bytes[24] ^= 0x80;
+    fs::write(&path, bytes).expect("tamper pending fixture");
+    assert!(matches!(
+        key.recover_pending_publication(&state, &store, audit_limits()),
+        Err(SnapshotStoreHeadStateError::AuthenticationFailed)
+    ));
+    assert!(
+        path.exists(),
+        "tampered pending evidence must not be deleted"
+    );
+}
+
+const RECOVERY_FSYNC_HELPER_ROOT: &str = "SECURITY_LAB_HEAD_RECOVERY_FSYNC_HELPER_ROOT";
+
+#[test]
+fn recovery_fsync_failure_helper() {
+    let Some(root) = std::env::var_os(RECOVERY_FSYNC_HELPER_ROOT) else {
+        return;
+    };
+    let root = PathBuf::from(root);
+    let store = root.join("store");
+    let state = root.join("head-state");
+    let key = SnapshotStoreHeadStateKey::new([0x66; 32]);
+
+    match key
+        .recover_pending_publication(&state, &store, audit_limits())
+        .expect_err("denied fsync must prevent recovered head advancement")
+    {
+        SnapshotStoreHeadStateError::Transaction(source) => match *source {
+            SnapshotStoreTransactionError::Store(SnapshotStoreError::Io { phase, source }) => {
+                assert_eq!(phase, "sync durable snapshot object");
+                assert_eq!(source.raw_os_error(), Some(libc::EPERM));
+            }
+            other => panic!("unexpected recovery transaction error: {other}"),
+        },
+        other => panic!("unexpected denied-fsync recovery result: {other}"),
+    }
+}
+
+#[test]
+fn recovery_requires_durability_barrier_before_advancing_head() {
+    let workspace = TempDir::new("recover-durability");
+    let (store, state) = roots(workspace.path());
+    let key = SnapshotStoreHeadStateKey::new([0x66; 32]);
+    let candidate = fixture(
+        workspace.path(),
+        "recover-durability",
+        b"recover-durability\n",
+        0x66,
+    );
+    let previous = initialize_snapshot_store_head_state(&state, &key, &store, audit_limits())
+        .expect("initialize durability recovery predecessor");
+    let successor = projected_successor_fixture(workspace.path(), previous, &candidate);
+    write_pending_fixture(&state, &key, previous, successor, &candidate);
+
+    let put = store_snapshot_archive_ed25519_atomic(
+        &store,
+        &candidate.archive,
+        &candidate.public_key,
+        &candidate.signature,
+        archive_limits(),
+    )
+    .expect("simulate visible object before durable acknowledgement");
+    assert!(put.inserted);
+    assert_eq!(
+        snapshot_store_inventory_identity(&store, audit_limits())
+            .expect("audit visible successor before recovery"),
+        successor.inventory
+    );
+
+    let mut command =
+        Command::new(std::env::current_exe().expect("resolve current test executable"));
+    command
+        .arg("--exact")
+        .arg("recovery_fsync_failure_helper")
+        .arg("--nocapture")
+        .env(RECOVERY_FSYNC_HELPER_ROOT, workspace.path());
+    unsafe {
+        command.pre_exec(install_fsync_deny_filter);
+    }
+    let status = command
+        .status()
+        .expect("run denied-fsync recovery helper subprocess");
+    assert!(
+        status.success(),
+        "denied-fsync recovery helper failed: {status}"
+    );
+
+    assert!(
+        pending_path(&state).exists(),
+        "failed recovery must preserve authenticated pending evidence"
+    );
+    let pending = pending_path(&state);
+    let held = state.join("snapshot-store-head-pending.inspect");
+    fs::rename(&pending, &held).expect("temporarily move pending evidence for head inspection");
+    assert_eq!(
+        load_snapshot_store_head_state(&state, &key).expect("load head after denied recovery"),
+        previous,
+        "denied durability barrier must not advance authenticated head"
+    );
+    fs::rename(&held, &pending).expect("restore pending evidence after head inspection");
+
+    assert_eq!(
+        key.recover_pending_publication(&state, &store, audit_limits())
+            .expect("retry recovery with durability barrier available"),
+        successor
+    );
+    assert!(!pending.exists());
+    assert_eq!(
+        verify_snapshot_store_head_state(&state, &key, &store, audit_limits())
+            .expect("verify recovered durable successor"),
+        successor
+    );
+}
+
+fn install_fsync_deny_filter() -> std::io::Result<()> {
+    const BPF_LD_W_ABS: u16 = 0x20;
+    const BPF_JMP_JEQ_K: u16 = 0x15;
+    const BPF_RET_K: u16 = 0x06;
+    const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
+    const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
+    const SECCOMP_MODE_FILTER: libc::c_ulong = 2;
+
+    let mut filter = [
+        libc::sock_filter {
+            code: BPF_LD_W_ABS,
+            jt: 0,
+            jf: 0,
+            k: 0,
+        },
+        libc::sock_filter {
+            code: BPF_JMP_JEQ_K,
+            jt: 0,
+            jf: 1,
+            k: libc::SYS_fsync as u32,
+        },
+        libc::sock_filter {
+            code: BPF_RET_K,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_RET_ERRNO | libc::EPERM as u32,
+        },
+        libc::sock_filter {
+            code: BPF_RET_K,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_RET_ALLOW,
+        },
+    ];
+    let program = libc::sock_fprog {
+        len: filter.len() as u16,
+        filter: filter.as_mut_ptr(),
+    };
+
+    let no_new_privs = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
+    if no_new_privs != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let seccomp = unsafe {
+        libc::prctl(
+            libc::PR_SET_SECCOMP,
+            SECCOMP_MODE_FILTER,
+            &program as *const libc::sock_fprog,
+        )
+    };
+    if seccomp != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 #[test]

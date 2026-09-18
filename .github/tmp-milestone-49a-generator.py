@@ -500,17 +500,17 @@ fn interpreter_binding_is_modeled_as_an_exact_execution_restriction() {
     let reduced = run_json(&baseline, &restricted);
     assert_eq!(reduced.status.code(), Some(0));
     let stdout = String::from_utf8(reduced.stdout).expect("utf8 output");
-    assert!(stdout.contains("\\"field\\":\\"execution.executable_interpreter_binding\\",\\"class\\":\\"reduced\\""));
+    assert!(stdout.contains(r#""field":"execution.executable_interpreter_binding","class":"reduced""#));
 
     let widened = run_json(&restricted, &baseline);
     assert_eq!(widened.status.code(), Some(5));
     let stdout = String::from_utf8(widened.stdout).expect("utf8 output");
-    assert!(stdout.contains("\\"field\\":\\"execution.executable_interpreter_binding\\",\\"class\\":\\"widened\\""));
+    assert!(stdout.contains(r#""field":"execution.executable_interpreter_binding","class":"widened""#));
 
     let incomparable = run_json(&restricted, &changed);
     assert_eq!(incomparable.status.code(), Some(6));
     let stdout = String::from_utf8(incomparable.stdout).expect("utf8 output");
-    assert!(stdout.contains("\\"field\\":\\"execution.executable_interpreter_binding\\",\\"class\\":\\"incomparable\\""));
+    assert!(stdout.contains(r#""field":"execution.executable_interpreter_binding","class":"incomparable""#));
 }
 
 '''

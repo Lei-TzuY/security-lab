@@ -1145,7 +1145,7 @@ After 46A integrates, seal caller-hosted local HMAC head-state rollback detectio
 
 ### Slice 47A — one-generation batch head publication
 
-**Current verified candidate.** Extends the authenticated head from one-object guarded publication to a bounded cooperative batch without claiming crash-atomic rollback of durable members.
+**Status: complete on `main`.** Extends the authenticated head from one-object guarded publication to a bounded cooperative batch without claiming crash-atomic rollback of durable members.
 
 Acceptance evidence is executable:
 
@@ -1161,7 +1161,28 @@ Boundary: 47A is a bounded cooperative publication unit, not a crash-atomic all-
 
 ### Milestone 47 promotion rule
 
-After 47A integrates, seal bounded cooperative batch publication under one authenticated head generation. Do not farm larger caps, batch aliases, retry wrappers, or alternate duplicate spellings. A stronger snapshot-store phase must add true crash-atomic/point-in-time semantics or an external/hardware monotonic witness with executable evidence; otherwise promote to another independent authority frontier.
+47A is sealed on `main`. Do not farm larger caps, batch aliases, retry wrappers, or alternate duplicate spellings. A stronger snapshot-store phase must add true crash-atomic/point-in-time semantics or an external/hardware monotonic witness with executable evidence; otherwise promote to another independent authority frontier.
+
+## Milestone 48 — initial executable content binding
+
+### Slice 48A — policy-bound sealed initial executable
+
+**Current verified candidate.** Adds an optional exact content restriction for the initial executable and executes the verified bytes from an immutable launcher-owned image instead of merely pinning a mutable host inode.
+
+Acceptance evidence is executable:
+
+- `executable.sha256` accepts exactly 64 hexadecimal characters and decodes to the exact 32 expected bytes; malformed lengths or non-hex input fail policy parsing;
+- the static authority manifest exposes the canonical lowercase digest, while authority-delta models adding a digest as a restriction, removing one as a widening, and changing one exact digest to another as incomparable;
+- the configured-filesystem preflight reopens the executable beneath the pinned root with read-only `openat2`, requires the same `(st_dev, st_ino)`, bounds the read to 64 MiB, and requires the complete streamed SHA-256 to match without creating namespaces, mounts, executable images, or target processes;
+- production first retains the existing path pin/execute-bit checks, then reopens that same inode read-only, hashes and copies the identical byte stream into `memfd_create(MFD_EXEC | MFD_ALLOW_SEALING)`, rejects empty/oversized/mismatched images, and applies plus verifies `F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL`;
+- when the digest is requested, unsupported executable-memfd/sealing support fails explicitly instead of falling back to the host inode; successful launch continues through the existing `execveat(AT_EMPTY_PATH)` path using the sealed descriptor;
+- a raw fixture under its exact digest exits successfully, while a one-bit digest mismatch returns a pre-launch setup failure; stable rustfmt, Clippy with `-D warnings`, complete stable tests, and the complete Rust 1.74 suite are green.
+
+Boundary: 48A binds only the byte content of the initial executable file selected by policy. SHA-256 here is an expected-content restriction, not a digital signature, provenance statement, or trust-distribution mechanism. The slice does not bind an ELF `PT_INTERP`, dynamic loader/shared libraries, later target `execve`/`execveat` calls, or the rest of the root filesystem, and it does not claim a process-lifetime executable allowlist.
+
+### Milestone 48 promotion rule
+
+After 48A integrates, seal initial-executable content binding. Do not farm hash aliases, larger copy ceilings, size-only variants, or alternate seal masks. A stronger execution-integrity phase must bind a materially different dependency such as interpreter/library closure or later-exec authority with executable evidence; otherwise promote to another independent authority frontier.
 
 ## Independent host-local IPC frontier — post-launch object transfer
 
@@ -1184,4 +1205,4 @@ Promotion rule: do not farm additional payload bytes, target descriptor numbers,
 
 ## Later frontiers
 
-Supplementary-group isolation with a viable mapping architecture, broader/generalized persistent-volume policy, routed/broader network authority beyond the bounded IPv4 brokers, broader host-local IPC mediation beyond the bounded receive-only SCM_RIGHTS handoff, and delegated aggregate cgroup accounting remain separate evidence-backed frontiers. Do not add configuration-only names without executable kernel behavior and integration evidence.
+Supplementary-group isolation with a viable mapping architecture, broader/generalized persistent-volume policy, routed/broader network authority beyond the bounded IPv4 brokers, broader host-local IPC mediation beyond the bounded receive-only SCM_RIGHTS handoff, interpreter/shared-library closure or later-exec authority beyond 48A, and delegated aggregate cgroup accounting remain separate evidence-backed frontiers. Do not add configuration-only names without executable kernel behavior and integration evidence.

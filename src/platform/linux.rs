@@ -27,6 +27,7 @@ mod x86_64 {
         CancellationToken, CapturedOutput, ChildOutcome, EnforcementReceipt, PolicyError,
         ProcessTreeUsage, ResourceLimits, RunReport, SandboxError, SandboxPolicy,
     };
+    use sha2::{Digest, Sha256};
     use std::ffi::CString;
     use std::io;
     use std::net::Ipv4Addr;
@@ -72,6 +73,10 @@ mod x86_64 {
     const FSCONFIG_CMD_CREATE: libc::c_uint = 6;
     const EXECVEAT_AT_EMPTY_PATH: libc::c_int = 0x1000;
     const CLONE_NEWTIME: libc::c_int = 0x0000_0080;
+    const MFD_CLOEXEC: libc::c_uint = 0x0001;
+    const MFD_ALLOW_SEALING: libc::c_uint = 0x0002;
+    const MFD_EXEC: libc::c_uint = 0x0010;
+    const MAX_SEALED_EXECUTABLE_BYTES: u64 = 64 * 1024 * 1024;
 
     const ENFORCEMENT_BASE_NAMESPACES: u64 = 1 << 0;
     const ENFORCEMENT_TIME_NAMESPACE: u64 = 1 << 1;
@@ -402,6 +407,165 @@ mod x86_64 {
             storage_fd,
             target_fd: target_fd as RawFd,
         })
+    }
+
+    fn prepare_verified_executable_image(
+        root_fd: RawFd,
+        path: &Path,
+        pinned: OwnedFd,
+        expected_sha256: [u8; 32],
+    ) -> Result<OwnedFd, SandboxError> {
+        let readable = open_beneath_root(
+            root_fd,
+            path,
+            (libc::O_RDONLY | libc::O_CLOEXEC) as u64,
+            "executable content",
+        )?;
+        let mut pinned_stat = unsafe { std::mem::zeroed::<libc::stat>() };
+        let mut readable_stat = unsafe { std::mem::zeroed::<libc::stat>() };
+        if unsafe { libc::fstat(pinned.raw(), &mut pinned_stat) } == -1
+            || unsafe { libc::fstat(readable.raw(), &mut readable_stat) } == -1
+        {
+            return Err(SandboxError::SetupFailed(format!(
+                "cannot inspect executable identity before sealed copy: {}",
+                io::Error::last_os_error()
+            )));
+        }
+        if pinned_stat.st_dev != readable_stat.st_dev || pinned_stat.st_ino != readable_stat.st_ino
+        {
+            return Err(SandboxError::SetupFailed(
+                "executable identity changed before sealed content copy".to_owned(),
+            ));
+        }
+        if readable_stat.st_size < 0 || readable_stat.st_size as u64 > MAX_SEALED_EXECUTABLE_BYTES {
+            return Err(SandboxError::SetupFailed(format!(
+                "executable image exceeds sealed-copy byte ceiling of {MAX_SEALED_EXECUTABLE_BYTES}"
+            )));
+        }
+
+        let name = CString::new("security-lab-executable").expect("fixed memfd name has no NUL");
+        let raw_memfd = unsafe {
+            libc::syscall(
+                libc::SYS_memfd_create,
+                name.as_ptr(),
+                MFD_CLOEXEC | MFD_ALLOW_SEALING | MFD_EXEC,
+            )
+        };
+        if raw_memfd == -1 {
+            let error = io::Error::last_os_error();
+            return if matches!(
+                error.raw_os_error(),
+                Some(libc::ENOSYS) | Some(libc::EINVAL) | Some(libc::EPERM) | Some(libc::EACCES)
+            ) {
+                Err(SandboxError::UnsupportedPlatform(format!(
+                    "executable SHA-256 sealing requires executable memfd support: {error}"
+                )))
+            } else {
+                Err(SandboxError::SetupFailed(format!(
+                    "cannot create sealed executable memfd: {error}"
+                )))
+            };
+        }
+        let memfd = OwnedFd(raw_memfd as RawFd);
+        let mut hasher = Sha256::new();
+        let mut total = 0u64;
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let read = unsafe {
+                libc::read(
+                    readable.raw(),
+                    buffer.as_mut_ptr().cast::<libc::c_void>(),
+                    buffer.len(),
+                )
+            };
+            if read == -1 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                return Err(SandboxError::SetupFailed(format!(
+                    "cannot read executable for sealed verification: {error}"
+                )));
+            }
+            if read == 0 {
+                break;
+            }
+            let count = read as usize;
+            total = total.checked_add(count as u64).ok_or_else(|| {
+                SandboxError::SetupFailed("sealed executable byte count overflow".to_owned())
+            })?;
+            if total > MAX_SEALED_EXECUTABLE_BYTES {
+                return Err(SandboxError::SetupFailed(format!(
+                    "executable image exceeds sealed-copy byte ceiling of {MAX_SEALED_EXECUTABLE_BYTES}"
+                )));
+            }
+            hasher.update(&buffer[..count]);
+            let mut offset = 0usize;
+            while offset < count {
+                let written = unsafe {
+                    libc::write(
+                        memfd.raw(),
+                        buffer[offset..count].as_ptr().cast::<libc::c_void>(),
+                        count - offset,
+                    )
+                };
+                if written == -1 {
+                    let error = io::Error::last_os_error();
+                    if error.raw_os_error() == Some(libc::EINTR) {
+                        continue;
+                    }
+                    return Err(SandboxError::SetupFailed(format!(
+                        "cannot populate sealed executable memfd: {error}"
+                    )));
+                }
+                if written == 0 {
+                    return Err(SandboxError::SetupFailed(
+                        "sealed executable memfd write made no progress".to_owned(),
+                    ));
+                }
+                offset += written as usize;
+            }
+        }
+        if total == 0 {
+            return Err(SandboxError::SetupFailed(
+                "executable image is empty".to_owned(),
+            ));
+        }
+        let actual: [u8; 32] = hasher.finalize().into();
+        if actual != expected_sha256 {
+            return Err(SandboxError::SetupFailed(
+                "executable SHA-256 does not match executable.sha256 policy".to_owned(),
+            ));
+        }
+        if unsafe { libc::fchmod(memfd.raw(), 0o555) } == -1 {
+            return Err(SandboxError::SetupFailed(format!(
+                "cannot set sealed executable memfd mode: {}",
+                io::Error::last_os_error()
+            )));
+        }
+        let required_seals =
+            libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
+        if unsafe { libc::fcntl(memfd.raw(), libc::F_ADD_SEALS, required_seals) } == -1 {
+            return Err(SandboxError::SetupFailed(format!(
+                "cannot seal verified executable memfd: {}",
+                io::Error::last_os_error()
+            )));
+        }
+        let observed_seals = unsafe { libc::fcntl(memfd.raw(), libc::F_GET_SEALS) };
+        if observed_seals == -1 {
+            return Err(SandboxError::SetupFailed(format!(
+                "cannot verify executable memfd seals: {}",
+                io::Error::last_os_error()
+            )));
+        }
+        if observed_seals & required_seals != required_seals {
+            return Err(SandboxError::SetupFailed(
+                "verified executable memfd is missing required immutable seals".to_owned(),
+            ));
+        }
+        drop(readable);
+        drop(pinned);
+        Ok(memfd)
     }
 
     fn connect_host_tcp_ipv4(
@@ -1066,6 +1230,15 @@ mod x86_64 {
                 "executable",
             )?;
             validate_executable_fd(executable_fd.raw(), &policy.executable)?;
+            let executable_fd = match policy.executable_sha256 {
+                Some(expected_sha256) => prepare_verified_executable_image(
+                    root_fd.raw(),
+                    &policy.executable,
+                    executable_fd,
+                    expected_sha256,
+                )?,
+                None => executable_fd,
+            };
 
             let mut landlock_read_execute = Vec::with_capacity(policy.landlock_read_execute.len());
             for path in &policy.landlock_read_execute {

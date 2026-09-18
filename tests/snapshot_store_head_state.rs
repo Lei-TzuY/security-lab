@@ -5,17 +5,19 @@ use security_lab::{
     initialize_snapshot_store_head_state, load_snapshot_store_head_state,
     serialize_snapshot_archive, sign_snapshot_ed25519, snapshot_store_head_state_path,
     snapshot_store_inventory_identity, snapshot_store_object_path,
-    store_snapshot_archive_ed25519_durable, store_snapshot_archive_ed25519_durable_with_head_state,
+    store_snapshot_archive_ed25519_atomic, store_snapshot_archive_ed25519_durable,
+    store_snapshot_archive_ed25519_durable_with_head_state,
     store_snapshot_archives_ed25519_durable_with_head_state, verify_snapshot_store_head_state,
     SnapshotArchiveLimits, SnapshotIdentity, SnapshotIdentityLimits, SnapshotStoreAuditLimits,
     SnapshotStoreHeadBatchItem, SnapshotStoreHeadBatchPublishRequest,
     SnapshotStoreHeadPublishRequest, SnapshotStoreHeadStateError, SnapshotStoreHeadStateIdentity,
-    SnapshotStoreHeadStateKey,
+    SnapshotStoreHeadStateKey, SnapshotStoreError, SnapshotStoreTransactionError,
 };
 use sha2::Sha256;
 use std::fs;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process;
+use std::process::{self, Command};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
@@ -118,10 +120,10 @@ fn batch_item(fixture: &Fixture) -> SnapshotStoreHeadBatchItem<'_> {
     }
 }
 
-const PENDING_DOMAIN: &[u8] = b"security-lab-snapshot-store-head-pending-v1\0";
-const PENDING_MAGIC: [u8; 8] = *b"SLHPND1\0";
-const PENDING_HEADER_BYTES: usize = 120;
-const PENDING_BYTES: usize = 152;
+const PENDING_DOMAIN: &[u8] = b"security-lab-snapshot-store-head-pending-v2\0";
+const PENDING_MAGIC: [u8; 8] = *b"SLHPND2\0";
+const PENDING_HEADER_BYTES: usize = 176;
+const PENDING_BYTES: usize = 208;
 
 fn encode_pending_identity(bytes: &mut [u8], identity: SnapshotStoreHeadStateIdentity) {
     assert_eq!(bytes.len(), 56);
@@ -135,11 +137,16 @@ fn pending_bytes(
     key: &SnapshotStoreHeadStateKey,
     previous: SnapshotStoreHeadStateIdentity,
     successor: SnapshotStoreHeadStateIdentity,
+    candidate: &Fixture,
 ) -> [u8; PENDING_BYTES] {
     let mut bytes = [0u8; PENDING_BYTES];
     bytes[0..8].copy_from_slice(&PENDING_MAGIC);
     encode_pending_identity(&mut bytes[8..64], previous);
     encode_pending_identity(&mut bytes[64..120], successor);
+    bytes[120..152].copy_from_slice(&candidate.identity.sha256);
+    bytes[152..160].copy_from_slice(&candidate.identity.encoded_bytes.to_le_bytes());
+    bytes[160..168].copy_from_slice(&candidate.identity.nodes.to_le_bytes());
+    bytes[168..176].copy_from_slice(&(candidate.archive.len() as u64).to_le_bytes());
     let mut mac =
         <Hmac<Sha256> as Mac>::new_from_slice(key.as_bytes()).expect("fixed HMAC key is valid");
     mac.update(PENDING_DOMAIN);
@@ -157,9 +164,13 @@ fn write_pending_fixture(
     key: &SnapshotStoreHeadStateKey,
     previous: SnapshotStoreHeadStateIdentity,
     successor: SnapshotStoreHeadStateIdentity,
+    candidate: &Fixture,
 ) {
-    fs::write(pending_path(state), pending_bytes(key, previous, successor))
-        .expect("write authenticated pending fixture");
+    fs::write(
+        pending_path(state),
+        pending_bytes(key, previous, successor, candidate),
+    )
+    .expect("write authenticated pending fixture");
 }
 
 fn projected_successor_fixture(
@@ -358,7 +369,7 @@ fn recovery_clears_pre_store_intent_without_advancing_head() {
     let previous = initialize_snapshot_store_head_state(&state, &key, &store, audit_limits())
         .expect("initialize recovery predecessor");
     let successor = projected_successor_fixture(workspace.path(), previous, &candidate);
-    write_pending_fixture(&state, &key, previous, successor);
+    write_pending_fixture(&state, &key, previous, successor, &candidate);
 
     match load_snapshot_store_head_state(&state, &key) {
         Err(SnapshotStoreHeadStateError::RecoveryRequired {
@@ -399,7 +410,7 @@ fn recovery_advances_head_for_exact_durable_successor() {
     let previous = initialize_snapshot_store_head_state(&state, &key, &store, audit_limits())
         .expect("initialize recovery predecessor");
     let successor = projected_successor_fixture(workspace.path(), previous, &candidate);
-    write_pending_fixture(&state, &key, previous, successor);
+    write_pending_fixture(&state, &key, previous, successor, &candidate);
 
     let put = store_snapshot_archive_ed25519_durable(
         &store,
@@ -449,7 +460,7 @@ fn recovery_clears_leftover_intent_after_head_commit() {
     )
     .expect("commit exact successor before simulating leftover intent");
     assert_eq!(committed.previous, previous);
-    write_pending_fixture(&state, &key, previous, committed.successor);
+    write_pending_fixture(&state, &key, previous, committed.successor, &candidate);
 
     assert_eq!(
         key.recover_pending_publication(&state, &store, audit_limits())
@@ -478,7 +489,7 @@ fn recovery_keeps_pending_intent_on_unknown_store_state() {
     let previous = initialize_snapshot_store_head_state(&state, &key, &store, audit_limits())
         .expect("initialize recovery predecessor");
     let successor = projected_successor_fixture(workspace.path(), previous, &expected);
-    write_pending_fixture(&state, &key, previous, successor);
+    write_pending_fixture(&state, &key, previous, successor, &expected);
 
     store_snapshot_archive_ed25519_durable(
         &store,
@@ -530,7 +541,7 @@ fn pending_intent_authentication_fails_closed() {
     let previous = initialize_snapshot_store_head_state(&state, &key, &store, audit_limits())
         .expect("initialize recovery predecessor");
     let successor = projected_successor_fixture(workspace.path(), previous, &candidate);
-    write_pending_fixture(&state, &key, previous, successor);
+    write_pending_fixture(&state, &key, previous, successor, &candidate);
 
     assert!(matches!(
         wrong_key.recover_pending_publication(&state, &store, audit_limits()),
@@ -550,6 +561,164 @@ fn pending_intent_authentication_fails_closed() {
         path.exists(),
         "tampered pending evidence must not be deleted"
     );
+}
+
+const RECOVERY_FSYNC_HELPER_ROOT: &str =
+    "SECURITY_LAB_HEAD_RECOVERY_FSYNC_HELPER_ROOT";
+
+#[test]
+fn recovery_fsync_failure_helper() {
+    let Some(root) = std::env::var_os(RECOVERY_FSYNC_HELPER_ROOT) else {
+        return;
+    };
+    let root = PathBuf::from(root);
+    let store = root.join("store");
+    let state = root.join("head-state");
+    let key = SnapshotStoreHeadStateKey::new([0x66; 32]);
+
+    match key
+        .recover_pending_publication(&state, &store, audit_limits())
+        .expect_err("denied fsync must prevent recovered head advancement")
+    {
+        SnapshotStoreHeadStateError::Transaction(source) => match *source {
+            SnapshotStoreTransactionError::Store(SnapshotStoreError::Io { phase, source }) => {
+                assert_eq!(phase, "sync durable snapshot object");
+                assert_eq!(source.raw_os_error(), Some(libc::EPERM));
+            }
+            other => panic!("unexpected recovery transaction error: {other}"),
+        },
+        other => panic!("unexpected denied-fsync recovery result: {other}"),
+    }
+}
+
+#[test]
+fn recovery_requires_durability_barrier_before_advancing_head() {
+    let workspace = TempDir::new("recover-durability");
+    let (store, state) = roots(workspace.path());
+    let key = SnapshotStoreHeadStateKey::new([0x66; 32]);
+    let candidate = fixture(
+        workspace.path(),
+        "recover-durability",
+        b"recover-durability\n",
+        0x66,
+    );
+    let previous = initialize_snapshot_store_head_state(&state, &key, &store, audit_limits())
+        .expect("initialize durability recovery predecessor");
+    let successor = projected_successor_fixture(workspace.path(), previous, &candidate);
+    write_pending_fixture(&state, &key, previous, successor, &candidate);
+
+    let put = store_snapshot_archive_ed25519_atomic(
+        &store,
+        &candidate.archive,
+        &candidate.public_key,
+        &candidate.signature,
+        archive_limits(),
+    )
+    .expect("simulate visible object before durable acknowledgement");
+    assert!(put.inserted);
+    assert_eq!(
+        snapshot_store_inventory_identity(&store, audit_limits())
+            .expect("audit visible successor before recovery"),
+        successor.inventory
+    );
+
+    let mut command =
+        Command::new(std::env::current_exe().expect("resolve current test executable"));
+    command
+        .arg("--exact")
+        .arg("recovery_fsync_failure_helper")
+        .arg("--nocapture")
+        .env(RECOVERY_FSYNC_HELPER_ROOT, workspace.path());
+    unsafe {
+        command.pre_exec(install_fsync_deny_filter);
+    }
+    let status = command
+        .status()
+        .expect("run denied-fsync recovery helper subprocess");
+    assert!(status.success(), "denied-fsync recovery helper failed: {status}");
+
+    assert!(
+        pending_path(&state).exists(),
+        "failed recovery must preserve authenticated pending evidence"
+    );
+    let pending = pending_path(&state);
+    let held = state.join("snapshot-store-head-pending.inspect");
+    fs::rename(&pending, &held).expect("temporarily move pending evidence for head inspection");
+    assert_eq!(
+        load_snapshot_store_head_state(&state, &key).expect("load head after denied recovery"),
+        previous,
+        "denied durability barrier must not advance authenticated head"
+    );
+    fs::rename(&held, &pending).expect("restore pending evidence after head inspection");
+
+    assert_eq!(
+        key.recover_pending_publication(&state, &store, audit_limits())
+            .expect("retry recovery with durability barrier available"),
+        successor
+    );
+    assert!(!pending.exists());
+    assert_eq!(
+        verify_snapshot_store_head_state(&state, &key, &store, audit_limits())
+            .expect("verify recovered durable successor"),
+        successor
+    );
+}
+
+fn install_fsync_deny_filter() -> std::io::Result<()> {
+    const BPF_LD_W_ABS: u16 = 0x20;
+    const BPF_JMP_JEQ_K: u16 = 0x15;
+    const BPF_RET_K: u16 = 0x06;
+    const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
+    const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
+    const SECCOMP_MODE_FILTER: libc::c_ulong = 2;
+
+    let mut filter = [
+        libc::sock_filter {
+            code: BPF_LD_W_ABS,
+            jt: 0,
+            jf: 0,
+            k: 0,
+        },
+        libc::sock_filter {
+            code: BPF_JMP_JEQ_K,
+            jt: 0,
+            jf: 1,
+            k: libc::SYS_fsync as u32,
+        },
+        libc::sock_filter {
+            code: BPF_RET_K,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_RET_ERRNO | libc::EPERM as u32,
+        },
+        libc::sock_filter {
+            code: BPF_RET_K,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_RET_ALLOW,
+        },
+    ];
+    let program = libc::sock_fprog {
+        len: filter.len() as u16,
+        filter: filter.as_mut_ptr(),
+    };
+
+    let no_new_privs =
+        unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
+    if no_new_privs != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let seccomp = unsafe {
+        libc::prctl(
+            libc::PR_SET_SECCOMP,
+            SECCOMP_MODE_FILTER,
+            &program as *const libc::sock_fprog,
+        )
+    };
+    if seccomp != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 #[test]

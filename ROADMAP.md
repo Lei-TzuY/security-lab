@@ -1273,7 +1273,7 @@ Boundary: 50B is **bounded authenticated forward recovery**, not rollback or ato
 
 ### Slice 51A — bounded stale object-temp recovery
 
-**Current verified candidate.** Adds a crash-residue lifecycle for the content-addressed store's existing temporary-object publication namespace without turning cleanup into general garbage collection.
+**Status: complete on `main`.** Adds a crash-residue lifecycle for the content-addressed store's existing temporary-object publication namespace without turning cleanup into general garbage collection.
 
 Acceptance evidence is executable:
 
@@ -1309,6 +1309,29 @@ Boundary: this slice is receive-only target-side capability transfer over one al
 
 Promotion rule: do not farm additional payload bytes, target descriptor numbers, or ancillary-message spelling variants. A stronger host-local IPC phase must add materially new mediation such as bounded object-type/rights policy, launcher-owned dynamic brokering, revocation/lifetime control, or a generalized endpoint/object graph with executable evidence.
 
+
+## Milestone 52 — launcher-owned runtime object mediation
+
+### Slice 52A — one-shot read-only regular-file runtime grant
+
+**Current verified candidate.** Converts the previously peer-driven receive-only `SCM_RIGHTS` channel into a bounded trusted-caller mediation API for one regular-file data capability.
+
+Acceptance evidence is executable:
+
+- `RuntimeFdBroker::configure_policy()` reuses the existing exact-path AF_UNIX broker rather than adding a second transport surface; it refuses an already-configured host-UNIX broker, requires `recvmsg` to already be explicit in target `seccomp.allow`, validates a cloned candidate, and never partially mutates the caller policy on failure;
+- `RuntimeFdBroker::bind()` records the broker owner's process/effective credentials and exact socket inode. `accept()` requires Linux `SO_PEERCRED` to match that exact PID/UID/GID before producing a session, while the existing launcher-side AF_UNIX preparation independently retains its exact peer UID/GID check;
+- `prepare_readonly_regular_file()` accepts only regular files that already carry read authority, rejects `O_WRONLY`, `O_PATH`, directories/devices/pipes/sockets, reopens `/proc/self/fd/<n>` as `O_RDONLY|O_CLOEXEC`, revalidates `(st_dev, st_ino)`, and therefore gives the target an independent open-file description rather than sharing the caller's file offset;
+- `RuntimeFdSession` is a fail-closed state machine: a grant before the exact target readiness byte is rejected, readiness can be consumed only once, one successful `SCM_RIGHTS` grant moves the session terminally to `GrantSent`, and a second grant is rejected. A readiness/protocol I/O failure poisons the session instead of permitting an ambiguous retry;
+- the real sandbox target receives the grant only after executed target code publishes readiness, receives it with `MSG_CMSG_CLOEXEC`, gets exact `EBADF` when it attempts `write(2)` despite `write` being explicitly allowed for the readiness handshake, reads the exact marker bytes successfully, and still gets `ENOENT` for the original host pathname;
+- host-side evidence proves the caller's original source offset remains unchanged, while deterministic local regressions also reject write-only, path-only, and non-regular sources plus premature/duplicate session operations;
+- exact candidate stable format/Clippy/full tests and the full Rust 1.74 suite are green.
+
+Boundary: 52A attenuates the transferred regular file's **open-file-description data access mode** to `O_RDONLY`; it does not make the underlying inode immutable, revoke metadata-changing authority independently granted by target syscalls/kernel ownership/Landlock state, provide descriptor revocation after transfer, accept directory/device/socket capabilities, multiplex multiple grants per session, add target `sendmsg`, provide cryptographic peer identity, or create a general post-launch IPC/RPC broker.
+
+### Milestone 52 promotion rule
+
+After 52A integrates, seal regular-file/read-only aliases and readiness-byte variants. A stronger runtime-object phase must add a materially different property such as explicit lifetime/revocation control, another carefully specified object class with real rights attenuation, or a bounded multi-object protocol whose ordering and partial-failure semantics are executable—not merely more `SCM_RIGHTS` payloads.
+
 ## Later frontiers
 
-Supplementary-group isolation with a viable mapping architecture, broader/generalized persistent-volume policy, routed/broader network authority beyond the bounded IPv4 brokers, broader host-local IPC mediation beyond the bounded receive-only SCM_RIGHTS handoff, interpreter/shared-library closure or later-exec authority beyond 48A, and delegated aggregate cgroup accounting remain separate evidence-backed frontiers. Do not add configuration-only names without executable kernel behavior and integration evidence.
+Supplementary-group isolation with a viable mapping architecture, broader/generalized persistent-volume policy, routed/broader network authority beyond the bounded IPv4 brokers, broader host-local IPC mediation beyond the bounded one-shot read-only regular-file grant, interpreter/shared-library closure or later-exec authority beyond 48A, and delegated aggregate cgroup accounting remain separate evidence-backed frontiers. Do not add configuration-only names without executable kernel behavior and integration evidence.

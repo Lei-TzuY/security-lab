@@ -1251,7 +1251,7 @@ Boundary: 50A is single-object forward recovery only. It is not rollback, a two-
 
 ### Slice 50B — bounded recoverable batch head transition
 
-**Current verified candidate.** Retrofitting the 47A batch path adds a materially stronger recovery boundary rather than another pending-file spelling.
+**Status: complete on `main`.** Retrofitting the 47A batch path adds a materially stronger recovery boundary rather than another pending-file spelling.
 
 Acceptance evidence is executable:
 
@@ -1267,7 +1267,28 @@ Boundary: 50B is **bounded authenticated forward recovery**, not rollback or ato
 
 ### Milestone 50 promotion rule
 
-After 50B integrates, the bounded authenticated head-recovery phase is sealed. Do not farm larger batch counts, alternate stage filenames, retry aliases, or more recovery-state names. The next snapshot-store phase must add a qualitatively stronger property such as true point-in-time/crash-atomic semantics, stale-temp-safe recovery, or an external/hardware monotonic witness; otherwise promote to another independent authority frontier.
+50B is sealed on `main`. Do not farm larger batch counts, alternate stage filenames, retry aliases, or more recovery-state names. Promotion must add a qualitatively stronger property such as true point-in-time/crash-atomic semantics, stale-temp-safe recovery, or an external/hardware monotonic witness; otherwise move to another independent authority frontier.
+
+## Milestone 51 — cooperative stale snapshot-store temporary recovery
+
+### Slice 51A — bounded stale object-temp recovery
+
+**Current verified candidate.** Adds a crash-residue lifecycle for the content-addressed store's existing temporary-object publication namespace without turning cleanup into general garbage collection.
+
+Acceptance evidence is executable:
+
+- every runtime publisher that can create `.tmp-<pid>-<counter>` first acquires a shared store-root `.snapshot-store-temp-recovery.lock` flock and retains it through temporary creation, sealing, final `renameat2(RENAME_NOREPLACE)`, or cleanup; after waiting for that lock it rechecks the final object before creating a temp;
+- blocking recovery acquires the exclusive form of the same lock, while the nonblocking API returns typed `RecoveryLockContended` instead of deleting concurrently with a cooperating publisher;
+- recovery performs a complete bounded enumeration before mutation. Exceeding `max_entries` returns `RecoveryBudgetExceeded` with every candidate preserved;
+- only canonical reserved names `.tmp-<pid>-<counter>` are candidates. Every candidate must be a single-link regular file under fd-relative `fstatat(..., AT_SYMLINK_NOFOLLOW)`; a reserved-name symlink or other unsafe object fails closed before any candidate is deleted;
+- canonical content-addressed objects and unrelated entries are left untouched. Successful removal crosses `fsync` barriers for `objects/` and the pre-existing store root before the report acknowledges removed files;
+- deterministic integration tests cover exact stale-temp removal with canonical/unrelated preservation, pre-mutation entry-budget failure, unsafe reserved-name rejection with evidence preservation, and nonblocking contention/retry. Stable format/Clippy/full tests and the full Rust 1.74 suite are green.
+
+Boundary: 51A is **cooperative reserved-temp crash-residue recovery**. It is not general orphan detection/GC, age-based cleanup, hostile/non-cooperating writer serialization, canonical-object repair, head/journal rollback, a point-in-time filesystem snapshot, or proof of physical power-loss behavior beyond the local Linux `fsync` contract.
+
+### Milestone 51 promotion rule
+
+After 51A integrates, do not farm alternate temp prefixes, higher scan counts, or cleanup aliases. A stronger snapshot-store phase must add a qualitatively new property such as point-in-time/crash-atomic semantics or an external/hardware monotonic witness, or promote to another independent authority frontier.
 
 ## Independent host-local IPC frontier — post-launch object transfer
 

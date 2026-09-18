@@ -33,6 +33,7 @@ pub(super) fn probe(policy: &SandboxPolicy) -> ConfiguredFilesystemProbe {
 mod linux_x86_64 {
     use super::ConfiguredFilesystemProbe;
     use security_lab::SandboxPolicy;
+    use sha2::{Digest, Sha256};
     use std::ffi::CString;
     use std::io;
     use std::os::unix::ffi::OsStrExt;
@@ -42,6 +43,7 @@ mod linux_x86_64 {
     const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
     const RESOLVE_NO_SYMLINKS: u64 = 0x04;
     const RESOLVE_BENEATH: u64 = 0x08;
+    const MAX_EXECUTABLE_DIGEST_BYTES: u64 = 64 * 1024 * 1024;
 
     #[repr(C)]
     struct OpenHow {
@@ -183,6 +185,76 @@ mod linux_x86_64 {
         }
         if stat.st_mode & 0o111 == 0 {
             return ConfiguredFilesystemProbe::unavailable("executable_execute_bit", None);
+        }
+
+        if let Some(expected_sha256) = policy.executable_sha256 {
+            let readable = match open_beneath(
+                root.raw(),
+                &policy.executable,
+                (libc::O_RDONLY | libc::O_CLOEXEC) as u64,
+            ) {
+                Ok(fd) => fd,
+                Err(error) => {
+                    return ConfiguredFilesystemProbe::unavailable(
+                        "executable_digest_open",
+                        Some(error),
+                    );
+                }
+            };
+            let mut readable_stat = unsafe { std::mem::zeroed::<libc::stat>() };
+            if unsafe { libc::fstat(readable.raw(), &mut readable_stat) } != 0 {
+                return ConfiguredFilesystemProbe::unavailable(
+                    "executable_digest_stat",
+                    Some(errno()),
+                );
+            }
+            if readable_stat.st_dev != stat.st_dev || readable_stat.st_ino != stat.st_ino {
+                return ConfiguredFilesystemProbe::unavailable("executable_digest_identity", None);
+            }
+            if readable_stat.st_size < 0
+                || readable_stat.st_size as u64 > MAX_EXECUTABLE_DIGEST_BYTES
+            {
+                return ConfiguredFilesystemProbe::unavailable("executable_digest_size", None);
+            }
+            let mut hasher = Sha256::new();
+            let mut total = 0u64;
+            let mut buffer = [0u8; 64 * 1024];
+            loop {
+                let read = unsafe {
+                    libc::read(
+                        readable.raw(),
+                        buffer.as_mut_ptr().cast::<libc::c_void>(),
+                        buffer.len(),
+                    )
+                };
+                if read == -1 {
+                    let error = errno();
+                    if error == libc::EINTR {
+                        continue;
+                    }
+                    return ConfiguredFilesystemProbe::unavailable(
+                        "executable_digest_read",
+                        Some(error),
+                    );
+                }
+                if read == 0 {
+                    break;
+                }
+                total = match total.checked_add(read as u64) {
+                    Some(total) if total <= MAX_EXECUTABLE_DIGEST_BYTES => total,
+                    _ => {
+                        return ConfiguredFilesystemProbe::unavailable(
+                            "executable_digest_size",
+                            None,
+                        );
+                    }
+                };
+                hasher.update(&buffer[..read as usize]);
+            }
+            let actual: [u8; 32] = hasher.finalize().into();
+            if actual != expected_sha256 {
+                return ConfiguredFilesystemProbe::unavailable("executable_digest_mismatch", None);
+            }
         }
 
         if let Err(result) =

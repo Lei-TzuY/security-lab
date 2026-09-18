@@ -660,7 +660,7 @@ replace_one(
 replace_one(
     "src/platform/linux.rs",
     "    const PHASE_COW_DIFF_EXPORT: u32 = 65;\n",
-    "    const PHASE_COW_DIFF_EXPORT: u32 = 65;\n    const PHASE_INTERPRETER_BIND: u32 = 66;\n    const PHASE_INTERPRETER_READONLY: u32 = 67;\n",
+    "    const PHASE_COW_DIFF_EXPORT: u32 = 65;\n    const PHASE_INTERPRETER_CLONE: u32 = 66;\n    const PHASE_INTERPRETER_TARGET_PIN: u32 = 67;\n    const PHASE_INTERPRETER_READONLY: u32 = 68;\n    const PHASE_INTERPRETER_ATTACH: u32 = 69;\n",
     "interpreter phases",
 )
 replace_one(
@@ -858,6 +858,17 @@ install_fn = r'''    unsafe fn install_sealed_interpreter_or_fail(
         launch_error: *mut LaunchErrorRecord,
         error_exit_syscall: libc::c_long,
     ) {
+        let interpreter_tree_fd = libc::syscall(
+            libc::SYS_open_tree,
+            interpreter.image_fd.raw(),
+            b"\0".as_ptr().cast::<libc::c_char>(),
+            AT_EMPTY_PATH | OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC,
+        );
+        if interpreter_tree_fd == -1 {
+            child_fail(launch_error, PHASE_INTERPRETER_CLONE, error_exit_syscall);
+        }
+        let interpreter_tree_fd = interpreter_tree_fd as RawFd;
+
         let target_how = OpenHow {
             flags: (libc::O_PATH | libc::O_CLOEXEC) as u64,
             mode: 0,
@@ -874,40 +885,37 @@ install_fn = r'''    unsafe fn install_sealed_interpreter_or_fail(
             std::mem::size_of::<OpenHow>(),
         );
         if target_fd == -1 {
-            child_fail(launch_error, PHASE_INTERPRETER_BIND, error_exit_syscall);
+            child_fail(
+                launch_error,
+                PHASE_INTERPRETER_TARGET_PIN,
+                error_exit_syscall,
+            );
         }
         let target_fd = target_fd as RawFd;
         let mut target_stat = std::mem::zeroed::<libc::stat>();
         if libc::fstat(target_fd, &mut target_stat) == -1
             || target_stat.st_mode & libc::S_IFMT != libc::S_IFREG
         {
-            child_fail(launch_error, PHASE_INTERPRETER_BIND, error_exit_syscall);
+            child_fail(
+                launch_error,
+                PHASE_INTERPRETER_TARGET_PIN,
+                error_exit_syscall,
+            );
         }
 
-        let mut source_buffer = [0u8; 32];
-        let source_path = proc_fd_path(interpreter.image_fd.raw(), &mut source_buffer);
+        let mount_attr = MountAttr {
+            attr_set: MOUNT_ATTR_RDONLY | MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV,
+            attr_clr: 0,
+            propagation: 0,
+            userns_fd: 0,
+        };
         if libc::syscall(
-            libc::SYS_mount,
-            source_path,
-            interpreter.target_relative.as_ptr(),
-            ptr::null::<libc::c_char>(),
-            libc::MS_BIND as libc::c_ulong,
-            ptr::null::<libc::c_void>(),
-        ) == -1
-        {
-            child_fail(launch_error, PHASE_INTERPRETER_BIND, error_exit_syscall);
-        }
-        if libc::syscall(
-            libc::SYS_mount,
-            ptr::null::<libc::c_char>(),
-            interpreter.target_relative.as_ptr(),
-            ptr::null::<libc::c_char>(),
-            (libc::MS_BIND
-                | libc::MS_REMOUNT
-                | libc::MS_RDONLY
-                | libc::MS_NOSUID
-                | libc::MS_NODEV) as libc::c_ulong,
-            ptr::null::<libc::c_void>(),
+            libc::SYS_mount_setattr,
+            interpreter_tree_fd,
+            b"\0".as_ptr().cast::<libc::c_char>(),
+            AT_EMPTY_PATH,
+            &mount_attr as *const MountAttr,
+            std::mem::size_of::<MountAttr>(),
         ) == -1
         {
             child_fail(
@@ -916,8 +924,28 @@ install_fn = r'''    unsafe fn install_sealed_interpreter_or_fail(
                 error_exit_syscall,
             );
         }
-        if libc::close(target_fd) == -1 {
-            child_fail(launch_error, PHASE_INTERPRETER_BIND, error_exit_syscall);
+
+        if libc::syscall(
+            libc::SYS_move_mount,
+            interpreter_tree_fd,
+            b"\0".as_ptr().cast::<libc::c_char>(),
+            target_fd,
+            b"\0".as_ptr().cast::<libc::c_char>(),
+            MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_EMPTY_PATH,
+        ) == -1
+        {
+            child_fail(
+                launch_error,
+                PHASE_INTERPRETER_ATTACH,
+                error_exit_syscall,
+            );
+        }
+        if libc::close(target_fd) == -1 || libc::close(interpreter_tree_fd) == -1 {
+            child_fail(
+                launch_error,
+                PHASE_INTERPRETER_ATTACH,
+                error_exit_syscall,
+            );
         }
     }
 
@@ -931,8 +959,10 @@ if phase_anchor not in text:
 text=text.replace(
     phase_anchor,
     phase_anchor + '''
-            PHASE_INTERPRETER_BIND => "sealed ELF interpreter bind mount",
-            PHASE_INTERPRETER_READONLY => "sealed ELF interpreter mount hardening",''',
+            PHASE_INTERPRETER_CLONE => "sealed ELF interpreter detached mount clone",
+            PHASE_INTERPRETER_TARGET_PIN => "sealed ELF interpreter target pin",
+            PHASE_INTERPRETER_READONLY => "sealed ELF interpreter mount hardening",
+            PHASE_INTERPRETER_ATTACH => "sealed ELF interpreter mount attachment",''',
     1,
 )
 p.write_text(text)

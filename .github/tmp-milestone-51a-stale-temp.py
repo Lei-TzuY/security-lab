@@ -470,12 +470,7 @@ replace_one(
         }
         if unsafe { libc::flock(lock.raw(), operation) } != 0 {
             let error = std::io::Error::last_os_error();
-            if nonblocking
-                && matches!(
-                    error.raw_os_error(),
-                    Some(libc::EAGAIN) | Some(libc::EWOULDBLOCK)
-                )
-            {
+            if nonblocking && error.raw_os_error() == Some(libc::EAGAIN) {
                 return Err(SnapshotStoreError::RecoveryLockContended);
             }
             return Err(SnapshotStoreError::Io {

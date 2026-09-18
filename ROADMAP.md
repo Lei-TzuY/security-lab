@@ -1330,7 +1330,7 @@ Boundary: 52A attenuates the transferred regular file's **open-file-description 
 
 ### Slice 53A — bounded sealed runtime byte snapshot grant
 
-**Current verified candidate.** Adds content-lifetime isolation after preparation rather than another regular-file descriptor-number or access-mode variant.
+**Status: complete on `main`.** Adds content-lifetime isolation after preparation rather than another regular-file descriptor-number or access-mode variant.
 
 Acceptance evidence is executable:
 
@@ -1346,7 +1346,29 @@ Boundary: 53A freezes the **completed copied byte sequence and length** after pr
 
 ### Milestone 53 promotion rule
 
-After 53A integrates, do not farm alternative byte ceilings, seal spelling, or immutable-copy aliases. Promotion must add a different runtime-capability property such as explicit lifetime/revocation, a bounded multi-object transaction protocol with executable partial-failure semantics, or another object class whose rights can be demonstrably attenuated beyond what 52A/53A already cover.
+53A is sealed on `main`; do not farm alternative byte ceilings, seal spelling, or immutable-copy aliases.
+
+### Slice 54A — bounded ordered sealed snapshot bundle
+
+**Current verified candidate.** Adds a bounded multi-object runtime protocol with explicit ordering and fail-closed partial-failure semantics rather than another single-object grant alias.
+
+Acceptance evidence is executable:
+
+- `prepare_sealed_snapshot_bundle(grants, max_total_bytes)` consumes 2–8 already-prepared 53A sealed snapshots and requires an explicit aggregate ceiling from 1 byte through 64 MiB; too few/many members, zero/oversized ceilings, checked-add overflow, or aggregate bytes above the chosen ceiling fail closed before transfer;
+- bundle membership and order are fixed by consuming the prepared snapshots, and the public bundle reports exact member count plus aggregate copied-byte length;
+- one readiness event gates the whole bundle, then one `sendmsg(MSG_NOSIGNAL)` carries payload `B` plus one `SCM_RIGHTS` control message containing the ordered descriptor list; the ancillary buffer is statically bounded for at most eight Linux x86_64 file descriptors;
+- a successful bundle consumes the same terminal `RuntimeFdSession` transition as every 52A/53A grant; any send error poisons the session and a later retry is rejected instead of attempting to infer which receiver-side capabilities survived;
+- local executable evidence receives two descriptors in order, verifies both remain `O_RDONLY` with all four 53A seals, reads distinct first/second markers, and proves a later single-object grant is rejected on that already-consumed session;
+- a separate failure regression closes the peer before bundle send, requires an I/O failure, then proves the session is terminally failed and rejects a later retry;
+- the real raw-syscall sandbox target publishes post-exec readiness, receives exactly two descriptors with `MSG_CMSG_CLOEXEC`, requires payload `B`, rejects `MSG_CTRUNC`, validates the exact `SCM_RIGHTS` header/count, gets `EBADF` on writes, reads the two frozen markers in declared order, and still gets `ENOENT` for both original host source pathnames;
+- a negative real-target run sends three descriptors to that two-descriptor receive contract and must exit through the fail-closed oracle when ancillary control is truncated rather than accepting the surviving subset;
+- exact candidate stable format/Clippy/full tests and the full Rust 1.74 suite are green.
+
+Boundary: 54A bounds and orders one sender-side multi-FD ancillary message; it is not a distributed transaction or receiver-acknowledged commit. A successful `sendmsg` does not prove the receiver consumed or retained every descriptor, and a receiver can always close granted descriptors. The slice adds no post-transfer revocation, no multiple successful grants per session, no arbitrary object-class mixture, and no general RPC protocol.
+
+### Milestone 54 promotion rule
+
+After 54A integrates, do not farm bundle sizes, payload-byte aliases, or equivalent multi-FD shapes. Promote to a materially different runtime-capability property such as explicit lifetime/revocation or another object class with demonstrable rights attenuation beyond regular-file snapshots.
 
 ## Later frontiers
 

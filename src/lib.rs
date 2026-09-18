@@ -43,8 +43,10 @@ pub use report::{
     RunReport,
 };
 pub use runtime_fd_broker::{
-    PreparedReadOnlyRegularFile, PreparedSealedRegularFileSnapshot, RuntimeFdBroker,
-    RuntimeFdBrokerError, RuntimeFdSession, MAX_RUNTIME_SEALED_SNAPSHOT_BYTES,
+    PreparedReadOnlyRegularFile, PreparedSealedRegularFileSnapshot, PreparedSealedSnapshotBundle,
+    RuntimeFdBroker, RuntimeFdBrokerError, RuntimeFdSession, MAX_RUNTIME_SEALED_BUNDLE_BYTES,
+    MAX_RUNTIME_SEALED_BUNDLE_ITEMS, MAX_RUNTIME_SEALED_SNAPSHOT_BYTES,
+    MIN_RUNTIME_SEALED_BUNDLE_ITEMS,
 };
 pub use snapshot_archive::{
     materialize_snapshot_archive_atomic, materialize_snapshot_archive_ed25519_atomic,

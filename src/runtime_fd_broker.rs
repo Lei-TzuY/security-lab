@@ -6,6 +6,9 @@ use std::io;
 use std::path::Path;
 
 pub const MAX_RUNTIME_SEALED_SNAPSHOT_BYTES: u64 = 64 * 1024 * 1024;
+pub const MIN_RUNTIME_SEALED_BUNDLE_ITEMS: usize = 2;
+pub const MAX_RUNTIME_SEALED_BUNDLE_ITEMS: usize = 8;
+pub const MAX_RUNTIME_SEALED_BUNDLE_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug)]
 pub enum RuntimeFdBrokerError {
@@ -16,6 +19,9 @@ pub enum RuntimeFdBrokerError {
     SourceNotReadable,
     SourcePathOnly,
     SourceSnapshotTooLarge {
+        max_bytes: u64,
+    },
+    SnapshotBundleTooLarge {
         max_bytes: u64,
     },
     UnexpectedPeer {
@@ -55,6 +61,10 @@ impl fmt::Display for RuntimeFdBrokerError {
             Self::SourceSnapshotTooLarge { max_bytes } => write!(
                 f,
                 "runtime FD broker source exceeds sealed snapshot byte ceiling of {max_bytes}"
+            ),
+            Self::SnapshotBundleTooLarge { max_bytes } => write!(
+                f,
+                "runtime FD broker sealed snapshot bundle exceeds aggregate byte ceiling of {max_bytes}"
             ),
             Self::UnexpectedPeer {
                 expected_pid,
@@ -132,6 +142,22 @@ mod imp {
             unsafe {
                 libc::close(self.fd);
             }
+        }
+    }
+
+    #[derive(Debug)]
+    pub struct PreparedSealedSnapshotBundle {
+        grants: Vec<PreparedSealedRegularFileSnapshot>,
+        total_len: u64,
+    }
+
+    impl PreparedSealedSnapshotBundle {
+        pub fn item_count(&self) -> usize {
+            self.grants.len()
+        }
+
+        pub fn total_len(&self) -> u64 {
+            self.total_len
         }
     }
 
@@ -299,6 +325,18 @@ mod imp {
         ) -> Result<PreparedSealedRegularFileSnapshot, RuntimeFdBrokerError> {
             prepare_sealed_regular_file_snapshot(source, max_bytes)
         }
+
+        /// Group 2-8 already-sealed snapshots into one bounded ordered grant.
+        ///
+        /// The aggregate ceiling is caller-selected but may not exceed the
+        /// global 64 MiB runtime bundle limit. Preparation consumes the snapshots
+        /// so their order and membership cannot be changed before transfer.
+        pub fn prepare_sealed_snapshot_bundle(
+            grants: Vec<PreparedSealedRegularFileSnapshot>,
+            max_total_bytes: u64,
+        ) -> Result<PreparedSealedSnapshotBundle, RuntimeFdBrokerError> {
+            prepare_sealed_snapshot_bundle(grants, max_total_bytes)
+        }
     }
 
     impl RuntimeFdSession {
@@ -349,7 +387,25 @@ mod imp {
             self.send_prepared_fd(grant.fd)
         }
 
+        /// Transfer one ordered sealed snapshot bundle in a single SCM_RIGHTS
+        /// control message. The whole bundle consumes the same one-shot session
+        /// transition as every other runtime grant.
+        pub fn send_sealed_snapshot_bundle(
+            &mut self,
+            bundle: PreparedSealedSnapshotBundle,
+        ) -> Result<(), RuntimeFdBrokerError> {
+            let mut fds = [-1; super::MAX_RUNTIME_SEALED_BUNDLE_ITEMS];
+            for (index, grant) in bundle.grants.iter().enumerate() {
+                fds[index] = grant.fd;
+            }
+            self.send_prepared_fds(&fds[..bundle.grants.len()])
+        }
+
         fn send_prepared_fd(&mut self, fd: RawFd) -> Result<(), RuntimeFdBrokerError> {
+            self.send_prepared_fds(&[fd])
+        }
+
+        fn send_prepared_fds(&mut self, fds: &[RawFd]) -> Result<(), RuntimeFdBrokerError> {
             if self.state != RuntimeFdSessionState::Ready {
                 let message = match self.state {
                     RuntimeFdSessionState::AwaitingReady => {
@@ -366,7 +422,7 @@ mod imp {
                 return Err(RuntimeFdBrokerError::Protocol(message.to_owned()));
             }
 
-            match send_one_fd(self.stream.as_raw_fd(), fd) {
+            match send_fds(self.stream.as_raw_fd(), fds) {
                 Ok(()) => {
                     self.state = RuntimeFdSessionState::GrantSent;
                     Ok(())
@@ -693,35 +749,85 @@ mod imp {
         Ok(readonly)
     }
 
-    #[repr(C, align(8))]
-    struct OneFdControl([u8; 24]);
+    fn prepare_sealed_snapshot_bundle(
+        grants: Vec<PreparedSealedRegularFileSnapshot>,
+        max_total_bytes: u64,
+    ) -> Result<PreparedSealedSnapshotBundle, RuntimeFdBrokerError> {
+        if max_total_bytes == 0 || max_total_bytes > super::MAX_RUNTIME_SEALED_BUNDLE_BYTES {
+            return Err(RuntimeFdBrokerError::InvalidConfiguration(format!(
+                "sealed runtime bundle max_total_bytes must be between 1 and {}",
+                super::MAX_RUNTIME_SEALED_BUNDLE_BYTES
+            )));
+        }
+        if !(super::MIN_RUNTIME_SEALED_BUNDLE_ITEMS..=super::MAX_RUNTIME_SEALED_BUNDLE_ITEMS)
+            .contains(&grants.len())
+        {
+            return Err(RuntimeFdBrokerError::InvalidConfiguration(format!(
+                "sealed runtime bundle must contain between {} and {} snapshots",
+                super::MIN_RUNTIME_SEALED_BUNDLE_ITEMS,
+                super::MAX_RUNTIME_SEALED_BUNDLE_ITEMS
+            )));
+        }
 
-    fn send_one_fd(socket_fd: RawFd, source_fd: RawFd) -> Result<(), RuntimeFdBrokerError> {
-        let mut payload = *b"F";
+        let mut total_len = 0u64;
+        for grant in &grants {
+            total_len = total_len.checked_add(grant.len).ok_or_else(|| {
+                RuntimeFdBrokerError::Protocol(
+                    "sealed runtime bundle aggregate byte count overflow".to_owned(),
+                )
+            })?;
+            if total_len > max_total_bytes {
+                return Err(RuntimeFdBrokerError::SnapshotBundleTooLarge {
+                    max_bytes: max_total_bytes,
+                });
+            }
+        }
+        Ok(PreparedSealedSnapshotBundle { grants, total_len })
+    }
+
+    #[repr(C, align(8))]
+    struct FdControl([u8; 48]);
+
+    fn cmsg_space_for_fd_count(count: usize) -> usize {
+        let unaligned = std::mem::size_of::<libc::cmsghdr>() + count * std::mem::size_of::<RawFd>();
+        let alignment = std::mem::size_of::<usize>();
+        (unaligned + alignment - 1) & !(alignment - 1)
+    }
+
+    fn send_fds(socket_fd: RawFd, source_fds: &[RawFd]) -> Result<(), RuntimeFdBrokerError> {
+        if source_fds.is_empty() || source_fds.len() > super::MAX_RUNTIME_SEALED_BUNDLE_ITEMS {
+            return Err(RuntimeFdBrokerError::Protocol(
+                "SCM_RIGHTS grant descriptor count is outside the supported bound".to_owned(),
+            ));
+        }
+
+        let mut payload = if source_fds.len() == 1 { *b"F" } else { *b"B" };
         let mut iovec = libc::iovec {
             iov_base: payload.as_mut_ptr().cast::<libc::c_void>(),
             iov_len: payload.len(),
         };
-        let mut control = OneFdControl([0; 24]);
+        let mut control = FdControl([0; 48]);
         let header = control.0.as_mut_ptr().cast::<libc::cmsghdr>();
         unsafe {
             (*header).cmsg_len =
-                std::mem::size_of::<libc::cmsghdr>() + std::mem::size_of::<RawFd>();
+                std::mem::size_of::<libc::cmsghdr>() + std::mem::size_of_val(source_fds);
             (*header).cmsg_level = libc::SOL_SOCKET;
             (*header).cmsg_type = libc::SCM_RIGHTS;
-            control
+            let data = control
                 .0
                 .as_mut_ptr()
                 .add(std::mem::size_of::<libc::cmsghdr>())
-                .cast::<RawFd>()
-                .write(source_fd);
+                .cast::<RawFd>();
+            for (index, source_fd) in source_fds.iter().enumerate() {
+                data.add(index).write(*source_fd);
+            }
         }
 
         let mut message = unsafe { std::mem::zeroed::<libc::msghdr>() };
         message.msg_iov = &mut iovec;
         message.msg_iovlen = 1;
         message.msg_control = control.0.as_mut_ptr().cast::<libc::c_void>();
-        message.msg_controllen = control.0.len();
+        message.msg_controllen = cmsg_space_for_fd_count(source_fds.len());
 
         loop {
             let sent = unsafe { libc::sendmsg(socket_fd, &message, libc::MSG_NOSIGNAL) };
@@ -754,6 +860,19 @@ mod imp {
 
     #[derive(Debug)]
     pub struct PreparedSealedRegularFileSnapshot;
+
+    #[derive(Debug)]
+    pub struct PreparedSealedSnapshotBundle;
+
+    impl PreparedSealedSnapshotBundle {
+        pub fn item_count(&self) -> usize {
+            0
+        }
+
+        pub fn total_len(&self) -> u64 {
+            0
+        }
+    }
 
     impl PreparedSealedRegularFileSnapshot {
         pub fn len(&self) -> u64 {
@@ -814,6 +933,15 @@ mod imp {
                 "sealed runtime FD snapshots currently require Linux x86_64".to_owned(),
             ))
         }
+
+        pub fn prepare_sealed_snapshot_bundle(
+            _grants: Vec<PreparedSealedRegularFileSnapshot>,
+            _max_total_bytes: u64,
+        ) -> Result<PreparedSealedSnapshotBundle, RuntimeFdBrokerError> {
+            Err(RuntimeFdBrokerError::UnsupportedPlatform(
+                "sealed runtime FD snapshot bundles currently require Linux x86_64".to_owned(),
+            ))
+        }
     }
 
     impl RuntimeFdSession {
@@ -840,10 +968,19 @@ mod imp {
                 "sealed runtime FD snapshots currently require Linux x86_64".to_owned(),
             ))
         }
+
+        pub fn send_sealed_snapshot_bundle(
+            &mut self,
+            _bundle: PreparedSealedSnapshotBundle,
+        ) -> Result<(), RuntimeFdBrokerError> {
+            Err(RuntimeFdBrokerError::UnsupportedPlatform(
+                "sealed runtime FD snapshot bundles currently require Linux x86_64".to_owned(),
+            ))
+        }
     }
 }
 
 pub use imp::{
-    PreparedReadOnlyRegularFile, PreparedSealedRegularFileSnapshot, RuntimeFdBroker,
-    RuntimeFdSession,
+    PreparedReadOnlyRegularFile, PreparedSealedRegularFileSnapshot, PreparedSealedSnapshotBundle,
+    RuntimeFdBroker, RuntimeFdSession,
 };

@@ -1163,11 +1163,11 @@ Boundary: 47A is a bounded cooperative publication unit, not a crash-atomic all-
 
 47A is sealed on `main`. Do not farm larger caps, batch aliases, retry wrappers, or alternate duplicate spellings. A stronger snapshot-store phase must add true crash-atomic/point-in-time semantics or an external/hardware monotonic witness with executable evidence; otherwise promote to another independent authority frontier.
 
-## Milestone 48 — initial executable content binding
+## Milestone 48 — initial executable content binding and bootstrap execution authority
 
 ### Slice 48A — policy-bound sealed initial executable
 
-**Current verified candidate.** Adds an optional exact content restriction for the initial executable and executes the verified bytes from an immutable launcher-owned image instead of merely pinning a mutable host inode.
+**Status: complete on `main`.** Adds an optional exact content restriction for the initial executable and executes the verified bytes from an immutable launcher-owned image instead of merely pinning a mutable host inode.
 
 Acceptance evidence is executable:
 
@@ -1175,14 +1175,31 @@ Acceptance evidence is executable:
 - the static authority manifest exposes the canonical lowercase digest, while authority-delta models adding a digest as a restriction, removing one as a widening, and changing one exact digest to another as incomparable;
 - the configured-filesystem preflight reopens the executable beneath the pinned root with read-only `openat2`, requires the same `(st_dev, st_ino)`, bounds the read to 64 MiB, and requires the complete streamed SHA-256 to match without creating namespaces, mounts, executable images, or target processes;
 - production first retains the existing path pin/execute-bit checks, then reopens that same inode read-only, hashes and copies the identical byte stream into `memfd_create(MFD_EXEC | MFD_ALLOW_SEALING)`, rejects empty/oversized/mismatched images, and applies plus verifies `F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL`;
-- when the digest is requested, unsupported executable-memfd/sealing support fails explicitly instead of falling back to the host inode; successful launch continues through the existing `execveat(AT_EMPTY_PATH)` path using the sealed descriptor;
-- a raw fixture under its exact digest exits successfully, while a one-bit digest mismatch returns a pre-launch setup failure; stable rustfmt, Clippy with `-D warnings`, complete stable tests, and the complete Rust 1.74 suite are green.
+- when the digest is requested, unsupported executable-memfd/sealing support fails explicitly instead of falling back to the host inode; successful launch continues through `execveat(AT_EMPTY_PATH)` using the sealed descriptor;
+- a raw fixture under its exact digest exits successfully, while a one-bit digest mismatch returns a pre-launch setup failure; exact PR merge-ref and post-merge `main` stable quality plus Rust 1.74 suites are green.
 
-Boundary: 48A binds only the byte content of the initial executable file selected by policy. SHA-256 here is an expected-content restriction, not a digital signature, provenance statement, or trust-distribution mechanism. The slice does not bind an ELF `PT_INTERP`, dynamic loader/shared libraries, later target `execve`/`execveat` calls, or the rest of the root filesystem, and it does not claim a process-lifetime executable allowlist.
+Boundary: 48A binds only the byte content of the initial executable file selected by policy. SHA-256 here is an expected-content restriction, not a digital signature, provenance statement, or trust-distribution mechanism. The slice does not bind an ELF `PT_INTERP`, dynamic loader/shared libraries, later target execution, or the rest of the root filesystem.
+
+### Slice 48B — one-shot bootstrap `execveat`
+
+**Current verified candidate.** Separates the launcher-required initial `execveat` transition from persistent target `execveat` authority.
+
+Acceptance evidence is executable:
+
+- target `seccomp.allow` no longer has to contain `execveat` merely so the launcher can start the pinned initial executable; the target still must explicitly grant an exit syscall for fail-closed post-filter setup errors;
+- when target `execveat` is absent, the launcher moves its bootstrap executable descriptor to a `CLOEXEC` fd number at or above the future `limit.open_files` / `RLIMIT_NOFILE` ceiling before the target limit is lowered;
+- the generated cBPF program adds one launcher-internal exception that admits `execveat` only when argument 0 exactly equals that bootstrap fd and argument 4 exactly equals `AT_EMPTY_PATH`; any fd/flag mismatch reloads the syscall number and falls through to normal target policy/default `EPERM`;
+- after the successful non-returning bootstrap exec, `CLOEXEC` removes that descriptor. With `RLIMIT_NOFILE` already active, target code cannot create, duplicate, or receive a replacement fd at or above the ceiling;
+- the 48A sealed-image regression now launches successfully with only target `exit` authority, proving sealed content binding composes with the one-shot bootstrap exception;
+- a raw target under `limit.open_files=32` opens a valid lower executable fd, requires `fcntl(F_DUPFD_CLOEXEC, 32)` to fail with `EINVAL`, then requires a later `execveat(..., AT_EMPTY_PATH)` through that lower fd to fail with seccomp `EPERM`;
+- a separate policy explicitly granting target `execveat` re-execs the same raw fixture and exits 42, proving the change does not silently revoke authority that policy deliberately grants;
+- exact candidate rustfmt, Clippy with `-D warnings`, complete stable tests, and the complete Rust 1.74 suite are green.
+
+Boundary: 48B narrows only implicit `execveat` authority needed for the initial launcher transition. It does not remove an explicit target `execveat` grant, does not restrict a separately granted `execve`, and does not bind dynamic interpreters/shared libraries or provide process-lifetime executable identity enforcement. The fd-number isolation relies on Linux `RLIMIT_NOFILE` allocation semantics plus the launcher-held descriptor being `CLOEXEC`.
 
 ### Milestone 48 promotion rule
 
-After 48A integrates, seal initial-executable content binding. Do not farm hash aliases, larger copy ceilings, size-only variants, or alternate seal masks. A stronger execution-integrity phase must bind a materially different dependency such as interpreter/library closure or later-exec authority with executable evidence; otherwise promote to another independent authority frontier.
+After 48B integrates, seal the initial executable byte binding and bootstrap/later-`execveat` authority split. Do not farm hash aliases, descriptor-number variants, copy ceilings, or alternate seal masks. A stronger execution-integrity phase must bind a materially different dependency such as `PT_INTERP`/library closure, explicitly granted later execution, or another independent authority frontier with executable evidence.
 
 ## Independent host-local IPC frontier — post-launch object transfer
 

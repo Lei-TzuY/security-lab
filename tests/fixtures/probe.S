@@ -22,6 +22,8 @@
 #   e write one brokered host-IPv4 UDP datagram while fresh target UDP stays isolated
 #   b exchange bytes over a brokered host pathname AF_UNIX stream; direct host path stays hidden
 #   0 receive one post-launch SCM_RIGHTS fd over that broker and prove its host pathname stays hidden
+#   1 prove launcher bootstrap execveat is one-shot when target execveat is not granted
+#   2 prove an explicit target execveat grant still permits a later exec
 #   q accept one connection through a launcher-brokered host-loopback TCP listening fd
 #   r prove Landlock allows declared reads and returns EACCES for an undeclared visible file
 #   m prove Landlock narrows regular-file mutation inside scratch and a writable persistent volume
@@ -93,6 +95,10 @@ _start:
     je .brokered_host_unix
     cmp $48, %al
     je .brokered_host_unix_scm_rights
+    cmp $49, %al
+    je .bootstrap_execveat_one_shot
+    cmp $50, %al
+    je .later_execveat_allowed
     cmp $113, %al
     je .brokered_host_loopback_ingress
     cmp $114, %al
@@ -2088,6 +2094,73 @@ _start:
     add $4096, %rsp
     jmp .fail48
 
+.bootstrap_execveat_one_shot:
+    # Open a valid executable fd below RLIMIT_NOFILE.
+    mov $257, %eax
+    mov $-100, %edi
+    lea probe_path(%rip), %rsi
+    mov $0x280000, %edx
+    xor %r10d, %r10d
+    syscall
+    test %rax, %rax
+    js .fail29
+    mov %rax, %r12
+
+    # The launcher stores its bootstrap executable at an fd >= 32. Once
+    # RLIMIT_NOFILE=32 is active, target code cannot recreate any such slot.
+    mov $72, %eax
+    mov %r12, %rdi
+    mov $1030, %esi
+    mov $32, %edx
+    syscall
+    cmp $-22, %rax
+    jne .fail29
+
+    # execveat is absent from the target allowlist. A valid lower fd therefore
+    # must be denied by seccomp rather than becoming a second executable image.
+    mov $322, %eax
+    mov %r12, %rdi
+    lea empty_exec_path(%rip), %rsi
+    xor %edx, %edx
+    xor %r10d, %r10d
+    mov $0x1000, %r8d
+    syscall
+    cmp $-1, %rax
+    jne .fail29
+
+    mov $3, %eax
+    mov %r12, %rdi
+    syscall
+    test %rax, %rax
+    js .fail29
+    xor %edi, %edi
+    jmp .exit
+
+.later_execveat_allowed:
+    mov $257, %eax
+    mov $-100, %edi
+    lea probe_path(%rip), %rsi
+    mov $0x280000, %edx
+    xor %r10d, %r10d
+    syscall
+    test %rax, %rax
+    js .fail29
+    mov %rax, %r12
+
+    # Re-exec this same raw fixture as mode X. This path is expected to work
+    # only when target execveat is explicitly present in seccomp.allow.
+    mov 16(%rsp), %r13
+    movb $88, (%r13)
+    mov (%rsp), %rax
+    lea 16(%rsp,%rax,8), %r10
+    mov $322, %eax
+    mov %r12, %rdi
+    lea empty_exec_path(%rip), %rsi
+    lea 8(%rsp), %rdx
+    mov $0x1000, %r8d
+    syscall
+    jmp .fail29
+
 .forbidden:
     mov $39, %eax
     syscall
@@ -2848,6 +2921,8 @@ sandbox_root:
     .asciz "/"
 probe_path:
     .asciz "/probe"
+empty_exec_path:
+    .asciz ""
 forbidden_create:
     .asciz "/root-write-must-fail"
 scratch_create:

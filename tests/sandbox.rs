@@ -405,7 +405,7 @@ fn fixture_executable_sha256() -> [u8; 32] {
 
 #[test]
 fn executable_sha256_runs_verified_sealed_image_and_mismatch_fails_closed() {
-    let mut verified = policy("X", &[], &["execveat", "exit"]);
+    let mut verified = policy("X", &[], &["exit"]);
     verified.executable_sha256 = Some(fixture_executable_sha256());
     assert_eq!(run(&verified).unwrap(), ChildOutcome::Exited(42));
 
@@ -419,6 +419,18 @@ fn executable_sha256_runs_verified_sealed_image_and_mismatch_fails_closed() {
         }
         other => panic!("unexpected executable digest mismatch result: {other}"),
     }
+}
+
+#[test]
+fn bootstrap_execveat_is_one_shot_without_persistent_target_grant() {
+    let isolated = policy("1", &[], &["openat", "fcntl", "close", "exit"]);
+    assert_eq!(run(&isolated).unwrap(), ChildOutcome::Exited(0));
+}
+
+#[test]
+fn explicit_target_execveat_grant_preserves_later_exec_authority() {
+    let allowed = policy("2", &[], &["openat", "execveat", "exit"]);
+    assert_eq!(run(&allowed).unwrap(), ChildOutcome::Exited(42));
 }
 
 #[test]

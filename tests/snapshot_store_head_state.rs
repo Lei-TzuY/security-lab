@@ -5,8 +5,7 @@ use security_lab::{
     initialize_snapshot_store_head_state, load_snapshot_store_head_state,
     serialize_snapshot_archive, sign_snapshot_ed25519, snapshot_store_head_state_path,
     snapshot_store_inventory_identity, snapshot_store_object_path,
-    store_snapshot_archive_ed25519_durable,
-    store_snapshot_archive_ed25519_durable_with_head_state,
+    store_snapshot_archive_ed25519_durable, store_snapshot_archive_ed25519_durable_with_head_state,
     store_snapshot_archives_ed25519_durable_with_head_state, verify_snapshot_store_head_state,
     SnapshotArchiveLimits, SnapshotIdentity, SnapshotIdentityLimits, SnapshotStoreAuditLimits,
     SnapshotStoreHeadBatchItem, SnapshotStoreHeadBatchPublishRequest,
@@ -159,11 +158,8 @@ fn write_pending_fixture(
     previous: SnapshotStoreHeadStateIdentity,
     successor: SnapshotStoreHeadStateIdentity,
 ) {
-    fs::write(
-        pending_path(state),
-        pending_bytes(key, previous, successor),
-    )
-    .expect("write authenticated pending fixture");
+    fs::write(pending_path(state), pending_bytes(key, previous, successor))
+        .expect("write authenticated pending fixture");
 }
 
 fn projected_successor_fixture(
@@ -353,7 +349,12 @@ fn recovery_clears_pre_store_intent_without_advancing_head() {
     let workspace = TempDir::new("recover-before-store");
     let (store, state) = roots(workspace.path());
     let key = SnapshotStoreHeadStateKey::new([0x11; 32]);
-    let candidate = fixture(workspace.path(), "recover-before-store", b"before-store\n", 0x11);
+    let candidate = fixture(
+        workspace.path(),
+        "recover-before-store",
+        b"before-store\n",
+        0x11,
+    );
     let previous = initialize_snapshot_store_head_state(&state, &key, &store, audit_limits())
         .expect("initialize recovery predecessor");
     let successor = projected_successor_fixture(workspace.path(), previous, &candidate);
@@ -389,7 +390,12 @@ fn recovery_advances_head_for_exact_durable_successor() {
     let workspace = TempDir::new("recover-after-store");
     let (store, state) = roots(workspace.path());
     let key = SnapshotStoreHeadStateKey::new([0x22; 32]);
-    let candidate = fixture(workspace.path(), "recover-after-store", b"after-store\n", 0x22);
+    let candidate = fixture(
+        workspace.path(),
+        "recover-after-store",
+        b"after-store\n",
+        0x22,
+    );
     let previous = initialize_snapshot_store_head_state(&state, &key, &store, audit_limits())
         .expect("initialize recovery predecessor");
     let successor = projected_successor_fixture(workspace.path(), previous, &candidate);
@@ -427,7 +433,12 @@ fn recovery_clears_leftover_intent_after_head_commit() {
     let workspace = TempDir::new("recover-after-head");
     let (store, state) = roots(workspace.path());
     let key = SnapshotStoreHeadStateKey::new([0x33; 32]);
-    let candidate = fixture(workspace.path(), "recover-after-head", b"after-head\n", 0x33);
+    let candidate = fixture(
+        workspace.path(),
+        "recover-after-head",
+        b"after-head\n",
+        0x33,
+    );
     let previous = initialize_snapshot_store_head_state(&state, &key, &store, audit_limits())
         .expect("initialize recovery predecessor");
     let committed = store_snapshot_archive_ed25519_durable_with_head_state(
@@ -458,7 +469,12 @@ fn recovery_keeps_pending_intent_on_unknown_store_state() {
     let (store, state) = roots(workspace.path());
     let key = SnapshotStoreHeadStateKey::new([0x44; 32]);
     let expected = fixture(workspace.path(), "recover-expected", b"expected\n", 0x44);
-    let unexpected = fixture(workspace.path(), "recover-unexpected", b"unexpected\n", 0x45);
+    let unexpected = fixture(
+        workspace.path(),
+        "recover-unexpected",
+        b"unexpected\n",
+        0x45,
+    );
     let previous = initialize_snapshot_store_head_state(&state, &key, &store, audit_limits())
         .expect("initialize recovery predecessor");
     let successor = projected_successor_fixture(workspace.path(), previous, &expected);
@@ -505,7 +521,12 @@ fn pending_intent_authentication_fails_closed() {
     let (store, state) = roots(workspace.path());
     let key = SnapshotStoreHeadStateKey::new([0x55; 32]);
     let wrong_key = SnapshotStoreHeadStateKey::new([0x56; 32]);
-    let candidate = fixture(workspace.path(), "recover-authentication", b"pending-auth\n", 0x55);
+    let candidate = fixture(
+        workspace.path(),
+        "recover-authentication",
+        b"pending-auth\n",
+        0x55,
+    );
     let previous = initialize_snapshot_store_head_state(&state, &key, &store, audit_limits())
         .expect("initialize recovery predecessor");
     let successor = projected_successor_fixture(workspace.path(), previous, &candidate);
@@ -525,7 +546,10 @@ fn pending_intent_authentication_fails_closed() {
         key.recover_pending_publication(&state, &store, audit_limits()),
         Err(SnapshotStoreHeadStateError::AuthenticationFailed)
     ));
-    assert!(path.exists(), "tampered pending evidence must not be deleted");
+    assert!(
+        path.exists(),
+        "tampered pending evidence must not be deleted"
+    );
 }
 
 #[test]

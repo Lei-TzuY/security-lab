@@ -925,7 +925,7 @@ install_fn = r'''    unsafe fn install_sealed_interpreter_or_fail(
 replace_one("src/platform/linux.rs", install_marker, install_fn + install_marker, "interpreter install helper")
 # Phase labels near existing COW labels.
 p=Path("src/platform/linux.rs"); text=p.read_text()
-phase_anchor='''            PHASE_COW_DIFF_EXPORT => "copy-on-write diff export",'''
+phase_anchor='''            PHASE_COW_DIFF_EXPORT => "bounded copy-on-write diff export",'''
 if phase_anchor not in text:
     raise SystemExit("phase-name anchor not found")
 text=text.replace(

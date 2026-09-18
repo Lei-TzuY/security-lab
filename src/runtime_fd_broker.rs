@@ -15,7 +15,9 @@ pub enum RuntimeFdBrokerError {
     SourceNotRegular,
     SourceNotReadable,
     SourcePathOnly,
-    SourceSnapshotTooLarge { max_bytes: u64 },
+    SourceSnapshotTooLarge {
+        max_bytes: u64,
+    },
     UnexpectedPeer {
         expected_pid: i32,
         expected_uid: u32,
@@ -633,8 +635,7 @@ mod imp {
 
         let proc_path = CString::new(format!("/proc/self/fd/{}", memfd.fd))
             .expect("numeric runtime snapshot procfd path contains no NUL");
-        let readonly =
-            unsafe { libc::open(proc_path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+        let readonly = unsafe { libc::open(proc_path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
         if readonly == -1 {
             return Err(RuntimeFdBrokerError::io(
                 "cannot reopen sealed runtime FD snapshot read-only",

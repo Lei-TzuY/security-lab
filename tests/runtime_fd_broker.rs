@@ -366,7 +366,6 @@ fn broker_configuration_is_fail_closed_and_non_overwriting() {
     std::fs::remove_dir_all(&root).expect("remove broker policy root");
 }
 
-
 #[test]
 fn sealed_runtime_snapshot_freezes_bounded_bytes_after_preparation() {
     let socket_path = unique_path("runtime-sealed-local.sock");
@@ -434,8 +433,7 @@ fn sealed_runtime_snapshot_freezes_bounded_bytes_after_preparation() {
     assert_eq!(flags & libc::O_ACCMODE, libc::O_RDONLY);
     let seals = unsafe { libc::fcntl(received.raw(), libc::F_GET_SEALS) };
     assert!(seals >= 0, "inspect sealed snapshot seals");
-    let required =
-        libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
+    let required = libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
     assert_eq!(seals & required, required);
     let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
     assert_eq!(unsafe { libc::fstat(received.raw(), &mut stat) }, 0);

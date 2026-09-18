@@ -1243,23 +1243,31 @@ Boundary: 49B binds at most one direct **path-qualified** `DT_NEEDED` object fro
 
 ### Slice 50A — one recoverable single-object head transition
 
-**Current verified candidate.** Converts the existing authenticated **single-object** store-head publication from detect-only two-resource divergence into a bounded authenticated recovery protocol without claiming rollback or crash-atomic store+state commit.
+**Status: complete on `main`.** The single-object store-head path durably records one HMAC-authenticated exact predecessor/successor/candidate intent before store mutation, and explicit recovery converges only predecessor/predecessor, predecessor/successor, or successor/successor while preserving unknown-state evidence.
+
+Acceptance evidence remains the established 50A suite: pre-store intent cleanup, exact durable-successor advancement with renewed object/directory/root durability barriers, post-head cleanup, unknown-state preservation, wrong-key/tamper rejection, and a real seccomp-denied `fsync` recovery retry.
+
+Boundary: 50A is single-object forward recovery only. It is not rollback, a two-root crash-atomic transaction, non-cooperating-writer serialization, a point-in-time filesystem snapshot, stale object-temp scavenging, or a hardware/remote monotonic witness.
+
+### Slice 50B — bounded recoverable batch head transition
+
+**Current verified candidate.** Retrofitting the 47A batch path adds a materially stronger recovery boundary rather than another pending-file spelling.
 
 Acceptance evidence is executable:
 
-- before a non-deduplicated candidate mutates the store, the launcher validates its archive/signature, projects the exact canonical successor inventory with the same audit ordering/hash/budgets, and durably creates one fixed-size HMAC-SHA256 pending record committing to the authenticated predecessor, exact successor, candidate identity, and candidate archive length;
-- pending creation is fail-closed and durable under the local Linux contract: the pending file is created with `O_EXCL|O_NOFOLLOW`, required to be a single-link regular file, fully written, `fsync`ed, then the state-root directory is `fsync`ed before object publication begins. Normal head load/verify/store/batch operations return `RecoveryRequired` while authenticated pending evidence exists;
-- recovery acquires the same head-state-exclusive → store-write-transaction lock order as publication and accepts only three exact states: predecessor/predecessor clears a pre-store intent; predecessor/successor first re-runs the candidate object's object → `objects/` directory → store-root durability barriers, re-audits the exact successor, durably publishes the successor head, then clears pending; successor/successor clears a leftover post-head intent;
-- any other authenticated predecessor/successor/head/inventory combination returns `PendingStateDiverged` and leaves the pending evidence in place. Wrong-key or byte-tampered pending records fail HMAC authentication rather than being interpreted;
-- the pending decoder additionally requires generation to advance exactly once, successor object count to increase by exactly one, non-zero candidate archive bytes, and exact predecessor-plus-candidate aggregate byte accounting;
-- deterministic regressions cover pre-store intent cleanup, exact durable-successor head advancement, leftover post-head intent cleanup, unknown-store-state preservation, wrong-key/tamper rejection, and a real seccomp-denied `fsync` recovery attempt that must leave the old head and pending evidence intact before a normal retry converges;
-- the recovery path reuses an exact-object durability helper that reopens only the committed content-addressed object, revalidates regular/read-only shape and exact length, and performs the established object → objects-directory → store-root `fsync` sequence while the exclusive store transaction remains held.
+- all 1–16 members are archive/signature-prevalidated and duplicate identities rejected before locking/mutation; an ordered batch projection derives the exact current inventory, final successor, and every new-member intermediate inventory under the existing canonical audit ordering and budgets;
+- members already present in the predecessor are exact-byte durable-dedup validated before the journal. A batch that is entirely deduplicated creates no recovery state and does not advance the head;
+- before any **new** object publication, the state root durably receives a fixed-size HMAC-authenticated batch journal committing to predecessor, successor, member identity/length, public key/signature, preexisting classification, and every new-member intermediate inventory, plus read-only staged copies of all member archives; each stage and then the state directory cross `fsync` barriers;
+- normal publication inserts new members in request order and re-audits after each insertion against the exact journaled intermediate inventory. The head advances exactly once only after the final inventory equals the authenticated successor; cleanup durably removes stages before removing the journal;
+- recovery uses the same head-exclusive → store-write lock order. Predecessor/predecessor aborts an unmutated staged batch. Predecessor plus an exact authenticated durable-prefix inventory validates **every** staged archive/signature before mutation, idempotently resynchronizes already-present members, publishes remaining members, checks each remaining intermediate inventory, then publishes the exact successor head. Successor/successor only finishes cleanup;
+- no arbitrary subset/order is promoted: any non-journaled inventory returns `PendingStateDiverged` without adding expected objects or clearing evidence. A tampered batch journal fails HMAC authentication, and a tampered stage fails before forward replay;
+- deterministic tests cover ordinary two-object publication/dedup, mixed preexisting+new publication, pre-mutation aggregate-budget rejection, staged-predecessor abort, exact partial-prefix completion, unknown-inventory refusal, staged-archive tamper refusal, and batch-journal authentication tamper. Stable format/Clippy/full tests and the full Rust 1.74 suite are green.
 
-Boundary: 50A is **single-object recovery only**. It does not roll back a published object, make the store and state roots one crash-atomic transaction, recover the 47A multi-object batch path, infer an arbitrary observed inventory as the new head, serialize non-cooperating/privileged writers, provide a point-in-time filesystem snapshot, or add hardware/remote monotonicity. The guarantee remains relative to an intact independently trusted state root/HMAC key, cooperative lock users, and the local kernel/filesystem `fsync` contract.
+Boundary: 50B is **bounded authenticated forward recovery**, not rollback or atomic commit. It does not accept non-prefix partial states, serialize callers bypassing the cooperative transaction layer, make the store and state roots one crash-atomic resource, scavenge arbitrary stale object-store temp files, provide a hostile-writer point-in-time snapshot, or add external/hardware monotonicity. Recovery remains relative to an intact independent state root/HMAC key and local filesystem durability semantics.
 
 ### Milestone 50 promotion rule
 
-After 50A integrates, do not farm pending-file encodings, retry aliases, or extra recovery state names. A stronger snapshot-store phase must add a materially different boundary such as evidence-backed recoverable batch publication, true point-in-time/crash-atomic semantics, or an external/hardware monotonic witness; otherwise promote to another independent authority frontier.
+After 50B integrates, the bounded authenticated head-recovery phase is sealed. Do not farm larger batch counts, alternate stage filenames, retry aliases, or more recovery-state names. The next snapshot-store phase must add a qualitatively stronger property such as true point-in-time/crash-atomic semantics, stale-temp-safe recovery, or an external/hardware monotonic witness; otherwise promote to another independent authority frontier.
 
 ## Independent host-local IPC frontier — post-launch object transfer
 

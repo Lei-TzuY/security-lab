@@ -1182,7 +1182,7 @@ Boundary: 48A binds only the byte content of the initial executable file selecte
 
 ### Slice 48B — one-shot bootstrap `execveat`
 
-**Current verified candidate.** Separates the launcher-required initial `execveat` transition from persistent target `execveat` authority.
+**Status: complete on `main`.** Separates the launcher-required initial `execveat` transition from persistent target `execveat` authority.
 
 Acceptance evidence is executable:
 
@@ -1199,7 +1199,29 @@ Boundary: 48B narrows only implicit `execveat` authority needed for the initial 
 
 ### Milestone 48 promotion rule
 
-After 48B integrates, seal the initial executable byte binding and bootstrap/later-`execveat` authority split. Do not farm hash aliases, descriptor-number variants, copy ceilings, or alternate seal masks. A stronger execution-integrity phase must bind a materially different dependency such as `PT_INTERP`/library closure, explicitly granted later execution, or another independent authority frontier with executable evidence.
+48A–48B are sealed on `main`. Do not farm hash aliases, descriptor-number variants, copy ceilings, or alternate seal masks. Stronger execution integrity must bind a materially different dependency or execution transition with executable evidence.
+
+## Milestone 49 — content-bound initial ELF interpreter
+
+### Slice 49A — sealed exact `PT_INTERP` loader
+
+**Current verified candidate.** Extends initial-executable content binding to the dynamic ELF loader named by that exact executable rather than trusting a mutable host loader pathname at exec time.
+
+Acceptance evidence is executable:
+
+- `executable.interpreter` and `executable.interpreter_sha256` are an all-or-nothing restriction and require `executable.sha256`; the interpreter path is absolute, differs from the main executable, and cannot overlap private procfs, scratch, or persistent-volume targets;
+- the launcher parses `PT_INTERP` from the already content-bound ELF64 little-endian x86_64 initial executable, rejects malformed/multiple/oversized interpreter segments, and requires the embedded path to equal the policy path byte-for-byte;
+- the declared loader is pinned beneath `filesystem.root`, required to be a regular executable, identity-revalidated during sealed copying, SHA-256 checked under the existing 64 MiB ceiling, and retained as an immutable sealed memfd image;
+- before chroot, the child copies only those sealed bytes into a private tmpfs file, clones that file as a detached mount, applies read-only + `nosuid` + `nodev`, and attaches it exactly over the declared `PT_INTERP` target path;
+- configured-filesystem preflight read-only validates the content-bound executable's `PT_INTERP`, interpreter shape, and interpreter digest; static authority manifest/delta surfaces include the interpreter path+digest restriction;
+- a deliberately dynamic PIE fixture embeds `/loader`, launches successfully through the sealed loader and exits 73, while a wrong loader digest and a policy path different from the content-bound `PT_INTERP` both fail before target execution; the trusted parent also proves the host loader copy is unchanged;
+- exact branch rustfmt, Clippy with `-D warnings`, complete stable tests, and the complete Rust 1.74 suite are green.
+
+Boundary: 49A binds only the initial ELF64 x86_64 `PT_INTERP` loader selected by the already content-bound main image. The expected digest is not signer/provenance evidence. This slice does not bind shared libraries opened by the loader, statically linked images without `PT_INTERP`, later target `execve` or explicitly granted later `execveat`, or provide a process-lifetime executable closure.
+
+### Milestone 49 promotion rule
+
+After 49A integrates, seal single-loader `PT_INTERP` binding. Do not farm alternate loader paths, ELF-header variants, tmpfs sizes, or seal spellings. A stronger execution-integrity phase must bind a materially different dependency such as the loader's shared-library closure or explicitly authorized later execution, or move to another independent authority frontier with executable evidence.
 
 ## Independent host-local IPC frontier — post-launch object transfer
 

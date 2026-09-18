@@ -136,6 +136,18 @@ pub(crate) fn compare(baseline: &SandboxPolicy, candidate: &SandboxPolicy) -> Au
         candidate.executable_sha256,
         &mut changes,
     );
+    compare_optional_restriction(
+        "execution.executable_interpreter_binding",
+        baseline
+            .executable_interpreter
+            .as_ref()
+            .zip(baseline.executable_interpreter_sha256.as_ref()),
+        candidate
+            .executable_interpreter
+            .as_ref()
+            .zip(candidate.executable_interpreter_sha256.as_ref()),
+        &mut changes,
+    );
     compare_exact_incomparable(
         "execution.arguments",
         &baseline.args,

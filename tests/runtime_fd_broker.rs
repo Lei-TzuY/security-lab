@@ -321,10 +321,7 @@ fn broker_configuration_is_fail_closed_and_non_overwriting() {
         "missing recvmsg must not partially mutate policy"
     );
 
-    policy
-        .seccomp
-        .allowed_syscalls
-        .insert("recvmsg".to_owned());
+    policy.seccomp.allowed_syscalls.insert("recvmsg".to_owned());
     policy.host_unix_stream_path = Some(unique_path("already-configured.sock"));
     let before_existing_broker = policy.clone();
     assert!(matches!(

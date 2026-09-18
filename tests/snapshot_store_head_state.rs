@@ -926,7 +926,10 @@ fn batch_mixes_preexisting_and_new_members_under_one_recoverable_transition() {
     )
     .expect("publish mixed dedup/new batch");
     assert_eq!(committed.previous, first_commit.successor);
-    assert_eq!(committed.successor.generation, first_commit.successor.generation + 1);
+    assert_eq!(
+        committed.successor.generation,
+        first_commit.successor.generation + 1
+    );
     assert_eq!(committed.successor.inventory.objects, 2);
     assert!(!committed.puts[0].inserted);
     assert!(committed.puts[1].inserted);
@@ -945,8 +948,18 @@ fn batch_pending_authentication_tamper_fails_closed_before_store_mutation() {
     let workspace = TempDir::new("batch-pending-auth");
     let (store, state) = roots(workspace.path());
     let key = SnapshotStoreHeadStateKey::new([0x7C; 32]);
-    let first = fixture(workspace.path(), "batch-auth-first", b"batch-auth-first\n", 0x37);
-    let second = fixture(workspace.path(), "batch-auth-second", b"batch-auth-second\n", 0x38);
+    let first = fixture(
+        workspace.path(),
+        "batch-auth-first",
+        b"batch-auth-first\n",
+        0x37,
+    );
+    let second = fixture(
+        workspace.path(),
+        "batch-auth-second",
+        b"batch-auth-second\n",
+        0x38,
+    );
     let previous = initialize_snapshot_store_head_state(&state, &key, &store, audit_limits())
         .expect("initialize batch auth head");
     let (after, successor) =

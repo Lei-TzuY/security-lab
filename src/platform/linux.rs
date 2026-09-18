@@ -1286,9 +1286,12 @@ mod x86_64 {
                 landlock_device_ioctl.push(sandbox_relative(path)?);
             }
 
-            // Keep every launcher-owned source above all target-visible handle
-            // destinations. With no selected handles this floor is only 3, so
-            // existing sandboxes do not gain an unnecessary fd>=64 requirement.
+            // Keep every launcher-owned selected-object source above all target-visible
+            // handle destinations. If target execveat is not explicitly granted, move
+            // the bootstrap executable above the future RLIMIT_NOFILE boundary as well.
+            // That descriptor survives the rlimit lowering only long enough for the
+            // trusted initial exec and is CLOEXEC, while target code cannot recreate any
+            // descriptor number at or above the limit.
             let selected_storage_floor = policy
                 .selected_handles
                 .keys()
@@ -1302,9 +1305,20 @@ mod x86_64 {
                 .map_or(FIRST_NON_STDIO_FD as RawFd, |target_fd| {
                     target_fd as RawFd + 1
                 });
+            let executable_storage_floor =
+                if policy.seccomp.allowed_syscalls.contains("execveat") {
+                    selected_storage_floor
+                } else {
+                    if policy.limits.open_files >= i32::MAX as u64 {
+                        return Err(SandboxError::InvalidPolicy(PolicyError::new(
+                            "limit.open_files is too large for one-shot bootstrap exec isolation",
+                        )));
+                    }
+                    selected_storage_floor.max(policy.limits.open_files as RawFd)
+                };
             let executable_fd = move_owned_fd_to_selected_storage(
                 executable_fd,
-                selected_storage_floor,
+                executable_storage_floor,
                 "pinned executable",
             )?;
 
@@ -1701,7 +1715,7 @@ mod x86_64 {
         )?;
         ensure_landlock_supported(policy)?;
         let prepared = PreparedLaunch::new(policy, cancellation)?;
-        let seccomp = compile_seccomp(policy)?;
+        let seccomp = compile_seccomp(policy, prepared.executable_fd.raw())?;
         let launch_state = SharedLaunchState::new()?;
         let lifecycle = SharedTargetLifecycle::new().map_err(|err| {
             SandboxError::SetupFailed(format!(
@@ -2099,7 +2113,10 @@ mod x86_64 {
         }
     }
 
-    fn compile_seccomp(policy: &SandboxPolicy) -> Result<CompiledSeccomp, SandboxError> {
+    fn compile_seccomp(
+        policy: &SandboxPolicy,
+        bootstrap_exec_fd: RawFd,
+    ) -> Result<CompiledSeccomp, SandboxError> {
         let error_exit_syscall = if policy.seccomp.allowed_syscalls.contains("exit") {
             libc::SYS_exit
         } else if policy.seccomp.allowed_syscalls.contains("exit_group") {
@@ -2109,12 +2126,6 @@ mod x86_64 {
                 "seccomp allowlist must include exit or exit_group so launch failures can terminate after filter installation",
             )));
         };
-
-        if !policy.seccomp.allowed_syscalls.contains("execveat") {
-            return Err(SandboxError::InvalidPolicy(PolicyError::new(
-                "seccomp allowlist must include execveat so the pinned child can start",
-            )));
-        }
 
         let mut syscalls = Vec::with_capacity(policy.seccomp.allowed_syscalls.len());
         for name in &policy.seccomp.allowed_syscalls {
@@ -2141,6 +2152,10 @@ mod x86_64 {
             stmt(BPF_RET_K, SECCOMP_RET_KILL_PROCESS),
             stmt(BPF_LD_W_ABS, 0),
         ];
+
+        if !policy.seccomp.allowed_syscalls.contains("execveat") {
+            append_bootstrap_execveat_allow(&mut filter, bootstrap_exec_fd);
+        }
 
         for (number, name) in syscalls {
             let mut checks = Vec::new();
@@ -2195,6 +2210,40 @@ mod x86_64 {
             filter,
             error_exit_syscall,
         })
+    }
+
+    fn append_bootstrap_execveat_allow(
+        filter: &mut Vec<libc::sock_filter>,
+        bootstrap_exec_fd: RawFd,
+    ) {
+        debug_assert!(bootstrap_exec_fd >= 0);
+        let fd_offset = SECCOMP_DATA_ARGS_OFFSET;
+        let flags_offset = SECCOMP_DATA_ARGS_OFFSET + 4 * 8;
+
+        // The initial syscall number is already loaded. A non-execveat syscall
+        // skips the entire bootstrap block and enters normal target-policy
+        // matching. For execveat, any fd/flag mismatch reloads the syscall
+        // number and falls through to normal policy matching; because this
+        // helper is installed only when execveat is absent from seccomp.allow,
+        // that path ultimately receives the default EPERM.
+        filter.push(jump(
+            BPF_JMP_JEQ_K,
+            libc::SYS_execveat as u32,
+            0,
+            10,
+        ));
+        filter.extend([
+            stmt(BPF_LD_W_ABS, fd_offset),
+            jump(BPF_JMP_JEQ_K, bootstrap_exec_fd as u32, 0, 7),
+            stmt(BPF_LD_W_ABS, fd_offset + 4),
+            jump(BPF_JMP_JEQ_K, 0, 0, 5),
+            stmt(BPF_LD_W_ABS, flags_offset),
+            jump(BPF_JMP_JEQ_K, EXECVEAT_AT_EMPTY_PATH as u32, 0, 3),
+            stmt(BPF_LD_W_ABS, flags_offset + 4),
+            jump(BPF_JMP_JEQ_K, 0, 0, 1),
+            stmt(BPF_RET_K, SECCOMP_RET_ALLOW),
+            stmt(BPF_LD_W_ABS, 0),
+        ]);
     }
 
     fn append_seccomp_argument_checks(

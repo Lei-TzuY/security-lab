@@ -1221,7 +1221,7 @@ Boundary: 49A binds only the initial ELF64 x86_64 `PT_INTERP` loader selected by
 
 ### Slice 49B — one sealed path-qualified direct `DT_NEEDED`
 
-**Current verified candidate.** Extends the sealed initial-execution chain to one direct shared object whose pathname is selected by the content-bound main ELF itself, without claiming general dynamic-loader search or a transitive library closure.
+**Status: complete on `main`.** Extends the sealed initial-execution chain to one direct shared object whose pathname is selected by the content-bound main ELF itself, without claiming general dynamic-loader search or a transitive library closure.
 
 Acceptance evidence is executable:
 
@@ -1237,7 +1237,29 @@ Boundary: 49B binds at most one direct **path-qualified** `DT_NEEDED` object fro
 
 ### Milestone 49 promotion rule
 
-After 49B integrates, seal this bounded direct-path dependency slice. Do not farm extra direct paths, parser tags, SONAME spellings, or mount aliases. A stronger execution-integrity phase must either model materially broader loader resolution/transitive closure with executable evidence, bind explicitly authorized later execution, or move to another independent authority frontier.
+49A–49B are sealed on `main`. Do not farm extra direct paths, parser tags, SONAME spellings, or mount aliases. A stronger execution-integrity phase must either model materially broader loader resolution/transitive closure with executable evidence, bind explicitly authorized later execution, or move to another independent authority frontier.
+
+## Milestone 50 — recoverable authenticated snapshot-store head publication
+
+### Slice 50A — one recoverable single-object head transition
+
+**Current verified candidate.** Converts the existing authenticated **single-object** store-head publication from detect-only two-resource divergence into a bounded authenticated recovery protocol without claiming rollback or crash-atomic store+state commit.
+
+Acceptance evidence is executable:
+
+- before a non-deduplicated candidate mutates the store, the launcher validates its archive/signature, projects the exact canonical successor inventory with the same audit ordering/hash/budgets, and durably creates one fixed-size HMAC-SHA256 pending record committing to the authenticated predecessor, exact successor, candidate identity, and candidate archive length;
+- pending creation is fail-closed and durable under the local Linux contract: the pending file is created with `O_EXCL|O_NOFOLLOW`, required to be a single-link regular file, fully written, `fsync`ed, then the state-root directory is `fsync`ed before object publication begins. Normal head load/verify/store/batch operations return `RecoveryRequired` while authenticated pending evidence exists;
+- recovery acquires the same head-state-exclusive → store-write-transaction lock order as publication and accepts only three exact states: predecessor/predecessor clears a pre-store intent; predecessor/successor first re-runs the candidate object's object → `objects/` directory → store-root durability barriers, re-audits the exact successor, durably publishes the successor head, then clears pending; successor/successor clears a leftover post-head intent;
+- any other authenticated predecessor/successor/head/inventory combination returns `PendingStateDiverged` and leaves the pending evidence in place. Wrong-key or byte-tampered pending records fail HMAC authentication rather than being interpreted;
+- the pending decoder additionally requires generation to advance exactly once, successor object count to increase by exactly one, non-zero candidate archive bytes, and exact predecessor-plus-candidate aggregate byte accounting;
+- deterministic regressions cover pre-store intent cleanup, exact durable-successor head advancement, leftover post-head intent cleanup, unknown-store-state preservation, wrong-key/tamper rejection, and a real seccomp-denied `fsync` recovery attempt that must leave the old head and pending evidence intact before a normal retry converges;
+- the recovery path reuses an exact-object durability helper that reopens only the committed content-addressed object, revalidates regular/read-only shape and exact length, and performs the established object → objects-directory → store-root `fsync` sequence while the exclusive store transaction remains held.
+
+Boundary: 50A is **single-object recovery only**. It does not roll back a published object, make the store and state roots one crash-atomic transaction, recover the 47A multi-object batch path, infer an arbitrary observed inventory as the new head, serialize non-cooperating/privileged writers, provide a point-in-time filesystem snapshot, or add hardware/remote monotonicity. The guarantee remains relative to an intact independently trusted state root/HMAC key, cooperative lock users, and the local kernel/filesystem `fsync` contract.
+
+### Milestone 50 promotion rule
+
+After 50A integrates, do not farm pending-file encodings, retry aliases, or extra recovery state names. A stronger snapshot-store phase must add a materially different boundary such as evidence-backed recoverable batch publication, true point-in-time/crash-atomic semantics, or an external/hardware monotonic witness; otherwise promote to another independent authority frontier.
 
 ## Independent host-local IPC frontier — post-launch object transfer
 

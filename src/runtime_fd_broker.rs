@@ -13,6 +13,7 @@ pub const MAX_RUNTIME_REVOCABLE_STREAM_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_RUNTIME_MESSAGE_BYTES: u64 = 64 * 1024;
 pub const MAX_RUNTIME_MESSAGE_REQUEST_WAIT_MILLISECONDS: u64 = 86_400_000;
 pub const MAX_RUNTIME_MESSAGE_RESPONSE_WAIT_MILLISECONDS: u64 = 86_400_000;
+pub const MAX_RUNTIME_MULTI_MESSAGE_SESSION_MILLISECONDS: u64 = 86_400_000;
 pub const MIN_RUNTIME_MULTI_MESSAGE_ROUNDS: u32 = 2;
 pub const MAX_RUNTIME_MULTI_MESSAGE_ROUNDS: u32 = 32;
 
@@ -44,6 +45,9 @@ pub enum RuntimeFdBrokerError {
     },
     RuntimeResponseTimedOut {
         wait_milliseconds: u64,
+    },
+    RuntimeSessionTimedOut {
+        limit_milliseconds: u64,
     },
     UnexpectedPeer {
         expected_pid: i32,
@@ -106,6 +110,10 @@ impl fmt::Display for RuntimeFdBrokerError {
             Self::RuntimeResponseTimedOut { wait_milliseconds } => write!(
                 f,
                 "runtime FD broker response publication wait exceeded {wait_milliseconds} ms"
+            ),
+            Self::RuntimeSessionTimedOut { limit_milliseconds } => write!(
+                f,
+                "runtime FD broker multi-message session lifetime exceeded {limit_milliseconds} ms"
             ),
             Self::UnexpectedPeer {
                 expected_pid,
@@ -387,6 +395,7 @@ mod imp {
         controller: RuntimeMessageExchangeController,
         max_rounds: u32,
         completed_rounds: u32,
+        session_deadline: Option<SessionDeadlineTimer>,
     }
 
     #[derive(Debug)]
@@ -507,6 +516,69 @@ mod imp {
         }
     }
 
+    #[derive(Debug)]
+    struct SessionDeadlineTimer {
+        fd: RawFd,
+        limit_milliseconds: u64,
+    }
+
+    impl SessionDeadlineTimer {
+        fn new(limit_milliseconds: u64) -> Result<Self, RuntimeFdBrokerError> {
+            let fd = unsafe {
+                libc::timerfd_create(
+                    libc::CLOCK_MONOTONIC,
+                    libc::TFD_CLOEXEC | libc::TFD_NONBLOCK,
+                )
+            };
+            if fd == -1 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::ENOSYS) {
+                    return Err(RuntimeFdBrokerError::UnsupportedPlatform(
+                        "runtime multi-message session deadlines require timerfd".to_owned(),
+                    ));
+                }
+                return Err(RuntimeFdBrokerError::io(
+                    "cannot create runtime multi-message session deadline timer",
+                    error,
+                ));
+            }
+
+            let spec = libc::itimerspec {
+                it_interval: libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: 0,
+                },
+                it_value: libc::timespec {
+                    tv_sec: (limit_milliseconds / 1000) as libc::time_t,
+                    tv_nsec: ((limit_milliseconds % 1000) * 1_000_000) as libc::c_long,
+                },
+            };
+            if unsafe { libc::timerfd_settime(fd, 0, &spec, std::ptr::null_mut()) } == -1 {
+                let error = std::io::Error::last_os_error();
+                unsafe {
+                    libc::close(fd);
+                }
+                return Err(RuntimeFdBrokerError::io(
+                    "cannot arm runtime multi-message session deadline timer",
+                    error,
+                ));
+            }
+
+            Ok(Self {
+                fd,
+                limit_milliseconds,
+            })
+        }
+    }
+
+    impl Drop for SessionDeadlineTimer {
+        fn drop(&mut self) {
+            unsafe {
+                libc::close(self.fd);
+            }
+        }
+    }
+
     impl RuntimeMessageExchangeController {
         pub fn is_complete(&self) -> bool {
             self.state == RuntimeMessageExchangeState::Complete
@@ -609,6 +681,65 @@ mod imp {
                 bytes.truncate(received as usize);
                 self.state = RuntimeMessageExchangeState::RequestReceived;
                 return Ok(bytes);
+            }
+        }
+
+        fn receive_request_with_session_deadline(
+            &mut self,
+            timer_fd: RawFd,
+            limit_milliseconds: u64,
+        ) -> Result<Vec<u8>, RuntimeFdBrokerError> {
+            if self.state != RuntimeMessageExchangeState::AwaitingRequest {
+                return self.receive_request();
+            }
+
+            let mut fds = [
+                libc::pollfd {
+                    fd: self.fd,
+                    events: libc::POLLIN | libc::POLLERR | libc::POLLHUP,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: timer_fd,
+                    events: libc::POLLIN | libc::POLLERR | libc::POLLHUP,
+                    revents: 0,
+                },
+            ];
+
+            loop {
+                fds[0].revents = 0;
+                fds[1].revents = 0;
+                let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
+                if ready == -1 {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() == Some(libc::EINTR) {
+                        continue;
+                    }
+                    self.state = RuntimeMessageExchangeState::Failed;
+                    return Err(RuntimeFdBrokerError::io(
+                        "cannot poll runtime multi-message session request deadline",
+                        error,
+                    ));
+                }
+
+                // The whole-session ceiling is stricter than a per-operation
+                // wait: once expiration is observable, queued request readiness
+                // cannot revive the session.
+                if fds[1].revents & libc::POLLIN != 0 {
+                    self.state = RuntimeMessageExchangeState::Failed;
+                    return Err(RuntimeFdBrokerError::RuntimeSessionTimedOut {
+                        limit_milliseconds,
+                    });
+                }
+                if fds[1].revents != 0 {
+                    self.state = RuntimeMessageExchangeState::Failed;
+                    return Err(RuntimeFdBrokerError::Protocol(
+                        "runtime multi-message session deadline timer became unusable".to_owned(),
+                    ));
+                }
+                if fds[0].revents != 0 {
+                    return self.receive_request();
+                }
             }
         }
 
@@ -770,6 +901,107 @@ mod imp {
             }
         }
 
+        fn send_response_with_session_deadline(
+            &mut self,
+            bytes: &[u8],
+            timer_fd: RawFd,
+            limit_milliseconds: u64,
+        ) -> Result<(), RuntimeFdBrokerError> {
+            if self.state != RuntimeMessageExchangeState::RequestReceived {
+                return self.send_response(bytes);
+            }
+            if bytes.is_empty() {
+                self.state = RuntimeMessageExchangeState::Failed;
+                return Err(RuntimeFdBrokerError::Protocol(
+                    "runtime message response must be non-empty".to_owned(),
+                ));
+            }
+            if bytes.len() as u64 > self.max_response_bytes {
+                self.state = RuntimeMessageExchangeState::Failed;
+                return Err(RuntimeFdBrokerError::RuntimeResponseTooLarge {
+                    max_bytes: self.max_response_bytes,
+                });
+            }
+
+            let mut fds = [
+                libc::pollfd {
+                    fd: self.fd,
+                    events: libc::POLLOUT | libc::POLLERR | libc::POLLHUP,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: timer_fd,
+                    events: libc::POLLIN | libc::POLLERR | libc::POLLHUP,
+                    revents: 0,
+                },
+            ];
+
+            loop {
+                fds[0].revents = 0;
+                fds[1].revents = 0;
+                let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
+                if ready == -1 {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() == Some(libc::EINTR) {
+                        continue;
+                    }
+                    self.state = RuntimeMessageExchangeState::Failed;
+                    return Err(RuntimeFdBrokerError::io(
+                        "cannot poll runtime multi-message session response deadline",
+                        error,
+                    ));
+                }
+
+                // Session expiration wins over a simultaneously writable socket,
+                // so an already-expired global budget cannot be refreshed by
+                // entering another response operation.
+                if fds[1].revents & libc::POLLIN != 0 {
+                    self.state = RuntimeMessageExchangeState::Failed;
+                    return Err(RuntimeFdBrokerError::RuntimeSessionTimedOut {
+                        limit_milliseconds,
+                    });
+                }
+                if fds[1].revents != 0 {
+                    self.state = RuntimeMessageExchangeState::Failed;
+                    return Err(RuntimeFdBrokerError::Protocol(
+                        "runtime multi-message session deadline timer became unusable".to_owned(),
+                    ));
+                }
+                if fds[0].revents != 0 {
+                    let sent = unsafe {
+                        libc::send(
+                            self.fd,
+                            bytes.as_ptr().cast::<libc::c_void>(),
+                            bytes.len(),
+                            libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT,
+                        )
+                    };
+                    if sent == bytes.len() as isize {
+                        self.state = RuntimeMessageExchangeState::Complete;
+                        return Ok(());
+                    }
+                    if sent == -1 {
+                        let error = std::io::Error::last_os_error();
+                        if error.raw_os_error() == Some(libc::EINTR)
+                            || error.raw_os_error() == Some(libc::EAGAIN)
+                        {
+                            continue;
+                        }
+                        self.state = RuntimeMessageExchangeState::Failed;
+                        return Err(RuntimeFdBrokerError::io(
+                            "cannot send runtime message response",
+                            error,
+                        ));
+                    }
+
+                    self.state = RuntimeMessageExchangeState::Failed;
+                    return Err(RuntimeFdBrokerError::Protocol(format!(
+                        "runtime message response sent unexpected packet length {sent}"
+                    )));
+                }
+            }
+        }
+
         fn send_response_with_timer(
             &mut self,
             bytes: &[u8],
@@ -881,6 +1113,51 @@ mod imp {
             self.completed_rounds == self.max_rounds && self.controller.is_complete()
         }
 
+        /// Arm one non-resettable CLOCK_MONOTONIC lifetime budget for every
+        /// remaining request/response operation in this multi-round session.
+        ///
+        /// The timer starts at this call. It must be armed before the first
+        /// request. Once active, use the ordinary receive_request/send_response
+        /// methods; per-operation deadline methods are intentionally rejected
+        /// rather than composing two independent clocks.
+        pub fn start_session_deadline(
+            &mut self,
+            limit_milliseconds: u64,
+        ) -> Result<(), RuntimeFdBrokerError> {
+            if !(1..=super::MAX_RUNTIME_MULTI_MESSAGE_SESSION_MILLISECONDS)
+                .contains(&limit_milliseconds)
+            {
+                return Err(RuntimeFdBrokerError::InvalidConfiguration(format!(
+                    "runtime multi-message session lifetime must be between 1 and {} milliseconds",
+                    super::MAX_RUNTIME_MULTI_MESSAGE_SESSION_MILLISECONDS
+                )));
+            }
+            if self.session_deadline.is_some() {
+                return Err(RuntimeFdBrokerError::InvalidConfiguration(
+                    "runtime multi-message session deadline cannot be reset".to_owned(),
+                ));
+            }
+            if self.completed_rounds != 0
+                || self.controller.state != RuntimeMessageExchangeState::AwaitingRequest
+            {
+                return Err(RuntimeFdBrokerError::InvalidConfiguration(
+                    "runtime multi-message session deadline must be armed before the first request"
+                        .to_owned(),
+                ));
+            }
+
+            match SessionDeadlineTimer::new(limit_milliseconds) {
+                Ok(timer) => {
+                    self.session_deadline = Some(timer);
+                    Ok(())
+                }
+                Err(error) => {
+                    self.controller.state = RuntimeMessageExchangeState::Failed;
+                    Err(error)
+                }
+            }
+        }
+
         pub fn completed_rounds(&self) -> u32 {
             self.completed_rounds
         }
@@ -900,7 +1177,16 @@ mod imp {
 
         pub fn receive_request(&mut self) -> Result<Vec<u8>, RuntimeFdBrokerError> {
             self.reject_after_round_limit()?;
-            self.controller.receive_request()
+            let session_deadline = self
+                .session_deadline
+                .as_ref()
+                .map(|timer| (timer.fd, timer.limit_milliseconds));
+            match session_deadline {
+                Some((timer_fd, limit_milliseconds)) => self
+                    .controller
+                    .receive_request_with_session_deadline(timer_fd, limit_milliseconds),
+                None => self.controller.receive_request(),
+            }
         }
 
         pub fn receive_request_with_deadline(
@@ -908,13 +1194,27 @@ mod imp {
             wait_milliseconds: u64,
         ) -> Result<Vec<u8>, RuntimeFdBrokerError> {
             self.reject_after_round_limit()?;
+            if self.session_deadline.is_some() {
+                return Err(RuntimeFdBrokerError::InvalidConfiguration(
+                    "per-operation request deadlines cannot be combined with an active runtime multi-message session deadline".to_owned(),
+                ));
+            }
             self.controller
                 .receive_request_with_deadline(wait_milliseconds)
         }
 
         pub fn send_response(&mut self, bytes: &[u8]) -> Result<(), RuntimeFdBrokerError> {
             self.reject_after_round_limit()?;
-            self.controller.send_response(bytes)?;
+            let session_deadline = self
+                .session_deadline
+                .as_ref()
+                .map(|timer| (timer.fd, timer.limit_milliseconds));
+            match session_deadline {
+                Some((timer_fd, limit_milliseconds)) => self
+                    .controller
+                    .send_response_with_session_deadline(bytes, timer_fd, limit_milliseconds)?,
+                None => self.controller.send_response(bytes)?,
+            }
             self.complete_response_round();
             Ok(())
         }
@@ -925,6 +1225,11 @@ mod imp {
             wait_milliseconds: u64,
         ) -> Result<(), RuntimeFdBrokerError> {
             self.reject_after_round_limit()?;
+            if self.session_deadline.is_some() {
+                return Err(RuntimeFdBrokerError::InvalidConfiguration(
+                    "per-operation response deadlines cannot be combined with an active runtime multi-message session deadline".to_owned(),
+                ));
+            }
             self.controller
                 .send_response_with_deadline(bytes, wait_milliseconds)?;
             self.complete_response_round();
@@ -1694,6 +1999,7 @@ mod imp {
                 controller,
                 max_rounds,
                 completed_rounds: 0,
+                session_deadline: None,
             },
         ))
     }
@@ -1889,6 +2195,15 @@ mod imp {
 
         pub fn max_rounds(&self) -> u32 {
             0
+        }
+
+        pub fn start_session_deadline(
+            &mut self,
+            _limit_milliseconds: u64,
+        ) -> Result<(), RuntimeFdBrokerError> {
+            Err(RuntimeFdBrokerError::UnsupportedPlatform(
+                "runtime multi-message session deadlines currently require Linux x86_64".to_owned(),
+            ))
         }
 
         pub fn receive_request(&mut self) -> Result<Vec<u8>, RuntimeFdBrokerError> {

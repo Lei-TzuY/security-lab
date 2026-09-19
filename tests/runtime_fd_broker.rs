@@ -4,7 +4,8 @@ use security_lab::{
     run, ChildOutcome, RuntimeFdBroker, RuntimeFdBrokerError, SandboxPolicy,
     MAX_RUNTIME_MESSAGE_BYTES, MAX_RUNTIME_MESSAGE_REQUEST_WAIT_MILLISECONDS,
     MAX_RUNTIME_MESSAGE_RESPONSE_WAIT_MILLISECONDS, MAX_RUNTIME_MULTI_MESSAGE_ROUNDS,
-    MAX_RUNTIME_REVOCABLE_STREAM_BYTES, MAX_RUNTIME_SEALED_BUNDLE_BYTES,
+    MAX_RUNTIME_MULTI_MESSAGE_SESSION_MILLISECONDS, MAX_RUNTIME_REVOCABLE_STREAM_BYTES,
+    MAX_RUNTIME_SEALED_BUNDLE_BYTES,
     MAX_RUNTIME_SEALED_BUNDLE_ITEMS, MAX_RUNTIME_SEALED_SNAPSHOT_BYTES,
     MIN_RUNTIME_MULTI_MESSAGE_ROUNDS,
 };
@@ -1430,6 +1431,181 @@ fn runtime_multi_message_response_deadline_closes_on_real_backpressure() {
     assert!(!controller.is_complete());
     assert!(matches!(
         controller.receive_request(),
+        Err(RuntimeFdBrokerError::Protocol(message)) if message.contains("closed after")
+    ));
+}
+
+#[test]
+fn runtime_multi_message_session_deadline_is_nonresettable_and_excludes_per_operation_deadlines() {
+    let socket_path = unique_path("runtime-multi-session-deadline-config.sock");
+    let _ = std::fs::remove_file(&socket_path);
+    let broker = RuntimeFdBroker::bind(&socket_path).unwrap();
+    let mut client = UnixStream::connect(broker.path()).unwrap();
+    let mut session = broker.accept().unwrap();
+    client.write_all(b"R").unwrap();
+    session.wait_for_ready(b'R').unwrap();
+
+    let (grant, mut controller) =
+        RuntimeFdBroker::prepare_runtime_multi_message_exchange(16, 16, 2).unwrap();
+    session.send_runtime_message_channel(grant).unwrap();
+    let endpoint = receive_one_fd(&client);
+
+    assert!(matches!(
+        controller.start_session_deadline(0),
+        Err(RuntimeFdBrokerError::InvalidConfiguration(_))
+    ));
+    assert!(matches!(
+        controller.start_session_deadline(MAX_RUNTIME_MULTI_MESSAGE_SESSION_MILLISECONDS + 1),
+        Err(RuntimeFdBrokerError::InvalidConfiguration(_))
+    ));
+    controller.start_session_deadline(1000).unwrap();
+    assert!(matches!(
+        controller.start_session_deadline(1000),
+        Err(RuntimeFdBrokerError::InvalidConfiguration(message)) if message.contains("cannot be reset")
+    ));
+
+    assert_eq!(
+        unsafe {
+            libc::send(
+                endpoint.raw(),
+                b"one".as_ptr().cast::<libc::c_void>(),
+                3,
+                libc::MSG_NOSIGNAL,
+            )
+        },
+        3
+    );
+    assert!(matches!(
+        controller.receive_request_with_deadline(1000),
+        Err(RuntimeFdBrokerError::InvalidConfiguration(message)) if message.contains("cannot be combined")
+    ));
+    assert_eq!(controller.receive_request().unwrap(), b"one");
+    assert!(matches!(
+        controller.send_response_with_deadline(b"ONE", 1000),
+        Err(RuntimeFdBrokerError::InvalidConfiguration(message)) if message.contains("cannot be combined")
+    ));
+    controller.send_response(b"ONE").unwrap();
+
+    let mut response = [0u8; 8];
+    assert_eq!(
+        unsafe {
+            libc::recv(
+                endpoint.raw(),
+                response.as_mut_ptr().cast::<libc::c_void>(),
+                response.len(),
+                0,
+            )
+        },
+        3
+    );
+    assert_eq!(&response[..3], b"ONE");
+    assert_eq!(controller.completed_rounds(), 1);
+}
+
+#[test]
+fn runtime_multi_message_session_deadline_spans_rounds_and_beats_queued_request() {
+    let socket_path = unique_path("runtime-multi-session-deadline-rounds.sock");
+    let _ = std::fs::remove_file(&socket_path);
+    let broker = RuntimeFdBroker::bind(&socket_path).unwrap();
+    let mut client = UnixStream::connect(broker.path()).unwrap();
+    let mut session = broker.accept().unwrap();
+    client.write_all(b"R").unwrap();
+    session.wait_for_ready(b'R').unwrap();
+
+    let (grant, mut controller) =
+        RuntimeFdBroker::prepare_runtime_multi_message_exchange(16, 16, 2).unwrap();
+    session.send_runtime_message_channel(grant).unwrap();
+    let endpoint = receive_one_fd(&client);
+    controller.start_session_deadline(50).unwrap();
+
+    assert_eq!(
+        unsafe {
+            libc::send(
+                endpoint.raw(),
+                b"one".as_ptr().cast::<libc::c_void>(),
+                3,
+                libc::MSG_NOSIGNAL,
+            )
+        },
+        3
+    );
+    assert_eq!(controller.receive_request().unwrap(), b"one");
+    controller.send_response(b"ONE").unwrap();
+    let mut response = [0u8; 8];
+    assert_eq!(
+        unsafe {
+            libc::recv(
+                endpoint.raw(),
+                response.as_mut_ptr().cast::<libc::c_void>(),
+                response.len(),
+                0,
+            )
+        },
+        3
+    );
+
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    assert_eq!(
+        unsafe {
+            libc::send(
+                endpoint.raw(),
+                b"two".as_ptr().cast::<libc::c_void>(),
+                3,
+                libc::MSG_NOSIGNAL,
+            )
+        },
+        3
+    );
+    assert!(matches!(
+        controller.receive_request(),
+        Err(RuntimeFdBrokerError::RuntimeSessionTimedOut { limit_milliseconds }) if limit_milliseconds == 50
+    ));
+    assert_eq!(controller.completed_rounds(), 1);
+    assert!(!controller.is_complete());
+    assert!(matches!(
+        controller.receive_request(),
+        Err(RuntimeFdBrokerError::Protocol(message)) if message.contains("closed after")
+    ));
+}
+
+#[test]
+fn runtime_multi_message_session_deadline_also_bounds_response_publication() {
+    let socket_path = unique_path("runtime-multi-session-deadline-response.sock");
+    let _ = std::fs::remove_file(&socket_path);
+    let broker = RuntimeFdBroker::bind(&socket_path).unwrap();
+    let mut client = UnixStream::connect(broker.path()).unwrap();
+    let mut session = broker.accept().unwrap();
+    client.write_all(b"R").unwrap();
+    session.wait_for_ready(b'R').unwrap();
+
+    let (grant, mut controller) =
+        RuntimeFdBroker::prepare_runtime_multi_message_exchange(16, 16, 2).unwrap();
+    session.send_runtime_message_channel(grant).unwrap();
+    let endpoint = receive_one_fd(&client);
+    controller.start_session_deadline(50).unwrap();
+
+    assert_eq!(
+        unsafe {
+            libc::send(
+                endpoint.raw(),
+                b"one".as_ptr().cast::<libc::c_void>(),
+                3,
+                libc::MSG_NOSIGNAL,
+            )
+        },
+        3
+    );
+    assert_eq!(controller.receive_request().unwrap(), b"one");
+
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    assert!(matches!(
+        controller.send_response(b"late"),
+        Err(RuntimeFdBrokerError::RuntimeSessionTimedOut { limit_milliseconds }) if limit_milliseconds == 50
+    ));
+    assert_eq!(controller.completed_rounds(), 0);
+    assert!(!controller.is_complete());
+    assert!(matches!(
+        controller.send_response(b"retry"),
         Err(RuntimeFdBrokerError::Protocol(message)) if message.contains("closed after")
     ));
 }

@@ -112,6 +112,12 @@ fn assess(policy: &SandboxPolicy, receipt: &EnforcementReceipt) -> ReceiptAssess
         "base_namespaces",
         receipt.base_namespaces,
     );
+    require(
+        &mut required,
+        &mut missing,
+        "supplementary_groups_cleared",
+        receipt.supplementary_groups_cleared,
+    );
     if policy.time_monotonic_offset_seconds.is_some() {
         require(
             &mut required,
@@ -347,6 +353,7 @@ mod tests {
     fn complete_base_receipt() -> EnforcementReceipt {
         EnforcementReceipt {
             base_namespaces: true,
+            supplementary_groups_cleared: true,
             time_namespace_offsets: false,
             hostname: true,
             private_mount_propagation: true,

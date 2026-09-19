@@ -2011,6 +2011,7 @@ fn allowed_operation_succeeds() {
     assert_eq!(report.outcome, ChildOutcome::Exited(0));
     let receipt = report.enforcement;
     assert!(receipt.base_namespaces);
+    assert!(receipt.supplementary_groups_cleared);
     assert!(!receipt.time_namespace_offsets);
     assert!(receipt.hostname);
     assert!(receipt.private_mount_propagation);
@@ -2362,7 +2363,15 @@ fn namespace_identity_and_capabilities_are_reduced() {
         run(&policy(
             "I",
             &[],
-            &["execveat", "getuid", "getgid", "capget", "prctl", "exit"]
+            &[
+                "execveat",
+                "getuid",
+                "getgid",
+                "getgroups",
+                "capget",
+                "prctl",
+                "exit",
+            ]
         ))
         .unwrap(),
         ChildOutcome::Exited(0)

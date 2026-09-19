@@ -52,7 +52,7 @@
 #   W create argv[2] marker
 #   D assert descriptor number in argv[2] is closed after exec
 #   H assert absolute host path argv[2] is hidden by filesystem root
-#   I assert namespace uid/gid are 0 and all capability sets are empty
+#   I assert namespace uid/gid are 0, supplementary groups are empty, and all capability sets are empty
 #   M assert root is read-only while /scratch is writable
 #   O assert stdin/stdout/stderr are all closed
 #   T assert stdin/stderr are closed while stdout is inherited and writable
@@ -2805,6 +2805,13 @@ _start:
     test %rax, %rax
     jne .fail17
     mov $104, %eax
+    syscall
+    test %rax, %rax
+    jne .fail17
+
+    mov $115, %eax
+    xor %edi, %edi
+    xor %esi, %esi
     syscall
     test %rax, %rax
     jne .fail17

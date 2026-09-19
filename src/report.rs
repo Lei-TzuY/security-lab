@@ -99,6 +99,9 @@ pub struct ProcessTreeUsage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct EnforcementReceipt {
     pub base_namespaces: bool,
+    /// The launcher cleared the inherited supplementary group vector inside
+    /// the fresh user namespace before permanently disabling setgroups.
+    pub supplementary_groups_cleared: bool,
     pub time_namespace_offsets: bool,
     pub hostname: bool,
     pub private_mount_propagation: bool,

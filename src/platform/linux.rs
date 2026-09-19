@@ -94,6 +94,7 @@ mod x86_64 {
     const ENFORCEMENT_SECCOMP: u64 = 1 << 11;
     const ENFORCEMENT_PRIVATE_PROCFS: u64 = 1 << 12;
     const ENFORCEMENT_COW_ROOT: u64 = 1 << 13;
+    const ENFORCEMENT_SUPPLEMENTARY_GROUPS: u64 = 1 << 14;
     const ENFORCEMENT_KNOWN: u64 = ENFORCEMENT_BASE_NAMESPACES
         | ENFORCEMENT_TIME_NAMESPACE
         | ENFORCEMENT_HOSTNAME
@@ -107,7 +108,8 @@ mod x86_64 {
         | ENFORCEMENT_LANDLOCK
         | ENFORCEMENT_SECCOMP
         | ENFORCEMENT_PRIVATE_PROCFS
-        | ENFORCEMENT_COW_ROOT;
+        | ENFORCEMENT_COW_ROOT
+        | ENFORCEMENT_SUPPLEMENTARY_GROUPS;
 
     const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
     const PR_CAPBSET_DROP: libc::c_int = 24;
@@ -193,6 +195,7 @@ mod x86_64 {
     const PHASE_NEEDED_TARGET_PIN: u32 = 77;
     const PHASE_NEEDED_READONLY: u32 = 78;
     const PHASE_NEEDED_ATTACH: u32 = 79;
+    const PHASE_SUPPLEMENTARY_GROUPS: u32 = 80;
 
     const SYS_LANDLOCK_CREATE_RULESET: libc::c_long = 444;
     const SYS_LANDLOCK_ADD_RULE: libc::c_long = 445;
@@ -1041,8 +1044,13 @@ mod x86_64 {
         };
 
         require_predecessor(
-            ENFORCEMENT_HOSTNAME,
+            ENFORCEMENT_SUPPLEMENTARY_GROUPS,
             ENFORCEMENT_BASE_NAMESPACES,
+            "supplementary group clear",
+        )?;
+        require_predecessor(
+            ENFORCEMENT_HOSTNAME,
+            ENFORCEMENT_SUPPLEMENTARY_GROUPS,
             "hostname",
         )?;
         require_predecessor(
@@ -1164,6 +1172,7 @@ mod x86_64 {
 
         Ok(EnforcementReceipt {
             base_namespaces: bits & ENFORCEMENT_BASE_NAMESPACES != 0,
+            supplementary_groups_cleared: bits & ENFORCEMENT_SUPPLEMENTARY_GROUPS != 0,
             time_namespace_offsets,
             hostname: bits & ENFORCEMENT_HOSTNAME != 0,
             private_mount_propagation: bits & ENFORCEMENT_PRIVATE_MOUNTS != 0,
@@ -3227,6 +3236,22 @@ mod x86_64 {
         }
         mark_enforcement(launch_error, ENFORCEMENT_BASE_NAMESPACES);
 
+        if libc::setgroups(0, std::ptr::null()) != 0 {
+            child_fail(
+                launch_error,
+                PHASE_SUPPLEMENTARY_GROUPS,
+                seccomp.error_exit_syscall,
+            );
+        }
+        if libc::getgroups(0, std::ptr::null_mut()) != 0 {
+            child_fail(
+                launch_error,
+                PHASE_SUPPLEMENTARY_GROUPS,
+                seccomp.error_exit_syscall,
+            );
+        }
+        mark_enforcement(launch_error, ENFORCEMENT_SUPPLEMENTARY_GROUPS);
+
         write_proc_file_or_fail(
             b"/proc/self/setgroups\0",
             b"deny\n",
@@ -4408,6 +4433,7 @@ mod x86_64 {
     fn format_launch_error(record: LaunchErrorRecord) -> String {
         let phase = match record.phase {
             PHASE_NAMESPACE => "user/mount/PID/network/IPC/UTS namespace creation",
+            PHASE_SUPPLEMENTARY_GROUPS => "supplementary group clear/verification",
             PHASE_SETGROUPS => "setgroups deny",
             PHASE_UID_MAP => "uid_map",
             PHASE_GID_MAP => "gid_map",
@@ -4542,6 +4568,7 @@ mod x86_64 {
             "nanosleep" => libc::SYS_nanosleep,
             "getuid" => libc::SYS_getuid,
             "getgid" => libc::SYS_getgid,
+            "getgroups" => libc::SYS_getgroups,
             "geteuid" => libc::SYS_geteuid,
             "getegid" => libc::SYS_getegid,
             "getgroups" => libc::SYS_getgroups,
@@ -4612,6 +4639,7 @@ mod x86_64 {
         fn private_procfs_receipt_is_request_bound_and_ordered() {
             let unrequested = enforcement_receipt_from_bits_for_policy(
                 ENFORCEMENT_BASE_NAMESPACES
+                    | ENFORCEMENT_SUPPLEMENTARY_GROUPS
                     | ENFORCEMENT_HOSTNAME
                     | ENFORCEMENT_PRIVATE_MOUNTS
                     | ENFORCEMENT_READONLY_ROOT
@@ -4627,6 +4655,7 @@ mod x86_64 {
 
             let skipped = enforcement_receipt_from_bits_for_policy(
                 ENFORCEMENT_BASE_NAMESPACES
+                    | ENFORCEMENT_SUPPLEMENTARY_GROUPS
                     | ENFORCEMENT_HOSTNAME
                     | ENFORCEMENT_PRIVATE_MOUNTS
                     | ENFORCEMENT_READONLY_ROOT
@@ -4642,6 +4671,7 @@ mod x86_64 {
 
             let observed = enforcement_receipt_from_bits_for_policy(
                 ENFORCEMENT_BASE_NAMESPACES
+                    | ENFORCEMENT_SUPPLEMENTARY_GROUPS
                     | ENFORCEMENT_HOSTNAME
                     | ENFORCEMENT_PRIVATE_MOUNTS
                     | ENFORCEMENT_READONLY_ROOT
@@ -4661,6 +4691,7 @@ mod x86_64 {
         #[test]
         fn copy_on_write_receipt_is_request_bound_and_mutually_exclusive() {
             let cow_bits = ENFORCEMENT_BASE_NAMESPACES
+                | ENFORCEMENT_SUPPLEMENTARY_GROUPS
                 | ENFORCEMENT_HOSTNAME
                 | ENFORCEMENT_PRIVATE_MOUNTS
                 | ENFORCEMENT_COW_ROOT

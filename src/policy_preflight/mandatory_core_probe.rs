@@ -207,6 +207,7 @@ const fn stage_name(stage: i32) -> &'static str {
         37 => "capability_current_sets",
         38 => "no_new_privs",
         39 => "seccomp_filter",
+        40 => "supplementary_groups_clear",
         _ => "unknown_stage",
     }
 }
@@ -241,6 +242,12 @@ unsafe fn probe_child(report_fd: libc::c_int, uid_map: &[u8], gid_map: &[u8]) ->
         | libc::CLONE_NEWUTS;
     if libc::unshare(namespace_flags) != 0 {
         fail(report_fd, 10, errno());
+    }
+    if libc::setgroups(0, std::ptr::null()) != 0 {
+        fail(report_fd, 40, errno());
+    }
+    if libc::getgroups(0, std::ptr::null_mut()) != 0 {
+        fail(report_fd, 40, libc::EIO);
     }
     write_file(report_fd, 11, b"/proc/self/setgroups\0", b"deny\n");
     write_file(report_fd, 12, b"/proc/self/uid_map\0", uid_map);

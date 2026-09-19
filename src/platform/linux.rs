@@ -4571,7 +4571,6 @@ mod x86_64 {
             "getgroups" => libc::SYS_getgroups,
             "geteuid" => libc::SYS_geteuid,
             "getegid" => libc::SYS_getegid,
-            "getgroups" => libc::SYS_getgroups,
             "capget" => libc::SYS_capget,
             "fcntl" => libc::SYS_fcntl,
             "getcwd" => libc::SYS_getcwd,

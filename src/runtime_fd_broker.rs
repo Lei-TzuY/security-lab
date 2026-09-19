@@ -10,6 +10,7 @@ pub const MIN_RUNTIME_SEALED_BUNDLE_ITEMS: usize = 2;
 pub const MAX_RUNTIME_SEALED_BUNDLE_ITEMS: usize = 8;
 pub const MAX_RUNTIME_SEALED_BUNDLE_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_RUNTIME_REVOCABLE_STREAM_BYTES: u64 = 64 * 1024 * 1024;
+pub const MAX_RUNTIME_MESSAGE_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug)]
 pub enum RuntimeFdBrokerError {
@@ -26,6 +27,12 @@ pub enum RuntimeFdBrokerError {
         max_bytes: u64,
     },
     RuntimeStreamBudgetExceeded {
+        max_bytes: u64,
+    },
+    RuntimeRequestTooLarge {
+        max_bytes: u64,
+    },
+    RuntimeResponseTooLarge {
         max_bytes: u64,
     },
     UnexpectedPeer {
@@ -73,6 +80,14 @@ impl fmt::Display for RuntimeFdBrokerError {
             Self::RuntimeStreamBudgetExceeded { max_bytes } => write!(
                 f,
                 "runtime FD broker stream exceeds total byte ceiling of {max_bytes}"
+            ),
+            Self::RuntimeRequestTooLarge { max_bytes } => write!(
+                f,
+                "runtime FD broker request exceeds message byte ceiling of {max_bytes}"
+            ),
+            Self::RuntimeResponseTooLarge { max_bytes } => write!(
+                f,
+                "runtime FD broker response exceeds message byte ceiling of {max_bytes}"
             ),
             Self::UnexpectedPeer {
                 expected_pid,
@@ -312,6 +327,183 @@ mod imp {
         }
     }
 
+
+    #[derive(Debug)]
+    pub struct PreparedRuntimeMessageChannel {
+        fd: RawFd,
+    }
+
+    impl Drop for PreparedRuntimeMessageChannel {
+        fn drop(&mut self) {
+            unsafe {
+                libc::close(self.fd);
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum RuntimeMessageExchangeState {
+        AwaitingRequest,
+        RequestReceived,
+        Complete,
+        Failed,
+    }
+
+    #[derive(Debug)]
+    pub struct RuntimeMessageExchangeController {
+        fd: RawFd,
+        max_request_bytes: u64,
+        max_response_bytes: u64,
+        state: RuntimeMessageExchangeState,
+    }
+
+    impl Drop for RuntimeMessageExchangeController {
+        fn drop(&mut self) {
+            unsafe {
+                libc::close(self.fd);
+            }
+        }
+    }
+
+    impl RuntimeMessageExchangeController {
+        pub fn is_complete(&self) -> bool {
+            self.state == RuntimeMessageExchangeState::Complete
+        }
+
+        /// Receive exactly one non-empty request packet from the target.
+        ///
+        /// SOCK_SEQPACKET preserves the message boundary. Oversized/truncated,
+        /// empty/closed-peer, and I/O failures make the exchange terminal so a
+        /// caller never retries an ambiguous protocol state.
+        pub fn receive_request(&mut self) -> Result<Vec<u8>, RuntimeFdBrokerError> {
+            if self.state != RuntimeMessageExchangeState::AwaitingRequest {
+                let message = match self.state {
+                    RuntimeMessageExchangeState::RequestReceived => {
+                        "runtime message exchange already received its one request"
+                    }
+                    RuntimeMessageExchangeState::Complete => {
+                        "runtime message exchange permits exactly one completed round"
+                    }
+                    RuntimeMessageExchangeState::Failed => {
+                        "runtime message exchange is closed after a protocol or I/O failure"
+                    }
+                    RuntimeMessageExchangeState::AwaitingRequest => unreachable!(),
+                };
+                return Err(RuntimeFdBrokerError::Protocol(message.to_owned()));
+            }
+
+            let capacity = self.max_request_bytes as usize + 1;
+            let mut bytes = vec![0u8; capacity];
+            let mut iovec = libc::iovec {
+                iov_base: bytes.as_mut_ptr().cast::<libc::c_void>(),
+                iov_len: bytes.len(),
+            };
+            let mut message = unsafe { std::mem::zeroed::<libc::msghdr>() };
+            message.msg_iov = &mut iovec;
+            message.msg_iovlen = 1;
+
+            loop {
+                message.msg_flags = 0;
+                let received = unsafe { libc::recvmsg(self.fd, &mut message, 0) };
+                if received == -1 {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() == Some(libc::EINTR) {
+                        continue;
+                    }
+                    self.state = RuntimeMessageExchangeState::Failed;
+                    return Err(RuntimeFdBrokerError::io(
+                        "cannot receive runtime message request",
+                        error,
+                    ));
+                }
+                if received == 0 {
+                    self.state = RuntimeMessageExchangeState::Failed;
+                    return Err(RuntimeFdBrokerError::Protocol(
+                        "runtime message request must be non-empty and arrive before peer shutdown"
+                            .to_owned(),
+                    ));
+                }
+                if message.msg_flags & libc::MSG_TRUNC != 0
+                    || received as u64 > self.max_request_bytes
+                {
+                    self.state = RuntimeMessageExchangeState::Failed;
+                    return Err(RuntimeFdBrokerError::RuntimeRequestTooLarge {
+                        max_bytes: self.max_request_bytes,
+                    });
+                }
+
+                bytes.truncate(received as usize);
+                self.state = RuntimeMessageExchangeState::RequestReceived;
+                return Ok(bytes);
+            }
+        }
+
+        /// Send exactly one non-empty response packet after a valid request.
+        ///
+        /// The response is completely budget-checked before the atomic
+        /// SOCK_SEQPACKET send. Any invalid response or send failure makes the
+        /// controller terminal; success completes the only permitted round.
+        pub fn send_response(&mut self, bytes: &[u8]) -> Result<(), RuntimeFdBrokerError> {
+            if self.state != RuntimeMessageExchangeState::RequestReceived {
+                let message = match self.state {
+                    RuntimeMessageExchangeState::AwaitingRequest => {
+                        "runtime message response requires a request first"
+                    }
+                    RuntimeMessageExchangeState::Complete => {
+                        "runtime message exchange permits exactly one completed round"
+                    }
+                    RuntimeMessageExchangeState::Failed => {
+                        "runtime message exchange is closed after a protocol or I/O failure"
+                    }
+                    RuntimeMessageExchangeState::RequestReceived => unreachable!(),
+                };
+                return Err(RuntimeFdBrokerError::Protocol(message.to_owned()));
+            }
+            if bytes.is_empty() {
+                self.state = RuntimeMessageExchangeState::Failed;
+                return Err(RuntimeFdBrokerError::Protocol(
+                    "runtime message response must be non-empty".to_owned(),
+                ));
+            }
+            if bytes.len() as u64 > self.max_response_bytes {
+                self.state = RuntimeMessageExchangeState::Failed;
+                return Err(RuntimeFdBrokerError::RuntimeResponseTooLarge {
+                    max_bytes: self.max_response_bytes,
+                });
+            }
+
+            loop {
+                let sent = unsafe {
+                    libc::send(
+                        self.fd,
+                        bytes.as_ptr().cast::<libc::c_void>(),
+                        bytes.len(),
+                        libc::MSG_NOSIGNAL,
+                    )
+                };
+                if sent == -1 {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() == Some(libc::EINTR) {
+                        continue;
+                    }
+                    self.state = RuntimeMessageExchangeState::Failed;
+                    return Err(RuntimeFdBrokerError::io(
+                        "cannot send runtime message response",
+                        error,
+                    ));
+                }
+                if sent != bytes.len() as isize {
+                    self.state = RuntimeMessageExchangeState::Failed;
+                    return Err(RuntimeFdBrokerError::Protocol(format!(
+                        "runtime message response sent unexpected packet length {sent}"
+                    )));
+                }
+                self.state = RuntimeMessageExchangeState::Complete;
+                return Ok(());
+            }
+        }
+    }
+
     #[derive(Debug)]
     pub struct RuntimeFdBroker {
         path: PathBuf,
@@ -503,6 +695,21 @@ mod imp {
         > {
             prepare_revocable_byte_stream(max_bytes)
         }
+
+        /// Prepare one bounded one-shot bidirectional message exchange.
+        ///
+        /// The target receives one SOCK_SEQPACKET endpoint through the existing
+        /// post-exec broker grant. The trusted controller accepts one bounded
+        /// request packet and may publish one bounded response packet.
+        pub fn prepare_runtime_message_exchange(
+            max_request_bytes: u64,
+            max_response_bytes: u64,
+        ) -> Result<
+            (PreparedRuntimeMessageChannel, RuntimeMessageExchangeController),
+            RuntimeFdBrokerError,
+        > {
+            prepare_runtime_message_exchange(max_request_bytes, max_response_bytes)
+        }
     }
 
     impl RuntimeFdSession {
@@ -573,6 +780,16 @@ mod imp {
         pub fn send_revocable_byte_stream(
             &mut self,
             grant: PreparedRevocableByteStream,
+        ) -> Result<(), RuntimeFdBrokerError> {
+            self.send_prepared_fd(grant.fd)
+        }
+
+        /// Transfer one prepared SOCK_SEQPACKET request/response endpoint.
+        /// The transfer consumes the same one-shot session transition as every
+        /// other runtime capability grant.
+        pub fn send_runtime_message_channel(
+            &mut self,
+            grant: PreparedRuntimeMessageChannel,
         ) -> Result<(), RuntimeFdBrokerError> {
             self.send_prepared_fd(grant.fd)
         }
@@ -986,6 +1203,54 @@ mod imp {
         ))
     }
 
+
+    fn prepare_runtime_message_exchange(
+        max_request_bytes: u64,
+        max_response_bytes: u64,
+    ) -> Result<
+        (PreparedRuntimeMessageChannel, RuntimeMessageExchangeController),
+        RuntimeFdBrokerError,
+    > {
+        if max_request_bytes == 0 || max_request_bytes > super::MAX_RUNTIME_MESSAGE_BYTES {
+            return Err(RuntimeFdBrokerError::InvalidConfiguration(format!(
+                "runtime message max_request_bytes must be between 1 and {}",
+                super::MAX_RUNTIME_MESSAGE_BYTES
+            )));
+        }
+        if max_response_bytes == 0 || max_response_bytes > super::MAX_RUNTIME_MESSAGE_BYTES {
+            return Err(RuntimeFdBrokerError::InvalidConfiguration(format!(
+                "runtime message max_response_bytes must be between 1 and {}",
+                super::MAX_RUNTIME_MESSAGE_BYTES
+            )));
+        }
+
+        let mut fds = [-1; 2];
+        if unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+                0,
+                fds.as_mut_ptr(),
+            )
+        } == -1
+        {
+            return Err(RuntimeFdBrokerError::io(
+                "cannot create runtime message exchange socketpair",
+                std::io::Error::last_os_error(),
+            ));
+        }
+
+        Ok((
+            PreparedRuntimeMessageChannel { fd: fds[0] },
+            RuntimeMessageExchangeController {
+                fd: fds[1],
+                max_request_bytes,
+                max_response_bytes,
+                state: RuntimeMessageExchangeState::AwaitingRequest,
+            },
+        ))
+    }
+
     fn prepare_sealed_snapshot_bundle(
         grants: Vec<PreparedSealedRegularFileSnapshot>,
         max_total_bytes: u64,
@@ -1107,6 +1372,30 @@ mod imp {
     #[derive(Debug)]
     pub struct RevocableByteStreamController;
 
+    #[derive(Debug)]
+    pub struct PreparedRuntimeMessageChannel;
+
+    #[derive(Debug)]
+    pub struct RuntimeMessageExchangeController;
+
+    impl RuntimeMessageExchangeController {
+        pub fn is_complete(&self) -> bool {
+            false
+        }
+
+        pub fn receive_request(&mut self) -> Result<Vec<u8>, RuntimeFdBrokerError> {
+            Err(RuntimeFdBrokerError::UnsupportedPlatform(
+                "runtime message exchanges currently require Linux x86_64".to_owned(),
+            ))
+        }
+
+        pub fn send_response(&mut self, _bytes: &[u8]) -> Result<(), RuntimeFdBrokerError> {
+            Err(RuntimeFdBrokerError::UnsupportedPlatform(
+                "runtime message exchanges currently require Linux x86_64".to_owned(),
+            ))
+        }
+    }
+
     impl RevocableByteStreamController {
         pub fn sent_bytes(&self) -> u64 {
             0
@@ -1218,6 +1507,18 @@ mod imp {
                 "revocable runtime byte streams currently require Linux x86_64".to_owned(),
             ))
         }
+
+        pub fn prepare_runtime_message_exchange(
+            _max_request_bytes: u64,
+            _max_response_bytes: u64,
+        ) -> Result<
+            (PreparedRuntimeMessageChannel, RuntimeMessageExchangeController),
+            RuntimeFdBrokerError,
+        > {
+            Err(RuntimeFdBrokerError::UnsupportedPlatform(
+                "runtime message exchanges currently require Linux x86_64".to_owned(),
+            ))
+        }
     }
 
     impl RuntimeFdSession {
@@ -1262,10 +1563,20 @@ mod imp {
                 "revocable runtime byte streams currently require Linux x86_64".to_owned(),
             ))
         }
+
+        pub fn send_runtime_message_channel(
+            &mut self,
+            _grant: PreparedRuntimeMessageChannel,
+        ) -> Result<(), RuntimeFdBrokerError> {
+            Err(RuntimeFdBrokerError::UnsupportedPlatform(
+                "runtime message exchanges currently require Linux x86_64".to_owned(),
+            ))
+        }
     }
 }
 
 pub use imp::{
-    PreparedReadOnlyRegularFile, PreparedRevocableByteStream, PreparedSealedRegularFileSnapshot,
-    PreparedSealedSnapshotBundle, RevocableByteStreamController, RuntimeFdBroker, RuntimeFdSession,
+    PreparedReadOnlyRegularFile, PreparedRevocableByteStream, PreparedRuntimeMessageChannel,
+    PreparedSealedRegularFileSnapshot, PreparedSealedSnapshotBundle, RevocableByteStreamController,
+    RuntimeFdBroker, RuntimeFdSession, RuntimeMessageExchangeController,
 };

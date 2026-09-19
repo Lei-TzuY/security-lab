@@ -24,6 +24,7 @@
 #   0 receive one post-launch SCM_RIGHTS fd over that broker and prove its host pathname stays hidden
 #   3 receive an ordered two-FD sealed snapshot bundle and reject truncated ancillary control
 #   4 receive a write-disabled runtime stream, read bounded bytes, then observe revoke EOF
+#   5 exchange one bounded request/response packet over a runtime SOCK_SEQPACKET channel
 #   1 prove launcher bootstrap execveat is one-shot when target execveat is not granted
 #   2 prove an explicit target execveat grant still permits a later exec
 #   q accept one connection through a launcher-brokered host-loopback TCP listening fd
@@ -101,6 +102,8 @@ _start:
     je .brokered_host_unix_scm_rights_bundle
     cmp $52, %al
     je .brokered_revocable_runtime_stream
+    cmp $53, %al
+    je .brokered_runtime_message_exchange
     cmp $49, %al
     je .bootstrap_execveat_one_shot
     cmp $50, %al
@@ -1399,6 +1402,124 @@ _start:
     syscall
 .brokered_revocable_runtime_stream_restore:
     add $160, %rsp
+    jmp .fail29
+
+
+.brokered_runtime_message_exchange:
+    sub $192, %rsp
+    mov $-1, %r12
+
+    # Publish post-exec readiness before the message endpoint grant.
+    movb $82, 175(%rsp)
+    mov $1, %eax
+    mov $10, %edi
+    lea 175(%rsp), %rsi
+    mov $1, %edx
+    syscall
+    cmp $1, %rax
+    jne .brokered_runtime_message_exchange_fail
+
+    # Receive exactly one SOCK_SEQPACKET endpoint through the existing
+    # single-FD SCM_RIGHTS broker ABI.
+    xor %eax, %eax
+    mov %rax, 0(%rsp)
+    mov %rax, 8(%rsp)
+    lea 64(%rsp), %rax
+    mov %rax, 16(%rsp)
+    movq $1, 24(%rsp)
+    lea 80(%rsp), %rax
+    mov %rax, 32(%rsp)
+    movq $24, 40(%rsp)
+    movq $0, 48(%rsp)
+    lea 176(%rsp), %rax
+    mov %rax, 64(%rsp)
+    movq $1, 72(%rsp)
+    movq $0, 80(%rsp)
+    movq $0, 88(%rsp)
+    movq $0, 96(%rsp)
+
+    mov $47, %eax
+    mov $10, %edi
+    mov %rsp, %rsi
+    mov $0x40000000, %edx
+    syscall
+    cmp $1, %rax
+    jne .brokered_runtime_message_exchange_fail
+    cmpb $70, 176(%rsp)
+    jne .brokered_runtime_message_exchange_fail
+    testl $8, 48(%rsp)
+    jne .brokered_runtime_message_exchange_fail
+    cmpq $20, 80(%rsp)
+    jne .brokered_runtime_message_exchange_fail
+    cmpl $1, 88(%rsp)
+    jne .brokered_runtime_message_exchange_fail
+    cmpl $1, 92(%rsp)
+    jne .brokered_runtime_message_exchange_fail
+    mov 96(%rsp), %r12d
+    test %r12d, %r12d
+    js .brokered_runtime_message_exchange_fail
+
+    # Send one packet request; SOCK_SEQPACKET preserves this boundary.
+    movq $0, 32(%rsp)
+    movq $0, 40(%rsp)
+    movq $0, 48(%rsp)
+    lea runtime_message_request(%rip), %rax
+    mov %rax, 64(%rsp)
+    movq $runtime_message_request_len, 72(%rsp)
+    mov $46, %eax
+    mov %r12d, %edi
+    mov %rsp, %rsi
+    mov $0x4000, %edx
+    syscall
+    cmp $runtime_message_request_len, %rax
+    jne .brokered_runtime_message_exchange_fail
+
+    # Receive exactly one response packet and reject truncation or byte drift.
+    lea 112(%rsp), %rax
+    mov %rax, 64(%rsp)
+    movq $64, 72(%rsp)
+    movq $0, 32(%rsp)
+    movq $0, 40(%rsp)
+    movq $0, 48(%rsp)
+    mov $47, %eax
+    mov %r12d, %edi
+    mov %rsp, %rsi
+    xor %edx, %edx
+    syscall
+    cmp $runtime_message_response_len, %rax
+    jne .brokered_runtime_message_exchange_fail
+    testl $0x20, 48(%rsp)
+    jne .brokered_runtime_message_exchange_fail
+    lea 112(%rsp), %rsi
+    lea runtime_message_response(%rip), %rdi
+    mov $runtime_message_response_len, %ecx
+    repe cmpsb
+    jne .brokered_runtime_message_exchange_fail
+
+    mov $3, %eax
+    mov %r12d, %edi
+    syscall
+    test %rax, %rax
+    js .brokered_runtime_message_exchange_fail
+    mov $-1, %r12
+
+    mov $3, %eax
+    mov $10, %edi
+    syscall
+    test %rax, %rax
+    js .brokered_runtime_message_exchange_fail
+    add $192, %rsp
+    xor %edi, %edi
+    jmp .exit
+
+.brokered_runtime_message_exchange_fail:
+    test %r12d, %r12d
+    js .brokered_runtime_message_exchange_restore
+    mov $3, %eax
+    mov %r12d, %edi
+    syscall
+.brokered_runtime_message_exchange_restore:
+    add $192, %rsp
     jmp .fail29
 
 .brokered_host_unix_scm_rights:
@@ -3311,6 +3432,12 @@ runtime_bundle_second:
 runtime_revocable_stream:
     .ascii "runtime-revocable-stream\n"
 .set runtime_revocable_stream_len, . - runtime_revocable_stream
+runtime_message_request:
+    .ascii "runtime-request\n"
+.set runtime_message_request_len, . - runtime_message_request
+runtime_message_response:
+    .ascii "runtime-response\n"
+.set runtime_message_response_len, . - runtime_message_response
 brokered_host_unix_reply:
     .ascii "host-unix-reply"
 .set brokered_host_unix_reply_len, . - brokered_host_unix_reply

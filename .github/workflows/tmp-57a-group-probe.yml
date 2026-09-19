@@ -26,8 +26,10 @@ jobs:
           gid="$(id -g)"
           subuid="$(awk -F: -v u="$(id -un)" '$1 == u { print $2; exit }' /etc/subuid)"
           subgid="$(awk -F: -v u="$(id -un)" '$1 == u { print $2; exit }' /etc/subgid)"
+          supplementary="$(id -G | tr ' ' '\n' | awk -v g="$gid" '$1 != g { print $1; exit }')"
           test -n "$subuid"
           test -n "$subgid"
+          test -n "$supplementary"
           cat >/tmp/group-map-probe.c <<'EOF'
           #define _GNU_SOURCE
           #include <errno.h>
@@ -46,13 +48,13 @@ jobs:
               exit(1);
           }
 
-          static int run_gid_map(pid_t pid, const char *host_gid) {
+          static int run_gid_map(pid_t pid, const char *host_gid, const char *extra_gid) {
               char pid_text[32];
               snprintf(pid_text, sizeof(pid_text), "%ld", (long)pid);
               pid_t helper = fork();
               if (helper < 0) die("fork helper");
               if (helper == 0) {
-                  execlp("newgidmap", "newgidmap", pid_text, "0", host_gid, "1", (char *)0);
+                  execlp("newgidmap", "newgidmap", pid_text, "0", host_gid, "1", "1", extra_gid, "1", (char *)0);
                   die("exec newgidmap");
               }
               int status = 0;
@@ -109,7 +111,7 @@ jobs:
               close(go[0]);
               char byte;
               if (read(ready[0], &byte, 1) != 1) die("ready read");
-              int grc = run_gid_map(child, argv[2]);
+              int grc = run_gid_map(child, argv[2], argv[3]);
               printf("newgidmap_rc=%d\n", grc);
               fflush(stdout);
               if (grc != 0) {
@@ -125,4 +127,4 @@ jobs:
           }
           EOF
           cc -Wall -Wextra -Werror /tmp/group-map-probe.c -o /tmp/group-map-probe
-          /tmp/group-map-probe "$uid" "$gid" "$subuid" "$subgid"
+          /tmp/group-map-probe "$uid" "$gid" "$supplementary" "$subgid"

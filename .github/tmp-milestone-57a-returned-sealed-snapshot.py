@@ -548,9 +548,15 @@ replace_one(
 
 replace_one(
     broker,
-    '''    impl RuntimeMessageExchangeController {
+    '''    #[derive(Debug)]
+    pub struct RuntimeMessageExchangeController;
+
+    impl RuntimeMessageExchangeController {
 ''',
-    '''    impl ReturnedSealedRuntimeSnapshot {
+    '''    #[derive(Debug)]
+    pub struct RuntimeMessageExchangeController;
+
+    impl ReturnedSealedRuntimeSnapshot {
         pub fn len(&self) -> u64 {
             0
         }

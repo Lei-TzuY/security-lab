@@ -890,7 +890,6 @@ fn sealed_snapshot_bundle_target_rejects_truncated_control() {
     std::fs::remove_dir_all(&root).unwrap();
 }
 
-
 #[test]
 fn bounded_runtime_message_exchange_is_one_shot_and_message_preserving() {
     let socket_path = unique_path("runtime-message-local.sock");
@@ -898,7 +897,9 @@ fn bounded_runtime_message_exchange_is_one_shot_and_message_preserving() {
     let broker = RuntimeFdBroker::bind(&socket_path).expect("bind runtime message broker");
     let mut client = UnixStream::connect(broker.path()).expect("connect runtime message client");
     let mut session = broker.accept().expect("accept runtime message client");
-    client.write_all(b"R").expect("publish runtime message readiness");
+    client
+        .write_all(b"R")
+        .expect("publish runtime message readiness");
     session.wait_for_ready(b'R').unwrap();
 
     let (grant, mut controller) =
@@ -1045,7 +1046,8 @@ fn runtime_message_exchange_poisoning_is_fail_closed_for_response_and_io_failure
     client.write_all(b"R").unwrap();
     session.wait_for_ready(b'R').unwrap();
 
-    let (grant, mut controller) = RuntimeFdBroker::prepare_runtime_message_exchange(16, 16).unwrap();
+    let (grant, mut controller) =
+        RuntimeFdBroker::prepare_runtime_message_exchange(16, 16).unwrap();
     session.send_runtime_message_channel(grant).unwrap();
     let endpoint = receive_one_fd(&client);
     assert_eq!(
@@ -1217,7 +1219,6 @@ fn revocable_runtime_stream_rejects_invalid_ceiling_and_poisoned_send_retry() {
     drop(broker);
 }
 
-
 #[test]
 fn bounded_runtime_message_exchange_reaches_real_target() {
     let root = build_probe_root();
@@ -1256,17 +1257,17 @@ fn bounded_runtime_message_exchange_reaches_real_target() {
     }
     session.send_runtime_message_channel(grant).unwrap();
 
-    assert_eq!(
-        controller.receive_request().unwrap(),
-        b"runtime-request\n"
-    );
+    assert_eq!(controller.receive_request().unwrap(), b"runtime-request\n");
     controller
         .send_response(b"runtime-response\n")
         .expect("send bounded runtime response");
     assert!(controller.is_complete());
 
     assert_eq!(
-        runner.join().expect("runtime message runner panicked").unwrap(),
+        runner
+            .join()
+            .expect("runtime message runner panicked")
+            .unwrap(),
         ChildOutcome::Exited(0)
     );
 

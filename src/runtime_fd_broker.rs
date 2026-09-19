@@ -327,7 +327,6 @@ mod imp {
         }
     }
 
-
     #[derive(Debug)]
     pub struct PreparedRuntimeMessageChannel {
         fd: RawFd,
@@ -705,7 +704,10 @@ mod imp {
             max_request_bytes: u64,
             max_response_bytes: u64,
         ) -> Result<
-            (PreparedRuntimeMessageChannel, RuntimeMessageExchangeController),
+            (
+                PreparedRuntimeMessageChannel,
+                RuntimeMessageExchangeController,
+            ),
             RuntimeFdBrokerError,
         > {
             prepare_runtime_message_exchange(max_request_bytes, max_response_bytes)
@@ -1203,12 +1205,14 @@ mod imp {
         ))
     }
 
-
     fn prepare_runtime_message_exchange(
         max_request_bytes: u64,
         max_response_bytes: u64,
     ) -> Result<
-        (PreparedRuntimeMessageChannel, RuntimeMessageExchangeController),
+        (
+            PreparedRuntimeMessageChannel,
+            RuntimeMessageExchangeController,
+        ),
         RuntimeFdBrokerError,
     > {
         if max_request_bytes == 0 || max_request_bytes > super::MAX_RUNTIME_MESSAGE_BYTES {
@@ -1512,7 +1516,10 @@ mod imp {
             _max_request_bytes: u64,
             _max_response_bytes: u64,
         ) -> Result<
-            (PreparedRuntimeMessageChannel, RuntimeMessageExchangeController),
+            (
+                PreparedRuntimeMessageChannel,
+                RuntimeMessageExchangeController,
+            ),
             RuntimeFdBrokerError,
         > {
             Err(RuntimeFdBrokerError::UnsupportedPlatform(

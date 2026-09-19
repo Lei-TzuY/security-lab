@@ -1,0 +1,24 @@
+name: probe supplementary group prerequisites
+
+on:
+  push:
+    branches: [tmp-57a-group-probe]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Inspect launcher credential prerequisites
+        run: |
+          id
+          printf 'groups='
+          id -G
+          grep '^Groups:' /proc/self/status || true
+          command -v newgidmap || true
+          printf '%s\n' '--- /etc/subgid ---'
+          cat /etc/subgid 2>/dev/null || true
+          printf '%s\n' '--- /etc/subuid ---'
+          cat /etc/subuid 2>/dev/null || true

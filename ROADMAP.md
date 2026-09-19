@@ -1451,7 +1451,7 @@ Boundary: 58A is a bounded **sequential** message lifecycle over one already-gra
 
 ### Slice 59A — launcher-owned bounded response-publication wait
 
-**Current verified candidate.** Closes the trusted controller's distinct blocking-send liveness gap under real peer receive-queue backpressure without changing target syscall authority or claiming target consumption.
+**Status: complete on `main`.** Closes the trusted controller's distinct blocking-send liveness gap under real peer receive-queue backpressure without changing target syscall authority or claiming target consumption.
 
 Acceptance evidence is executable:
 
@@ -1468,7 +1468,29 @@ Boundary: 59A bounds only the trusted controller's wait until the complete respo
 
 ### Milestone 59 promotion rule
 
-After 59A integrates, simple per-operation request/response wait bounds are sealed. Do not farm timeout values, deadline units, or duplicate send wrappers. Promote only to a materially different property such as one monotonic whole-session lifetime budget spanning multiple rounds, explicit correlation/multiplexing, authenticated application semantics, or another independent authority frontier.
+59A is sealed on `main`. Simple per-operation request/response wait bounds are complete at this laboratory scope; do not farm timeout values, deadline units, or duplicate send wrappers.
+
+## Milestone 60 — bounded multi-round session lifetime
+
+### Slice 60A — one non-resettable monotonic whole-session budget
+
+**Current verified candidate.** Adds one lifecycle-wide liveness bound across the existing bounded multi-round controller rather than another per-operation timeout variant.
+
+Acceptance evidence is executable:
+
+- `start_session_deadline(limit_milliseconds)` accepts 1–86,400,000 ms, must be called before the first request, and can be armed only once; invalid limits do not alter protocol state, while an already-armed deadline cannot be reset;
+- the controller owns one `timerfd(CLOCK_MONOTONIC, TFD_CLOEXEC|TFD_NONBLOCK)` for the remainder of the session, so round completion and `EINTR` never recreate or extend the lifetime budget;
+- while active, ordinary multi-round `receive_request()` and `send_response()` poll the existing private SOCK_SEQPACKET endpoint together with that same timer; per-operation request/response deadline methods are deliberately rejected instead of composing ambiguous independent clocks;
+- after the session timer becomes observably expired, expiration wins over a simultaneously queued request or writable response socket. The controller returns typed `RuntimeSessionTimedOut { limit_milliseconds }`, does not advance the round, and remains terminal for later ordinary or per-operation-deadline calls;
+- deterministic regressions complete an initial round, allow the persistent timer to expire, then prove a pre-queued second request cannot revive the session; a separate response-side regression proves an otherwise writable socket cannot publish after the lifetime budget has expired;
+- configuration regressions prove zero/above-maximum limits, reset attempts, and per-operation deadline mixing fail without silently disabling the active lifetime boundary;
+- exact candidate stable format/Clippy/full tests and the complete Rust 1.74 suite are green.
+
+Boundary: 60A starts its budget when the trusted caller explicitly invokes `start_session_deadline`, not at endpoint preparation, readiness, SCM_RIGHTS grant, or target exec. It bounds controller progress only when the next request/response operation observes the persistent timer; it is not a hard real-time cutoff, does not prove target response consumption/processing/acknowledgment, and does not add request IDs, concurrent in-flight operations, multiplexing, authentication, replay protection, or general RPC semantics.
+
+### Milestone 60 promotion rule
+
+After 60A integrates, request, response-publication, and whole-session time bounds are sealed. Do not farm reset modes, alternate units, clock aliases, or more timeout wrappers. Promote to a materially different protocol property such as explicit correlation/multiplexing, authenticated application semantics, or another independent authority frontier.
 
 ## Later frontiers
 

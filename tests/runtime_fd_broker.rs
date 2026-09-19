@@ -3,9 +3,10 @@
 use security_lab::{
     run, ChildOutcome, RuntimeFdBroker, RuntimeFdBrokerError, SandboxPolicy,
     MAX_RUNTIME_MESSAGE_BYTES, MAX_RUNTIME_MESSAGE_REQUEST_WAIT_MILLISECONDS,
-    MAX_RUNTIME_MULTI_MESSAGE_ROUNDS, MAX_RUNTIME_REVOCABLE_STREAM_BYTES,
-    MAX_RUNTIME_SEALED_BUNDLE_BYTES, MAX_RUNTIME_SEALED_BUNDLE_ITEMS,
-    MAX_RUNTIME_SEALED_SNAPSHOT_BYTES, MIN_RUNTIME_MULTI_MESSAGE_ROUNDS,
+    MAX_RUNTIME_MESSAGE_RESPONSE_WAIT_MILLISECONDS, MAX_RUNTIME_MULTI_MESSAGE_ROUNDS,
+    MAX_RUNTIME_REVOCABLE_STREAM_BYTES, MAX_RUNTIME_SEALED_BUNDLE_BYTES,
+    MAX_RUNTIME_SEALED_BUNDLE_ITEMS, MAX_RUNTIME_SEALED_SNAPSHOT_BYTES,
+    MIN_RUNTIME_MULTI_MESSAGE_ROUNDS,
 };
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
@@ -1316,6 +1317,121 @@ fn revocable_runtime_stream_rejects_invalid_ceiling_and_poisoned_send_retry() {
     drop(session);
     drop(client);
     drop(broker);
+}
+
+#[test]
+fn runtime_message_response_deadline_validates_bounds_without_consuming_request() {
+    let socket_path = unique_path("runtime-message-response-deadline-ready.sock");
+    let _ = std::fs::remove_file(&socket_path);
+    let broker = RuntimeFdBroker::bind(&socket_path).unwrap();
+    let mut client = UnixStream::connect(broker.path()).unwrap();
+    let mut session = broker.accept().unwrap();
+    client.write_all(b"R").unwrap();
+    session.wait_for_ready(b'R').unwrap();
+
+    let (grant, mut controller) =
+        RuntimeFdBroker::prepare_runtime_message_exchange(16, 16).unwrap();
+    session.send_runtime_message_channel(grant).unwrap();
+    let endpoint = receive_one_fd(&client);
+
+    assert_eq!(
+        unsafe {
+            libc::send(
+                endpoint.raw(),
+                b"request".as_ptr().cast::<libc::c_void>(),
+                7,
+                libc::MSG_NOSIGNAL,
+            )
+        },
+        7
+    );
+    assert_eq!(controller.receive_request().unwrap(), b"request");
+
+    assert!(matches!(
+        controller.send_response_with_deadline(b"ok", 0),
+        Err(RuntimeFdBrokerError::InvalidConfiguration(_))
+    ));
+    assert!(matches!(
+        controller
+            .send_response_with_deadline(b"ok", MAX_RUNTIME_MESSAGE_RESPONSE_WAIT_MILLISECONDS + 1),
+        Err(RuntimeFdBrokerError::InvalidConfiguration(_))
+    ));
+
+    controller.send_response_with_deadline(b"ok", 1000).unwrap();
+    let mut response = [0u8; 8];
+    assert_eq!(
+        unsafe {
+            libc::recv(
+                endpoint.raw(),
+                response.as_mut_ptr().cast::<libc::c_void>(),
+                response.len(),
+                0,
+            )
+        },
+        2
+    );
+    assert_eq!(&response[..2], b"ok");
+}
+
+#[test]
+fn runtime_multi_message_response_deadline_closes_on_real_backpressure() {
+    let socket_path = unique_path("runtime-multi-response-backpressure.sock");
+    let _ = std::fs::remove_file(&socket_path);
+    let broker = RuntimeFdBroker::bind(&socket_path).unwrap();
+    let mut client = UnixStream::connect(broker.path()).unwrap();
+    let mut session = broker.accept().unwrap();
+    client.write_all(b"R").unwrap();
+    session.wait_for_ready(b'R').unwrap();
+
+    let (grant, mut controller) = RuntimeFdBroker::prepare_runtime_multi_message_exchange(
+        1,
+        MAX_RUNTIME_MESSAGE_BYTES,
+        MAX_RUNTIME_MULTI_MESSAGE_ROUNDS,
+    )
+    .unwrap();
+    session.send_runtime_message_channel(grant).unwrap();
+    let endpoint = receive_one_fd(&client);
+    let response = vec![0x5au8; MAX_RUNTIME_MESSAGE_BYTES as usize];
+
+    let mut timed_out = None;
+    for round in 0..MAX_RUNTIME_MULTI_MESSAGE_ROUNDS {
+        assert_eq!(
+            unsafe {
+                libc::send(
+                    endpoint.raw(),
+                    b"x".as_ptr().cast::<libc::c_void>(),
+                    1,
+                    libc::MSG_NOSIGNAL,
+                )
+            },
+            1
+        );
+        assert_eq!(
+            controller.receive_request_with_deadline(1000).unwrap(),
+            b"x"
+        );
+
+        match controller.send_response_with_deadline(&response, 10) {
+            Ok(()) => {}
+            Err(RuntimeFdBrokerError::RuntimeResponseTimedOut { wait_milliseconds }) => {
+                assert_eq!(wait_milliseconds, 10);
+                timed_out = Some(round);
+                break;
+            }
+            Err(other) => panic!("unexpected response publication result: {other}"),
+        }
+    }
+
+    let timed_out_round = timed_out.expect(
+        "32 maximum-size unread response packets must create deterministic socket backpressure",
+    );
+    assert!(timed_out_round > 0);
+    assert!(controller.completed_rounds() < MAX_RUNTIME_MULTI_MESSAGE_ROUNDS);
+    assert!(!controller.is_complete());
+    assert!(matches!(
+        controller.receive_request(),
+        Err(RuntimeFdBrokerError::Protocol(message)) if message.contains("closed after")
+    ));
 }
 
 #[test]

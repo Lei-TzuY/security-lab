@@ -1429,7 +1429,7 @@ Boundary: 56B bounds only the trusted controller's blocking wait beginning when 
 
 ### Slice 58A — bounded sequential multi-round exchange
 
-**Current verified candidate.** Promotes the one-round request/response mechanism into a bounded sequential session without changing the existing target endpoint-grant authority.
+**Status: complete on `main`.** Promotes the one-round request/response mechanism into a bounded sequential session without changing the existing target endpoint-grant authority.
 
 Acceptance evidence is executable:
 
@@ -1445,7 +1445,30 @@ Boundary: 58A is a bounded **sequential** message lifecycle over one already-gra
 
 ### Milestone 58 promotion rule
 
-After 58A integrates, seal simple sequential round-count expansion. Do not farm larger round caps, per-round aliases, message tags, or timeout wrappers. A further runtime-protocol phase must add a materially different property such as explicit correlation/multiplexing, end-to-end session lifetime ownership, authenticated peer/application semantics, or another independent authority frontier with executable evidence.
+58A is sealed on `main`. Do not farm larger round caps, per-round aliases, message tags, or request-timeout wrappers. Further runtime work must close a distinct lifecycle/authority gap with executable evidence rather than repackage the same state machine.
+
+## Milestone 59 — bounded response publication liveness
+
+### Slice 59A — launcher-owned bounded response-publication wait
+
+**Current verified candidate.** Closes the trusted controller's distinct blocking-send liveness gap under real peer receive-queue backpressure without changing target syscall authority or claiming target consumption.
+
+Acceptance evidence is executable:
+
+- `send_response_with_deadline(bytes, wait_milliseconds)` is separate from the existing blocking `send_response()`; valid waits are 1–86,400,000 ms, while invalid bounds return `InvalidConfiguration` without consuming the already-received request state;
+- each bounded send creates launcher/controller-owned `timerfd(CLOCK_MONOTONIC, TFD_CLOEXEC|TFD_NONBLOCK)` state and polls the private response socket plus timer, so `EINTR` does not restart the deadline;
+- socket readiness is attempted before a simultaneously readable timer, but the final arbiter is an atomic `send(..., MSG_NOSIGNAL|MSG_DONTWAIT)`; `EAGAIN` is never treated as publication success and the loop retains the original timer state;
+- exact full-packet send completes the one-round controller; expiration returns typed `RuntimeResponseTimedOut { wait_milliseconds }`, and timer/poll/send ambiguity fails closed;
+- the multi-round wrapper exposes the same bounded publication operation and increments `completed_rounds` / reopens `AwaitingRequest` only after successful publication, so timeout cannot revive the session into another round;
+- deterministic broker integration performs the real readiness handshake and SCM_RIGHTS endpoint transfer, repeatedly sends one-byte requests while deliberately never draining maximum-size responses, and observes actual SOCK_SEQPACKET backpressure produce the typed publication timeout before the 32-round ceiling; the poisoned controller rejects later use;
+- a separate regression proves zero and above-maximum response wait bounds leave a valid received request usable, after which a 1,000 ms bounded publication succeeds and the peer reads exact response bytes;
+- exact candidate stable format/Clippy/full tests and the complete Rust 1.74 suite are green.
+
+Boundary: 59A bounds only the trusted controller's wait until the complete response packet is accepted into the peer socket's kernel receive queue. It does not prove target read, processing, acknowledgment, or application progress; it does not add an endpoint-grant-to-request deadline, target-side response deadline, whole-session lifetime bound, multiplexing, authentication, replay protection, or general RPC semantics.
+
+### Milestone 59 promotion rule
+
+After 59A integrates, simple per-operation request/response wait bounds are sealed. Do not farm timeout values, deadline units, or duplicate send wrappers. Promote only to a materially different property such as one monotonic whole-session lifetime budget spanning multiple rounds, explicit correlation/multiplexing, authenticated application semantics, or another independent authority frontier.
 
 ## Later frontiers
 

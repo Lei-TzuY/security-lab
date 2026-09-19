@@ -228,7 +228,7 @@ mod tests {
 
         assert_eq!(
             report_json(&report),
-            "{\"ok\":true,\"outcome\":{\"kind\":\"exited\",\"code\":7},\"stdout\":{\"encoding\":\"hex\",\"data\":\"0022ff\",\"truncated\":true},\"cow_diff\":null,\"reaped_descendants\":3,\"process_tree_usage\":{\"user_cpu_micros\":11,\"system_cpu_micros\":22,\"max_child_rss_kib\":33},\"enforcement\":{\"base_namespaces\":false,\"time_namespace_offsets\":false,\"hostname\":false,\"private_mount_propagation\":false,\"readonly_root\":false,\"copy_on_write_root\":false,\"chroot\":false,\"fd_sanitization\":false,\"private_procfs\":false,\"rlimits\":false,\"capabilities_reduced\":false,\"no_new_privs\":false,\"landlock\":false,\"seccomp\":false}}"
+            "{\"ok\":true,\"outcome\":{\"kind\":\"exited\",\"code\":7},\"stdout\":{\"encoding\":\"hex\",\"data\":\"0022ff\",\"truncated\":true},\"cow_diff\":null,\"reaped_descendants\":3,\"process_tree_usage\":{\"user_cpu_micros\":11,\"system_cpu_micros\":22,\"max_child_rss_kib\":33},\"enforcement\":{\"base_namespaces\":false,\"supplementary_groups_cleared\":false,\"time_namespace_offsets\":false,\"hostname\":false,\"private_mount_propagation\":false,\"readonly_root\":false,\"copy_on_write_root\":false,\"chroot\":false,\"fd_sanitization\":false,\"private_procfs\":false,\"rlimits\":false,\"capabilities_reduced\":false,\"no_new_privs\":false,\"landlock\":false,\"seccomp\":false}}"
         );
     }
 

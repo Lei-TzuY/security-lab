@@ -1391,7 +1391,7 @@ Boundary: 55A revokes only **future host-to-target byte supply** on one bounded 
 
 ### Slice 56A — one-shot request/response exchange
 
-**Current verified candidate.** Adds a materially different message-oriented runtime protocol property rather than extending the 55A byte stream.
+**Status: complete on `main`.** Adds a materially different message-oriented runtime protocol property rather than extending the 55A byte stream.
 
 Acceptance evidence is executable:
 
@@ -1403,11 +1403,27 @@ Acceptance evidence is executable:
 - the raw-syscall sandbox target explicitly grants `recvmsg` and `sendmsg`, publishes post-exec readiness, receives exactly one endpoint with `MSG_CMSG_CLOEXEC`, sends exact `runtime-request\n`, receives exact `runtime-response\n` with no `MSG_TRUNC`, and exits successfully;
 - exact candidate stable format/Clippy/full tests and the full Rust 1.74 suite are green.
 
-Boundary: 56A is one bounded target-to-host request followed by one bounded host-to-target response. It does not provide multiple rounds, multiplexing, streaming, message authentication, replay/ordering identifiers beyond the single kernel packet boundary, request cancellation, per-exchange deadlines, peer attestation, or a general long-lived RPC/control protocol.
+Boundary: 56A is one bounded target-to-host request followed by one bounded host-to-target response. It does not provide multiple rounds, multiplexing, streaming, message authentication, replay/ordering identifiers beyond the single kernel packet boundary, request cancellation, request-wait deadlines, peer attestation, or a general long-lived RPC/control protocol.
+
+### Slice 56B — launcher-owned bounded request wait
+
+**Current verified candidate.** Adds a lifecycle bound to the 56A controller without changing target syscall authority or turning the one-round exchange into a general RPC protocol.
+
+Acceptance evidence is executable:
+
+- `RuntimeMessageExchangeController::receive_request_with_deadline(wait_milliseconds)` accepts an explicit 1–86,400,000 ms bound while the existing `receive_request()` blocking semantics remain unchanged; zero or larger values fail as `InvalidConfiguration` without consuming an otherwise-awaiting exchange;
+- each bounded call creates and arms a launcher-owned `timerfd(CLOCK_MONOTONIC, TFD_CLOEXEC|TFD_NONBLOCK)`; the deadline therefore continues across interrupted `poll` calls instead of restarting after `EINTR`;
+- the controller polls only its private request socket and timer. When request/peer readiness and timer readiness are observed in the same poll cycle, socket readiness is handled first and the existing bounded `recvmsg` path remains the packet-versus-peer-shutdown arbiter;
+- an expired wait returns typed `RuntimeRequestTimedOut { wait_milliseconds }`, transitions the controller terminally to failed state, and later request/response attempts are rejected rather than reviving an ambiguous exchange; mandatory timer creation/arming/poll failure also fails closed, with `ENOSYS` reported as unsupported rather than falling back to an unbounded requested wait;
+- deterministic local regressions prove a 1 ms no-request timeout is terminal, invalid wait bounds do not consume protocol state, and a request already queued before a 1 ms bounded receive wins the documented request-first arbitration and completes normally;
+- the real raw-syscall sandbox request/response oracle now receives `runtime-request\n` through the 1,000 ms bounded API and returns the exact response while retaining the existing explicit target `recvmsg`/`sendmsg` policy;
+- exact candidate stable format/Clippy/full tests and the full Rust 1.74 suite are green.
+
+Boundary: 56B bounds only the trusted controller's blocking wait beginning when `receive_request_with_deadline()` is invoked. It is not an endpoint-grant-to-request or end-to-end API deadline, does not terminate the sandbox process tree, does not bound response computation/delivery, and does not add multiple rounds, multiplexing, authentication, cancellation, or peer attestation.
 
 ### Milestone 56 promotion rule
 
-After 56A integrates, do not farm packet sizes, extra message tags, or equivalent one-round wrappers. Promote only to a distinct runtime-capability lifecycle/protocol property with new executable evidence, or move to a different architectural frontier.
+After 56B integrates, seal this bounded one-round message-protocol phase. Do not farm deadline units, timeout values, packet sizes, message tags, or equivalent one-round wrappers. Further runtime-protocol work must add a materially different capability lifecycle or authority property with executable evidence; otherwise promote to another architectural frontier.
 
 ## Later frontiers
 

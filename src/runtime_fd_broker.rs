@@ -1194,6 +1194,11 @@ mod imp {
             wait_milliseconds: u64,
         ) -> Result<Vec<u8>, RuntimeFdBrokerError> {
             self.reject_after_round_limit()?;
+            if self.controller.state == RuntimeMessageExchangeState::Failed {
+                return Err(RuntimeFdBrokerError::Protocol(
+                    "runtime message exchange is closed after a protocol or I/O failure".to_owned(),
+                ));
+            }
             if self.session_deadline.is_some() {
                 return Err(RuntimeFdBrokerError::InvalidConfiguration(
                     "per-operation request deadlines cannot be combined with an active runtime multi-message session deadline".to_owned(),
@@ -1225,6 +1230,11 @@ mod imp {
             wait_milliseconds: u64,
         ) -> Result<(), RuntimeFdBrokerError> {
             self.reject_after_round_limit()?;
+            if self.controller.state == RuntimeMessageExchangeState::Failed {
+                return Err(RuntimeFdBrokerError::Protocol(
+                    "runtime message exchange is closed after a protocol or I/O failure".to_owned(),
+                ));
+            }
             if self.session_deadline.is_some() {
                 return Err(RuntimeFdBrokerError::InvalidConfiguration(
                     "per-operation response deadlines cannot be combined with an active runtime multi-message session deadline".to_owned(),

@@ -1565,6 +1565,10 @@ fn runtime_multi_message_session_deadline_spans_rounds_and_beats_queued_request(
         controller.receive_request(),
         Err(RuntimeFdBrokerError::Protocol(message)) if message.contains("closed after")
     ));
+    assert!(matches!(
+        controller.receive_request_with_deadline(1000),
+        Err(RuntimeFdBrokerError::Protocol(message)) if message.contains("closed after")
+    ));
 }
 
 #[test]
@@ -1605,6 +1609,10 @@ fn runtime_multi_message_session_deadline_also_bounds_response_publication() {
     assert!(!controller.is_complete());
     assert!(matches!(
         controller.send_response(b"retry"),
+        Err(RuntimeFdBrokerError::Protocol(message)) if message.contains("closed after")
+    ));
+    assert!(matches!(
+        controller.send_response_with_deadline(b"retry", 1000),
         Err(RuntimeFdBrokerError::Protocol(message)) if message.contains("closed after")
     ));
 }

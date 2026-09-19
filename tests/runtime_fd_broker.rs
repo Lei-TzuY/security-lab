@@ -2,7 +2,8 @@
 
 use security_lab::{
     run, ChildOutcome, RuntimeFdBroker, RuntimeFdBrokerError, SandboxPolicy,
-    MAX_RUNTIME_MESSAGE_BYTES, MAX_RUNTIME_REVOCABLE_STREAM_BYTES, MAX_RUNTIME_SEALED_BUNDLE_BYTES,
+    MAX_RUNTIME_MESSAGE_BYTES, MAX_RUNTIME_MESSAGE_REQUEST_WAIT_MILLISECONDS,
+    MAX_RUNTIME_REVOCABLE_STREAM_BYTES, MAX_RUNTIME_SEALED_BUNDLE_BYTES,
     MAX_RUNTIME_SEALED_BUNDLE_ITEMS, MAX_RUNTIME_SEALED_SNAPSHOT_BYTES,
 };
 use std::ffi::CString;
@@ -953,6 +954,103 @@ fn bounded_runtime_message_exchange_is_one_shot_and_message_preserving() {
 }
 
 #[test]
+fn runtime_message_request_deadline_times_out_and_poison_exchange() {
+    let socket_path = unique_path("runtime-message-deadline-timeout.sock");
+    let _ = std::fs::remove_file(&socket_path);
+    let broker = RuntimeFdBroker::bind(&socket_path).unwrap();
+    let mut client = UnixStream::connect(broker.path()).unwrap();
+    let mut session = broker.accept().unwrap();
+    client.write_all(b"R").unwrap();
+    session.wait_for_ready(b'R').unwrap();
+
+    let (grant, mut controller) =
+        RuntimeFdBroker::prepare_runtime_message_exchange(16, 16).unwrap();
+    session.send_runtime_message_channel(grant).unwrap();
+    let endpoint = receive_one_fd(&client);
+
+    assert!(matches!(
+        controller.receive_request_with_deadline(1),
+        Err(RuntimeFdBrokerError::RuntimeRequestTimedOut {
+            wait_milliseconds: 1
+        })
+    ));
+    assert!(matches!(
+        controller.receive_request(),
+        Err(RuntimeFdBrokerError::Protocol(message)) if message.contains("closed after")
+    ));
+    assert!(matches!(
+        controller.send_response(b"late"),
+        Err(RuntimeFdBrokerError::Protocol(message)) if message.contains("closed after")
+    ));
+
+    drop(endpoint);
+    drop(session);
+    drop(client);
+    drop(broker);
+}
+
+#[test]
+fn runtime_message_request_deadline_validates_bounds_without_consuming_ready_request() {
+    let socket_path = unique_path("runtime-message-deadline-ready.sock");
+    let _ = std::fs::remove_file(&socket_path);
+    let broker = RuntimeFdBroker::bind(&socket_path).unwrap();
+    let mut client = UnixStream::connect(broker.path()).unwrap();
+    let mut session = broker.accept().unwrap();
+    client.write_all(b"R").unwrap();
+    session.wait_for_ready(b'R').unwrap();
+
+    let (grant, mut controller) =
+        RuntimeFdBroker::prepare_runtime_message_exchange(64, 64).unwrap();
+    session.send_runtime_message_channel(grant).unwrap();
+    let endpoint = receive_one_fd(&client);
+
+    assert!(matches!(
+        controller.receive_request_with_deadline(0),
+        Err(RuntimeFdBrokerError::InvalidConfiguration(_))
+    ));
+    assert!(matches!(
+        controller.receive_request_with_deadline(MAX_RUNTIME_MESSAGE_REQUEST_WAIT_MILLISECONDS + 1),
+        Err(RuntimeFdBrokerError::InvalidConfiguration(_))
+    ));
+
+    let request = b"queued-before-deadline
+";
+    assert_eq!(
+        unsafe {
+            libc::send(
+                endpoint.raw(),
+                request.as_ptr().cast::<libc::c_void>(),
+                request.len(),
+                libc::MSG_NOSIGNAL,
+            )
+        },
+        request.len() as isize
+    );
+    assert_eq!(
+        controller.receive_request_with_deadline(1).unwrap(),
+        request
+    );
+    controller.send_response(b"ok").unwrap();
+
+    let mut response = [0u8; 8];
+    let received = unsafe {
+        libc::recv(
+            endpoint.raw(),
+            response.as_mut_ptr().cast::<libc::c_void>(),
+            response.len(),
+            0,
+        )
+    };
+    assert_eq!(received, 2);
+    assert_eq!(&response[..2], b"ok");
+
+    drop(endpoint);
+    drop(session);
+    drop(client);
+    drop(broker);
+}
+
+#[test]
 fn runtime_message_exchange_rejects_invalid_bounds_and_oversized_request() {
     assert!(matches!(
         RuntimeFdBroker::prepare_runtime_message_exchange(0, 1),
@@ -1257,7 +1355,10 @@ fn bounded_runtime_message_exchange_reaches_real_target() {
     }
     session.send_runtime_message_channel(grant).unwrap();
 
-    assert_eq!(controller.receive_request().unwrap(), b"runtime-request\n");
+    assert_eq!(
+        controller.receive_request_with_deadline(1000).unwrap(),
+        b"runtime-request\n"
+    );
     controller
         .send_response(b"runtime-response\n")
         .expect("send bounded runtime response");

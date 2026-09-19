@@ -716,7 +716,9 @@ fn failed_bundle_send_poison_session_against_retry() {
     session
         .wait_for_ready(b'R')
         .expect("consume failure readiness");
-    drop(client);
+    client
+        .shutdown(std::net::Shutdown::Read)
+        .expect("explicit bundle peer read shutdown");
 
     let bundle = RuntimeFdBroker::prepare_sealed_snapshot_bundle(
         vec![
@@ -738,6 +740,7 @@ fn failed_bundle_send_poison_session_against_retry() {
     ));
 
     drop(session);
+    drop(client);
     drop(broker);
     std::fs::remove_file(&first_path).expect("remove first failure source");
     std::fs::remove_file(&second_path).expect("remove second failure source");

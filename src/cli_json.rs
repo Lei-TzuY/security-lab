@@ -53,10 +53,7 @@ pub(crate) fn report_json(report: &RunReport) -> String {
     output.push_str("},\"enforcement\":{\"base_namespaces\":");
     push_bool(&mut output, report.enforcement.base_namespaces);
     output.push_str(",\"supplementary_groups_cleared\":");
-    push_bool(
-        &mut output,
-        report.enforcement.supplementary_groups_cleared,
-    );
+    push_bool(&mut output, report.enforcement.supplementary_groups_cleared);
     output.push_str(",\"time_namespace_offsets\":");
     push_bool(&mut output, report.enforcement.time_namespace_offsets);
     output.push_str(",\"hostname\":");

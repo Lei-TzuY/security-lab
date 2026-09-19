@@ -12,6 +12,7 @@ pub const MAX_RUNTIME_SEALED_BUNDLE_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_RUNTIME_REVOCABLE_STREAM_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_RUNTIME_MESSAGE_BYTES: u64 = 64 * 1024;
 pub const MAX_RUNTIME_MESSAGE_REQUEST_WAIT_MILLISECONDS: u64 = 86_400_000;
+pub const MAX_RUNTIME_MESSAGE_RESPONSE_WAIT_MILLISECONDS: u64 = 86_400_000;
 pub const MIN_RUNTIME_MULTI_MESSAGE_ROUNDS: u32 = 2;
 pub const MAX_RUNTIME_MULTI_MESSAGE_ROUNDS: u32 = 32;
 
@@ -39,6 +40,9 @@ pub enum RuntimeFdBrokerError {
         max_bytes: u64,
     },
     RuntimeRequestTimedOut {
+        wait_milliseconds: u64,
+    },
+    RuntimeResponseTimedOut {
         wait_milliseconds: u64,
     },
     UnexpectedPeer {
@@ -98,6 +102,10 @@ impl fmt::Display for RuntimeFdBrokerError {
             Self::RuntimeRequestTimedOut { wait_milliseconds } => write!(
                 f,
                 "runtime FD broker request wait exceeded {wait_milliseconds} ms"
+            ),
+            Self::RuntimeResponseTimedOut { wait_milliseconds } => write!(
+                f,
+                "runtime FD broker response publication wait exceeded {wait_milliseconds} ms"
             ),
             Self::UnexpectedPeer {
                 expected_pid,
@@ -440,6 +448,65 @@ mod imp {
         }
     }
 
+    #[derive(Debug)]
+    struct ResponseDeadlineTimer {
+        fd: RawFd,
+    }
+
+    impl ResponseDeadlineTimer {
+        fn new(wait_milliseconds: u64) -> Result<Self, RuntimeFdBrokerError> {
+            let fd = unsafe {
+                libc::timerfd_create(
+                    libc::CLOCK_MONOTONIC,
+                    libc::TFD_CLOEXEC | libc::TFD_NONBLOCK,
+                )
+            };
+            if fd == -1 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::ENOSYS) {
+                    return Err(RuntimeFdBrokerError::UnsupportedPlatform(
+                        "runtime message response publication deadlines require timerfd".to_owned(),
+                    ));
+                }
+                return Err(RuntimeFdBrokerError::io(
+                    "cannot create runtime message response publication deadline timer",
+                    error,
+                ));
+            }
+
+            let spec = libc::itimerspec {
+                it_interval: libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: 0,
+                },
+                it_value: libc::timespec {
+                    tv_sec: (wait_milliseconds / 1000) as libc::time_t,
+                    tv_nsec: ((wait_milliseconds % 1000) * 1_000_000) as libc::c_long,
+                },
+            };
+            if unsafe { libc::timerfd_settime(fd, 0, &spec, std::ptr::null_mut()) } == -1 {
+                let error = std::io::Error::last_os_error();
+                unsafe {
+                    libc::close(fd);
+                }
+                return Err(RuntimeFdBrokerError::io(
+                    "cannot arm runtime message response publication deadline timer",
+                    error,
+                ));
+            }
+
+            Ok(Self { fd })
+        }
+    }
+
+    impl Drop for ResponseDeadlineTimer {
+        fn drop(&mut self) {
+            unsafe {
+                libc::close(self.fd);
+            }
+        }
+    }
+
     impl RuntimeMessageExchangeController {
         pub fn is_complete(&self) -> bool {
             self.state == RuntimeMessageExchangeState::Complete
@@ -609,6 +676,37 @@ mod imp {
         /// SOCK_SEQPACKET send. Any invalid response or send failure makes the
         /// controller terminal; success completes the only permitted round.
         pub fn send_response(&mut self, bytes: &[u8]) -> Result<(), RuntimeFdBrokerError> {
+            self.send_response_inner(bytes, None)
+        }
+
+        /// Send one response packet while bounding only publication into the
+        /// peer socket's kernel receive queue.
+        ///
+        /// The timeout starts at this method call and does not claim that the
+        /// target has read or processed the response. Socket writability wins
+        /// over a simultaneously readable timer, but the actual atomic
+        /// MSG_DONTWAIT send remains the arbiter when readiness races.
+        pub fn send_response_with_deadline(
+            &mut self,
+            bytes: &[u8],
+            wait_milliseconds: u64,
+        ) -> Result<(), RuntimeFdBrokerError> {
+            if !(1..=super::MAX_RUNTIME_MESSAGE_RESPONSE_WAIT_MILLISECONDS)
+                .contains(&wait_milliseconds)
+            {
+                return Err(RuntimeFdBrokerError::InvalidConfiguration(format!(
+                    "runtime message response publication wait must be between 1 and {} milliseconds",
+                    super::MAX_RUNTIME_MESSAGE_RESPONSE_WAIT_MILLISECONDS
+                )));
+            }
+            self.send_response_inner(bytes, Some(wait_milliseconds))
+        }
+
+        fn send_response_inner(
+            &mut self,
+            bytes: &[u8],
+            wait_milliseconds: Option<u64>,
+        ) -> Result<(), RuntimeFdBrokerError> {
             if self.state != RuntimeMessageExchangeState::RequestReceived {
                 let message = match self.state {
                     RuntimeMessageExchangeState::AwaitingRequest => {
@@ -635,6 +733,10 @@ mod imp {
                 return Err(RuntimeFdBrokerError::RuntimeResponseTooLarge {
                     max_bytes: self.max_response_bytes,
                 });
+            }
+
+            if let Some(wait_milliseconds) = wait_milliseconds {
+                return self.send_response_with_timer(bytes, wait_milliseconds);
             }
 
             loop {
@@ -665,6 +767,111 @@ mod imp {
                 }
                 self.state = RuntimeMessageExchangeState::Complete;
                 return Ok(());
+            }
+        }
+
+        fn send_response_with_timer(
+            &mut self,
+            bytes: &[u8],
+            wait_milliseconds: u64,
+        ) -> Result<(), RuntimeFdBrokerError> {
+            let timer = match ResponseDeadlineTimer::new(wait_milliseconds) {
+                Ok(timer) => timer,
+                Err(error) => {
+                    self.state = RuntimeMessageExchangeState::Failed;
+                    return Err(error);
+                }
+            };
+            let mut fds = [
+                libc::pollfd {
+                    fd: self.fd,
+                    events: libc::POLLOUT | libc::POLLERR | libc::POLLHUP,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: timer.fd,
+                    events: libc::POLLIN | libc::POLLERR | libc::POLLHUP,
+                    revents: 0,
+                },
+            ];
+
+            loop {
+                fds[0].revents = 0;
+                fds[1].revents = 0;
+                let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
+                if ready == -1 {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() == Some(libc::EINTR) {
+                        continue;
+                    }
+                    self.state = RuntimeMessageExchangeState::Failed;
+                    return Err(RuntimeFdBrokerError::io(
+                        "cannot poll runtime message response publication deadline",
+                        error,
+                    ));
+                }
+
+                // Socket readiness wins over a simultaneously readable timer.
+                // MSG_DONTWAIT makes the atomic send itself the final race arbiter.
+                if fds[0].revents != 0 {
+                    let sent = unsafe {
+                        libc::send(
+                            self.fd,
+                            bytes.as_ptr().cast::<libc::c_void>(),
+                            bytes.len(),
+                            libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT,
+                        )
+                    };
+                    if sent == bytes.len() as isize {
+                        self.state = RuntimeMessageExchangeState::Complete;
+                        return Ok(());
+                    }
+                    if sent == -1 {
+                        let error = std::io::Error::last_os_error();
+                        if error.raw_os_error() == Some(libc::EINTR) {
+                            continue;
+                        }
+                        if error.raw_os_error() == Some(libc::EAGAIN) {
+                            if fds[1].revents & libc::POLLIN != 0 {
+                                self.state = RuntimeMessageExchangeState::Failed;
+                                return Err(RuntimeFdBrokerError::RuntimeResponseTimedOut {
+                                    wait_milliseconds,
+                                });
+                            }
+                            if fds[1].revents != 0 {
+                                self.state = RuntimeMessageExchangeState::Failed;
+                                return Err(RuntimeFdBrokerError::Protocol(
+                                    "runtime message response deadline timer became unusable"
+                                        .to_owned(),
+                                ));
+                            }
+                            continue;
+                        }
+                        self.state = RuntimeMessageExchangeState::Failed;
+                        return Err(RuntimeFdBrokerError::io(
+                            "cannot send runtime message response",
+                            error,
+                        ));
+                    }
+
+                    self.state = RuntimeMessageExchangeState::Failed;
+                    return Err(RuntimeFdBrokerError::Protocol(format!(
+                        "runtime message response sent unexpected packet length {sent}"
+                    )));
+                }
+
+                if fds[1].revents & libc::POLLIN != 0 {
+                    self.state = RuntimeMessageExchangeState::Failed;
+                    return Err(RuntimeFdBrokerError::RuntimeResponseTimedOut {
+                        wait_milliseconds,
+                    });
+                }
+                if fds[1].revents != 0 {
+                    self.state = RuntimeMessageExchangeState::Failed;
+                    return Err(RuntimeFdBrokerError::Protocol(
+                        "runtime message response deadline timer became unusable".to_owned(),
+                    ));
+                }
             }
         }
     }
@@ -708,11 +915,27 @@ mod imp {
         pub fn send_response(&mut self, bytes: &[u8]) -> Result<(), RuntimeFdBrokerError> {
             self.reject_after_round_limit()?;
             self.controller.send_response(bytes)?;
+            self.complete_response_round();
+            Ok(())
+        }
+
+        pub fn send_response_with_deadline(
+            &mut self,
+            bytes: &[u8],
+            wait_milliseconds: u64,
+        ) -> Result<(), RuntimeFdBrokerError> {
+            self.reject_after_round_limit()?;
+            self.controller
+                .send_response_with_deadline(bytes, wait_milliseconds)?;
+            self.complete_response_round();
+            Ok(())
+        }
+
+        fn complete_response_round(&mut self) {
             self.completed_rounds += 1;
             if self.completed_rounds < self.max_rounds {
                 self.controller.state = RuntimeMessageExchangeState::AwaitingRequest;
             }
-            Ok(())
         }
     }
 
@@ -1688,6 +1911,17 @@ mod imp {
                 "runtime multi-message exchanges currently require Linux x86_64".to_owned(),
             ))
         }
+
+        pub fn send_response_with_deadline(
+            &mut self,
+            _bytes: &[u8],
+            _wait_milliseconds: u64,
+        ) -> Result<(), RuntimeFdBrokerError> {
+            Err(RuntimeFdBrokerError::UnsupportedPlatform(
+                "runtime multi-message response deadlines currently require Linux x86_64"
+                    .to_owned(),
+            ))
+        }
     }
 
     impl RuntimeMessageExchangeController {
@@ -1713,6 +1947,16 @@ mod imp {
         pub fn send_response(&mut self, _bytes: &[u8]) -> Result<(), RuntimeFdBrokerError> {
             Err(RuntimeFdBrokerError::UnsupportedPlatform(
                 "runtime message exchanges currently require Linux x86_64".to_owned(),
+            ))
+        }
+
+        pub fn send_response_with_deadline(
+            &mut self,
+            _bytes: &[u8],
+            _wait_milliseconds: u64,
+        ) -> Result<(), RuntimeFdBrokerError> {
+            Err(RuntimeFdBrokerError::UnsupportedPlatform(
+                "runtime message response deadlines currently require Linux x86_64".to_owned(),
             ))
         }
     }

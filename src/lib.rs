@@ -46,7 +46,8 @@ pub use runtime_fd_broker::{
     PreparedReadOnlyRegularFile, PreparedRevocableByteStream, PreparedRuntimeMessageChannel,
     PreparedSealedRegularFileSnapshot, PreparedSealedSnapshotBundle, RevocableByteStreamController,
     RuntimeFdBroker, RuntimeFdBrokerError, RuntimeFdSession, RuntimeMessageExchangeController,
-    MAX_RUNTIME_MESSAGE_BYTES, MAX_RUNTIME_REVOCABLE_STREAM_BYTES, MAX_RUNTIME_SEALED_BUNDLE_BYTES,
+    MAX_RUNTIME_MESSAGE_BYTES, MAX_RUNTIME_MESSAGE_REQUEST_WAIT_MILLISECONDS,
+    MAX_RUNTIME_REVOCABLE_STREAM_BYTES, MAX_RUNTIME_SEALED_BUNDLE_BYTES,
     MAX_RUNTIME_SEALED_BUNDLE_ITEMS, MAX_RUNTIME_SEALED_SNAPSHOT_BYTES,
     MIN_RUNTIME_SEALED_BUNDLE_ITEMS,
 };

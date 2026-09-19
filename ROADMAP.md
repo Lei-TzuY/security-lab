@@ -1368,7 +1368,7 @@ Boundary: 54A bounds and orders one sender-side multi-FD ancillary message; it i
 
 ### Slice 55A — bounded revocable runtime byte stream
 
-**Current verified candidate.** Adds an explicit runtime-capability lifetime property rather than another immutable-file or multi-FD handoff variant.
+**Status: complete on `main`.** Adds an explicit runtime-capability lifetime property rather than another immutable-file or multi-FD handoff variant.
 
 Acceptance evidence is executable:
 
@@ -1385,7 +1385,29 @@ Boundary: 55A revokes only **future host-to-target byte supply** on one bounded 
 
 ### Milestone 55 promotion rule
 
-After 55A integrates, do not farm stream byte ceilings, extra EOF spellings, or equivalent one-way socket wrappers. Promote to a materially different runtime-capability lifecycle or protocol property only when it has a distinct kernel mechanism and executable evidence.
+55A is sealed on `main`; do not farm stream byte ceilings, extra EOF spellings, or equivalent one-way socket wrappers.
+
+## Milestone 56 — bounded runtime message protocol
+
+### Slice 56A — one-shot request/response exchange
+
+**Current verified candidate.** Adds a materially different message-oriented runtime protocol property rather than extending the 55A byte stream.
+
+Acceptance evidence is executable:
+
+- `prepare_runtime_message_exchange(max_request_bytes, max_response_bytes)` requires independent 1-byte through 64-KiB ceilings and creates one private `AF_UNIX/SOCK_SEQPACKET|SOCK_CLOEXEC` pair, giving kernel-preserved packet boundaries in both directions;
+- the target endpoint reuses the existing exact-peer, post-exec readiness gate and one-successful-grant `RuntimeFdSession` transition; no new target syscall is silently added;
+- `RuntimeMessageExchangeController::receive_request()` accepts exactly one non-empty packet, uses a bounded buffer plus `MSG_TRUNC` evidence to reject oversized requests, and makes empty/closed-peer, truncation, and I/O failure terminal;
+- `send_response()` is legal only after a valid request, rejects an empty or over-budget complete response before send, uses `MSG_NOSIGNAL`, and makes any send failure terminal; one successful response completes the controller and later request/response calls are rejected;
+- local regressions prove exact request/response bytes, preserved one-message boundaries, invalid configuration rejection, oversized-request failure, oversized-response failure, one-round lifecycle, and I/O-failure poisoning;
+- the raw-syscall sandbox target explicitly grants `recvmsg` and `sendmsg`, publishes post-exec readiness, receives exactly one endpoint with `MSG_CMSG_CLOEXEC`, sends exact `runtime-request\n`, receives exact `runtime-response\n` with no `MSG_TRUNC`, and exits successfully;
+- exact candidate stable format/Clippy/full tests and the full Rust 1.74 suite are green.
+
+Boundary: 56A is one bounded target-to-host request followed by one bounded host-to-target response. It does not provide multiple rounds, multiplexing, streaming, message authentication, replay/ordering identifiers beyond the single kernel packet boundary, request cancellation, per-exchange deadlines, peer attestation, or a general long-lived RPC/control protocol.
+
+### Milestone 56 promotion rule
+
+After 56A integrates, do not farm packet sizes, extra message tags, or equivalent one-round wrappers. Promote only to a distinct runtime-capability lifecycle/protocol property with new executable evidence, or move to a different architectural frontier.
 
 ## Later frontiers
 

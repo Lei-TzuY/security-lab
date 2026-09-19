@@ -477,11 +477,8 @@ cmsg_insert = '''    fn cmsg_space_for_fd_count(count: usize) -> usize {
                 )));
             }
 
-            let parsed = parse_received_rights(&control, message.msg_controllen);
-            let (rights, cmsg_count) = match parsed {
-                Ok(parsed) => parsed,
-                Err(error) => return Err(error),
-            };
+            let (rights, cmsg_count) =
+                parse_received_rights(&control, message.msg_controllen)?;
             let fail = |rights: Vec<RawFd>, message: String| {
                 close_fds(&rights);
                 RuntimeFdBrokerError::Protocol(message)

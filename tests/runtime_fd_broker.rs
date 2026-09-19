@@ -2,7 +2,7 @@
 
 use security_lab::{
     run, ChildOutcome, RuntimeFdBroker, RuntimeFdBrokerError, SandboxPolicy,
-    MAX_RUNTIME_REVOCABLE_STREAM_BYTES, MAX_RUNTIME_SEALED_BUNDLE_BYTES,
+    MAX_RUNTIME_MESSAGE_BYTES, MAX_RUNTIME_REVOCABLE_STREAM_BYTES, MAX_RUNTIME_SEALED_BUNDLE_BYTES,
     MAX_RUNTIME_SEALED_BUNDLE_ITEMS, MAX_RUNTIME_SEALED_SNAPSHOT_BYTES,
 };
 use std::ffi::CString;
@@ -891,6 +891,194 @@ fn sealed_snapshot_bundle_target_rejects_truncated_control() {
 }
 
 #[test]
+fn bounded_runtime_message_exchange_is_one_shot_and_message_preserving() {
+    let socket_path = unique_path("runtime-message-local.sock");
+    let _ = std::fs::remove_file(&socket_path);
+    let broker = RuntimeFdBroker::bind(&socket_path).expect("bind runtime message broker");
+    let mut client = UnixStream::connect(broker.path()).expect("connect runtime message client");
+    let mut session = broker.accept().expect("accept runtime message client");
+    client
+        .write_all(b"R")
+        .expect("publish runtime message readiness");
+    session.wait_for_ready(b'R').unwrap();
+
+    let (grant, mut controller) =
+        RuntimeFdBroker::prepare_runtime_message_exchange(64, 64).unwrap();
+    session.send_runtime_message_channel(grant).unwrap();
+    let endpoint = receive_one_fd(&client);
+
+    let request = b"runtime-request\n";
+    assert_eq!(
+        unsafe {
+            libc::send(
+                endpoint.raw(),
+                request.as_ptr().cast::<libc::c_void>(),
+                request.len(),
+                libc::MSG_NOSIGNAL,
+            )
+        },
+        request.len() as isize
+    );
+    assert_eq!(controller.receive_request().unwrap(), request);
+
+    let response = b"runtime-response\n";
+    controller.send_response(response).unwrap();
+    assert!(controller.is_complete());
+
+    let mut received = [0u8; 64];
+    let count = unsafe {
+        libc::recv(
+            endpoint.raw(),
+            received.as_mut_ptr().cast::<libc::c_void>(),
+            received.len(),
+            0,
+        )
+    };
+    assert_eq!(count, response.len() as isize);
+    assert_eq!(&received[..count as usize], response);
+
+    assert!(matches!(
+        controller.receive_request(),
+        Err(RuntimeFdBrokerError::Protocol(message)) if message.contains("exactly one")
+    ));
+    assert!(matches!(
+        controller.send_response(b"second"),
+        Err(RuntimeFdBrokerError::Protocol(message)) if message.contains("exactly one")
+    ));
+
+    drop(endpoint);
+    drop(session);
+    drop(client);
+    drop(broker);
+}
+
+#[test]
+fn runtime_message_exchange_rejects_invalid_bounds_and_oversized_request() {
+    assert!(matches!(
+        RuntimeFdBroker::prepare_runtime_message_exchange(0, 1),
+        Err(RuntimeFdBrokerError::InvalidConfiguration(_))
+    ));
+    assert!(matches!(
+        RuntimeFdBroker::prepare_runtime_message_exchange(1, MAX_RUNTIME_MESSAGE_BYTES + 1),
+        Err(RuntimeFdBrokerError::InvalidConfiguration(_))
+    ));
+
+    let socket_path = unique_path("runtime-message-request-too-large.sock");
+    let _ = std::fs::remove_file(&socket_path);
+    let broker = RuntimeFdBroker::bind(&socket_path).unwrap();
+    let mut client = UnixStream::connect(broker.path()).unwrap();
+    let mut session = broker.accept().unwrap();
+    client.write_all(b"R").unwrap();
+    session.wait_for_ready(b'R').unwrap();
+
+    let (grant, mut controller) = RuntimeFdBroker::prepare_runtime_message_exchange(4, 4).unwrap();
+    session.send_runtime_message_channel(grant).unwrap();
+    let endpoint = receive_one_fd(&client);
+    assert_eq!(
+        unsafe {
+            libc::send(
+                endpoint.raw(),
+                b"12345".as_ptr().cast::<libc::c_void>(),
+                5,
+                libc::MSG_NOSIGNAL,
+            )
+        },
+        5
+    );
+    assert!(matches!(
+        controller.receive_request(),
+        Err(RuntimeFdBrokerError::RuntimeRequestTooLarge { max_bytes }) if max_bytes == 4
+    ));
+    assert!(matches!(
+        controller.send_response(b"ok"),
+        Err(RuntimeFdBrokerError::Protocol(message)) if message.contains("closed after")
+    ));
+
+    drop(endpoint);
+    drop(session);
+    drop(client);
+    drop(broker);
+}
+
+#[test]
+fn runtime_message_exchange_poisoning_is_fail_closed_for_response_and_io_failure() {
+    let socket_path = unique_path("runtime-message-response-too-large.sock");
+    let _ = std::fs::remove_file(&socket_path);
+    let broker = RuntimeFdBroker::bind(&socket_path).unwrap();
+    let mut client = UnixStream::connect(broker.path()).unwrap();
+    let mut session = broker.accept().unwrap();
+    client.write_all(b"R").unwrap();
+    session.wait_for_ready(b'R').unwrap();
+
+    let (grant, mut controller) = RuntimeFdBroker::prepare_runtime_message_exchange(16, 4).unwrap();
+    session.send_runtime_message_channel(grant).unwrap();
+    let endpoint = receive_one_fd(&client);
+    assert_eq!(
+        unsafe {
+            libc::send(
+                endpoint.raw(),
+                b"request".as_ptr().cast::<libc::c_void>(),
+                7,
+                libc::MSG_NOSIGNAL,
+            )
+        },
+        7
+    );
+    assert_eq!(controller.receive_request().unwrap(), b"request");
+    assert!(matches!(
+        controller.send_response(b"12345"),
+        Err(RuntimeFdBrokerError::RuntimeResponseTooLarge { max_bytes }) if max_bytes == 4
+    ));
+    assert!(matches!(
+        controller.send_response(b"ok"),
+        Err(RuntimeFdBrokerError::Protocol(message)) if message.contains("closed after")
+    ));
+    drop(endpoint);
+    drop(session);
+    drop(client);
+    drop(broker);
+
+    let socket_path = unique_path("runtime-message-io-failure.sock");
+    let _ = std::fs::remove_file(&socket_path);
+    let broker = RuntimeFdBroker::bind(&socket_path).unwrap();
+    let mut client = UnixStream::connect(broker.path()).unwrap();
+    let mut session = broker.accept().unwrap();
+    client.write_all(b"R").unwrap();
+    session.wait_for_ready(b'R').unwrap();
+
+    let (grant, mut controller) =
+        RuntimeFdBroker::prepare_runtime_message_exchange(16, 16).unwrap();
+    session.send_runtime_message_channel(grant).unwrap();
+    let endpoint = receive_one_fd(&client);
+    assert_eq!(
+        unsafe {
+            libc::send(
+                endpoint.raw(),
+                b"request".as_ptr().cast::<libc::c_void>(),
+                7,
+                libc::MSG_NOSIGNAL,
+            )
+        },
+        7
+    );
+    assert_eq!(controller.receive_request().unwrap(), b"request");
+    assert_eq!(unsafe { libc::shutdown(endpoint.raw(), libc::SHUT_RD) }, 0);
+    assert!(matches!(
+        controller.send_response(b"response"),
+        Err(RuntimeFdBrokerError::Io { .. })
+    ));
+    assert!(matches!(
+        controller.send_response(b"retry"),
+        Err(RuntimeFdBrokerError::Protocol(message)) if message.contains("closed after")
+    ));
+
+    drop(endpoint);
+    drop(session);
+    drop(client);
+    drop(broker);
+}
+
+#[test]
 fn revocable_runtime_stream_is_receive_only_bounded_and_revokes_to_eof() {
     let socket_path = unique_path("runtime-revocable-local.sock");
     let _ = std::fs::remove_file(&socket_path);
@@ -1029,6 +1217,63 @@ fn revocable_runtime_stream_rejects_invalid_ceiling_and_poisoned_send_retry() {
     drop(session);
     drop(client);
     drop(broker);
+}
+
+#[test]
+fn bounded_runtime_message_exchange_reaches_real_target() {
+    let root = build_probe_root();
+    let socket_path = unique_path("runtime-message-sandbox.sock");
+    let _ = std::fs::remove_file(&socket_path);
+    let broker = RuntimeFdBroker::bind(&socket_path).expect("bind sandbox runtime message broker");
+    let text = format!(
+        "filesystem.root = {}\n\
+         identity.hostname = security-lab\n\
+         executable = /probe\n\
+         arg = 5\n\
+         working_dir = /work\n\
+         stdio.stdin = closed\n\
+         stdio.stdout = closed\n\
+         stdio.stderr = closed\n\
+         limit.wall_clock_milliseconds = 3000\n\
+         limit.cpu_seconds = 2\n\
+         limit.address_space_bytes = 134217728\n\
+         limit.file_size_bytes = 1048576\n\
+         limit.open_files = 32\n\
+         seccomp.allow = execveat,write,recvmsg,sendmsg,close,exit\n",
+        root.display()
+    );
+    let mut policy: SandboxPolicy = text.parse().expect("parse runtime message policy");
+    broker.configure_policy(&mut policy, 10).unwrap();
+
+    let (grant, mut controller) =
+        RuntimeFdBroker::prepare_runtime_message_exchange(4096, 4096).unwrap();
+    let runner = thread::spawn(move || run(&policy));
+    let mut session = broker.accept().expect("accept runtime message target");
+    if let Err(readiness_error) = session.wait_for_ready(b'R') {
+        let runner_result = runner.join().expect("runtime message runner panicked");
+        panic!(
+            "runtime message target failed before readiness: {readiness_error}; runner result: {runner_result:?}"
+        );
+    }
+    session.send_runtime_message_channel(grant).unwrap();
+
+    assert_eq!(controller.receive_request().unwrap(), b"runtime-request\n");
+    controller
+        .send_response(b"runtime-response\n")
+        .expect("send bounded runtime response");
+    assert!(controller.is_complete());
+
+    assert_eq!(
+        runner
+            .join()
+            .expect("runtime message runner panicked")
+            .unwrap(),
+        ChildOutcome::Exited(0)
+    );
+
+    drop(session);
+    drop(broker);
+    std::fs::remove_dir_all(&root).unwrap();
 }
 
 #[test]

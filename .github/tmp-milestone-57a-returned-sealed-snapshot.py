@@ -972,7 +972,6 @@ replace_one(
 
 mode_marker = '''    jmp .fail29
 
-
 .brokered_host_unix_scm_rights:
 '''
 mode_code = '''    jmp .fail29

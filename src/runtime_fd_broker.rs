@@ -12,6 +12,8 @@ pub const MAX_RUNTIME_SEALED_BUNDLE_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_RUNTIME_REVOCABLE_STREAM_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_RUNTIME_MESSAGE_BYTES: u64 = 64 * 1024;
 pub const MAX_RUNTIME_MESSAGE_REQUEST_WAIT_MILLISECONDS: u64 = 86_400_000;
+pub const MIN_RUNTIME_MULTI_MESSAGE_ROUNDS: u32 = 2;
+pub const MAX_RUNTIME_MULTI_MESSAGE_ROUNDS: u32 = 32;
 
 #[derive(Debug)]
 pub enum RuntimeFdBrokerError {
@@ -373,6 +375,13 @@ mod imp {
     }
 
     #[derive(Debug)]
+    pub struct RuntimeMultiMessageExchangeController {
+        controller: RuntimeMessageExchangeController,
+        max_rounds: u32,
+        completed_rounds: u32,
+    }
+
+    #[derive(Debug)]
     struct RequestDeadlineTimer {
         fd: RawFd,
     }
@@ -660,6 +669,53 @@ mod imp {
         }
     }
 
+    impl RuntimeMultiMessageExchangeController {
+        pub fn is_complete(&self) -> bool {
+            self.completed_rounds == self.max_rounds && self.controller.is_complete()
+        }
+
+        pub fn completed_rounds(&self) -> u32 {
+            self.completed_rounds
+        }
+
+        pub fn max_rounds(&self) -> u32 {
+            self.max_rounds
+        }
+
+        fn reject_after_round_limit(&self) -> Result<(), RuntimeFdBrokerError> {
+            if self.is_complete() {
+                return Err(RuntimeFdBrokerError::Protocol(
+                    "runtime multi-message exchange reached its configured round limit".to_owned(),
+                ));
+            }
+            Ok(())
+        }
+
+        pub fn receive_request(&mut self) -> Result<Vec<u8>, RuntimeFdBrokerError> {
+            self.reject_after_round_limit()?;
+            self.controller.receive_request()
+        }
+
+        pub fn receive_request_with_deadline(
+            &mut self,
+            wait_milliseconds: u64,
+        ) -> Result<Vec<u8>, RuntimeFdBrokerError> {
+            self.reject_after_round_limit()?;
+            self.controller
+                .receive_request_with_deadline(wait_milliseconds)
+        }
+
+        pub fn send_response(&mut self, bytes: &[u8]) -> Result<(), RuntimeFdBrokerError> {
+            self.reject_after_round_limit()?;
+            self.controller.send_response(bytes)?;
+            self.completed_rounds += 1;
+            if self.completed_rounds < self.max_rounds {
+                self.controller.state = RuntimeMessageExchangeState::AwaitingRequest;
+            }
+            Ok(())
+        }
+    }
+
     #[derive(Debug)]
     pub struct RuntimeFdBroker {
         path: PathBuf,
@@ -868,6 +924,30 @@ mod imp {
             RuntimeFdBrokerError,
         > {
             prepare_runtime_message_exchange(max_request_bytes, max_response_bytes)
+        }
+
+        /// Prepare one bounded multi-round SOCK_SEQPACKET request/response session.
+        ///
+        /// Each request and response retains the existing per-message byte ceiling.
+        /// The explicit 2-32 round bound also statically bounds total request and
+        /// response bytes. Any protocol, I/O, truncation, oversize, or bounded-wait
+        /// failure remains terminal for the whole session.
+        pub fn prepare_runtime_multi_message_exchange(
+            max_request_bytes: u64,
+            max_response_bytes: u64,
+            max_rounds: u32,
+        ) -> Result<
+            (
+                PreparedRuntimeMessageChannel,
+                RuntimeMultiMessageExchangeController,
+            ),
+            RuntimeFdBrokerError,
+        > {
+            prepare_runtime_multi_message_exchange(
+                max_request_bytes,
+                max_response_bytes,
+                max_rounds,
+            )
         }
     }
 
@@ -1362,6 +1442,39 @@ mod imp {
         ))
     }
 
+    fn prepare_runtime_multi_message_exchange(
+        max_request_bytes: u64,
+        max_response_bytes: u64,
+        max_rounds: u32,
+    ) -> Result<
+        (
+            PreparedRuntimeMessageChannel,
+            RuntimeMultiMessageExchangeController,
+        ),
+        RuntimeFdBrokerError,
+    > {
+        if !(super::MIN_RUNTIME_MULTI_MESSAGE_ROUNDS..=super::MAX_RUNTIME_MULTI_MESSAGE_ROUNDS)
+            .contains(&max_rounds)
+        {
+            return Err(RuntimeFdBrokerError::InvalidConfiguration(format!(
+                "runtime multi-message max_rounds must be between {} and {}",
+                super::MIN_RUNTIME_MULTI_MESSAGE_ROUNDS,
+                super::MAX_RUNTIME_MULTI_MESSAGE_ROUNDS
+            )));
+        }
+
+        let (grant, controller) =
+            prepare_runtime_message_exchange(max_request_bytes, max_response_bytes)?;
+        Ok((
+            grant,
+            RuntimeMultiMessageExchangeController {
+                controller,
+                max_rounds,
+                completed_rounds: 0,
+            },
+        ))
+    }
+
     fn prepare_runtime_message_exchange(
         max_request_bytes: u64,
         max_response_bytes: u64,
@@ -1539,6 +1652,44 @@ mod imp {
     #[derive(Debug)]
     pub struct RuntimeMessageExchangeController;
 
+    #[derive(Debug)]
+    pub struct RuntimeMultiMessageExchangeController;
+
+    impl RuntimeMultiMessageExchangeController {
+        pub fn is_complete(&self) -> bool {
+            false
+        }
+
+        pub fn completed_rounds(&self) -> u32 {
+            0
+        }
+
+        pub fn max_rounds(&self) -> u32 {
+            0
+        }
+
+        pub fn receive_request(&mut self) -> Result<Vec<u8>, RuntimeFdBrokerError> {
+            Err(RuntimeFdBrokerError::UnsupportedPlatform(
+                "runtime multi-message exchanges currently require Linux x86_64".to_owned(),
+            ))
+        }
+
+        pub fn receive_request_with_deadline(
+            &mut self,
+            _wait_milliseconds: u64,
+        ) -> Result<Vec<u8>, RuntimeFdBrokerError> {
+            Err(RuntimeFdBrokerError::UnsupportedPlatform(
+                "runtime multi-message request deadlines currently require Linux x86_64".to_owned(),
+            ))
+        }
+
+        pub fn send_response(&mut self, _bytes: &[u8]) -> Result<(), RuntimeFdBrokerError> {
+            Err(RuntimeFdBrokerError::UnsupportedPlatform(
+                "runtime multi-message exchanges currently require Linux x86_64".to_owned(),
+            ))
+        }
+    }
+
     impl RuntimeMessageExchangeController {
         pub fn is_complete(&self) -> bool {
             false
@@ -1692,6 +1843,22 @@ mod imp {
                 "runtime message exchanges currently require Linux x86_64".to_owned(),
             ))
         }
+
+        pub fn prepare_runtime_multi_message_exchange(
+            _max_request_bytes: u64,
+            _max_response_bytes: u64,
+            _max_rounds: u32,
+        ) -> Result<
+            (
+                PreparedRuntimeMessageChannel,
+                RuntimeMultiMessageExchangeController,
+            ),
+            RuntimeFdBrokerError,
+        > {
+            Err(RuntimeFdBrokerError::UnsupportedPlatform(
+                "runtime multi-message exchanges currently require Linux x86_64".to_owned(),
+            ))
+        }
     }
 
     impl RuntimeFdSession {
@@ -1752,4 +1919,5 @@ pub use imp::{
     PreparedReadOnlyRegularFile, PreparedRevocableByteStream, PreparedRuntimeMessageChannel,
     PreparedSealedRegularFileSnapshot, PreparedSealedSnapshotBundle, RevocableByteStreamController,
     RuntimeFdBroker, RuntimeFdSession, RuntimeMessageExchangeController,
+    RuntimeMultiMessageExchangeController,
 };

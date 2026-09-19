@@ -46,18 +46,28 @@ jobs:
               exit(1);
           }
 
-          static int run_map(const char *tool, pid_t pid, const char *host_id, const char *sub_id) {
+          static int run_gid_map(pid_t pid, const char *host_gid) {
               char pid_text[32];
               snprintf(pid_text, sizeof(pid_text), "%ld", (long)pid);
               pid_t helper = fork();
               if (helper < 0) die("fork helper");
               if (helper == 0) {
-                  execlp(tool, tool, pid_text, "0", host_id, "1", "1", sub_id, "1", (char *)0);
-                  die("exec map helper");
+                  execlp("newgidmap", "newgidmap", pid_text, "0", host_gid, "1", (char *)0);
+                  die("exec newgidmap");
               }
               int status = 0;
-              if (waitpid(helper, &status, 0) < 0) die("wait map helper");
+              if (waitpid(helper, &status, 0) < 0) die("wait newgidmap");
               return WIFEXITED(status) ? WEXITSTATUS(status) : 255;
+          }
+
+          static void write_uid_map(const char *host_uid) {
+              char map[64];
+              int len = snprintf(map, sizeof(map), "0 %s 1\n", host_uid);
+              if (len <= 0 || (size_t)len >= sizeof(map)) die("format uid_map");
+              int fd = open("/proc/self/uid_map", O_WRONLY | O_CLOEXEC);
+              if (fd < 0) die("open uid_map");
+              if (write(fd, map, (size_t)len) != len) die("write uid_map");
+              close(fd);
           }
 
           int main(int argc, char **argv) {
@@ -70,6 +80,7 @@ jobs:
                   close(ready[0]);
                   close(go[1]);
                   if (unshare(CLONE_NEWUSER) != 0) die("unshare");
+                  write_uid_map(argv[1]);
                   if (write(ready[1], "R", 1) != 1) die("ready write");
                   char byte;
                   if (read(go[0], &byte, 1) != 1) die("go read");
@@ -98,11 +109,10 @@ jobs:
               close(go[0]);
               char byte;
               if (read(ready[0], &byte, 1) != 1) die("ready read");
-              int urc = run_map("newuidmap", child, argv[1], argv[3]);
-              int grc = run_map("newgidmap", child, argv[2], argv[4]);
-              printf("newuidmap_rc=%d newgidmap_rc=%d\n", urc, grc);
+              int grc = run_gid_map(child, argv[2]);
+              printf("newgidmap_rc=%d\n", grc);
               fflush(stdout);
-              if (urc != 0 || grc != 0) {
+              if (grc != 0) {
                   kill(child, SIGKILL);
                   waitpid(child, NULL, 0);
                   return 4;

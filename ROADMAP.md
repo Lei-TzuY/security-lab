@@ -1407,7 +1407,7 @@ Boundary: 56A is one bounded target-to-host request followed by one bounded host
 
 ### Slice 56B — launcher-owned bounded request wait
 
-**Current verified candidate.** Adds a lifecycle bound to the 56A controller without changing target syscall authority or turning the one-round exchange into a general RPC protocol.
+**Status: complete on `main`.** Adds a lifecycle bound to the 56A controller without changing target syscall authority or turning the one-round exchange into a general RPC protocol.
 
 Acceptance evidence is executable:
 
@@ -1423,7 +1423,29 @@ Boundary: 56B bounds only the trusted controller's blocking wait beginning when 
 
 ### Milestone 56 promotion rule
 
-After 56B integrates, seal this bounded one-round message-protocol phase. Do not farm deadline units, timeout values, packet sizes, message tags, or equivalent one-round wrappers. Further runtime-protocol work must add a materially different capability lifecycle or authority property with executable evidence; otherwise promote to another architectural frontier.
+56A–56B are sealed on `main`. Do not farm deadline units, timeout values, packet sizes, message tags, or equivalent one-round wrappers. Further runtime-protocol work must add a materially different capability lifecycle or authority property with executable evidence; otherwise promote to another architectural frontier.
+
+## Milestone 58 — bounded multi-round runtime message lifecycle
+
+### Slice 58A — bounded sequential multi-round exchange
+
+**Current verified candidate.** Promotes the one-round request/response mechanism into a bounded sequential session without changing the existing target endpoint-grant authority.
+
+Acceptance evidence is executable:
+
+- `prepare_runtime_multi_message_exchange(max_request_bytes, max_response_bytes, max_rounds)` reuses the existing private `AF_UNIX/SOCK_SEQPACKET|SOCK_CLOEXEC` endpoint and requires `max_rounds` from 2 through 32; each request and response independently retains the existing 1-byte–64-KiB ceiling;
+- the new controller wraps the proven one-round receive/timer/send primitives rather than duplicating packet parsing. A successful response increments `completed_rounds`; only when more configured rounds remain does it transition back to `AwaitingRequest`, while the final response leaves the underlying controller complete;
+- `receive_request_with_deadline()` remains available on every awaiting round with the existing 1–86,400,000 ms `CLOCK_MONOTONIC` timerfd semantics and request/peer-readiness-before-timer arbitration;
+- any empty/truncated/oversized request, invalid/oversized response, I/O ambiguity, or request-wait timeout leaves the underlying controller terminally failed. The wrapper never resets a failed controller into a later round;
+- broker-level integration evidence performs the real readiness handshake and `SCM_RIGHTS` transfer of the prepared endpoint, then completes two exact ordered request/response packets and rejects any third round at the configured limit;
+- deterministic regressions reject round counts outside 2–32, prove a second-round oversized request poisons the whole session after one completed round, and prove a second-round timeout is likewise terminal;
+- exact candidate stable format/Clippy/full tests and the complete Rust 1.74 suite are green.
+
+Boundary: 58A is a bounded **sequential** message lifecycle over one already-granted endpoint. It does not add a new sandbox grant path, multiplexing, concurrent in-flight requests, request IDs, out-of-order responses, authentication, replay protection, an endpoint-grant-to-request deadline, a response deadline, or an unbounded/general RPC transport. The executable multi-round evidence is at the broker/controller integration layer; existing full sandbox regressions remain green, but this slice does not claim a new dedicated multi-round raw-target oracle.
+
+### Milestone 58 promotion rule
+
+After 58A integrates, seal simple sequential round-count expansion. Do not farm larger round caps, per-round aliases, message tags, or timeout wrappers. A further runtime-protocol phase must add a materially different property such as explicit correlation/multiplexing, end-to-end session lifetime ownership, authenticated peer/application semantics, or another independent authority frontier with executable evidence.
 
 ## Later frontiers
 

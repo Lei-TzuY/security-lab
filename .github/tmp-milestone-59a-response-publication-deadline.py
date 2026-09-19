@@ -311,10 +311,7 @@ send_block = r'''        /// Send exactly one non-empty response packet after a 
                         if error.raw_os_error() == Some(libc::EINTR) {
                             continue;
                         }
-                        if matches!(
-                            error.raw_os_error(),
-                            Some(libc::EAGAIN) | Some(libc::EWOULDBLOCK)
-                        ) {
+                        if error.raw_os_error() == Some(libc::EAGAIN) {
                             if fds[1].revents & libc::POLLIN != 0 {
                                 self.state = RuntimeMessageExchangeState::Failed;
                                 return Err(RuntimeFdBrokerError::RuntimeResponseTimedOut {

@@ -25,6 +25,7 @@
 #   3 receive an ordered two-FD sealed snapshot bundle and reject truncated ancillary control
 #   4 receive a write-disabled runtime stream, read bounded bytes, then observe revoke EOF
 #   5 exchange one bounded request/response packet over a runtime SOCK_SEQPACKET channel
+#   6 return one private-scratch regular-file result through a send-only SCM_RIGHTS channel
 #   1 prove launcher bootstrap execveat is one-shot when target execveat is not granted
 #   2 prove an explicit target execveat grant still permits a later exec
 #   q accept one connection through a launcher-brokered host-loopback TCP listening fd
@@ -104,6 +105,8 @@ _start:
     je .brokered_revocable_runtime_stream
     cmp $53, %al
     je .brokered_runtime_message_exchange
+    cmp $54, %al
+    je .brokered_runtime_snapshot_return
     cmp $49, %al
     je .bootstrap_execveat_one_shot
     cmp $50, %al
@@ -1521,6 +1524,149 @@ _start:
 .brokered_runtime_message_exchange_restore:
     add $192, %rsp
     jmp .fail29
+
+
+.brokered_runtime_snapshot_return:
+    sub $192, %rsp
+    mov $-1, %r12
+    mov $-1, %r13
+
+    # Publish post-exec readiness before receiving the private send-only endpoint.
+    movb $82, 175(%rsp)
+    mov $1, %eax
+    mov $10, %edi
+    lea 175(%rsp), %rsi
+    mov $1, %edx
+    syscall
+    cmp $1, %rax
+    jne .brokered_runtime_snapshot_return_fail
+
+    # Receive exactly one return-channel endpoint through the normal broker.
+    xor %eax, %eax
+    mov %rax, 0(%rsp)
+    mov %rax, 8(%rsp)
+    lea 64(%rsp), %rax
+    mov %rax, 16(%rsp)
+    movq $1, 24(%rsp)
+    lea 80(%rsp), %rax
+    mov %rax, 32(%rsp)
+    movq $24, 40(%rsp)
+    movq $0, 48(%rsp)
+    lea 176(%rsp), %rax
+    mov %rax, 64(%rsp)
+    movq $1, 72(%rsp)
+    movq $0, 80(%rsp)
+    movq $0, 88(%rsp)
+    movq $0, 96(%rsp)
+
+    mov $47, %eax
+    mov $10, %edi
+    mov %rsp, %rsi
+    mov $0x40000000, %edx
+    syscall
+    cmp $1, %rax
+    jne .brokered_runtime_snapshot_return_fail
+    cmpb $70, 176(%rsp)
+    jne .brokered_runtime_snapshot_return_fail
+    testl $8, 48(%rsp)
+    jne .brokered_runtime_snapshot_return_fail
+    cmpq $20, 80(%rsp)
+    jne .brokered_runtime_snapshot_return_fail
+    cmpl $1, 88(%rsp)
+    jne .brokered_runtime_snapshot_return_fail
+    cmpl $1, 92(%rsp)
+    jne .brokered_runtime_snapshot_return_fail
+    mov 96(%rsp), %r12d
+    test %r12d, %r12d
+    js .brokered_runtime_snapshot_return_fail
+
+    # Produce one result only inside private scratch. O_RDWR lets the target write
+    # it while allowing the trusted host to attenuate the returned descriptor.
+    mov $257, %eax
+    mov $-100, %edi
+    lea runtime_result_path(%rip), %rsi
+    mov $0x80242, %edx
+    mov $384, %r10d
+    syscall
+    test %rax, %rax
+    js .brokered_runtime_snapshot_return_fail
+    mov %eax, %r13d
+
+    mov $1, %eax
+    mov %r13d, %edi
+    lea runtime_result_snapshot(%rip), %rsi
+    mov $runtime_result_snapshot_len, %edx
+    syscall
+    cmp $runtime_result_snapshot_len, %rax
+    jne .brokered_runtime_snapshot_return_fail
+
+    # Return exactly one descriptor and one-byte marker via SCM_RIGHTS.
+    movq $0, 0(%rsp)
+    movq $0, 8(%rsp)
+    lea 64(%rsp), %rax
+    mov %rax, 16(%rsp)
+    movq $1, 24(%rsp)
+    lea 80(%rsp), %rax
+    mov %rax, 32(%rsp)
+    movq $24, 40(%rsp)
+    movq $0, 48(%rsp)
+    movb $70, 176(%rsp)
+    lea 176(%rsp), %rax
+    mov %rax, 64(%rsp)
+    movq $1, 72(%rsp)
+    movq $20, 80(%rsp)
+    movl $1, 88(%rsp)
+    movl $1, 92(%rsp)
+    mov %r13d, 96(%rsp)
+
+    mov $46, %eax
+    mov %r12d, %edi
+    mov %rsp, %rsi
+    mov $0x4000, %edx
+    syscall
+    cmp $1, %rax
+    jne .brokered_runtime_snapshot_return_fail
+
+    mov $3, %eax
+    mov %r13d, %edi
+    syscall
+    test %rax, %rax
+    js .brokered_runtime_snapshot_return_fail
+    mov $-1, %r13
+
+    mov $3, %eax
+    mov %r12d, %edi
+    syscall
+    test %rax, %rax
+    js .brokered_runtime_snapshot_return_fail
+    mov $-1, %r12
+
+    mov $3, %eax
+    mov $10, %edi
+    syscall
+    test %rax, %rax
+    js .brokered_runtime_snapshot_return_fail
+
+    add $192, %rsp
+    xor %edi, %edi
+    jmp .exit
+
+.brokered_runtime_snapshot_return_fail:
+    test %r13d, %r13d
+    js .brokered_runtime_snapshot_return_close_endpoint
+    mov $3, %eax
+    mov %r13d, %edi
+    syscall
+.brokered_runtime_snapshot_return_close_endpoint:
+    test %r12d, %r12d
+    js .brokered_runtime_snapshot_return_restore
+    mov $3, %eax
+    mov %r12d, %edi
+    syscall
+.brokered_runtime_snapshot_return_restore:
+    add $192, %rsp
+    jmp .fail29
+
 
 .brokered_host_unix_scm_rights:
     # argv[2] is the original trusted host pathname for the transferred file.
@@ -3438,6 +3584,11 @@ runtime_message_request:
 runtime_message_response:
     .ascii "runtime-response\n"
 .set runtime_message_response_len, . - runtime_message_response
+runtime_result_path:
+    .asciz "/scratch/runtime-result"
+runtime_result_snapshot:
+    .ascii "runtime-result-snapshot\n"
+.set runtime_result_snapshot_len, . - runtime_result_snapshot
 brokered_host_unix_reply:
     .ascii "host-unix-reply"
 .set brokered_host_unix_reply_len, . - brokered_host_unix_reply

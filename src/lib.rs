@@ -44,12 +44,13 @@ pub use report::{
 };
 pub use runtime_fd_broker::{
     PreparedReadOnlyRegularFile, PreparedRevocableByteStream, PreparedRuntimeMessageChannel,
-    PreparedSealedRegularFileSnapshot, PreparedSealedSnapshotBundle, RevocableByteStreamController,
+    PreparedRuntimeSnapshotReturnChannel, PreparedSealedRegularFileSnapshot,
+    PreparedSealedSnapshotBundle, ReturnedSealedRuntimeSnapshot, RevocableByteStreamController,
     RuntimeFdBroker, RuntimeFdBrokerError, RuntimeFdSession, RuntimeMessageExchangeController,
-    MAX_RUNTIME_MESSAGE_BYTES, MAX_RUNTIME_MESSAGE_REQUEST_WAIT_MILLISECONDS,
-    MAX_RUNTIME_REVOCABLE_STREAM_BYTES, MAX_RUNTIME_SEALED_BUNDLE_BYTES,
-    MAX_RUNTIME_SEALED_BUNDLE_ITEMS, MAX_RUNTIME_SEALED_SNAPSHOT_BYTES,
-    MIN_RUNTIME_SEALED_BUNDLE_ITEMS,
+    RuntimeSnapshotReturnController, MAX_RUNTIME_MESSAGE_BYTES,
+    MAX_RUNTIME_MESSAGE_REQUEST_WAIT_MILLISECONDS, MAX_RUNTIME_REVOCABLE_STREAM_BYTES,
+    MAX_RUNTIME_SEALED_BUNDLE_BYTES, MAX_RUNTIME_SEALED_BUNDLE_ITEMS,
+    MAX_RUNTIME_SEALED_SNAPSHOT_BYTES, MIN_RUNTIME_SEALED_BUNDLE_ITEMS,
 };
 pub use snapshot_archive::{
     materialize_snapshot_archive_atomic, materialize_snapshot_archive_ed25519_atomic,

@@ -43,6 +43,40 @@ impl TestFd {
 #[repr(C, align(8))]
 struct OneFdControl([u8; 24]);
 
+fn send_one_fd(socket_fd: RawFd, source_fd: RawFd) {
+    let mut payload = *b"F";
+    let mut iovec = libc::iovec {
+        iov_base: payload.as_mut_ptr().cast::<libc::c_void>(),
+        iov_len: payload.len(),
+    };
+    let mut control = OneFdControl([0; 24]);
+    let header = control.0.as_mut_ptr().cast::<libc::cmsghdr>();
+    unsafe {
+        (*header).cmsg_len = std::mem::size_of::<libc::cmsghdr>() + std::mem::size_of::<RawFd>();
+        (*header).cmsg_level = libc::SOL_SOCKET;
+        (*header).cmsg_type = libc::SCM_RIGHTS;
+        control
+            .0
+            .as_mut_ptr()
+            .add(std::mem::size_of::<libc::cmsghdr>())
+            .cast::<RawFd>()
+            .write(source_fd);
+    }
+
+    let mut message = unsafe { std::mem::zeroed::<libc::msghdr>() };
+    message.msg_iov = &mut iovec;
+    message.msg_iovlen = 1;
+    message.msg_control = control.0.as_mut_ptr().cast::<libc::c_void>();
+    message.msg_controllen = control.0.len();
+
+    assert_eq!(
+        unsafe { libc::sendmsg(socket_fd, &message, libc::MSG_NOSIGNAL) },
+        1,
+        "send one reverse SCM_RIGHTS descriptor failed: {}",
+        std::io::Error::last_os_error()
+    );
+}
+
 fn receive_one_fd(stream: &UnixStream) -> TestFd {
     let mut payload = [0u8; 1];
     let mut iovec = libc::iovec {
@@ -291,6 +325,7 @@ fn build_probe_root() -> PathBuf {
     let root = unique_path("runtime-rights-root");
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(root.join("work")).expect("create sandbox work directory");
+    std::fs::create_dir_all(root.join("scratch")).expect("create sandbox scratch directory");
     let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/probe.S");
     let output = root.join("probe");
     let status = Command::new("cc")
@@ -1315,6 +1350,172 @@ fn revocable_runtime_stream_rejects_invalid_ceiling_and_poisoned_send_retry() {
     drop(session);
     drop(client);
     drop(broker);
+}
+
+#[test]
+fn runtime_snapshot_return_rejects_invalid_bounds_and_malformed_result() {
+    assert!(matches!(
+        RuntimeFdBroker::prepare_runtime_snapshot_return(0),
+        Err(RuntimeFdBrokerError::InvalidConfiguration(_))
+    ));
+    assert!(matches!(
+        RuntimeFdBroker::prepare_runtime_snapshot_return(MAX_RUNTIME_SEALED_SNAPSHOT_BYTES + 1),
+        Err(RuntimeFdBrokerError::InvalidConfiguration(_))
+    ));
+
+    let socket_path = unique_path("runtime-return-malformed.sock");
+    let _ = std::fs::remove_file(&socket_path);
+    let broker = RuntimeFdBroker::bind(&socket_path).unwrap();
+    let mut client = UnixStream::connect(broker.path()).unwrap();
+    let mut session = broker.accept().unwrap();
+    client.write_all(b"R").unwrap();
+    session.wait_for_ready(b'R').unwrap();
+
+    let (grant, mut controller) = RuntimeFdBroker::prepare_runtime_snapshot_return(4096).unwrap();
+    session.send_runtime_snapshot_return_channel(grant).unwrap();
+    let endpoint = receive_one_fd(&client);
+
+    assert_eq!(
+        unsafe {
+            libc::send(
+                endpoint.raw(),
+                b"F".as_ptr().cast::<libc::c_void>(),
+                1,
+                libc::MSG_NOSIGNAL,
+            )
+        },
+        1
+    );
+    assert!(matches!(
+        controller.receive_snapshot(),
+        Err(RuntimeFdBrokerError::Protocol(message))
+            if message.contains("exactly one SCM_RIGHTS descriptor")
+                || message.contains("ancillary")
+    ));
+    assert!(matches!(
+        controller.receive_snapshot(),
+        Err(RuntimeFdBrokerError::Protocol(message)) if message.contains("closed after")
+    ));
+
+    drop(endpoint);
+    drop(session);
+    drop(client);
+    drop(broker);
+}
+
+#[test]
+fn runtime_snapshot_return_enforces_copy_ceiling_and_terminal_failure() {
+    let socket_path = unique_path("runtime-return-too-large.sock");
+    let file_path = unique_path("runtime-return-too-large-source");
+    let _ = std::fs::remove_file(&socket_path);
+    let _ = std::fs::remove_file(&file_path);
+    std::fs::write(&file_path, b"12345").unwrap();
+
+    let broker = RuntimeFdBroker::bind(&socket_path).unwrap();
+    let mut client = UnixStream::connect(broker.path()).unwrap();
+    let mut session = broker.accept().unwrap();
+    client.write_all(b"R").unwrap();
+    session.wait_for_ready(b'R').unwrap();
+
+    let (grant, mut controller) = RuntimeFdBroker::prepare_runtime_snapshot_return(4).unwrap();
+    session.send_runtime_snapshot_return_channel(grant).unwrap();
+    let endpoint = receive_one_fd(&client);
+    let source = File::open(&file_path).unwrap();
+    send_one_fd(endpoint.raw(), source.as_raw_fd());
+
+    assert!(matches!(
+        controller.receive_snapshot(),
+        Err(RuntimeFdBrokerError::SourceSnapshotTooLarge { max_bytes: 4 })
+    ));
+    assert!(matches!(
+        controller.receive_snapshot(),
+        Err(RuntimeFdBrokerError::Protocol(message)) if message.contains("closed after")
+    ));
+
+    drop(source);
+    drop(endpoint);
+    drop(session);
+    drop(client);
+    drop(broker);
+    std::fs::remove_file(&file_path).unwrap();
+}
+
+#[test]
+fn returned_sealed_snapshot_reaches_host_from_real_target_private_scratch() {
+    let root = build_probe_root();
+    let socket_path = unique_path("runtime-return-sandbox.sock");
+    let _ = std::fs::remove_file(&socket_path);
+    let broker =
+        RuntimeFdBroker::bind(&socket_path).expect("bind sandbox runtime snapshot return broker");
+    let text = format!(
+        "filesystem.root = {}\n\
+         identity.hostname = security-lab\n\
+         filesystem.scratch = /scratch\n\
+         filesystem.scratch_bytes = 1048576\n\
+         executable = /probe\n\
+         arg = 6\n\
+         working_dir = /work\n\
+         stdio.stdin = closed\n\
+         stdio.stdout = closed\n\
+         stdio.stderr = closed\n\
+         limit.wall_clock_milliseconds = 3000\n\
+         limit.cpu_seconds = 2\n\
+         limit.address_space_bytes = 134217728\n\
+         limit.file_size_bytes = 1048576\n\
+         limit.open_files = 32\n\
+         seccomp.allow = execveat,write,recvmsg,openat,sendmsg,close,exit\n",
+        root.display()
+    );
+    let mut policy: SandboxPolicy = text.parse().expect("parse runtime snapshot return policy");
+    broker.configure_policy(&mut policy, 10).unwrap();
+
+    let (grant, mut controller) = RuntimeFdBroker::prepare_runtime_snapshot_return(4096).unwrap();
+    let runner = thread::spawn(move || run(&policy));
+    let mut session = broker
+        .accept()
+        .expect("accept runtime snapshot return target");
+    if let Err(readiness_error) = session.wait_for_ready(b'R') {
+        let runner_result = runner
+            .join()
+            .expect("runtime snapshot return runner panicked");
+        panic!(
+            "runtime snapshot return target failed before readiness: {readiness_error}; runner result: {runner_result:?}"
+        );
+    }
+    session
+        .send_runtime_snapshot_return_channel(grant)
+        .expect("transfer send-only runtime snapshot return endpoint");
+
+    let snapshot = controller
+        .receive_snapshot()
+        .expect("receive and seal target result snapshot");
+    assert_eq!(snapshot.len(), b"runtime-result-snapshot\n".len() as u64);
+    assert!(!snapshot.is_empty());
+    assert_eq!(
+        snapshot.read_all().expect("read returned sealed snapshot"),
+        b"runtime-result-snapshot\n"
+    );
+    assert!(controller.is_complete());
+    assert!(matches!(
+        controller.receive_snapshot(),
+        Err(RuntimeFdBrokerError::Protocol(message)) if message.contains("exactly one")
+    ));
+
+    assert_eq!(
+        runner
+            .join()
+            .expect("runtime snapshot return runner panicked")
+            .unwrap(),
+        ChildOutcome::Exited(0)
+    );
+    assert!(
+        !root.join("scratch/runtime-result").exists(),
+        "private scratch result unexpectedly persisted into the host root tree"
+    );
+
+    drop(session);
+    drop(broker);
+    std::fs::remove_dir_all(&root).unwrap();
 }
 
 #[test]

@@ -131,7 +131,7 @@ mod imp {
     use std::io::Read;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
-    use std::os::unix::io::{AsRawFd, RawFd};
+    use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Component, PathBuf};
 
@@ -345,6 +345,139 @@ mod imp {
             unsafe {
                 libc::close(self.fd);
             }
+        }
+    }
+
+    #[derive(Debug)]
+    pub struct PreparedRuntimeSnapshotReturnChannel {
+        fd: RawFd,
+    }
+
+    impl Drop for PreparedRuntimeSnapshotReturnChannel {
+        fn drop(&mut self) {
+            unsafe {
+                libc::close(self.fd);
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    pub struct ReturnedSealedRuntimeSnapshot {
+        snapshot: PreparedSealedRegularFileSnapshot,
+    }
+
+    impl ReturnedSealedRuntimeSnapshot {
+        pub fn len(&self) -> u64 {
+            self.snapshot.len
+        }
+
+        pub fn is_empty(&self) -> bool {
+            self.snapshot.len == 0
+        }
+
+        /// Read the immutable returned bytes without changing the snapshot's file offset.
+        pub fn read_all(&self) -> Result<Vec<u8>, RuntimeFdBrokerError> {
+            let len = usize::try_from(self.snapshot.len).map_err(|_| {
+                RuntimeFdBrokerError::Protocol(
+                    "returned sealed runtime snapshot length does not fit usize".to_owned(),
+                )
+            })?;
+            let mut bytes = vec![0u8; len];
+            let mut done = 0usize;
+            while done < bytes.len() {
+                let read = unsafe {
+                    libc::pread(
+                        self.snapshot.fd,
+                        bytes[done..].as_mut_ptr().cast::<libc::c_void>(),
+                        bytes.len() - done,
+                        done as libc::off_t,
+                    )
+                };
+                if read == -1 {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() == Some(libc::EINTR) {
+                        continue;
+                    }
+                    return Err(RuntimeFdBrokerError::io(
+                        "cannot read returned sealed runtime snapshot",
+                        error,
+                    ));
+                }
+                if read == 0 {
+                    return Err(RuntimeFdBrokerError::Protocol(
+                        "returned sealed runtime snapshot ended before its sealed length"
+                            .to_owned(),
+                    ));
+                }
+                done += read as usize;
+            }
+            Ok(bytes)
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum RuntimeSnapshotReturnState {
+        AwaitingSnapshot,
+        Complete,
+        Failed,
+    }
+
+    #[derive(Debug)]
+    pub struct RuntimeSnapshotReturnController {
+        fd: RawFd,
+        max_bytes: u64,
+        state: RuntimeSnapshotReturnState,
+    }
+
+    impl Drop for RuntimeSnapshotReturnController {
+        fn drop(&mut self) {
+            unsafe {
+                libc::close(self.fd);
+            }
+        }
+    }
+
+    impl RuntimeSnapshotReturnController {
+        pub fn is_complete(&self) -> bool {
+            self.state == RuntimeSnapshotReturnState::Complete
+        }
+
+        /// Receive exactly one target-returned regular-file descriptor, attenuate it
+        /// to read-only authority, and freeze a bounded byte copy into a sealed memfd.
+        pub fn receive_snapshot(
+            &mut self,
+        ) -> Result<ReturnedSealedRuntimeSnapshot, RuntimeFdBrokerError> {
+            if self.state != RuntimeSnapshotReturnState::AwaitingSnapshot {
+                let message = match self.state {
+                    RuntimeSnapshotReturnState::Complete => {
+                        "runtime snapshot return permits exactly one completed result"
+                    }
+                    RuntimeSnapshotReturnState::Failed => {
+                        "runtime snapshot return is closed after a protocol or I/O failure"
+                    }
+                    RuntimeSnapshotReturnState::AwaitingSnapshot => unreachable!(),
+                };
+                return Err(RuntimeFdBrokerError::Protocol(message.to_owned()));
+            }
+
+            let received_fd = match receive_one_fd(self.fd, "runtime snapshot return") {
+                Ok(fd) => fd,
+                Err(error) => {
+                    self.state = RuntimeSnapshotReturnState::Failed;
+                    return Err(error);
+                }
+            };
+            let received = unsafe { File::from_raw_fd(received_fd) };
+            let snapshot = match prepare_sealed_regular_file_snapshot(&received, self.max_bytes) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    self.state = RuntimeSnapshotReturnState::Failed;
+                    return Err(error);
+                }
+            };
+
+            self.state = RuntimeSnapshotReturnState::Complete;
+            Ok(ReturnedSealedRuntimeSnapshot { snapshot })
         }
     }
 
@@ -869,6 +1002,23 @@ mod imp {
         > {
             prepare_runtime_message_exchange(max_request_bytes, max_response_bytes)
         }
+
+        /// Prepare one receive-only controller channel for a bounded target result.
+        ///
+        /// The target endpoint can only send. The trusted controller receives
+        /// exactly one SCM_RIGHTS descriptor, validates regular/readable authority,
+        /// and freezes a bounded byte copy into an immutable sealed memfd.
+        pub fn prepare_runtime_snapshot_return(
+            max_bytes: u64,
+        ) -> Result<
+            (
+                PreparedRuntimeSnapshotReturnChannel,
+                RuntimeSnapshotReturnController,
+            ),
+            RuntimeFdBrokerError,
+        > {
+            prepare_runtime_snapshot_return(max_bytes)
+        }
     }
 
     impl RuntimeFdSession {
@@ -949,6 +1099,14 @@ mod imp {
         pub fn send_runtime_message_channel(
             &mut self,
             grant: PreparedRuntimeMessageChannel,
+        ) -> Result<(), RuntimeFdBrokerError> {
+            self.send_prepared_fd(grant.fd)
+        }
+
+        /// Transfer the send-only target endpoint for one returned sealed snapshot.
+        pub fn send_runtime_snapshot_return_channel(
+            &mut self,
+            grant: PreparedRuntimeSnapshotReturnChannel,
         ) -> Result<(), RuntimeFdBrokerError> {
             self.send_prepared_fd(grant.fd)
         }
@@ -1362,6 +1520,71 @@ mod imp {
         ))
     }
 
+    fn prepare_runtime_snapshot_return(
+        max_bytes: u64,
+    ) -> Result<
+        (
+            PreparedRuntimeSnapshotReturnChannel,
+            RuntimeSnapshotReturnController,
+        ),
+        RuntimeFdBrokerError,
+    > {
+        if max_bytes == 0 || max_bytes > super::MAX_RUNTIME_SEALED_SNAPSHOT_BYTES {
+            return Err(RuntimeFdBrokerError::InvalidConfiguration(format!(
+                "runtime snapshot return max_bytes must be between 1 and {}",
+                super::MAX_RUNTIME_SEALED_SNAPSHOT_BYTES
+            )));
+        }
+
+        let mut fds = [-1; 2];
+        if unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+                0,
+                fds.as_mut_ptr(),
+            )
+        } == -1
+        {
+            return Err(RuntimeFdBrokerError::io(
+                "cannot create runtime snapshot return socketpair",
+                std::io::Error::last_os_error(),
+            ));
+        }
+
+        if unsafe { libc::shutdown(fds[0], libc::SHUT_RD) } == -1 {
+            let error = std::io::Error::last_os_error();
+            unsafe {
+                libc::close(fds[0]);
+                libc::close(fds[1]);
+            }
+            return Err(RuntimeFdBrokerError::io(
+                "cannot make runtime snapshot target endpoint send-only",
+                error,
+            ));
+        }
+        if unsafe { libc::shutdown(fds[1], libc::SHUT_WR) } == -1 {
+            let error = std::io::Error::last_os_error();
+            unsafe {
+                libc::close(fds[0]);
+                libc::close(fds[1]);
+            }
+            return Err(RuntimeFdBrokerError::io(
+                "cannot make runtime snapshot controller endpoint receive-only",
+                error,
+            ));
+        }
+
+        Ok((
+            PreparedRuntimeSnapshotReturnChannel { fd: fds[0] },
+            RuntimeSnapshotReturnController {
+                fd: fds[1],
+                max_bytes,
+                state: RuntimeSnapshotReturnState::AwaitingSnapshot,
+            },
+        ))
+    }
+
     fn prepare_runtime_message_exchange(
         max_request_bytes: u64,
         max_response_bytes: u64,
@@ -1457,6 +1680,173 @@ mod imp {
         (unaligned + alignment - 1) & !(alignment - 1)
     }
 
+    fn close_fds(fds: &[RawFd]) {
+        for fd in fds {
+            if *fd >= 0 {
+                unsafe {
+                    libc::close(*fd);
+                }
+            }
+        }
+    }
+
+    fn parse_received_rights(
+        control: &FdControl,
+        used: usize,
+    ) -> Result<(Vec<RawFd>, usize), RuntimeFdBrokerError> {
+        if used > control.0.len() {
+            return Err(RuntimeFdBrokerError::Protocol(
+                "SCM_RIGHTS receive reported control length beyond its bounded buffer".to_owned(),
+            ));
+        }
+
+        let header_bytes = std::mem::size_of::<libc::cmsghdr>();
+        let alignment = std::mem::size_of::<usize>();
+        let mut offset = 0usize;
+        let mut cmsg_count = 0usize;
+        let mut rights = Vec::new();
+
+        while offset < used {
+            if used - offset < header_bytes {
+                close_fds(&rights);
+                return Err(RuntimeFdBrokerError::Protocol(
+                    "SCM_RIGHTS receive ended with a truncated ancillary header".to_owned(),
+                ));
+            }
+
+            let header = unsafe { &*control.0.as_ptr().add(offset).cast::<libc::cmsghdr>() };
+            let cmsg_len = header.cmsg_len;
+            if cmsg_len < header_bytes || cmsg_len > used - offset {
+                close_fds(&rights);
+                return Err(RuntimeFdBrokerError::Protocol(
+                    "SCM_RIGHTS receive reported an invalid ancillary length".to_owned(),
+                ));
+            }
+            if header.cmsg_level != libc::SOL_SOCKET || header.cmsg_type != libc::SCM_RIGHTS {
+                close_fds(&rights);
+                return Err(RuntimeFdBrokerError::Protocol(
+                    "runtime snapshot return received unexpected ancillary data".to_owned(),
+                ));
+            }
+
+            let data_bytes = cmsg_len - header_bytes;
+            if data_bytes == 0 || data_bytes % std::mem::size_of::<RawFd>() != 0 {
+                close_fds(&rights);
+                return Err(RuntimeFdBrokerError::Protocol(
+                    "SCM_RIGHTS receive contained an invalid descriptor payload".to_owned(),
+                ));
+            }
+            let count = data_bytes / std::mem::size_of::<RawFd>();
+            if rights.len() + count > super::MAX_RUNTIME_SEALED_BUNDLE_ITEMS {
+                close_fds(&rights);
+                return Err(RuntimeFdBrokerError::Protocol(
+                    "SCM_RIGHTS receive exceeded the bounded descriptor count".to_owned(),
+                ));
+            }
+
+            let data = unsafe {
+                control
+                    .0
+                    .as_ptr()
+                    .add(offset + header_bytes)
+                    .cast::<RawFd>()
+            };
+            for index in 0..count {
+                let fd = unsafe { data.add(index).read() };
+                if fd < 0 {
+                    close_fds(&rights);
+                    return Err(RuntimeFdBrokerError::Protocol(
+                        "SCM_RIGHTS receive produced an invalid descriptor".to_owned(),
+                    ));
+                }
+                rights.push(fd);
+            }
+
+            cmsg_count += 1;
+            let step = (cmsg_len + alignment - 1) & !(alignment - 1);
+            if step == 0 || step > used - offset {
+                close_fds(&rights);
+                return Err(RuntimeFdBrokerError::Protocol(
+                    "SCM_RIGHTS receive had invalid ancillary alignment".to_owned(),
+                ));
+            }
+            offset += step;
+        }
+
+        Ok((rights, cmsg_count))
+    }
+
+    fn receive_one_fd(
+        socket_fd: RawFd,
+        label: &'static str,
+    ) -> Result<RawFd, RuntimeFdBrokerError> {
+        let mut payload = [0u8; 1];
+        let mut iovec = libc::iovec {
+            iov_base: payload.as_mut_ptr().cast::<libc::c_void>(),
+            iov_len: payload.len(),
+        };
+        let mut control = FdControl([0; 48]);
+        let mut message = unsafe { std::mem::zeroed::<libc::msghdr>() };
+        message.msg_iov = &mut iovec;
+        message.msg_iovlen = 1;
+        message.msg_control = control.0.as_mut_ptr().cast::<libc::c_void>();
+        message.msg_controllen = control.0.len();
+
+        loop {
+            message.msg_flags = 0;
+            message.msg_controllen = control.0.len();
+            let received =
+                unsafe { libc::recvmsg(socket_fd, &mut message, libc::MSG_CMSG_CLOEXEC) };
+            if received == -1 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                return Err(RuntimeFdBrokerError::io(
+                    "cannot receive runtime snapshot return descriptor",
+                    error,
+                ));
+            }
+            if received == 0 {
+                return Err(RuntimeFdBrokerError::Protocol(format!(
+                    "{label} peer closed before returning a descriptor"
+                )));
+            }
+
+            let (rights, cmsg_count) = parse_received_rights(&control, message.msg_controllen)?;
+            let fail = |rights: Vec<RawFd>, message: String| {
+                close_fds(&rights);
+                RuntimeFdBrokerError::Protocol(message)
+            };
+
+            if received != 1 {
+                return Err(fail(
+                    rights,
+                    format!("{label} used unexpected payload length {received}"),
+                ));
+            }
+            if payload != *b"F" {
+                return Err(fail(
+                    rights,
+                    format!("{label} used an unexpected payload marker"),
+                ));
+            }
+            if message.msg_flags & (libc::MSG_CTRUNC | libc::MSG_TRUNC) != 0 {
+                return Err(fail(
+                    rights,
+                    format!("{label} ancillary or packet data was truncated"),
+                ));
+            }
+            if cmsg_count != 1 || rights.len() != 1 {
+                return Err(fail(
+                    rights,
+                    format!("{label} must return exactly one SCM_RIGHTS descriptor"),
+                ));
+            }
+            return Ok(rights[0]);
+        }
+    }
+
     fn send_fds(socket_fd: RawFd, source_fds: &[RawFd]) -> Result<(), RuntimeFdBrokerError> {
         if source_fds.is_empty() || source_fds.len() > super::MAX_RUNTIME_SEALED_BUNDLE_ITEMS {
             return Err(RuntimeFdBrokerError::Protocol(
@@ -1537,7 +1927,46 @@ mod imp {
     pub struct PreparedRuntimeMessageChannel;
 
     #[derive(Debug)]
+    pub struct PreparedRuntimeSnapshotReturnChannel;
+
+    #[derive(Debug)]
+    pub struct ReturnedSealedRuntimeSnapshot;
+
+    #[derive(Debug)]
+    pub struct RuntimeSnapshotReturnController;
+
+    #[derive(Debug)]
     pub struct RuntimeMessageExchangeController;
+
+    impl ReturnedSealedRuntimeSnapshot {
+        pub fn len(&self) -> u64 {
+            0
+        }
+
+        pub fn is_empty(&self) -> bool {
+            true
+        }
+
+        pub fn read_all(&self) -> Result<Vec<u8>, RuntimeFdBrokerError> {
+            Err(RuntimeFdBrokerError::UnsupportedPlatform(
+                "returned sealed runtime snapshots currently require Linux x86_64".to_owned(),
+            ))
+        }
+    }
+
+    impl RuntimeSnapshotReturnController {
+        pub fn is_complete(&self) -> bool {
+            false
+        }
+
+        pub fn receive_snapshot(
+            &mut self,
+        ) -> Result<ReturnedSealedRuntimeSnapshot, RuntimeFdBrokerError> {
+            Err(RuntimeFdBrokerError::UnsupportedPlatform(
+                "runtime snapshot returns currently require Linux x86_64".to_owned(),
+            ))
+        }
+    }
 
     impl RuntimeMessageExchangeController {
         pub fn is_complete(&self) -> bool {
@@ -1692,6 +2121,20 @@ mod imp {
                 "runtime message exchanges currently require Linux x86_64".to_owned(),
             ))
         }
+
+        pub fn prepare_runtime_snapshot_return(
+            _max_bytes: u64,
+        ) -> Result<
+            (
+                PreparedRuntimeSnapshotReturnChannel,
+                RuntimeSnapshotReturnController,
+            ),
+            RuntimeFdBrokerError,
+        > {
+            Err(RuntimeFdBrokerError::UnsupportedPlatform(
+                "runtime snapshot returns currently require Linux x86_64".to_owned(),
+            ))
+        }
     }
 
     impl RuntimeFdSession {
@@ -1745,11 +2188,22 @@ mod imp {
                 "runtime message exchanges currently require Linux x86_64".to_owned(),
             ))
         }
+
+        pub fn send_runtime_snapshot_return_channel(
+            &mut self,
+            _grant: PreparedRuntimeSnapshotReturnChannel,
+        ) -> Result<(), RuntimeFdBrokerError> {
+            Err(RuntimeFdBrokerError::UnsupportedPlatform(
+                "runtime snapshot returns currently require Linux x86_64".to_owned(),
+            ))
+        }
     }
 }
 
 pub use imp::{
     PreparedReadOnlyRegularFile, PreparedRevocableByteStream, PreparedRuntimeMessageChannel,
-    PreparedSealedRegularFileSnapshot, PreparedSealedSnapshotBundle, RevocableByteStreamController,
+    PreparedRuntimeSnapshotReturnChannel, PreparedSealedRegularFileSnapshot,
+    PreparedSealedSnapshotBundle, ReturnedSealedRuntimeSnapshot, RevocableByteStreamController,
     RuntimeFdBroker, RuntimeFdSession, RuntimeMessageExchangeController,
+    RuntimeSnapshotReturnController,
 };

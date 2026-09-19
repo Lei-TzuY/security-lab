@@ -82,7 +82,13 @@ fn run_json_emits_deterministic_machine_report() {
         .expect("run JSON CLI");
     let _ = fs::remove_file(path);
 
-    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "run-json failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(
         output.stderr.is_empty(),
         "unexpected stderr bytes: {:?}",
@@ -127,7 +133,13 @@ fn run_command_keeps_human_readable_status_contract() {
         .expect("run human CLI");
     let _ = fs::remove_file(path);
 
-    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "run failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(
         output.stderr.is_empty(),
         "unexpected stderr bytes: {:?}",

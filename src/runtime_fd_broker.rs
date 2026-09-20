@@ -4003,6 +4003,23 @@ mod imp {
     #[derive(Debug)]
     pub struct PreparedHostUnixStream;
 
+    #[derive(Debug)]
+    pub struct PreparedHostUnixSeqpacket;
+
+    impl PreparedHostUnixSeqpacket {
+        pub fn peer_pid(&self) -> i32 {
+            0
+        }
+
+        pub fn peer_uid(&self) -> u32 {
+            0
+        }
+
+        pub fn peer_gid(&self) -> u32 {
+            0
+        }
+    }
+
     #[must_use = "retain this controller and call revoke() when confirmed host-stream revocation is required"]
     #[derive(Debug)]
     pub struct HostUnixStreamRevocationController;
@@ -4515,6 +4532,15 @@ mod imp {
             ))
         }
 
+        pub fn prepare_host_unix_seqpacket(
+            _path: impl AsRef<Path>,
+            _expected_peer: Option<(u32, u32)>,
+        ) -> Result<PreparedHostUnixSeqpacket, RuntimeFdBrokerError> {
+            Err(RuntimeFdBrokerError::UnsupportedPlatform(
+                "runtime host UNIX seqpacket grants currently require Linux x86_64".to_owned(),
+            ))
+        }
+
         pub fn prepare_readonly_regular_file(
             _source: &File,
         ) -> Result<PreparedReadOnlyRegularFile, RuntimeFdBrokerError> {
@@ -4655,6 +4681,15 @@ mod imp {
             ))
         }
 
+        pub fn send_host_unix_seqpacket(
+            &mut self,
+            _grant: PreparedHostUnixSeqpacket,
+        ) -> Result<(), RuntimeFdBrokerError> {
+            Err(RuntimeFdBrokerError::UnsupportedPlatform(
+                "runtime host UNIX seqpacket grants currently require Linux x86_64".to_owned(),
+            ))
+        }
+
         pub fn send_revocable_host_unix_stream(
             &mut self,
             _grant: PreparedHostUnixStream,
@@ -4712,7 +4747,8 @@ mod imp {
 }
 
 pub use imp::{
-    HostUnixStreamRevocationController, PreparedHostUnixStream, PreparedReadOnlyRegularFile,
+    HostUnixStreamRevocationController, PreparedHostUnixSeqpacket, PreparedHostUnixStream,
+    PreparedReadOnlyRegularFile,
     PreparedRevocableByteStream, PreparedRuntimeMessageChannel, PreparedSealedRegularFileSnapshot,
     PreparedSealedSnapshotBundle, RevocableByteStreamController,
     RuntimeAcknowledgedCorrelatedMessageExchangeController,

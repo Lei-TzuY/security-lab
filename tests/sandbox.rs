@@ -243,6 +243,10 @@ fn fixture_root() -> &'static Path {
             .expect("create second sandbox writable-volume mountpoint");
         std::fs::create_dir_all(root.join("cowdata"))
             .expect("create sandbox copy-on-write volume mountpoint");
+        std::fs::create_dir_all(root.join("cowa"))
+            .expect("create first COW diff volume mountpoint");
+        std::fs::create_dir_all(root.join("cowb"))
+            .expect("create second COW diff volume mountpoint");
         std::fs::create_dir_all(root.join("devices"))
             .expect("create sandbox device-volume mountpoint");
         std::fs::create_dir_all(root.join("landlock-allowed"))
@@ -293,6 +297,7 @@ fn fixture_root() -> &'static Path {
         for (name, source_name) in [
             ("cow-volume-probe", "cow_volume_probe.S"),
             ("cow-volume-budget-probe", "cow_volume_budget_probe.S"),
+            ("cow-volume-diff-probe", "cow_volume_diff_probe.S"),
         ] {
             let output = root.join(name);
             let source = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1812,6 +1817,86 @@ fn copy_on_write_persistent_volume_enforces_private_byte_ceiling() {
     }];
 
     assert_eq!(run(&mounted).unwrap(), ChildOutcome::Exited(0));
+    assert!(!too_big.exists());
+}
+
+#[test]
+fn copy_on_write_volume_diffs_are_isolated_and_target_sorted() {
+    let first = std::env::temp_dir().join(format!(
+        "security-lab-cow-diff-a-{}",
+        process::id()
+    ));
+    let second = std::env::temp_dir().join(format!(
+        "security-lab-cow-diff-b-{}",
+        process::id()
+    ));
+    for source in [&first, &second] {
+        let _ = std::fs::remove_dir_all(source);
+        std::fs::create_dir_all(source).unwrap();
+    }
+
+    let mut mounted = policy("unused", &[], &["openat", "write", "close", "exit"]);
+    mounted.executable = PathBuf::from("/cow-volume-diff-probe");
+    mounted.copy_on_write_volume_bindings = vec![
+        CopyOnWriteVolumeBinding {
+            source: second.clone(),
+            target: PathBuf::from("/cowb"),
+            bytes: 1024 * 1024,
+            diff_bytes: Some(4096),
+        },
+        CopyOnWriteVolumeBinding {
+            source: first.clone(),
+            target: PathBuf::from("/cowa"),
+            bytes: 1024 * 1024,
+            diff_bytes: Some(4096),
+        },
+    ];
+
+    let report = run_report(&mounted).unwrap();
+    assert_eq!(report.outcome, ChildOutcome::Exited(0));
+    assert_eq!(report.cow_volume_diffs.len(), 2);
+    assert_eq!(report.cow_volume_diffs[0].target, b"/cowa");
+    assert_eq!(report.cow_volume_diffs[1].target, b"/cowb");
+
+    assert!(report.cow_volume_diffs[0].diff.entries.iter().any(|entry| {
+        matches!(
+            entry,
+            CowDiffEntry::UpsertFile { path, bytes, .. }
+                if path == b"/first" && bytes == b"alpha\n"
+        )
+    }));
+    assert!(report.cow_volume_diffs[1].diff.entries.iter().any(|entry| {
+        matches!(
+            entry,
+            CowDiffEntry::UpsertFile { path, bytes, .. }
+                if path == b"/second" && bytes == b"beta\n"
+        )
+    }));
+    assert!(!first.join("first").exists());
+    assert!(!second.join("second").exists());
+}
+
+#[test]
+fn copy_on_write_volume_diff_overflow_fails_closed() {
+    let source = cow_volume_source().to_path_buf();
+    let too_big = source.join("too-big");
+    let _ = std::fs::remove_file(&too_big);
+
+    let mut mounted = policy("unused", &[], &["openat", "write", "close", "exit"]);
+    mounted.executable = PathBuf::from("/cow-volume-budget-probe");
+    mounted.copy_on_write_volume_bindings = vec![CopyOnWriteVolumeBinding {
+        source,
+        target: PathBuf::from("/cowdata"),
+        bytes: 1024 * 1024,
+        diff_bytes: Some(64),
+    }];
+
+    match run_report(&mounted).unwrap_err() {
+        SandboxError::SetupFailed(message) => {
+            assert!(message.contains("copy-on-write diff"));
+        }
+        other => panic!("unexpected COW volume diff overflow result: {other}"),
+    }
     assert!(!too_big.exists());
 }
 

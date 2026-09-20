@@ -829,7 +829,7 @@ fn sealed_path_qualified_dt_needed_mismatch_fails_closed_before_target_execution
     match run(&verified).unwrap_err() {
         SandboxError::SetupFailed(message) => {
             assert!(message.contains(
-                "ELF direct dependency SHA-256 does not match executable.needed_sha256 policy"
+                "ELF dependency graph node SHA-256 does not match executable.needed_sha256 policy"
             ));
         }
         other => panic!("unexpected DT_NEEDED digest mismatch result: {other}"),
@@ -840,8 +840,8 @@ fn sealed_path_qualified_dt_needed_mismatch_fails_closed_before_target_execution
     wrong_path.executable_needed = Some(PathBuf::from("/not-the-needed-object"));
     match run(&wrong_path).unwrap_err() {
         SandboxError::SetupFailed(message) => {
-            assert!(message.contains("direct DT_NEEDED set"));
-            assert!(message.contains("does not exactly match"));
+            assert!(message.contains("sealed dependency graph root validation failed"));
+            assert!(message.contains("DT_NEEDED edge /dependency is not present"));
         }
         other => panic!("unexpected DT_NEEDED path mismatch result: {other}"),
     }
@@ -859,8 +859,8 @@ fn sealed_direct_needed_binding_rejects_additional_unbound_direct_dependency() {
 
     match run(&policy).unwrap_err() {
         SandboxError::SetupFailed(message) => {
-            assert!(message.contains("direct DT_NEEDED set"));
-            assert!(message.contains("does not exactly match"));
+            assert!(message.contains("sealed dependency graph root validation failed"));
+            assert!(message.contains("DT_NEEDED edge /dependency-extra is not present"));
         }
         other => panic!("unexpected direct dependency closure result: {other}"),
     }
@@ -924,7 +924,52 @@ fn sealed_bounded_needed_set_mounts_every_exact_direct_dependency() {
 }
 
 #[test]
-fn sealed_direct_dependency_rejects_unbound_transitive_needed_edge() {
+fn sealed_dependency_graph_executes_complete_transitive_closure() {
+    let mut verified = policy(
+        "unused",
+        &[],
+        &[
+            "read",
+            "close",
+            "fstat",
+            "mmap",
+            "mprotect",
+            "munmap",
+            "brk",
+            "arch_prctl",
+            "set_tid_address",
+            "set_robust_list",
+            "prlimit64",
+            "getrandom",
+            "openat",
+            "newfstatat",
+            "pread64",
+            "access",
+            "madvise",
+            "exit",
+            "exit_group",
+        ],
+    );
+    verified.executable = PathBuf::from("/dynamic-needed-transitive-probe");
+    verified.executable_sha256 = Some(dynamic_needed_transitive_fixture_sha256());
+    verified.executable_interpreter = Some(PathBuf::from("/loader"));
+    verified.executable_interpreter_sha256 = Some(fixture_loader_sha256());
+    verified.executable_needed_bindings = vec![
+        ExecutableNeededBinding {
+            path: PathBuf::from("/dependency-transitive"),
+            sha256: fixture_transitive_needed_sha256(),
+        },
+        ExecutableNeededBinding {
+            path: PathBuf::from("/dependency-extra"),
+            sha256: fixture_extra_needed_sha256(),
+        },
+    ];
+
+    assert_eq!(run(&verified).unwrap(), ChildOutcome::Exited(91));
+}
+
+#[test]
+fn sealed_dependency_graph_rejects_unbound_transitive_needed_edge() {
     let mut policy = policy("unused", &[], &["exit"]);
     policy.executable = PathBuf::from("/dynamic-needed-transitive-probe");
     policy.executable_sha256 = Some(dynamic_needed_transitive_fixture_sha256());
@@ -935,10 +980,41 @@ fn sealed_direct_dependency_rejects_unbound_transitive_needed_edge() {
 
     match run(&policy).unwrap_err() {
         SandboxError::SetupFailed(message) => {
-            assert!(message.contains("must be a DT_NEEDED leaf"));
-            assert!(message.contains("1 transitive dependency entries"));
+            assert!(message.contains("sealed dependency graph closure validation failed"));
+            assert!(message.contains(
+                "sealed dependency /dependency-transitive requires undeclared DT_NEEDED edge /dependency-extra"
+            ));
         }
         other => panic!("unexpected transitive dependency closure result: {other}"),
+    }
+}
+
+#[test]
+fn sealed_dependency_graph_rejects_unreachable_declared_node() {
+    let mut policy = policy("unused", &[], &["exit"]);
+    policy.executable = PathBuf::from("/dynamic-needed-probe");
+    policy.executable_sha256 = Some(dynamic_needed_fixture_sha256());
+    policy.executable_interpreter = Some(PathBuf::from("/loader"));
+    policy.executable_interpreter_sha256 = Some(fixture_loader_sha256());
+    policy.executable_needed_bindings = vec![
+        ExecutableNeededBinding {
+            path: PathBuf::from("/dependency"),
+            sha256: fixture_needed_sha256(),
+        },
+        ExecutableNeededBinding {
+            path: PathBuf::from("/dependency-extra"),
+            sha256: fixture_extra_needed_sha256(),
+        },
+    ];
+
+    match run(&policy).unwrap_err() {
+        SandboxError::SetupFailed(message) => {
+            assert!(message.contains("sealed dependency graph closure validation failed"));
+            assert!(message.contains(
+                "declared sealed dependency /dependency-extra is unreachable from the main executable"
+            ));
+        }
+        other => panic!("unexpected unreachable dependency result: {other}"),
     }
 }
 

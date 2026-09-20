@@ -129,12 +129,13 @@ pub struct SandboxPolicy {
     /// and its interpreter request are both content-bound.
     pub executable_interpreter: Option<PathBuf>,
     pub executable_interpreter_sha256: Option<[u8; 32]>,
-    /// Optional one direct absolute path-qualified DT_NEEDED dependency plus
-    /// exact SHA-256. Valid only when both the main executable and PT_INTERP
-    /// loader are content-bound, so the dependency is selected by sealed code.
+    /// Optional legacy one-node representation for the sealed DT_NEEDED
+    /// dependency graph plus exact SHA-256. Valid only when both the main
+    /// executable and PT_INTERP loader are content-bound.
     pub executable_needed: Option<PathBuf>,
     pub executable_needed_sha256: Option<[u8; 32]>,
-    /// Optional bounded exact set of path-qualified direct DT_NEEDED bindings.
+    /// Optional bounded exact set of path-qualified DT_NEEDED graph nodes.
+    /// Root and transitive edges must resolve entirely within this sealed set.
     /// This is mutually exclusive with the legacy single pair above.
     pub executable_needed_bindings: Vec<ExecutableNeededBinding>,
     pub args: Vec<String>,

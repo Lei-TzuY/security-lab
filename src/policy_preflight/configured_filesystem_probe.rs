@@ -36,7 +36,7 @@ mod linux_x86_64 {
     use crate::elf_needed;
     use security_lab::SandboxPolicy;
     use sha2::{Digest, Sha256};
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::ffi::CString;
     use std::io;
     use std::os::unix::ffi::OsStrExt;
@@ -389,32 +389,28 @@ mod linux_x86_64 {
                     );
                 }
             };
-            let needed = match elf_needed::read_elf64_x86_64_dt_needed(executable_readable.raw()) {
-                Ok(needed) => needed,
-                Err(_) => {
-                    return ConfiguredFilesystemProbe::unavailable("executable_needed_elf", None);
-                }
-            };
-            let mut observed = BTreeSet::new();
-            for entry in &needed {
-                if !observed.insert(entry.clone()) {
-                    return ConfiguredFilesystemProbe::unavailable(
-                        "executable_needed_duplicate_elf_entry",
-                        None,
-                    );
-                }
-            }
+            let root_needed =
+                match elf_needed::read_elf64_x86_64_dt_needed(executable_readable.raw()) {
+                    Ok(needed) => needed,
+                    Err(_) => {
+                        return ConfiguredFilesystemProbe::unavailable(
+                            "executable_needed_elf",
+                            None,
+                        );
+                    }
+                };
             let declared = needed_bindings
                 .iter()
                 .map(|binding| binding.path.as_os_str().as_bytes().to_vec())
                 .collect::<BTreeSet<_>>();
-            if observed != declared {
+            if elf_needed::validate_dependency_graph_roots(&root_needed, &declared).is_err() {
                 return ConfiguredFilesystemProbe::unavailable(
-                    "executable_needed_closure_mismatch",
+                    "executable_needed_graph_roots",
                     None,
                 );
             }
 
+            let mut dependency_graph = BTreeMap::new();
             for binding in &needed_bindings {
                 let dependency = &binding.path;
                 let object = match open_beneath(
@@ -486,8 +482,7 @@ mod linux_x86_64 {
                         None,
                     );
                 }
-                let transitive_needed = match elf_needed::read_elf64_x86_64_dt_needed(object.raw())
-                {
+                let node_needed = match elf_needed::read_elf64_x86_64_dt_needed(object.raw()) {
                     Ok(needed) => needed,
                     Err(_) => {
                         return ConfiguredFilesystemProbe::unavailable(
@@ -496,12 +491,15 @@ mod linux_x86_64 {
                         );
                     }
                 };
-                if !transitive_needed.is_empty() {
-                    return ConfiguredFilesystemProbe::unavailable(
-                        "executable_needed_transitive_dependency",
-                        None,
-                    );
-                }
+                dependency_graph.insert(dependency.as_os_str().as_bytes().to_vec(), node_needed);
+            }
+
+            if elf_needed::validate_exact_dependency_graph(&root_needed, &dependency_graph).is_err()
+            {
+                return ConfiguredFilesystemProbe::unavailable(
+                    "executable_needed_graph_closure",
+                    None,
+                );
             }
         }
 

@@ -1496,7 +1496,7 @@ Boundary: 60A starts its budget when the trusted caller explicitly invokes `star
 
 ### Slice 61A — explicit request IDs and out-of-order response correlation
 
-**Current verified candidate.** Adds a materially different protocol property over the existing readiness-gated private `SOCK_SEQPACKET` capability without changing sandbox grant authority.
+**Status: complete on `main`.** Adds a materially different protocol property over the existing readiness-gated private `SOCK_SEQPACKET` capability without changing sandbox grant authority.
 
 Acceptance evidence is executable:
 
@@ -1514,7 +1514,32 @@ Boundary: 61A is bounded correlation over one already-granted endpoint. It does 
 
 ### Milestone 61 promotion rule
 
-After 61A integrates, do not farm ID widths, larger caps, or more response-order permutations. Promote only to a materially different protocol authority property such as authenticated application framing/replay resistance, or to another independent architecture frontier.
+61A is sealed on `main`. Do not farm ID widths, larger caps, or more response-order permutations. Promote only to a materially different protocol authority property such as authenticated application framing/replay resistance, or to another independent architecture frontier.
+
+## Milestone 62 — authenticated correlated runtime framing
+
+### Slice 62A — fresh-challenge HMAC-SHA256 request/response authentication
+
+**Current implementation candidate.** Adds application-frame authenticity and bounded cross-session replay separation to the 61A correlated exchange without changing target syscall authority or replacing its bounded in-flight lifecycle.
+
+Acceptance evidence is executable:
+
+- `prepare_runtime_authenticated_correlated_exchange(max_request_bytes, max_response_bytes, max_requests, max_in_flight, key)` keeps the 61A 1-byte–64-KiB payload bounds, 2–32 total-request bound, and 2–8 in-flight bound while requiring exactly 32 caller-supplied HMAC key bytes;
+- preparation obtains a fresh 32-byte challenge directly from Linux `getrandom(2)`, failing closed on unavailable/failed randomness instead of substituting a predictable nonce;
+- after the existing readiness-gated `SCM_RIGHTS` endpoint transfer, the controller must publish exactly one `C || version=1 || challenge[32]` packet before any authenticated request can be accepted;
+- request and response frames use distinct direction bytes and HMAC-SHA256 over the versioned domain `security-lab-runtime-correlated-hmac-sha256-v1\0`, the session challenge, direction/version, little-endian request ID, little-endian payload length, and complete non-empty payload;
+- request MAC verification uses the pinned HMAC implementation's constant-time verification path and occurs before the request ID enters the seen/pending sets. A bad tag returns typed `RuntimeAuthenticationFailed` and terminally poisons the exchange;
+- trusted responses are authenticated under the same session challenge and key while retaining 61A out-of-order completion and atomic nonblocking publication semantics;
+- the controller's custom `Debug` representation omits both the secret HMAC key and session challenge rather than exposing key material through derived debug output;
+- broker-level regressions exercise the real readiness handshake and `SCM_RIGHTS` endpoint grant, authenticate two simultaneous requests, publish an out-of-order authenticated response, admit another request after a slot is freed, and verify each response tag at the peer;
+- negative regressions require a one-bit tag corruption and a frame authenticated under a different challenge to fail authentication terminally, while pre-challenge receive and double challenge publication are rejected without silently consuming request state;
+- exact-head stable rustfmt, Clippy with `-D warnings`, complete stable tests, and the Rust 1.74 suite are the integration gate for this candidate.
+
+Boundary: 62A provides shared-key frame authentication plus per-session freshness binding. The challenge is public, payloads are not encrypted, and the caller remains responsible for HMAC key generation, secrecy, distribution, rotation, revocation, and memory lifecycle. Fresh-challenge binding rejects frames authenticated for another challenge but is not a persistent replay ledger or hardware monotonic counter. This slice does not prove target processing/acknowledgment, compose the 56B/59A/60A deadline APIs into the correlated controller, expose an async host execution API, buffer responses under backpressure, or provide general RPC/attestation semantics. Its executable evidence remains at the real broker/controller integration layer rather than adding a new policy-level raw-target key-distribution mechanism.
+
+### Milestone 62 promotion rule
+
+After 62A integrates, do not farm tag sizes, alternate MAC encodings, nonce widths, or direction-byte variants. Further runtime-protocol work must add a materially different property such as authenticated target acknowledgment/processing evidence, a genuinely concurrent host execution surface, or move to another independent architecture frontier.
 
 ## Later frontiers
 

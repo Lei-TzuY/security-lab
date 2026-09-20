@@ -1364,13 +1364,11 @@ mod x86_64 {
                                 "cannot parse content-bound executable DT_NEEDED: {error}"
                             ))
                         })?;
-                    let matches = needed
-                        .iter()
-                        .filter(|entry| entry.as_slice() == path.as_os_str().as_bytes())
-                        .count();
-                    if matches != 1 {
+                    if needed.len() != 1
+                        || needed[0].as_slice() != path.as_os_str().as_bytes()
+                    {
                         return Err(SandboxError::SetupFailed(format!(
-                            "content-bound executable must contain exactly one DT_NEEDED entry matching executable.needed {}",
+                            "content-bound executable direct DT_NEEDED closure must contain exactly one entry and it must match executable.needed {}",
                             path.display()
                         )));
                     }

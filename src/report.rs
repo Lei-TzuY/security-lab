@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 use std::fmt;
 
 /// Observable terminal status of the direct sandbox target.
@@ -81,7 +79,8 @@ pub struct CowDiff {
 /// persistent-volume target.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CowVolumeDiff {
-    pub target: PathBuf,
+    /// Exact Unix bytes of the declared sandbox mount target.
+    pub target: Vec<u8>,
     pub diff: CowDiff,
 }
 

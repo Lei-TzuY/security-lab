@@ -790,8 +790,8 @@ fn sealed_path_qualified_dt_needed_mismatch_fails_closed_before_target_execution
     wrong_path.executable_needed = Some(PathBuf::from("/not-the-needed-object"));
     match run(&wrong_path).unwrap_err() {
         SandboxError::SetupFailed(message) => {
-            assert!(message.contains("DT_NEEDED"));
-            assert!(message.contains("exactly one"));
+            assert!(message.contains("direct DT_NEEDED set"));
+            assert!(message.contains("does not exactly match"));
         }
         other => panic!("unexpected DT_NEEDED path mismatch result: {other}"),
     }
@@ -818,8 +818,8 @@ fn sealed_direct_needed_binding_rejects_additional_unbound_direct_dependency() {
 
 #[test]
 fn sealed_bounded_needed_set_mounts_every_exact_direct_dependency() {
-    let dependency_before = std::fs::read(fixture_root().join("dependency"))
-        .expect("read first dependency before run");
+    let dependency_before =
+        std::fs::read(fixture_root().join("dependency")).expect("read first dependency before run");
     let extra_before = std::fs::read(fixture_root().join("dependency-extra"))
         .expect("read extra dependency before run");
     let mut verified = policy(

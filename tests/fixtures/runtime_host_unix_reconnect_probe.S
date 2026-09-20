@@ -159,17 +159,17 @@ receive_one_fd:
     syscall
     cmp $1, %rax
     jne .receive_fail
-    cmpb $70, 144(%rsp)
+    cmpb $70, 144(%r15)
     jne .receive_fail
-    testl $8, 48(%rsp)
+    testl $8, 48(%r15)
     jne .receive_fail
-    cmpq $20, 80(%rsp)
+    cmpq $20, 80(%r15)
     jne .receive_fail
-    cmpl $1, 88(%rsp)
+    cmpl $1, 88(%r15)
     jne .receive_fail
-    cmpl $1, 92(%rsp)
+    cmpl $1, 92(%r15)
     jne .receive_fail
-    mov 96(%rsp), %eax
+    mov 96(%r15), %eax
     test %eax, %eax
     js .receive_fail
     ret

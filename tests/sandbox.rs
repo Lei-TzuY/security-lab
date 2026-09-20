@@ -547,8 +547,10 @@ fn policy(mode: &str, extra_args: &[&str], syscalls: &[&str]) -> SandboxPolicy {
         host_loopback_tcp_listen_target_fd: None,
         readonly_volume_source: None,
         readonly_volume_target: None,
+        readonly_volume_bindings: Vec::new(),
         writable_volume_source: None,
         writable_volume_target: None,
+        writable_volume_bindings: Vec::new(),
         scratch_dir: Some(PathBuf::from("/scratch")),
         scratch_bytes: Some(SCRATCH_BYTES),
         stdio: StdioPolicy {

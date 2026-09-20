@@ -2,11 +2,13 @@
 
 use security_lab::{
     run, ChildOutcome, RuntimeFdBroker, RuntimeFdBrokerError, SandboxPolicy,
+    MAX_RUNTIME_CORRELATED_IN_FLIGHT, MAX_RUNTIME_CORRELATED_REQUESTS,
     MAX_RUNTIME_MESSAGE_BYTES, MAX_RUNTIME_MESSAGE_REQUEST_WAIT_MILLISECONDS,
     MAX_RUNTIME_MESSAGE_RESPONSE_WAIT_MILLISECONDS, MAX_RUNTIME_MULTI_MESSAGE_ROUNDS,
     MAX_RUNTIME_MULTI_MESSAGE_SESSION_MILLISECONDS, MAX_RUNTIME_REVOCABLE_STREAM_BYTES,
     MAX_RUNTIME_SEALED_BUNDLE_BYTES, MAX_RUNTIME_SEALED_BUNDLE_ITEMS,
-    MAX_RUNTIME_SEALED_SNAPSHOT_BYTES, MIN_RUNTIME_MULTI_MESSAGE_ROUNDS,
+    MAX_RUNTIME_SEALED_SNAPSHOT_BYTES, MIN_RUNTIME_CORRELATED_IN_FLIGHT,
+    MIN_RUNTIME_CORRELATED_REQUESTS, MIN_RUNTIME_MULTI_MESSAGE_ROUNDS,
 };
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
@@ -90,6 +92,47 @@ fn receive_one_fd(stream: &UnixStream) -> TestFd {
         assert!(fd >= 0);
         TestFd(fd)
     }
+}
+
+fn send_correlated_packet(fd: RawFd, request_id: u64, payload: &[u8]) {
+    assert!(!payload.is_empty());
+    let mut frame = Vec::with_capacity(8 + payload.len());
+    frame.extend_from_slice(&request_id.to_le_bytes());
+    frame.extend_from_slice(payload);
+    assert_eq!(
+        unsafe {
+            libc::send(
+                fd,
+                frame.as_ptr().cast::<libc::c_void>(),
+                frame.len(),
+                libc::MSG_NOSIGNAL,
+            )
+        },
+        frame.len() as isize,
+        "send correlated packet failed: {}",
+        std::io::Error::last_os_error()
+    );
+}
+
+fn receive_correlated_packet(fd: RawFd) -> (u64, Vec<u8>) {
+    let mut frame = vec![0u8; MAX_RUNTIME_MESSAGE_BYTES as usize + 8];
+    let received = unsafe {
+        libc::recv(
+            fd,
+            frame.as_mut_ptr().cast::<libc::c_void>(),
+            frame.len(),
+            0,
+        )
+    };
+    assert!(
+        received >= 9,
+        "receive correlated packet failed or malformed: received={received}, error={}",
+        std::io::Error::last_os_error()
+    );
+    frame.truncate(received as usize);
+    let mut request_id_bytes = [0u8; 8];
+    request_id_bytes.copy_from_slice(&frame[..8]);
+    (u64::from_le_bytes(request_id_bytes), frame[8..].to_vec())
 }
 
 #[repr(C, align(8))]
@@ -1614,6 +1657,175 @@ fn runtime_multi_message_session_deadline_also_bounds_response_publication() {
     assert!(matches!(
         controller.send_response_with_deadline(b"retry", 1000),
         Err(RuntimeFdBrokerError::Protocol(message)) if message.contains("closed after")
+    ));
+}
+
+#[test]
+fn correlated_runtime_exchange_tracks_multiple_inflight_and_out_of_order_responses() {
+    let socket_path = unique_path("runtime-correlated-out-of-order.sock");
+    let _ = std::fs::remove_file(&socket_path);
+    let broker = RuntimeFdBroker::bind(&socket_path).unwrap();
+    let mut client = UnixStream::connect(broker.path()).unwrap();
+    let mut session = broker.accept().unwrap();
+    client.write_all(b"R").unwrap();
+    session.wait_for_ready(b'R').unwrap();
+
+    let (grant, mut controller) =
+        RuntimeFdBroker::prepare_runtime_correlated_exchange(16, 16, 3, 2).unwrap();
+    session.send_runtime_message_channel(grant).unwrap();
+    let endpoint = receive_one_fd(&client);
+
+    send_correlated_packet(endpoint.raw(), 41, b"one");
+    send_correlated_packet(endpoint.raw(), 42, b"two");
+
+    let first = controller.receive_request().unwrap();
+    assert_eq!(first.request_id(), 41);
+    assert_eq!(first.payload(), b"one");
+    let second = controller.receive_request().unwrap();
+    assert_eq!(second.request_id(), 42);
+    assert_eq!(second.payload(), b"two");
+    assert_eq!(controller.pending_requests(), 2);
+    assert!(matches!(
+        controller.receive_request(),
+        Err(RuntimeFdBrokerError::InvalidConfiguration(message))
+            if message.contains("in-flight request limit")
+    ));
+
+    controller.send_response(42, b"TWO").unwrap();
+    assert_eq!(
+        receive_correlated_packet(endpoint.raw()),
+        (42, b"TWO".to_vec())
+    );
+    assert_eq!(controller.pending_requests(), 1);
+
+    send_correlated_packet(endpoint.raw(), 43, b"three");
+    let third = controller.receive_request().unwrap();
+    assert_eq!(third.request_id(), 43);
+    assert_eq!(third.into_payload(), b"three");
+    assert_eq!(controller.received_requests(), 3);
+    assert_eq!(controller.pending_requests(), 2);
+
+    controller.send_response(43, b"THREE").unwrap();
+    assert_eq!(
+        receive_correlated_packet(endpoint.raw()),
+        (43, b"THREE".to_vec())
+    );
+    controller.send_response(41, b"ONE").unwrap();
+    assert_eq!(
+        receive_correlated_packet(endpoint.raw()),
+        (41, b"ONE".to_vec())
+    );
+
+    assert_eq!(controller.completed_responses(), 3);
+    assert_eq!(controller.pending_requests(), 0);
+    assert_eq!(controller.max_requests(), 3);
+    assert_eq!(controller.max_in_flight(), 2);
+    assert!(controller.is_complete());
+    assert!(matches!(
+        controller.receive_request(),
+        Err(RuntimeFdBrokerError::Protocol(message))
+            if message.contains("request limit")
+    ));
+}
+
+#[test]
+fn correlated_runtime_exchange_rejects_duplicate_request_id_terminally() {
+    let socket_path = unique_path("runtime-correlated-duplicate.sock");
+    let _ = std::fs::remove_file(&socket_path);
+    let broker = RuntimeFdBroker::bind(&socket_path).unwrap();
+    let mut client = UnixStream::connect(broker.path()).unwrap();
+    let mut session = broker.accept().unwrap();
+    client.write_all(b"R").unwrap();
+    session.wait_for_ready(b'R').unwrap();
+
+    let (grant, mut controller) =
+        RuntimeFdBroker::prepare_runtime_correlated_exchange(16, 16, 3, 3).unwrap();
+    session.send_runtime_message_channel(grant).unwrap();
+    let endpoint = receive_one_fd(&client);
+
+    send_correlated_packet(endpoint.raw(), 7, b"first");
+    send_correlated_packet(endpoint.raw(), 7, b"duplicate");
+    assert_eq!(controller.receive_request().unwrap().request_id(), 7);
+    assert!(matches!(
+        controller.receive_request(),
+        Err(RuntimeFdBrokerError::RuntimeDuplicateRequestId { request_id }) if request_id == 7
+    ));
+    assert!(matches!(
+        controller.send_response(7, b"FIRST"),
+        Err(RuntimeFdBrokerError::Protocol(message)) if message.contains("closed after")
+    ));
+    assert!(!controller.is_complete());
+}
+
+#[test]
+fn correlated_runtime_exchange_rejects_unknown_response_id_terminally() {
+    let socket_path = unique_path("runtime-correlated-unknown-response.sock");
+    let _ = std::fs::remove_file(&socket_path);
+    let broker = RuntimeFdBroker::bind(&socket_path).unwrap();
+    let mut client = UnixStream::connect(broker.path()).unwrap();
+    let mut session = broker.accept().unwrap();
+    client.write_all(b"R").unwrap();
+    session.wait_for_ready(b'R').unwrap();
+
+    let (grant, mut controller) =
+        RuntimeFdBroker::prepare_runtime_correlated_exchange(16, 16, 2, 2).unwrap();
+    session.send_runtime_message_channel(grant).unwrap();
+    let endpoint = receive_one_fd(&client);
+
+    send_correlated_packet(endpoint.raw(), 9, b"request");
+    assert_eq!(controller.receive_request().unwrap().request_id(), 9);
+    assert!(matches!(
+        controller.send_response(10, b"wrong"),
+        Err(RuntimeFdBrokerError::RuntimeUnknownRequestId { request_id }) if request_id == 10
+    ));
+    assert!(matches!(
+        controller.send_response(9, b"correct"),
+        Err(RuntimeFdBrokerError::Protocol(message)) if message.contains("closed after")
+    ));
+    assert!(!controller.is_complete());
+}
+
+#[test]
+fn correlated_runtime_exchange_rejects_unsafe_bounds_without_creating_a_session() {
+    assert!(matches!(
+        RuntimeFdBroker::prepare_runtime_correlated_exchange(
+            16,
+            16,
+            MIN_RUNTIME_CORRELATED_REQUESTS - 1,
+            MIN_RUNTIME_CORRELATED_IN_FLIGHT,
+        ),
+        Err(RuntimeFdBrokerError::InvalidConfiguration(_))
+    ));
+    assert!(matches!(
+        RuntimeFdBroker::prepare_runtime_correlated_exchange(
+            16,
+            16,
+            MAX_RUNTIME_CORRELATED_REQUESTS + 1,
+            MIN_RUNTIME_CORRELATED_IN_FLIGHT,
+        ),
+        Err(RuntimeFdBrokerError::InvalidConfiguration(_))
+    ));
+    assert!(matches!(
+        RuntimeFdBroker::prepare_runtime_correlated_exchange(
+            16,
+            16,
+            2,
+            MIN_RUNTIME_CORRELATED_IN_FLIGHT - 1,
+        ),
+        Err(RuntimeFdBrokerError::InvalidConfiguration(_))
+    ));
+    assert!(matches!(
+        RuntimeFdBroker::prepare_runtime_correlated_exchange(
+            16,
+            16,
+            MAX_RUNTIME_CORRELATED_IN_FLIGHT,
+            MAX_RUNTIME_CORRELATED_IN_FLIGHT + 1,
+        ),
+        Err(RuntimeFdBrokerError::InvalidConfiguration(_))
+    ));
+    assert!(matches!(
+        RuntimeFdBroker::prepare_runtime_correlated_exchange(16, 16, 2, 3),
+        Err(RuntimeFdBrokerError::InvalidConfiguration(_))
     ));
 }
 

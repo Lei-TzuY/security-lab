@@ -1679,7 +1679,7 @@ After 68A integrates, do not farm deeper graph shapes, larger node ceilings, or 
 
 ### Slice 69A — private bounded writable overlays over trusted host directories
 
-**Status: complete on `main` once this candidate integrates.** Promotes the 67A persistent-volume set from only immutable host exposure or explicit host write-through into a third materially different storage mode: bounded target-side mutation over a trusted host directory without mutating that host lower tree.
+**Status: complete on `main`.** Promotes the 67A persistent-volume set from only immutable host exposure or explicit host write-through into a third materially different storage mode: bounded target-side mutation over a trusted host directory without mutating that host lower tree.
 
 Acceptance evidence is executable:
 
@@ -1697,7 +1697,7 @@ Boundary: 69A is an ephemeral per-volume OverlayFS capability, not a persistence
 
 ### Milestone 69 promotion rule
 
-After 69A integrates, do not farm larger volume ceilings, fixed additional COW slots, alternate tmpfs sizes, or more copy-up permutations. A further storage promotion must add a materially new lifecycle property such as bounded per-volume diff/export plus explicit commit/replay semantics, or move to another independent architecture frontier.
+69A is sealed on `main`. Do not farm larger volume ceilings, fixed additional COW slots, alternate tmpfs sizes, or more copy-up permutations. A further storage promotion must add a materially new lifecycle property such as bounded per-volume diff/export plus explicit commit/replay semantics, or move to another independent architecture frontier.
 
 ## Milestone 71 — post-launch host-local stream capability
 

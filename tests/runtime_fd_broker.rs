@@ -621,6 +621,121 @@ fn prepared_host_unix_stream_connects_exact_peer_and_reuses_one_shot_grant_state
 }
 
 #[test]
+fn transferred_host_unix_stream_can_be_revoked_after_grant() {
+    let service_path = unique_path("runtime-host-unix-revocable-service.sock");
+    let broker_path = unique_path("runtime-host-unix-revocable-broker.sock");
+    let _ = std::fs::remove_file(&service_path);
+    let _ = std::fs::remove_file(&broker_path);
+
+    let listener = UnixListener::bind(&service_path).expect("bind revocable host UNIX service");
+    let expected_uid = unsafe { libc::geteuid() };
+    let expected_gid = unsafe { libc::getegid() };
+    let grant = RuntimeFdBroker::prepare_host_unix_stream(
+        &service_path,
+        Some((expected_uid, expected_gid)),
+    )
+    .expect("prepare revocable host UNIX stream");
+    let (mut service, _) = listener.accept().expect("accept revocable host UNIX stream");
+
+    let broker = RuntimeFdBroker::bind(&broker_path).expect("bind revocable runtime broker");
+    let mut client = UnixStream::connect(broker.path()).expect("connect revocable runtime broker");
+    let mut session = broker.accept().expect("accept revocable runtime broker");
+    client.write_all(b"R").unwrap();
+    session.wait_for_ready(b'R').unwrap();
+    let mut controller = session
+        .send_revocable_host_unix_stream(grant)
+        .expect("transfer revocable host UNIX stream");
+    let received = receive_one_fd(&client);
+
+    let credentials = controller.peer_credentials();
+    assert!(credentials.pid() > 0);
+    assert_eq!(credentials.uid(), expected_uid);
+    assert_eq!(credentials.gid(), expected_gid);
+    assert!(!controller.is_revoked());
+    assert!(!controller.is_failed());
+
+    let request = b"before-host-revoke\n";
+    assert_eq!(
+        unsafe {
+            libc::send(
+                received.raw(),
+                request.as_ptr().cast::<libc::c_void>(),
+                request.len(),
+                libc::MSG_NOSIGNAL,
+            )
+        },
+        request.len() as isize
+    );
+    let mut observed = vec![0u8; request.len()];
+    service.read_exact(&mut observed).unwrap();
+    assert_eq!(observed, request);
+    service.write_all(b"before-host-revoke-ok\n").unwrap();
+    assert_eq!(
+        read_exact_fd(received.raw(), b"before-host-revoke-ok\n".len()),
+        b"before-host-revoke-ok\n"
+    );
+
+    controller.revoke().expect("revoke transferred host UNIX stream");
+    assert!(controller.is_revoked());
+    assert!(!controller.is_failed());
+
+    let mut byte = [0u8; 1];
+    assert_eq!(
+        unsafe {
+            libc::read(
+                received.raw(),
+                byte.as_mut_ptr().cast::<libc::c_void>(),
+                byte.len(),
+            )
+        },
+        0,
+        "target descriptor did not observe EOF after trusted shutdown"
+    );
+    assert_eq!(
+        unsafe {
+            libc::send(
+                received.raw(),
+                b"x".as_ptr().cast::<libc::c_void>(),
+                1,
+                libc::MSG_NOSIGNAL,
+            )
+        },
+        -1,
+        "target descriptor unexpectedly retained send authority after revocation"
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::EPIPE)
+    );
+    assert!(matches!(
+        controller.revoke(),
+        Err(RuntimeFdBrokerError::Protocol(message))
+            if message.contains("revoked exactly once")
+    ));
+
+    let second_path = unique_path("runtime-host-unix-revocable-second.sock");
+    let _ = std::fs::remove_file(&second_path);
+    let second_listener = UnixListener::bind(&second_path).unwrap();
+    let second_grant = RuntimeFdBroker::prepare_host_unix_stream(&second_path, None).unwrap();
+    let _second_service = second_listener.accept().unwrap();
+    assert!(matches!(
+        session.send_host_unix_stream(second_grant),
+        Err(RuntimeFdBrokerError::Protocol(message)) if message.contains("exactly one")
+    ));
+
+    drop(received);
+    drop(controller);
+    drop(session);
+    drop(client);
+    drop(broker);
+    drop(service);
+    drop(listener);
+    drop(second_listener);
+    std::fs::remove_file(&service_path).unwrap();
+    std::fs::remove_file(&second_path).unwrap();
+}
+
+#[test]
 fn host_unix_reconnect_controller_grants_two_fresh_connections_and_exhausts_bound() {
     let service_path = unique_path("runtime-host-unix-reconnect-service.sock");
     let broker_path = unique_path("runtime-host-unix-reconnect-broker.sock");

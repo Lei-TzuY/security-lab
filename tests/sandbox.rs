@@ -1871,6 +1871,58 @@ fn copy_on_write_volume_diffs_are_isolated_and_target_sorted() {
 }
 
 #[test]
+fn copy_on_write_volume_diff_omits_unrequested_volume() {
+    let first = std::env::temp_dir().join(format!(
+        "security-lab-cow-diff-requested-{}",
+        process::id()
+    ));
+    let second = std::env::temp_dir().join(format!(
+        "security-lab-cow-diff-unrequested-{}",
+        process::id()
+    ));
+    for source in [&first, &second] {
+        let _ = std::fs::remove_dir_all(source);
+        std::fs::create_dir_all(source).unwrap();
+    }
+
+    let mut mounted = policy("unused", &[], &["openat", "write", "close", "exit"]);
+    mounted.executable = PathBuf::from("/cow-volume-diff-probe");
+    mounted.copy_on_write_volume_bindings = vec![
+        CopyOnWriteVolumeBinding {
+            source: first.clone(),
+            target: PathBuf::from("/cowa"),
+            bytes: 1024 * 1024,
+            diff_bytes: Some(4096),
+        },
+        CopyOnWriteVolumeBinding {
+            source: second.clone(),
+            target: PathBuf::from("/cowb"),
+            bytes: 1024 * 1024,
+            diff_bytes: None,
+        },
+    ];
+
+    let report = run_report(&mounted).unwrap();
+    assert_eq!(report.outcome, ChildOutcome::Exited(0));
+    assert_eq!(report.cow_volume_diffs.len(), 1);
+    assert_eq!(report.cow_volume_diffs[0].target, b"/cowa");
+    assert!(report.cow_volume_diffs[0].diff.entries.iter().any(|entry| {
+        matches!(
+            entry,
+            CowDiffEntry::UpsertFile { path, bytes, .. }
+                if path == b"/first" && bytes == b"alpha\n"
+        )
+    }));
+    assert!(!report.cow_volume_diffs[0]
+        .diff
+        .entries
+        .iter()
+        .any(|entry| matches!(entry, CowDiffEntry::UpsertFile { path, .. } if path == b"/second")));
+    assert!(!first.join("first").exists());
+    assert!(!second.join("second").exists());
+}
+
+#[test]
 fn copy_on_write_volume_diff_overflow_fails_closed() {
     let source = cow_volume_source().to_path_buf();
     let too_big = source.join("too-big");

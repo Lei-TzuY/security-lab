@@ -3,14 +3,15 @@
 use security_lab::{
     publish_cow_volume_diff_atomic, run, run_report, run_report_with_cancel, CancellationToken,
     ChildOutcome, CopyOnWriteVolumeBinding, CowDiffApplyError, CowDiffApplyLimits, CowDiffEntry,
-    CowVolumePublicationError, ExecutableNeededBinding, PersistentVolumeBinding,
-    ResourceLimits, SandboxError, SandboxPolicy, SeccompArgRangeRule, SeccompArgRule,
-    SeccompPolicy, StdioMode, StdioPolicy,
+    CowVolumePublicationError, ExecutableNeededBinding, PersistentVolumeBinding, ResourceLimits,
+    SandboxError, SandboxPolicy, SeccompArgRangeRule, SeccompArgRule, SeccompPolicy, StdioMode,
+    StdioPolicy,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CString;
 use std::net::{Ipv4Addr, TcpListener, TcpStream, UdpSocket};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::UnixListener;
@@ -1793,8 +1794,8 @@ fn copy_on_write_persistent_volume_is_private_and_ephemeral() {
             target: PathBuf::from("/cowdata"),
             bytes: 1024 * 1024,
             diff_bytes: None,
-            base_identity_bytes: None,
-            base_identity_nodes: None,
+        base_identity_bytes: None,
+        base_identity_nodes: None,
         }];
 
         assert_eq!(run(&mounted).unwrap(), ChildOutcome::Exited(0));
@@ -1817,8 +1818,8 @@ fn copy_on_write_persistent_volume_enforces_private_byte_ceiling() {
         target: PathBuf::from("/cowdata"),
         bytes: 4096,
         diff_bytes: None,
-            base_identity_bytes: None,
-            base_identity_nodes: None,
+        base_identity_bytes: None,
+        base_identity_nodes: None,
     }];
 
     assert_eq!(run(&mounted).unwrap(), ChildOutcome::Exited(0));
@@ -1842,16 +1843,16 @@ fn copy_on_write_volume_diffs_are_isolated_and_target_sorted() {
             target: PathBuf::from("/cowb"),
             bytes: 1024 * 1024,
             diff_bytes: Some(4096),
-            base_identity_bytes: None,
-            base_identity_nodes: None,
+        base_identity_bytes: None,
+        base_identity_nodes: None,
         },
         CopyOnWriteVolumeBinding {
             source: first.clone(),
             target: PathBuf::from("/cowa"),
             bytes: 1024 * 1024,
             diff_bytes: Some(4096),
-            base_identity_bytes: None,
-            base_identity_nodes: None,
+        base_identity_bytes: None,
+        base_identity_nodes: None,
         },
     ];
 
@@ -1881,14 +1882,14 @@ fn copy_on_write_volume_diffs_are_isolated_and_target_sorted() {
 
 #[test]
 fn copy_on_write_volume_diff_guarded_publication_binds_exact_launch_base() {
-    let first =
-        std::env::temp_dir().join(format!("security-lab-cow-publish-a-{}", process::id()));
-    let second =
-        std::env::temp_dir().join(format!("security-lab-cow-publish-b-{}", process::id()));
+    let first = std::env::temp_dir().join(format!("security-lab-cow-publish-a-{}", process::id()));
+    let second = std::env::temp_dir().join(format!("security-lab-cow-publish-b-{}", process::id()));
     let destination =
         std::env::temp_dir().join(format!("security-lab-cow-published-{}", process::id()));
-    let stale_destination =
-        std::env::temp_dir().join(format!("security-lab-cow-published-stale-{}", process::id()));
+    let stale_destination = std::env::temp_dir().join(format!(
+        "security-lab-cow-published-stale-{}",
+        process::id()
+    ));
     for path in [&first, &second, &destination, &stale_destination] {
         let _ = std::fs::remove_dir_all(path);
     }
@@ -1903,8 +1904,8 @@ fn copy_on_write_volume_diff_guarded_publication_binds_exact_launch_base() {
             target: PathBuf::from("/cowb"),
             bytes: 1024 * 1024,
             diff_bytes: Some(4096),
-            base_identity_bytes: None,
-            base_identity_nodes: None,
+        base_identity_bytes: None,
+        base_identity_nodes: None,
         },
         CopyOnWriteVolumeBinding {
             source: first.clone(),
@@ -1935,16 +1936,14 @@ fn copy_on_write_volume_diff_guarded_publication_binds_exact_launch_base() {
         publish_cow_volume_diff_atomic(&first, &destination, bound, replay_limits).unwrap();
     assert_eq!(published.target, b"/cowa");
     assert!(!first.join("first").exists());
-    assert_eq!(std::fs::read(destination.join("first")).unwrap(), b"alpha\n");
+    assert_eq!(
+        std::fs::read(destination.join("first")).unwrap(),
+        b"alpha\n"
+    );
 
     std::fs::write(first.join("host-change"), b"changed\n").unwrap();
-    match publish_cow_volume_diff_atomic(
-        &first,
-        &stale_destination,
-        bound,
-        replay_limits,
-    )
-    .unwrap_err()
+    match publish_cow_volume_diff_atomic(&first, &stale_destination, bound, replay_limits)
+        .unwrap_err()
     {
         CowVolumePublicationError::Apply {
             source: CowDiffApplyError::BaseIdentityMismatch { .. },
@@ -1980,16 +1979,16 @@ fn copy_on_write_volume_diff_omits_unrequested_volume() {
             target: PathBuf::from("/cowa"),
             bytes: 1024 * 1024,
             diff_bytes: Some(4096),
-            base_identity_bytes: None,
-            base_identity_nodes: None,
+        base_identity_bytes: None,
+        base_identity_nodes: None,
         },
         CopyOnWriteVolumeBinding {
             source: second.clone(),
             target: PathBuf::from("/cowb"),
             bytes: 1024 * 1024,
             diff_bytes: None,
-            base_identity_bytes: None,
-            base_identity_nodes: None,
+        base_identity_bytes: None,
+        base_identity_nodes: None,
         },
     ];
 
@@ -2026,8 +2025,8 @@ fn copy_on_write_volume_diff_overflow_fails_closed() {
         target: PathBuf::from("/cowdata"),
         bytes: 1024 * 1024,
         diff_bytes: Some(64),
-            base_identity_bytes: None,
-            base_identity_nodes: None,
+        base_identity_bytes: None,
+        base_identity_nodes: None,
     }];
 
     match run_report(&mounted).unwrap_err() {

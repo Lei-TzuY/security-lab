@@ -1,3 +1,7 @@
+use crate::cow_volume_signature::{
+    publish_cow_volume_diff_trusted_ed25519_atomic, CowVolumeEd25519Signature,
+    CowVolumeTrustedPublicationError, CowVolumeTrustedPublicationReport,
+};
 use crate::snapshot_archive::SnapshotArchiveLimits;
 use crate::snapshot_signature::{
     SNAPSHOT_ED25519_PUBLIC_KEY_BYTES, SNAPSHOT_ED25519_SIGNATURE_BYTES,
@@ -8,7 +12,7 @@ use crate::snapshot_trust::{
     SnapshotTrustPolicy, SnapshotTrustPolicyIdentity, SnapshotTrustedMaterializeReport,
     SnapshotTrustedStorePutReport, SNAPSHOT_TRUST_MAX_KEYS,
 };
-use crate::SnapshotIdentity;
+use crate::{CowDiffApplyLimits, CowVolumeDiff, SnapshotIdentity};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::error::Error;
@@ -52,6 +56,52 @@ impl fmt::Debug for SnapshotTrustStateKey {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SnapshotTrustStateReceipt {
     pub policy: SnapshotTrustPolicyIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CowVolumePersistedTrustPublicationReport {
+    pub trusted: CowVolumeTrustedPublicationReport,
+    pub state: SnapshotTrustStateReceipt,
+}
+
+#[derive(Debug)]
+pub enum CowVolumePersistedTrustPublicationError {
+    State(SnapshotTrustStateError),
+    TrustedPublication(CowVolumeTrustedPublicationError),
+}
+
+impl fmt::Display for CowVolumePersistedTrustPublicationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::State(source) => {
+                write!(f, "persisted COW publication trust-state gate failed: {source}")
+            }
+            Self::TrustedPublication(source) => {
+                write!(f, "persisted COW publication failed after trust-state gate: {source}")
+            }
+        }
+    }
+}
+
+impl Error for CowVolumePersistedTrustPublicationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::State(source) => Some(source),
+            Self::TrustedPublication(source) => Some(source),
+        }
+    }
+}
+
+impl From<SnapshotTrustStateError> for CowVolumePersistedTrustPublicationError {
+    fn from(source: SnapshotTrustStateError) -> Self {
+        Self::State(source)
+    }
+}
+
+impl From<CowVolumeTrustedPublicationError> for CowVolumePersistedTrustPublicationError {
+    fn from(source: CowVolumeTrustedPublicationError) -> Self {
+        Self::TrustedPublication(source)
+    }
 }
 
 /// One persisted trust-state authority reused by state-backed snapshot operations.
@@ -228,6 +278,65 @@ pub fn rotate_snapshot_trust_state(
         Err(SnapshotTrustStateError::UnsupportedPlatform(
             "persisted snapshot trust rotation currently requires Linux flock, fsync, and fd-relative atomic publication"
                 .to_owned(),
+        ))
+    }
+}
+
+/// Require the caller-supplied signer policy to equal authenticated persisted
+/// host-owned state before any trusted COW publication work.
+///
+/// On Linux the shared state lock remains held across signer resolution,
+/// strict Ed25519 evidence verification, current/materialized base checks,
+/// bounded replay, and the final no-replace publication. A cooperating policy
+/// rotation therefore cannot overtake an accepted operation.
+pub fn publish_cow_volume_diff_persisted_trust_ed25519_atomic(
+    context: &SnapshotTrustStateContext<'_>,
+    base: &Path,
+    destination: &Path,
+    volume_diff: &CowVolumeDiff,
+    evidence: &CowVolumeEd25519Signature,
+    signer: SnapshotTrustKeyId,
+    replay_limits: CowDiffApplyLimits,
+) -> Result<CowVolumePersistedTrustPublicationReport, CowVolumePersistedTrustPublicationError> {
+    #[cfg(target_os = "linux")]
+    {
+        let _guard = linux::lock_shared_and_validate(
+            context.state_root,
+            context.state_key,
+            context.policy.identity(),
+        )?;
+        let trusted = publish_cow_volume_diff_trusted_ed25519_atomic(
+            base,
+            destination,
+            volume_diff,
+            evidence,
+            context.policy,
+            signer,
+            replay_limits,
+        )?;
+        Ok(CowVolumePersistedTrustPublicationReport {
+            trusted,
+            state: SnapshotTrustStateReceipt {
+                policy: context.policy.identity(),
+            },
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (
+            context,
+            base,
+            destination,
+            volume_diff,
+            evidence,
+            signer,
+            replay_limits,
+        );
+        Err(CowVolumePersistedTrustPublicationError::State(
+            SnapshotTrustStateError::UnsupportedPlatform(
+                "persisted trusted COW publication currently requires Linux flock and authenticated fd-relative trust-state access"
+                    .to_owned(),
+            ),
         ))
     }
 }

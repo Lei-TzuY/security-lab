@@ -1852,6 +1852,7 @@ mod x86_64 {
         capture_write_fd: RawFd,
         output_limit_fd: RawFd,
         cow_diff_state: *mut CowDiffState,
+        cow_volume_diff_states: [*mut CowDiffState; MAX_PERSISTENT_VOLUME_BINDINGS],
         wall_clock_milliseconds: u64,
     }
 
@@ -1936,6 +1937,26 @@ mod x86_64 {
                     "cannot allocate bounded copy-on-write diff state: {err}"
                 ))
             })?;
+        let mut cow_volume_diffs = Vec::with_capacity(policy.copy_on_write_volume_bindings.len());
+        for binding in &policy.copy_on_write_volume_bindings {
+            cow_volume_diffs.push(
+                binding
+                    .diff_bytes
+                    .map(SharedCowDiff::new)
+                    .transpose()
+                    .map_err(|err| {
+                        SandboxError::SetupFailed(format!(
+                            "cannot allocate bounded copy-on-write volume diff state: {err}"
+                        ))
+                    })?,
+            );
+        }
+        let mut cow_volume_diff_states =
+            [ptr::null_mut::<CowDiffState>(); MAX_PERSISTENT_VOLUME_BINDINGS];
+        for (index, state) in cow_volume_diffs.iter().enumerate() {
+            cow_volume_diff_states[index] =
+                state.as_ref().map_or(ptr::null_mut(), SharedCowDiff::raw);
+        }
         let output_limit_event = policy
             .stdout_total_bytes
             .map(|_| create_output_limit_eventfd())
@@ -1963,6 +1984,7 @@ mod x86_64 {
             cow_diff_state: cow_diff
                 .as_ref()
                 .map_or(ptr::null_mut(), SharedCowDiff::raw),
+            cow_volume_diff_states,
             wall_clock_milliseconds: policy.wall_clock_milliseconds.unwrap_or(0),
         };
 
@@ -2014,6 +2036,7 @@ mod x86_64 {
                 outcome,
                 stdout: None,
                 cow_diff: None,
+                cow_volume_diffs: Vec::new(),
                 reaped_descendants: 0,
                 process_tree_usage: ProcessTreeUsage::default(),
                 enforcement: EnforcementReceipt::default(),
@@ -2037,10 +2060,25 @@ mod x86_64 {
         };
         let outcome = resolve_lifecycle_outcome(&lifecycle_record, output_limit_observed)?;
         let cow_diff = cow_diff.as_ref().map(SharedCowDiff::snapshot).transpose()?;
+        let mut cow_volume_diff_reports = Vec::new();
+        for (binding, state) in policy
+            .copy_on_write_volume_bindings
+            .iter()
+            .zip(cow_volume_diffs.iter())
+        {
+            if let Some(state) = state {
+                cow_volume_diff_reports.push(CowVolumeDiff {
+                    target: binding.target.as_os_str().as_bytes().to_vec(),
+                    diff: state.snapshot()?,
+                });
+            }
+        }
+        cow_volume_diff_reports.sort_by(|left, right| left.target.cmp(&right.target));
         Ok(RunReport {
             outcome,
             stdout,
             cow_diff,
+            cow_volume_diffs: cow_volume_diff_reports,
             reaped_descendants: lifecycle_record.reaped_descendants,
             process_tree_usage: ProcessTreeUsage {
                 user_cpu_micros: lifecycle_record.user_cpu_micros,

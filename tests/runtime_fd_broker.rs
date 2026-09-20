@@ -5,10 +5,10 @@ use security_lab::{
     MAX_RUNTIME_CORRELATED_IN_FLIGHT, MAX_RUNTIME_CORRELATED_REQUESTS, MAX_RUNTIME_MESSAGE_BYTES,
     MAX_RUNTIME_MESSAGE_REQUEST_WAIT_MILLISECONDS, MAX_RUNTIME_MESSAGE_RESPONSE_WAIT_MILLISECONDS,
     MAX_RUNTIME_MULTI_GRANTS, MAX_RUNTIME_MULTI_MESSAGE_ROUNDS,
-    MAX_RUNTIME_MULTI_MESSAGE_SESSION_MILLISECONDS, MAX_RUNTIME_REVOCABLE_STREAM_BYTES, MAX_RUNTIME_SEALED_BUNDLE_BYTES,
-    MAX_RUNTIME_SEALED_BUNDLE_ITEMS, MAX_RUNTIME_SEALED_SNAPSHOT_BYTES,
-    MIN_RUNTIME_CORRELATED_IN_FLIGHT, MIN_RUNTIME_CORRELATED_REQUESTS,
-    MIN_RUNTIME_MULTI_GRANTS, MIN_RUNTIME_MULTI_MESSAGE_ROUNDS,
+    MAX_RUNTIME_MULTI_MESSAGE_SESSION_MILLISECONDS, MAX_RUNTIME_REVOCABLE_STREAM_BYTES,
+    MAX_RUNTIME_SEALED_BUNDLE_BYTES, MAX_RUNTIME_SEALED_BUNDLE_ITEMS,
+    MAX_RUNTIME_SEALED_SNAPSHOT_BYTES, MIN_RUNTIME_CORRELATED_IN_FLIGHT,
+    MIN_RUNTIME_CORRELATED_REQUESTS, MIN_RUNTIME_MULTI_GRANTS, MIN_RUNTIME_MULTI_MESSAGE_ROUNDS,
 };
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
@@ -373,7 +373,10 @@ fn bounded_multi_grant_session_requires_fresh_readiness_and_exact_limit() {
     let first_grant = RuntimeFdBroker::prepare_readonly_regular_file(&first).unwrap();
     session.send_readonly_regular_file(first_grant).unwrap();
     let received_first = receive_one_fd(&client);
-    assert_eq!(read_exact_fd(received_first.raw(), first_bytes.len()), first_bytes);
+    assert_eq!(
+        read_exact_fd(received_first.raw(), first_bytes.len()),
+        first_bytes
+    );
     assert_eq!(session.grants_sent(), 1);
     assert!(!session.is_complete());
 
@@ -546,8 +549,14 @@ fn bounded_multi_grant_session_reaches_real_target_in_two_readiness_gated_steps(
 
     let outcome = runner.join().unwrap().unwrap();
     assert_eq!(outcome, ChildOutcome::Exited(0));
-    assert_eq!(unsafe { libc::lseek(first.as_raw_fd(), 0, libc::SEEK_CUR) }, 0);
-    assert_eq!(unsafe { libc::lseek(second.as_raw_fd(), 0, libc::SEEK_CUR) }, 0);
+    assert_eq!(
+        unsafe { libc::lseek(first.as_raw_fd(), 0, libc::SEEK_CUR) },
+        0
+    );
+    assert_eq!(
+        unsafe { libc::lseek(second.as_raw_fd(), 0, libc::SEEK_CUR) },
+        0
+    );
 
     drop(session);
     drop(broker);

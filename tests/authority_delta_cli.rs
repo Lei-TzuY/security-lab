@@ -206,6 +206,61 @@ fn bounded_needed_binding_set_is_order_independent_exact_restriction() {
 }
 
 #[test]
+fn persistent_volume_sets_are_ordered_by_capability_inclusion() {
+    let root = unique_absent_root("volume-sets");
+    let base = base_policy(&root);
+    let first = format!(
+        "{base}volume.readonly_source = /srv/read-a
+volume.readonly_target = /data-a
+volume.writable_source = /srv/write-a
+volume.writable_target = /persist-a
+"
+    );
+    let expanded = format!(
+        "{base}volume.readonly_source = /srv/read-a
+volume.readonly_source = /srv/read-b
+volume.readonly_target = /data-a
+volume.readonly_target = /data-b
+volume.writable_source = /srv/write-a
+volume.writable_source = /srv/write-b
+volume.writable_target = /persist-a
+volume.writable_target = /persist-b
+"
+    );
+    let changed = format!(
+        "{base}volume.readonly_source = /srv/read-a
+volume.readonly_source = /srv/read-c
+volume.readonly_target = /data-a
+volume.readonly_target = /data-c
+volume.writable_source = /srv/write-a
+volume.writable_target = /persist-a
+"
+    );
+
+    let first = TempPolicy::new("volume-first", &first);
+    let expanded = TempPolicy::new("volume-expanded", &expanded);
+    let changed = TempPolicy::new("volume-changed", &changed);
+
+    let widened = run_json(&first, &expanded);
+    assert_eq!(widened.status.code(), Some(5));
+    let stdout = String::from_utf8(widened.stdout).expect("utf8 output");
+    assert!(stdout.contains(r#""field":"filesystem.read_only_volume","class":"widened""#));
+    assert!(stdout.contains(r#""field":"filesystem.writable_volume","class":"widened""#));
+
+    let reduced = run_json(&expanded, &first);
+    assert_eq!(reduced.status.code(), Some(0));
+    let stdout = String::from_utf8(reduced.stdout).expect("utf8 output");
+    assert!(stdout.contains(r#""field":"filesystem.read_only_volume","class":"reduced""#));
+    assert!(stdout.contains(r#""field":"filesystem.writable_volume","class":"reduced""#));
+
+    let incomparable = run_json(&expanded, &changed);
+    assert_eq!(incomparable.status.code(), Some(6));
+    let stdout = String::from_utf8(incomparable.stdout).expect("utf8 output");
+    assert!(stdout.contains(r#""field":"filesystem.read_only_volume","class":"incomparable""#));
+    assert!(stdout.contains(r#""field":"filesystem.writable_volume","class":"reduced""#));
+}
+
+#[test]
 fn copy_on_write_root_is_modeled_as_ephemeral_write_authority() {
     let root = unique_absent_root("cow-root");
     let baseline_text = base_policy(&root);

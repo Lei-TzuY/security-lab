@@ -16,6 +16,7 @@ const MAX_SYSCALLS: usize = 128;
 const MAX_SECCOMP_ARG_RULES: usize = 64;
 const MAX_SELECTED_HANDLES: usize = 16;
 pub const MAX_EXECUTABLE_NEEDED_BINDINGS: usize = 8;
+pub const MAX_PERSISTENT_VOLUME_BINDINGS: usize = 8;
 const MAX_LANDLOCK_READ_EXECUTE_PATHS: usize = 32;
 const MAX_LANDLOCK_FILE_MUTATE_PATHS: usize = 32;
 const MAX_LANDLOCK_PATH_TOPOLOGY_MUTATE_PATHS: usize = 32;
@@ -97,6 +98,12 @@ pub struct SeccompPolicy {
 pub struct ExecutableNeededBinding {
     pub path: PathBuf,
     pub sha256: [u8; 32],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PersistentVolumeBinding {
+    pub source: PathBuf,
+    pub target: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -194,10 +201,16 @@ pub struct SandboxPolicy {
     /// declared sandbox mountpoint. Source and target must be specified together.
     pub readonly_volume_source: Option<PathBuf>,
     pub readonly_volume_target: Option<PathBuf>,
+    /// Optional bounded read-only volume set. Mutually exclusive with the
+    /// legacy single read-only pair above.
+    pub readonly_volume_bindings: Vec<PersistentVolumeBinding>,
     /// Optional trusted host directory deliberately exposed writable at one
     /// declared sandbox mountpoint. This grants host mutation authority.
     pub writable_volume_source: Option<PathBuf>,
     pub writable_volume_target: Option<PathBuf>,
+    /// Optional bounded writable volume set. Mutually exclusive with the
+    /// legacy single writable pair above.
+    pub writable_volume_bindings: Vec<PersistentVolumeBinding>,
     /// Optional absolute path inside `root_dir` replaced by a private writable
     /// tmpfs after the root mount tree has been made recursively read-only.
     pub scratch_dir: Option<PathBuf>,
@@ -280,11 +293,79 @@ impl SandboxPolicy {
         }
     }
 
+    pub fn normalized_readonly_volume_bindings(&self) -> Vec<PersistentVolumeBinding> {
+        if !self.readonly_volume_bindings.is_empty() {
+            return self.readonly_volume_bindings.clone();
+        }
+        match (&self.readonly_volume_source, &self.readonly_volume_target) {
+            (Some(source), Some(target)) => vec![PersistentVolumeBinding {
+                source: source.clone(),
+                target: target.clone(),
+            }],
+            _ => Vec::new(),
+        }
+    }
+
+    pub fn normalized_writable_volume_bindings(&self) -> Vec<PersistentVolumeBinding> {
+        if !self.writable_volume_bindings.is_empty() {
+            return self.writable_volume_bindings.clone();
+        }
+        match (&self.writable_volume_source, &self.writable_volume_target) {
+            (Some(source), Some(target)) => vec![PersistentVolumeBinding {
+                source: source.clone(),
+                target: target.clone(),
+            }],
+            _ => Vec::new(),
+        }
+    }
+
     pub fn validate(&self) -> Result<(), PolicyError> {
         validate_absolute_path("filesystem.root", &self.root_dir)?;
         validate_hostname(&self.hostname)?;
         validate_absolute_path("executable", &self.executable)?;
         validate_absolute_path("working_dir", &self.working_dir)?;
+
+        match (&self.readonly_volume_source, &self.readonly_volume_target) {
+            (None, None) | (Some(_), Some(_)) => {}
+            _ => {
+                return Err(PolicyError::new(
+                    "volume.readonly_source and volume.readonly_target must be specified together",
+                ));
+            }
+        }
+        match (&self.writable_volume_source, &self.writable_volume_target) {
+            (None, None) | (Some(_), Some(_)) => {}
+            _ => {
+                return Err(PolicyError::new(
+                    "volume.writable_source and volume.writable_target must be specified together",
+                ));
+            }
+        }
+        if !self.readonly_volume_bindings.is_empty()
+            && (self.readonly_volume_source.is_some() || self.readonly_volume_target.is_some())
+        {
+            return Err(PolicyError::new(
+                "legacy read-only volume pair and readonly_volume_bindings are mutually exclusive",
+            ));
+        }
+        if !self.writable_volume_bindings.is_empty()
+            && (self.writable_volume_source.is_some() || self.writable_volume_target.is_some())
+        {
+            return Err(PolicyError::new(
+                "legacy writable volume pair and writable_volume_bindings are mutually exclusive",
+            ));
+        }
+        let readonly_volumes = self.normalized_readonly_volume_bindings();
+        let writable_volumes = self.normalized_writable_volume_bindings();
+        let volume_count = readonly_volumes
+            .len()
+            .checked_add(writable_volumes.len())
+            .ok_or_else(|| PolicyError::new("persistent volume binding count overflow"))?;
+        if volume_count > MAX_PERSISTENT_VOLUME_BINDINGS {
+            return Err(PolicyError::new(format!(
+                "too many persistent volume bindings: {volume_count} > {MAX_PERSISTENT_VOLUME_BINDINGS}"
+            )));
+        }
 
         match (
             &self.executable_interpreter,
@@ -314,23 +395,25 @@ impl SandboxPolicy {
                         "executable.interpreter must not overlap filesystem.proc",
                     ));
                 }
-                for (other, label) in [
-                    (self.scratch_dir.as_deref(), "filesystem.scratch"),
-                    (
-                        self.readonly_volume_target.as_deref(),
-                        "volume.readonly_target",
-                    ),
-                    (
-                        self.writable_volume_target.as_deref(),
-                        "volume.writable_target",
-                    ),
-                ] {
-                    if let Some(other) = other {
-                        if overlaps(other) {
-                            return Err(PolicyError::new(format!(
-                                "executable.interpreter must not overlap {label}"
-                            )));
-                        }
+                if let Some(scratch) = self.scratch_dir.as_deref() {
+                    if overlaps(scratch) {
+                        return Err(PolicyError::new(
+                            "executable.interpreter must not overlap filesystem.scratch",
+                        ));
+                    }
+                }
+                for volume in &readonly_volumes {
+                    if overlaps(&volume.target) {
+                        return Err(PolicyError::new(
+                            "executable.interpreter must not overlap volume.readonly_target",
+                        ));
+                    }
+                }
+                for volume in &writable_volumes {
+                    if overlaps(&volume.target) {
+                        return Err(PolicyError::new(
+                            "executable.interpreter must not overlap volume.writable_target",
+                        ));
                     }
                 }
             }
@@ -404,23 +487,25 @@ impl SandboxPolicy {
                     "executable.needed must not overlap filesystem.proc",
                 ));
             }
-            for (other, label) in [
-                (self.scratch_dir.as_deref(), "filesystem.scratch"),
-                (
-                    self.readonly_volume_target.as_deref(),
-                    "volume.readonly_target",
-                ),
-                (
-                    self.writable_volume_target.as_deref(),
-                    "volume.writable_target",
-                ),
-            ] {
-                if let Some(other) = other {
-                    if overlaps(other) {
-                        return Err(PolicyError::new(format!(
-                            "executable.needed must not overlap {label}"
-                        )));
-                    }
+            if let Some(scratch) = self.scratch_dir.as_deref() {
+                if overlaps(scratch) {
+                    return Err(PolicyError::new(
+                        "executable.needed must not overlap filesystem.scratch",
+                    ));
+                }
+            }
+            for volume in &readonly_volumes {
+                if overlaps(&volume.target) {
+                    return Err(PolicyError::new(
+                        "executable.needed must not overlap volume.readonly_target",
+                    ));
+                }
+            }
+            for volume in &writable_volumes {
+                if overlaps(&volume.target) {
+                    return Err(PolicyError::new(
+                        "executable.needed must not overlap volume.writable_target",
+                    ));
                 }
             }
         }
@@ -461,17 +546,25 @@ impl SandboxPolicy {
                     "filesystem.proc must not hide the executable or working_dir",
                 ));
             }
-            for (path, label) in [
-                (&self.scratch_dir, "filesystem.scratch"),
-                (&self.readonly_volume_target, "volume.readonly_target"),
-                (&self.writable_volume_target, "volume.writable_target"),
-            ] {
-                if let Some(path) = path {
-                    if path.starts_with(proc_path) || proc_path.starts_with(path) {
-                        return Err(PolicyError::new(format!(
-                            "filesystem.proc must not overlap {label}"
-                        )));
-                    }
+            if let Some(path) = &self.scratch_dir {
+                if path.starts_with(proc_path) || proc_path.starts_with(path) {
+                    return Err(PolicyError::new(
+                        "filesystem.proc must not overlap filesystem.scratch",
+                    ));
+                }
+            }
+            for volume in &readonly_volumes {
+                if volume.target.starts_with(proc_path) || proc_path.starts_with(&volume.target) {
+                    return Err(PolicyError::new(
+                        "filesystem.proc must not overlap volume.readonly_target",
+                    ));
+                }
+            }
+            for volume in &writable_volumes {
+                if volume.target.starts_with(proc_path) || proc_path.starts_with(&volume.target) {
+                    return Err(PolicyError::new(
+                        "filesystem.proc must not overlap volume.writable_target",
+                    ));
                 }
             }
         }
@@ -531,10 +624,9 @@ impl SandboxPolicy {
                     )));
                 }
                 let in_scratch = self.scratch_dir.as_ref() == Some(path);
-                let in_writable_volume = self
-                    .writable_volume_target
-                    .as_ref()
-                    .is_some_and(|target| path.starts_with(target));
+                let in_writable_volume = writable_volumes
+                    .iter()
+                    .any(|volume| path.starts_with(&volume.target));
                 if !in_scratch && !in_writable_volume {
                     return Err(PolicyError::new(
                         "landlock.file_mutate must be within filesystem.scratch or volume.writable_target",
@@ -861,100 +953,85 @@ impl SandboxPolicy {
             }
         }
 
-        match (&self.readonly_volume_source, &self.readonly_volume_target) {
-            (None, None) => {}
-            (Some(source), Some(target)) => {
-                validate_absolute_path("volume.readonly_source", source)?;
-                validate_absolute_path("volume.readonly_target", target)?;
-                if source.starts_with(&self.root_dir) || self.root_dir.starts_with(source) {
+        for volume in &readonly_volumes {
+            validate_absolute_path("volume.readonly_source", &volume.source)?;
+            validate_absolute_path("volume.readonly_target", &volume.target)?;
+            if volume.source.starts_with(&self.root_dir)
+                || self.root_dir.starts_with(&volume.source)
+            {
+                return Err(PolicyError::new(
+                    "volume.readonly_source must not overlap filesystem.root",
+                ));
+            }
+            if volume.target == Path::new("/") {
+                return Err(PolicyError::new(
+                    "volume.readonly_target must not replace the sandbox root",
+                ));
+            }
+            if self.executable.starts_with(&volume.target)
+                || self.working_dir.starts_with(&volume.target)
+            {
+                return Err(PolicyError::new(
+                    "volume.readonly_target must not contain the executable or working_dir",
+                ));
+            }
+            if let Some(scratch) = &self.scratch_dir {
+                if volume.target.starts_with(scratch) || scratch.starts_with(&volume.target) {
                     return Err(PolicyError::new(
-                        "volume.readonly_source must not overlap filesystem.root",
+                        "volume.readonly_target must not overlap filesystem.scratch",
                     ));
-                }
-                if target == Path::new("/") {
-                    return Err(PolicyError::new(
-                        "volume.readonly_target must not replace the sandbox root",
-                    ));
-                }
-                if self.executable.starts_with(target) || self.working_dir.starts_with(target) {
-                    return Err(PolicyError::new(
-                        "volume.readonly_target must not contain the executable or working_dir",
-                    ));
-                }
-                if let Some(scratch) = &self.scratch_dir {
-                    if target.starts_with(scratch) || scratch.starts_with(target) {
-                        return Err(PolicyError::new(
-                            "volume.readonly_target must not overlap filesystem.scratch",
-                        ));
-                    }
                 }
             }
-            _ => {
+        }
+        for volume in &writable_volumes {
+            validate_absolute_path("volume.writable_source", &volume.source)?;
+            validate_absolute_path("volume.writable_target", &volume.target)?;
+            if volume.source.starts_with(&self.root_dir)
+                || self.root_dir.starts_with(&volume.source)
+            {
                 return Err(PolicyError::new(
-                    "volume.readonly_source and volume.readonly_target must be specified together",
+                    "volume.writable_source must not overlap filesystem.root",
                 ));
+            }
+            if volume.target == Path::new("/") {
+                return Err(PolicyError::new(
+                    "volume.writable_target must not replace the sandbox root",
+                ));
+            }
+            if self.executable.starts_with(&volume.target)
+                || self.working_dir.starts_with(&volume.target)
+            {
+                return Err(PolicyError::new(
+                    "volume.writable_target must not contain the executable or working_dir",
+                ));
+            }
+            if let Some(scratch) = &self.scratch_dir {
+                if volume.target.starts_with(scratch) || scratch.starts_with(&volume.target) {
+                    return Err(PolicyError::new(
+                        "volume.writable_target must not overlap filesystem.scratch",
+                    ));
+                }
             }
         }
 
-        match (&self.writable_volume_source, &self.writable_volume_target) {
-            (None, None) => {}
-            (Some(source), Some(target)) => {
-                validate_absolute_path("volume.writable_source", source)?;
-                validate_absolute_path("volume.writable_target", target)?;
-                if source.starts_with(&self.root_dir) || self.root_dir.starts_with(source) {
+        let all_volumes = readonly_volumes
+            .iter()
+            .chain(writable_volumes.iter())
+            .collect::<Vec<_>>();
+        for (index, left) in all_volumes.iter().enumerate() {
+            for right in all_volumes.iter().skip(index + 1) {
+                if left.target.starts_with(&right.target) || right.target.starts_with(&left.target)
+                {
                     return Err(PolicyError::new(
-                        "volume.writable_source must not overlap filesystem.root",
+                        "persistent volume targets must not overlap each other",
                     ));
                 }
-                if target == Path::new("/") {
+                if left.source.starts_with(&right.source) || right.source.starts_with(&left.source)
+                {
                     return Err(PolicyError::new(
-                        "volume.writable_target must not replace the sandbox root",
+                        "persistent volume sources must not overlap each other",
                     ));
                 }
-                if self.executable.starts_with(target) || self.working_dir.starts_with(target) {
-                    return Err(PolicyError::new(
-                        "volume.writable_target must not contain the executable or working_dir",
-                    ));
-                }
-                if let Some(scratch) = &self.scratch_dir {
-                    if target.starts_with(scratch) || scratch.starts_with(target) {
-                        return Err(PolicyError::new(
-                            "volume.writable_target must not overlap filesystem.scratch",
-                        ));
-                    }
-                }
-            }
-            _ => {
-                return Err(PolicyError::new(
-                    "volume.writable_source and volume.writable_target must be specified together",
-                ));
-            }
-        }
-
-        if let (
-            Some(readonly_source),
-            Some(readonly_target),
-            Some(writable_source),
-            Some(writable_target),
-        ) = (
-            &self.readonly_volume_source,
-            &self.readonly_volume_target,
-            &self.writable_volume_source,
-            &self.writable_volume_target,
-        ) {
-            if readonly_target.starts_with(writable_target)
-                || writable_target.starts_with(readonly_target)
-            {
-                return Err(PolicyError::new(
-                    "read-only and writable volume targets must not overlap",
-                ));
-            }
-            if readonly_source.starts_with(writable_source)
-                || writable_source.starts_with(readonly_source)
-            {
-                return Err(PolicyError::new(
-                    "read-only and writable volume sources must not overlap",
-                ));
             }
         }
 
@@ -1360,10 +1437,10 @@ impl FromStr for SandboxPolicy {
         let mut host_unix_stream_peer_gid = None;
         let mut host_loopback_tcp_listen_port = None;
         let mut host_loopback_tcp_listen_target_fd = None;
-        let mut readonly_volume_source = None;
-        let mut readonly_volume_target = None;
-        let mut writable_volume_source = None;
-        let mut writable_volume_target = None;
+        let mut readonly_volume_source = Vec::new();
+        let mut readonly_volume_target = Vec::new();
+        let mut writable_volume_source = Vec::new();
+        let mut writable_volume_target = Vec::new();
         let mut scratch_dir = None;
         let mut scratch_bytes = None;
         let mut stdin = None;
@@ -1543,18 +1620,10 @@ impl FromStr for SandboxPolicy {
                     line_no,
                     key,
                 )?,
-                "volume.readonly_source" => {
-                    set_once(&mut readonly_volume_source, value.to_owned(), line_no, key)?
-                }
-                "volume.readonly_target" => {
-                    set_once(&mut readonly_volume_target, value.to_owned(), line_no, key)?
-                }
-                "volume.writable_source" => {
-                    set_once(&mut writable_volume_source, value.to_owned(), line_no, key)?
-                }
-                "volume.writable_target" => {
-                    set_once(&mut writable_volume_target, value.to_owned(), line_no, key)?
-                }
+                "volume.readonly_source" => readonly_volume_source.push(value.to_owned()),
+                "volume.readonly_target" => readonly_volume_target.push(value.to_owned()),
+                "volume.writable_source" => writable_volume_source.push(value.to_owned()),
+                "volume.writable_target" => writable_volume_target.push(value.to_owned()),
                 "filesystem.scratch" => set_once(&mut scratch_dir, value.to_owned(), line_no, key)?,
                 "filesystem.scratch_bytes" => set_once(
                     &mut scratch_bytes,
@@ -1873,6 +1942,58 @@ impl FromStr for SandboxPolicy {
                 (None, None, parsed_needed_bindings)
             };
 
+        if readonly_volume_source.len() != readonly_volume_target.len() {
+            return Err(PolicyError::new(
+                "volume.readonly_source and volume.readonly_target must have the same number of entries",
+            ));
+        }
+        if writable_volume_source.len() != writable_volume_target.len() {
+            return Err(PolicyError::new(
+                "volume.writable_source and volume.writable_target must have the same number of entries",
+            ));
+        }
+        let volume_count = readonly_volume_source
+            .len()
+            .checked_add(writable_volume_source.len())
+            .ok_or_else(|| PolicyError::new("persistent volume binding count overflow"))?;
+        if volume_count > MAX_PERSISTENT_VOLUME_BINDINGS {
+            return Err(PolicyError::new(format!(
+                "too many persistent volume bindings: {volume_count} > {MAX_PERSISTENT_VOLUME_BINDINGS}"
+            )));
+        }
+
+        let mut parsed_readonly_volumes = readonly_volume_source
+            .into_iter()
+            .zip(readonly_volume_target)
+            .map(|(source, target)| PersistentVolumeBinding {
+                source: PathBuf::from(source),
+                target: PathBuf::from(target),
+            })
+            .collect::<Vec<_>>();
+        let (legacy_readonly_source, legacy_readonly_target, readonly_volume_bindings) =
+            if parsed_readonly_volumes.len() == 1 {
+                let binding = parsed_readonly_volumes.pop().expect("one binding exists");
+                (Some(binding.source), Some(binding.target), Vec::new())
+            } else {
+                (None, None, parsed_readonly_volumes)
+            };
+
+        let mut parsed_writable_volumes = writable_volume_source
+            .into_iter()
+            .zip(writable_volume_target)
+            .map(|(source, target)| PersistentVolumeBinding {
+                source: PathBuf::from(source),
+                target: PathBuf::from(target),
+            })
+            .collect::<Vec<_>>();
+        let (legacy_writable_source, legacy_writable_target, writable_volume_bindings) =
+            if parsed_writable_volumes.len() == 1 {
+                let binding = parsed_writable_volumes.pop().expect("one binding exists");
+                (Some(binding.source), Some(binding.target), Vec::new())
+            } else {
+                (None, None, parsed_writable_volumes)
+            };
+
         let policy = Self {
             root_dir: PathBuf::from(required(root_dir, "filesystem.root")?),
             cow_root_bytes,
@@ -1925,10 +2046,12 @@ impl FromStr for SandboxPolicy {
             host_unix_stream_peer_gid,
             host_loopback_tcp_listen_port,
             host_loopback_tcp_listen_target_fd,
-            readonly_volume_source: readonly_volume_source.map(PathBuf::from),
-            readonly_volume_target: readonly_volume_target.map(PathBuf::from),
-            writable_volume_source: writable_volume_source.map(PathBuf::from),
-            writable_volume_target: writable_volume_target.map(PathBuf::from),
+            readonly_volume_source: legacy_readonly_source,
+            readonly_volume_target: legacy_readonly_target,
+            readonly_volume_bindings,
+            writable_volume_source: legacy_writable_source,
+            writable_volume_target: legacy_writable_target,
+            writable_volume_bindings,
             scratch_dir: scratch_dir.map(PathBuf::from),
             scratch_bytes,
             stdio: StdioPolicy {
@@ -2999,6 +3122,104 @@ mod tests {
             policy.writable_volume_target,
             Some(PathBuf::from("/persist"))
         );
+    }
+
+    #[test]
+    fn parses_bounded_persistent_volume_sets_and_rejects_invalid_sets() {
+        let base = volume_valid();
+        let multi = format!(
+            "{base}
+volume.readonly_source = /srv/read-a
+volume.readonly_source = /srv/read-b
+volume.readonly_target = /data-a
+volume.readonly_target = /data-b
+volume.writable_source = /srv/write-a
+volume.writable_source = /srv/write-b
+volume.writable_target = /persist-a
+volume.writable_target = /persist-b
+landlock.file_mutate = /persist-b/subdir"
+        );
+        let policy: SandboxPolicy = multi.parse().unwrap();
+        assert!(policy.readonly_volume_source.is_none());
+        assert!(policy.readonly_volume_target.is_none());
+        assert!(policy.writable_volume_source.is_none());
+        assert!(policy.writable_volume_target.is_none());
+        assert_eq!(
+            policy.normalized_readonly_volume_bindings(),
+            vec![
+                PersistentVolumeBinding {
+                    source: PathBuf::from("/srv/read-a"),
+                    target: PathBuf::from("/data-a"),
+                },
+                PersistentVolumeBinding {
+                    source: PathBuf::from("/srv/read-b"),
+                    target: PathBuf::from("/data-b"),
+                },
+            ]
+        );
+        assert_eq!(
+            policy.normalized_writable_volume_bindings(),
+            vec![
+                PersistentVolumeBinding {
+                    source: PathBuf::from("/srv/write-a"),
+                    target: PathBuf::from("/persist-a"),
+                },
+                PersistentVolumeBinding {
+                    source: PathBuf::from("/srv/write-b"),
+                    target: PathBuf::from("/persist-b"),
+                },
+            ]
+        );
+
+        let unequal = format!(
+            "{base}
+volume.readonly_source = /srv/read-a
+volume.readonly_source = /srv/read-b
+volume.readonly_target = /data-a"
+        );
+        assert!(unequal.parse::<SandboxPolicy>().is_err());
+
+        let overlap = format!(
+            "{base}
+volume.readonly_source = /srv/read-a
+volume.readonly_target = /data
+volume.writable_source = /srv/write-a
+volume.writable_target = /data/state"
+        );
+        let err = overlap.parse::<SandboxPolicy>().unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("persistent volume targets must not overlap"));
+
+        let source_overlap = format!(
+            "{base}
+volume.readonly_source = /srv/shared
+volume.readonly_target = /data-a
+volume.writable_source = /srv/shared/state
+volume.writable_target = /persist-a"
+        );
+        let err = source_overlap.parse::<SandboxPolicy>().unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("persistent volume sources must not overlap"));
+
+        let mut oversized = base.clone();
+        for index in 0..=MAX_PERSISTENT_VOLUME_BINDINGS {
+            oversized.push_str(&format!(
+                "
+volume.readonly_source = /srv/read-{index}
+volume.readonly_target = /data-{index}"
+            ));
+        }
+        assert!(oversized.parse::<SandboxPolicy>().is_err());
+
+        let mut mixed = policy;
+        mixed.readonly_volume_source = Some(PathBuf::from("/srv/legacy"));
+        mixed.readonly_volume_target = Some(PathBuf::from("/legacy"));
+        let err = mixed.validate().unwrap_err();
+        assert!(err.to_string().contains(
+            "legacy read-only volume pair and readonly_volume_bindings are mutually exclusive"
+        ));
     }
 
     #[test]

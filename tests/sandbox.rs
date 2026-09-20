@@ -2,8 +2,8 @@
 
 use security_lab::{
     run, run_report, run_report_with_cancel, CancellationToken, ChildOutcome, CowDiffEntry,
-    ExecutableNeededBinding, ResourceLimits, SandboxError, SandboxPolicy, SeccompArgRangeRule,
-    SeccompArgRule, SeccompPolicy, StdioMode, StdioPolicy,
+    ExecutableNeededBinding, PersistentVolumeBinding, ResourceLimits, SandboxError, SandboxPolicy,
+    SeccompArgRangeRule, SeccompArgRule, SeccompPolicy, StdioMode, StdioPolicy,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -234,8 +234,12 @@ fn fixture_root() -> &'static Path {
         std::fs::create_dir_all(root.join("proc")).expect("create sandbox procfs mountpoint");
         std::fs::create_dir_all(root.join("scratch")).expect("create sandbox scratch mountpoint");
         std::fs::create_dir_all(root.join("data")).expect("create sandbox volume mountpoint");
+        std::fs::create_dir_all(root.join("data2"))
+            .expect("create second sandbox volume mountpoint");
         std::fs::create_dir_all(root.join("persist"))
             .expect("create sandbox writable-volume mountpoint");
+        std::fs::create_dir_all(root.join("persist2"))
+            .expect("create second sandbox writable-volume mountpoint");
         std::fs::create_dir_all(root.join("devices"))
             .expect("create sandbox device-volume mountpoint");
         std::fs::create_dir_all(root.join("landlock-allowed"))
@@ -268,6 +272,20 @@ fn fixture_root() -> &'static Path {
             .status()
             .expect("Linux x86_64 integration tests require a C toolchain with cc");
         assert!(status.success(), "failed to assemble raw-syscall fixture");
+
+        let multi_volume_output = root.join("multi-volume-probe");
+        let multi_volume_source =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/multi_volume_probe.S");
+        let multi_volume_status = Command::new("cc")
+            .args(["-nostdlib", "-static", "-Wl,--build-id=none", "-o"])
+            .arg(&multi_volume_output)
+            .arg(&multi_volume_source)
+            .status()
+            .expect("Linux x86_64 integration tests require a C toolchain with cc");
+        assert!(
+            multi_volume_status.success(),
+            "failed to assemble bounded persistent-volume fixture"
+        );
 
         let loader_source = std::fs::canonicalize("/lib64/ld-linux-x86-64.so.2")
             .expect("Ubuntu x86_64 integration tests require the system ELF interpreter");
@@ -476,6 +494,36 @@ fn writable_volume_source() -> &'static Path {
         .as_path()
 }
 
+fn readonly_volume_source_second() -> &'static Path {
+    static SOURCE: OnceLock<PathBuf> = OnceLock::new();
+    SOURCE
+        .get_or_init(|| {
+            let source =
+                std::env::temp_dir().join(format!("security-lab-volume-second-{}", process::id()));
+            let _ = std::fs::remove_dir_all(&source);
+            std::fs::create_dir_all(&source).expect("create second read-only volume source");
+            std::fs::write(source.join("marker"), b"volume-marker-2\n")
+                .expect("write second persistent volume marker");
+            source
+        })
+        .as_path()
+}
+
+fn writable_volume_source_second() -> &'static Path {
+    static SOURCE: OnceLock<PathBuf> = OnceLock::new();
+    SOURCE
+        .get_or_init(|| {
+            let source = std::env::temp_dir().join(format!(
+                "security-lab-writable-volume-second-{}",
+                process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&source);
+            std::fs::create_dir_all(&source).expect("create second writable volume source");
+            source
+        })
+        .as_path()
+}
+
 fn landlock_topology_source() -> &'static Path {
     static SOURCE: OnceLock<PathBuf> = OnceLock::new();
     SOURCE
@@ -547,8 +595,10 @@ fn policy(mode: &str, extra_args: &[&str], syscalls: &[&str]) -> SandboxPolicy {
         host_loopback_tcp_listen_target_fd: None,
         readonly_volume_source: None,
         readonly_volume_target: None,
+        readonly_volume_bindings: Vec::new(),
         writable_volume_source: None,
         writable_volume_target: None,
+        writable_volume_bindings: Vec::new(),
         scratch_dir: Some(PathBuf::from("/scratch")),
         scratch_bytes: Some(SCRATCH_BYTES),
         stdio: StdioPolicy {
@@ -1550,6 +1600,61 @@ fn writable_persistent_volume_mutates_only_declared_host_tree() {
         !root_forbidden.exists(),
         "writable volume reopened mutation outside its declared target"
     );
+}
+
+#[test]
+fn bounded_persistent_volume_sets_mount_all_declared_members() {
+    let readonly_one = readonly_volume_source().to_path_buf();
+    let readonly_two = readonly_volume_source_second().to_path_buf();
+    let writable_one = writable_volume_source().to_path_buf();
+    let writable_two = writable_volume_source_second().to_path_buf();
+    for path in [
+        readonly_one.join("write-must-fail"),
+        readonly_two.join("write-must-fail"),
+        writable_one.join("persisted"),
+        writable_two.join("persisted"),
+    ] {
+        let _ = std::fs::remove_file(path);
+    }
+
+    let mut mounted = policy(
+        "unused",
+        &[],
+        &["execveat", "openat", "read", "write", "close", "exit"],
+    );
+    mounted.executable = PathBuf::from("/multi-volume-probe");
+    mounted.readonly_volume_bindings = vec![
+        PersistentVolumeBinding {
+            source: readonly_one.clone(),
+            target: PathBuf::from("/data"),
+        },
+        PersistentVolumeBinding {
+            source: readonly_two.clone(),
+            target: PathBuf::from("/data2"),
+        },
+    ];
+    mounted.writable_volume_bindings = vec![
+        PersistentVolumeBinding {
+            source: writable_one.clone(),
+            target: PathBuf::from("/persist"),
+        },
+        PersistentVolumeBinding {
+            source: writable_two.clone(),
+            target: PathBuf::from("/persist2"),
+        },
+    ];
+
+    assert_eq!(run(&mounted).unwrap(), ChildOutcome::Exited(0));
+    assert_eq!(
+        std::fs::read(writable_one.join("persisted")).unwrap(),
+        b"persistent-one\n"
+    );
+    assert_eq!(
+        std::fs::read(writable_two.join("persisted")).unwrap(),
+        b"persistent-two\n"
+    );
+    assert!(!readonly_one.join("write-must-fail").exists());
+    assert!(!readonly_two.join("write-must-fail").exists());
 }
 
 #[test]

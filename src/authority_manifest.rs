@@ -92,6 +92,18 @@ pub(crate) fn to_json(policy: &SandboxPolicy) -> String {
         policy.writable_volume_target.as_deref(),
         "writable",
     );
+    output.push_str(",\"read_only_volumes\":");
+    push_volume_array(
+        &mut output,
+        policy.normalized_readonly_volume_bindings(),
+        "read_only",
+    );
+    output.push_str(",\"writable_volumes\":");
+    push_volume_array(
+        &mut output,
+        policy.normalized_writable_volume_bindings(),
+        "writable",
+    );
     output.push('}');
 
     output.push_str(",\"network\":{\"isolated_loopback_enabled\":");
@@ -457,8 +469,8 @@ pub(crate) fn to_human(policy: &SandboxPolicy) -> String {
     writeln!(
         &mut output,
         "host-filesystem-volumes: read-only={} writable={}",
-        policy.readonly_volume_source.is_some() as u8,
-        policy.writable_volume_source.is_some() as u8
+        policy.normalized_readonly_volume_bindings().len(),
+        policy.normalized_writable_volume_bindings().len()
     )
     .expect("write to String cannot fail");
     writeln!(
@@ -581,6 +593,28 @@ fn push_volume(output: &mut String, source: Option<&Path>, target: Option<&Path>
         }
         _ => output.push_str("null"),
     }
+}
+
+fn push_volume_array(
+    output: &mut String,
+    mut bindings: Vec<security_lab::PersistentVolumeBinding>,
+    access: &str,
+) {
+    bindings.sort();
+    output.push('[');
+    for (index, binding) in bindings.iter().enumerate() {
+        if index != 0 {
+            output.push(',');
+        }
+        output.push_str("{\"access\":");
+        push_json_string(output, access);
+        output.push_str(",\"source\":");
+        push_path(output, &binding.source);
+        output.push_str(",\"target\":");
+        push_path(output, &binding.target);
+        output.push('}');
+    }
+    output.push(']');
 }
 
 fn push_sorted_path_array(output: &mut String, paths: &[PathBuf]) {

@@ -175,6 +175,47 @@ fn manifest_json_canonicalizes_bounded_needed_binding_set() {
 }
 
 #[test]
+fn manifest_reports_canonical_bounded_persistent_volume_sets() {
+    let root = root_path("volume-set");
+    let text = format!(
+        "{}volume.readonly_source = /srv/z-read
+volume.readonly_source = /srv/a-read
+volume.readonly_target = /z-data
+volume.readonly_target = /a-data
+volume.writable_source = /srv/z-write
+volume.writable_source = /srv/a-write
+volume.writable_target = /z-persist
+volume.writable_target = /a-persist
+",
+        manifest_policy(&root)
+    );
+    let path = write_policy("volume-set", &text);
+
+    let json = Command::new(binary())
+        .args(["manifest-json", path.to_str().expect("UTF-8 policy path")])
+        .output()
+        .expect("run volume-set manifest JSON");
+    let human = Command::new(binary())
+        .args(["manifest", path.to_str().expect("UTF-8 policy path")])
+        .output()
+        .expect("run volume-set human manifest");
+    let _ = fs::remove_file(path);
+
+    assert_eq!(json.status.code(), Some(0));
+    let stdout = String::from_utf8(json.stdout).expect("manifest JSON is UTF-8");
+    assert!(stdout.contains(
+        "\"read_only_volumes\":[{\"access\":\"read_only\",\"source\":\"/srv/a-read\",\"target\":\"/a-data\"},{\"access\":\"read_only\",\"source\":\"/srv/z-read\",\"target\":\"/z-data\"}]"
+    ));
+    assert!(stdout.contains(
+        "\"writable_volumes\":[{\"access\":\"writable\",\"source\":\"/srv/a-write\",\"target\":\"/a-persist\"},{\"access\":\"writable\",\"source\":\"/srv/z-write\",\"target\":\"/z-persist\"}]"
+    ));
+
+    assert_eq!(human.status.code(), Some(0));
+    let stdout = String::from_utf8(human.stdout).expect("human manifest is UTF-8");
+    assert!(stdout.contains("host-filesystem-volumes: read-only=2 writable=2\n"));
+}
+
+#[test]
 fn manifest_json_rejects_invalid_policy_fail_closed() {
     let path = write_policy("invalid", "unknown.field = value\n");
     let output = Command::new(binary())

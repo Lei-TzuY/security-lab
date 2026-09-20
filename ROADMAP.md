@@ -1749,7 +1749,7 @@ After 73A integrates, do not farm larger reconnect ceilings, more readiness-byte
 
 ### Slice 74A — revoke one transferred host AF_UNIX stream object
 
-**Current implementation candidate.** Adds opt-in trusted-controller revocation for one already-prepared 71A connected stream without changing the ordinary one-shot transfer or the 73A bounded reconnect controller.
+**Status: complete on `main`.** Adds opt-in trusted-controller revocation for one already-prepared 71A connected stream without changing the ordinary one-shot transfer or the 73A bounded reconnect controller.
 
 Acceptance evidence is executable:
 

@@ -16,6 +16,7 @@ const MAX_SYSCALLS: usize = 128;
 const MAX_SECCOMP_ARG_RULES: usize = 64;
 const MAX_SELECTED_HANDLES: usize = 16;
 pub const MAX_EXECUTABLE_NEEDED_BINDINGS: usize = 8;
+pub const MAX_PERSISTENT_VOLUME_BINDINGS: usize = 8;
 const MAX_LANDLOCK_READ_EXECUTE_PATHS: usize = 32;
 const MAX_LANDLOCK_FILE_MUTATE_PATHS: usize = 32;
 const MAX_LANDLOCK_PATH_TOPOLOGY_MUTATE_PATHS: usize = 32;
@@ -97,6 +98,12 @@ pub struct SeccompPolicy {
 pub struct ExecutableNeededBinding {
     pub path: PathBuf,
     pub sha256: [u8; 32],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PersistentVolumeBinding {
+    pub source: PathBuf,
+    pub target: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -194,10 +201,16 @@ pub struct SandboxPolicy {
     /// declared sandbox mountpoint. Source and target must be specified together.
     pub readonly_volume_source: Option<PathBuf>,
     pub readonly_volume_target: Option<PathBuf>,
+    /// Optional bounded read-only volume set. Mutually exclusive with the
+    /// legacy single read-only pair above.
+    pub readonly_volume_bindings: Vec<PersistentVolumeBinding>,
     /// Optional trusted host directory deliberately exposed writable at one
     /// declared sandbox mountpoint. This grants host mutation authority.
     pub writable_volume_source: Option<PathBuf>,
     pub writable_volume_target: Option<PathBuf>,
+    /// Optional bounded writable volume set. Mutually exclusive with the
+    /// legacy single writable pair above.
+    pub writable_volume_bindings: Vec<PersistentVolumeBinding>,
     /// Optional absolute path inside `root_dir` replaced by a private writable
     /// tmpfs after the root mount tree has been made recursively read-only.
     pub scratch_dir: Option<PathBuf>,
@@ -275,6 +288,32 @@ impl SandboxPolicy {
             (Some(path), Some(sha256)) => vec![ExecutableNeededBinding {
                 path: path.clone(),
                 sha256,
+            }],
+            _ => Vec::new(),
+        }
+    }
+
+    pub fn normalized_readonly_volume_bindings(&self) -> Vec<PersistentVolumeBinding> {
+        if !self.readonly_volume_bindings.is_empty() {
+            return self.readonly_volume_bindings.clone();
+        }
+        match (&self.readonly_volume_source, &self.readonly_volume_target) {
+            (Some(source), Some(target)) => vec![PersistentVolumeBinding {
+                source: source.clone(),
+                target: target.clone(),
+            }],
+            _ => Vec::new(),
+        }
+    }
+
+    pub fn normalized_writable_volume_bindings(&self) -> Vec<PersistentVolumeBinding> {
+        if !self.writable_volume_bindings.is_empty() {
+            return self.writable_volume_bindings.clone();
+        }
+        match (&self.writable_volume_source, &self.writable_volume_target) {
+            (Some(source), Some(target)) => vec![PersistentVolumeBinding {
+                source: source.clone(),
+                target: target.clone(),
             }],
             _ => Vec::new(),
         }

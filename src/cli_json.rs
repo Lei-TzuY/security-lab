@@ -297,7 +297,9 @@ mod tests {
         assert!(json.contains(
             "\"cow_volume_diffs\":[{\"target_encoding\":\"hex\",\"target\":\"2f7374617465ff\",\"diff\":{\"encoded_bytes\":23"
         ));
-        assert!(json.contains("\"kind\":\"remove\",\"path_encoding\":\"hex\",\"path\":\"2f6f6c64\""));
+        assert!(
+            json.contains("\"kind\":\"remove\",\"path_encoding\":\"hex\",\"path\":\"2f6f6c64\"")
+        );
     }
 
     #[test]

@@ -1628,6 +1628,280 @@ mod imp {
         }
     }
 
+    impl RuntimeAuthenticatedCorrelatedMessageExchangeController {
+        pub fn is_complete(&self) -> bool {
+            !self.failed
+                && self.challenge_published
+                && self.received_requests == self.max_requests
+                && self.completed_responses == self.max_requests
+                && self.pending_request_ids.is_empty()
+        }
+
+        pub fn received_requests(&self) -> u32 {
+            self.received_requests
+        }
+
+        pub fn completed_responses(&self) -> u32 {
+            self.completed_responses
+        }
+
+        pub fn pending_requests(&self) -> u32 {
+            self.pending_request_ids.len() as u32
+        }
+
+        pub fn max_requests(&self) -> u32 {
+            self.max_requests
+        }
+
+        pub fn max_in_flight(&self) -> u32 {
+            self.max_in_flight
+        }
+
+        pub fn challenge_published(&self) -> bool {
+            self.challenge_published
+        }
+
+        fn reject_if_failed(&self) -> Result<(), RuntimeFdBrokerError> {
+            if self.failed {
+                return Err(RuntimeFdBrokerError::Protocol(
+                    "authenticated runtime correlated exchange is closed after a protocol, authentication, or I/O failure".to_owned(),
+                ));
+            }
+            Ok(())
+        }
+
+        /// Publish the fresh per-session public authentication challenge.
+        pub fn publish_challenge(&mut self) -> Result<(), RuntimeFdBrokerError> {
+            self.reject_if_failed()?;
+            if self.challenge_published {
+                return Err(RuntimeFdBrokerError::InvalidConfiguration(
+                    "authenticated runtime session challenge may be published exactly once".to_owned(),
+                ));
+            }
+            let mut frame = [0u8; 2 + super::RUNTIME_AUTH_CHALLENGE_BYTES];
+            frame[0] = RUNTIME_AUTH_CHALLENGE_KIND;
+            frame[1] = RUNTIME_AUTH_PROTOCOL_VERSION;
+            frame[2..].copy_from_slice(&self.challenge);
+            loop {
+                let sent = unsafe {
+                    libc::send(
+                        self.fd,
+                        frame.as_ptr().cast::<libc::c_void>(),
+                        frame.len(),
+                        libc::MSG_NOSIGNAL,
+                    )
+                };
+                if sent == frame.len() as isize {
+                    self.challenge_published = true;
+                    return Ok(());
+                }
+                if sent == -1 {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() == Some(libc::EINTR) {
+                        continue;
+                    }
+                    self.failed = true;
+                    return Err(RuntimeFdBrokerError::io(
+                        "cannot publish authenticated runtime session challenge",
+                        error,
+                    ));
+                }
+                self.failed = true;
+                return Err(RuntimeFdBrokerError::Protocol(format!(
+                    "authenticated runtime challenge sent unexpected packet length {sent}"
+                )));
+            }
+        }
+
+        pub fn receive_request(
+            &mut self,
+        ) -> Result<RuntimeCorrelatedRequest, RuntimeFdBrokerError> {
+            self.reject_if_failed()?;
+            if !self.challenge_published {
+                return Err(RuntimeFdBrokerError::InvalidConfiguration(
+                    "authenticated runtime session challenge must be published before receiving requests".to_owned(),
+                ));
+            }
+            if self.received_requests == self.max_requests {
+                return Err(RuntimeFdBrokerError::Protocol(
+                    "authenticated runtime correlated exchange reached its configured request limit".to_owned(),
+                ));
+            }
+            if self.pending_request_ids.len() as u32 == self.max_in_flight {
+                return Err(RuntimeFdBrokerError::InvalidConfiguration(
+                    "authenticated runtime correlated exchange reached its in-flight request limit; publish a response before receiving another request".to_owned(),
+                ));
+            }
+
+            let framing_bytes = 2usize + 8 + super::RUNTIME_AUTH_TAG_BYTES;
+            let capacity = self.max_request_bytes as usize + framing_bytes;
+            let mut bytes = vec![0u8; capacity];
+            let mut iovec = libc::iovec {
+                iov_base: bytes.as_mut_ptr().cast::<libc::c_void>(),
+                iov_len: bytes.len(),
+            };
+            let mut message = unsafe { std::mem::zeroed::<libc::msghdr>() };
+            message.msg_iov = &mut iovec;
+            message.msg_iovlen = 1;
+
+            loop {
+                message.msg_flags = 0;
+                let received = unsafe { libc::recvmsg(self.fd, &mut message, 0) };
+                if received == -1 {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() == Some(libc::EINTR) {
+                        continue;
+                    }
+                    self.failed = true;
+                    return Err(RuntimeFdBrokerError::io(
+                        "cannot receive authenticated runtime correlated request",
+                        error,
+                    ));
+                }
+                if received == 0 {
+                    self.failed = true;
+                    return Err(RuntimeFdBrokerError::Protocol(
+                        "authenticated runtime request must arrive before peer shutdown".to_owned(),
+                    ));
+                }
+                if message.msg_flags & libc::MSG_TRUNC != 0 || received as usize > capacity {
+                    self.failed = true;
+                    return Err(RuntimeFdBrokerError::RuntimeRequestTooLarge {
+                        max_bytes: self.max_request_bytes,
+                    });
+                }
+                if received as usize <= framing_bytes {
+                    self.failed = true;
+                    return Err(RuntimeFdBrokerError::Protocol(
+                        "authenticated runtime request requires type/version, an 8-byte request id, a non-empty payload, and a 32-byte tag".to_owned(),
+                    ));
+                }
+
+                let received = received as usize;
+                if bytes[0] != RUNTIME_AUTH_REQUEST_KIND
+                    || bytes[1] != RUNTIME_AUTH_PROTOCOL_VERSION
+                {
+                    self.failed = true;
+                    return Err(RuntimeFdBrokerError::Protocol(
+                        "authenticated runtime request has an unsupported frame type or version".to_owned(),
+                    ));
+                }
+                let mut request_id_bytes = [0u8; 8];
+                request_id_bytes.copy_from_slice(&bytes[2..10]);
+                let request_id = u64::from_le_bytes(request_id_bytes);
+                let payload_end = received - super::RUNTIME_AUTH_TAG_BYTES;
+                let payload = &bytes[10..payload_end];
+                let tag = &bytes[payload_end..received];
+                if !runtime_auth_verify(
+                    &self.key,
+                    &self.challenge,
+                    RUNTIME_AUTH_REQUEST_KIND,
+                    request_id,
+                    payload,
+                    tag,
+                ) {
+                    self.failed = true;
+                    return Err(RuntimeFdBrokerError::RuntimeAuthenticationFailed);
+                }
+                if !self.seen_request_ids.insert(request_id) {
+                    self.failed = true;
+                    return Err(RuntimeFdBrokerError::RuntimeDuplicateRequestId { request_id });
+                }
+                if !self.pending_request_ids.insert(request_id) {
+                    self.failed = true;
+                    return Err(RuntimeFdBrokerError::Protocol(
+                        "authenticated runtime request pending-set insertion was inconsistent".to_owned(),
+                    ));
+                }
+                self.received_requests += 1;
+                return Ok(RuntimeCorrelatedRequest {
+                    request_id,
+                    payload: payload.to_vec(),
+                });
+            }
+        }
+
+        pub fn send_response(
+            &mut self,
+            request_id: u64,
+            bytes: &[u8],
+        ) -> Result<(), RuntimeFdBrokerError> {
+            self.reject_if_failed()?;
+            if !self.challenge_published {
+                return Err(RuntimeFdBrokerError::InvalidConfiguration(
+                    "authenticated runtime session challenge must be published before sending responses".to_owned(),
+                ));
+            }
+            if !self.pending_request_ids.contains(&request_id) {
+                self.failed = true;
+                return Err(RuntimeFdBrokerError::RuntimeUnknownRequestId { request_id });
+            }
+            if bytes.is_empty() {
+                self.failed = true;
+                return Err(RuntimeFdBrokerError::Protocol(
+                    "authenticated runtime correlated response must be non-empty".to_owned(),
+                ));
+            }
+            if bytes.len() as u64 > self.max_response_bytes {
+                self.failed = true;
+                return Err(RuntimeFdBrokerError::RuntimeResponseTooLarge {
+                    max_bytes: self.max_response_bytes,
+                });
+            }
+
+            let tag = runtime_auth_tag(
+                &self.key,
+                &self.challenge,
+                RUNTIME_AUTH_RESPONSE_KIND,
+                request_id,
+                bytes,
+            );
+            let mut frame = Vec::with_capacity(2 + 8 + bytes.len() + tag.len());
+            frame.push(RUNTIME_AUTH_RESPONSE_KIND);
+            frame.push(RUNTIME_AUTH_PROTOCOL_VERSION);
+            frame.extend_from_slice(&request_id.to_le_bytes());
+            frame.extend_from_slice(bytes);
+            frame.extend_from_slice(&tag);
+            loop {
+                let sent = unsafe {
+                    libc::send(
+                        self.fd,
+                        frame.as_ptr().cast::<libc::c_void>(),
+                        frame.len(),
+                        libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT,
+                    )
+                };
+                if sent == frame.len() as isize {
+                    self.pending_request_ids.remove(&request_id);
+                    self.completed_responses += 1;
+                    return Ok(());
+                }
+                if sent == -1 {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() == Some(libc::EINTR) {
+                        continue;
+                    }
+                    self.failed = true;
+                    if error.raw_os_error() == Some(libc::EAGAIN)
+                        || error.raw_os_error() == Some(libc::EWOULDBLOCK)
+                    {
+                        return Err(RuntimeFdBrokerError::Protocol(
+                            "authenticated runtime correlated response publication would block; the controller does not buffer responses".to_owned(),
+                        ));
+                    }
+                    return Err(RuntimeFdBrokerError::io(
+                        "cannot send authenticated runtime correlated response",
+                        error,
+                    ));
+                }
+                self.failed = true;
+                return Err(RuntimeFdBrokerError::Protocol(format!(
+                    "authenticated runtime correlated response sent unexpected packet length {sent}"
+                )));
+            }
+        }
+    }
+
     #[derive(Debug)]
     pub struct RuntimeFdBroker {
         path: PathBuf,

@@ -1630,6 +1630,28 @@ Boundary: 66A models only an exact bounded set of 1–8 absolute path-qualified 
 
 After 66A integrates, do not farm larger set ceilings or more declaration-order permutations. The next execution-integrity promotion must introduce a bounded loader-resolution/transitive graph model end-to-end, or move to another independent architecture frontier.
 
+## Milestone 67 — bounded persistent-volume sets
+
+### Slice 67A — generalize persistent host-directory grants into bounded RO/RW sets
+
+**Current implementation candidate.** Generalizes the legacy one-read-only plus one-writable volume surface into one bounded declarative set while preserving the same pinned-object mount architecture.
+
+Acceptance evidence is executable:
+
+- repeated `volume.readonly_source`/`volume.readonly_target` and `volume.writable_source`/`volume.writable_target` entries form ordered pairs and normalize into at most eight aggregate persistent-volume bindings; a single pair remains legacy-compatible;
+- validation rejects unequal source/target counts, legacy-plus-vector mixing, aggregate counts above eight, any source overlap across RO/RW grants, any target overlap across RO/RW grants, root/scratch/procfs/executable/working-directory conflicts, and Landlock mutation paths outside the complete writable-target set;
+- production prepares every normalized source through the existing pinned/reopened `(st_dev, st_ino)` identity path, recursively clones each mount tree, applies read-only mount attributes only to RO members, and attaches each object only at its declared sandbox target;
+- configured-filesystem preflight independently checks every normalized source and target;
+- authority JSON canonicalizes normalized RO/RW volume arrays, human output reports normalized counts, and authority-delta comparison uses set inclusion so added grants widen authority, removed grants reduce it, and partial replacement is incomparable;
+- a raw-syscall target in one sandbox invocation reads two independent RO mounts, proves writes to both fail with `EROFS`, and persists independent writes through two RW mounts;
+- stable rustfmt, Clippy with `-D warnings`, complete stable tests, and Rust 1.74 are the integration gate.
+
+Boundary: 67A still exposes only trusted-policy host directories as explicit bind-mount object capabilities. It does not infer filesystem alias equivalence beyond the existing lexical checks and pinned inode identity, does not make writable volumes transactional or snapshot-isolated, does not support per-volume quotas, and does not grant pathname mutation outside explicitly declared writable targets.
+
+### Milestone 67 promotion rule
+
+After 67A integrates, do not farm larger volume-count ceilings or fixed third/fourth slots. Promote to a distinct storage architecture capability such as per-volume bounded resource accounting/snapshot semantics, or move to another independent frontier.
+
 ## Later frontiers
 
-Supplementary-group isolation with a viable mapping architecture, broader/generalized persistent-volume policy, routed/broader network authority beyond the bounded IPv4 brokers, broader host-local IPC mediation beyond the bounded one-shot read-only and sealed-byte regular-file grants, bounded dynamic-loader graph resolution or later-exec authority, and delegated aggregate cgroup accounting remain separate evidence-backed frontiers. Do not add configuration-only names without executable kernel behavior and integration evidence.
+Supplementary-group isolation with a viable mapping architecture, routed/broader network authority beyond the bounded IPv4 brokers, broader host-local IPC mediation beyond the bounded one-shot read-only and sealed-byte regular-file grants, bounded dynamic-loader graph resolution or later-exec authority, per-volume storage accounting/snapshot semantics, and delegated aggregate cgroup accounting remain separate evidence-backed frontiers. Do not add configuration-only names without executable kernel behavior and integration evidence.

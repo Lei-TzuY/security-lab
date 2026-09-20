@@ -2,8 +2,8 @@
 
 use security_lab::{
     run, run_report, run_report_with_cancel, CancellationToken, ChildOutcome, CowDiffEntry,
-    ResourceLimits, SandboxError, SandboxPolicy, SeccompArgRangeRule, SeccompArgRule,
-    SeccompPolicy, StdioMode, StdioPolicy,
+    ExecutableNeededBinding, ResourceLimits, SandboxError, SandboxPolicy, SeccompArgRangeRule,
+    SeccompArgRule, SeccompPolicy, StdioMode, StdioPolicy,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -517,6 +517,7 @@ fn policy(mode: &str, extra_args: &[&str], syscalls: &[&str]) -> SandboxPolicy {
         executable_interpreter_sha256: None,
         executable_needed: None,
         executable_needed_sha256: None,
+        executable_needed_bindings: Vec::new(),
         args,
         environment: BTreeMap::new(),
         working_dir: PathBuf::from("/work"),
@@ -613,6 +614,12 @@ fn fixture_transitive_needed_sha256() -> [u8; 32] {
 
 fn fixture_needed_sha256() -> [u8; 32] {
     let bytes = std::fs::read(fixture_root().join("dependency")).expect("read fixture dependency");
+    Sha256::digest(bytes).into()
+}
+
+fn fixture_extra_needed_sha256() -> [u8; 32] {
+    let bytes =
+        std::fs::read(fixture_root().join("dependency-extra")).expect("read extra dependency");
     Sha256::digest(bytes).into()
 }
 
@@ -802,11 +809,68 @@ fn sealed_direct_needed_binding_rejects_additional_unbound_direct_dependency() {
 
     match run(&policy).unwrap_err() {
         SandboxError::SetupFailed(message) => {
-            assert!(message.contains("direct DT_NEEDED closure"));
-            assert!(message.contains("exactly one entry"));
+            assert!(message.contains("direct DT_NEEDED set"));
+            assert!(message.contains("does not exactly match"));
         }
         other => panic!("unexpected direct dependency closure result: {other}"),
     }
+}
+
+#[test]
+fn sealed_bounded_needed_set_mounts_every_exact_direct_dependency() {
+    let dependency_before = std::fs::read(fixture_root().join("dependency"))
+        .expect("read first dependency before run");
+    let extra_before = std::fs::read(fixture_root().join("dependency-extra"))
+        .expect("read extra dependency before run");
+    let mut verified = policy(
+        "unused",
+        &[],
+        &[
+            "read",
+            "close",
+            "fstat",
+            "mmap",
+            "mprotect",
+            "munmap",
+            "brk",
+            "arch_prctl",
+            "set_tid_address",
+            "set_robust_list",
+            "prlimit64",
+            "getrandom",
+            "openat",
+            "newfstatat",
+            "pread64",
+            "access",
+            "madvise",
+            "exit",
+            "exit_group",
+        ],
+    );
+    verified.executable = PathBuf::from("/dynamic-needed-extra-probe");
+    verified.executable_sha256 = Some(dynamic_needed_extra_fixture_sha256());
+    verified.executable_interpreter = Some(PathBuf::from("/loader"));
+    verified.executable_interpreter_sha256 = Some(fixture_loader_sha256());
+    verified.executable_needed_bindings = vec![
+        ExecutableNeededBinding {
+            path: PathBuf::from("/dependency-extra"),
+            sha256: fixture_extra_needed_sha256(),
+        },
+        ExecutableNeededBinding {
+            path: PathBuf::from("/dependency"),
+            sha256: fixture_needed_sha256(),
+        },
+    ];
+
+    assert_eq!(run(&verified).unwrap(), ChildOutcome::Exited(91));
+    assert_eq!(
+        std::fs::read(fixture_root().join("dependency")).unwrap(),
+        dependency_before
+    );
+    assert_eq!(
+        std::fs::read(fixture_root().join("dependency-extra")).unwrap(),
+        extra_before
+    );
 }
 
 #[test]

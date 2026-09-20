@@ -20,6 +20,9 @@ pub const MIN_RUNTIME_CORRELATED_REQUESTS: u32 = 2;
 pub const MAX_RUNTIME_CORRELATED_REQUESTS: u32 = 32;
 pub const MIN_RUNTIME_CORRELATED_IN_FLIGHT: u32 = 2;
 pub const MAX_RUNTIME_CORRELATED_IN_FLIGHT: u32 = 8;
+pub const RUNTIME_AUTH_KEY_BYTES: usize = 32;
+pub const RUNTIME_AUTH_CHALLENGE_BYTES: usize = 32;
+pub const RUNTIME_AUTH_TAG_BYTES: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeCorrelatedRequest {
@@ -79,6 +82,7 @@ pub enum RuntimeFdBrokerError {
     RuntimeUnknownRequestId {
         request_id: u64,
     },
+    RuntimeAuthenticationFailed,
     UnexpectedPeer {
         expected_pid: i32,
         expected_uid: u32,
@@ -153,6 +157,9 @@ impl fmt::Display for RuntimeFdBrokerError {
                 f,
                 "runtime FD broker correlated response references non-pending request id {request_id}"
             ),
+            Self::RuntimeAuthenticationFailed => f.write_str(
+                "runtime FD broker authenticated message failed HMAC verification",
+            ),
             Self::UnexpectedPeer {
                 expected_pid,
                 expected_uid,
@@ -183,6 +190,8 @@ impl Error for RuntimeFdBrokerError {
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod imp {
     use super::{File, Path, RuntimeCorrelatedRequest, RuntimeFdBrokerError, SandboxPolicy};
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
     use std::collections::BTreeSet;
     use std::ffi::CString;
     use std::io::Read;
@@ -457,6 +466,119 @@ mod imp {
                 libc::close(self.fd);
             }
         }
+    }
+
+    #[derive(Debug)]
+    pub struct RuntimeAuthenticatedCorrelatedMessageExchangeController {
+        fd: RawFd,
+        max_request_bytes: u64,
+        max_response_bytes: u64,
+        max_requests: u32,
+        max_in_flight: u32,
+        received_requests: u32,
+        completed_responses: u32,
+        seen_request_ids: BTreeSet<u64>,
+        pending_request_ids: BTreeSet<u64>,
+        key: [u8; super::RUNTIME_AUTH_KEY_BYTES],
+        challenge: [u8; super::RUNTIME_AUTH_CHALLENGE_BYTES],
+        challenge_published: bool,
+        failed: bool,
+    }
+
+    impl Drop for RuntimeAuthenticatedCorrelatedMessageExchangeController {
+        fn drop(&mut self) {
+            unsafe {
+                libc::close(self.fd);
+            }
+        }
+    }
+
+    const RUNTIME_AUTH_PROTOCOL_VERSION: u8 = 1;
+    const RUNTIME_AUTH_CHALLENGE_KIND: u8 = b'C';
+    const RUNTIME_AUTH_REQUEST_KIND: u8 = b'Q';
+    const RUNTIME_AUTH_RESPONSE_KIND: u8 = b'S';
+    const RUNTIME_AUTH_DOMAIN: &[u8] = b"security-lab-runtime-correlated-hmac-sha256-v1\0";
+    type RuntimeHmacSha256 = Hmac<Sha256>;
+
+    fn runtime_auth_mac(
+        key: &[u8; super::RUNTIME_AUTH_KEY_BYTES],
+        challenge: &[u8; super::RUNTIME_AUTH_CHALLENGE_BYTES],
+        kind: u8,
+        request_id: u64,
+        payload: &[u8],
+    ) -> RuntimeHmacSha256 {
+        let mut mac = RuntimeHmacSha256::new_from_slice(key)
+            .expect("HMAC-SHA256 accepts the fixed runtime authentication key length");
+        mac.update(RUNTIME_AUTH_DOMAIN);
+        mac.update(challenge);
+        mac.update(&[kind, RUNTIME_AUTH_PROTOCOL_VERSION]);
+        mac.update(&request_id.to_le_bytes());
+        mac.update(&(payload.len() as u64).to_le_bytes());
+        mac.update(payload);
+        mac
+    }
+
+    fn runtime_auth_tag(
+        key: &[u8; super::RUNTIME_AUTH_KEY_BYTES],
+        challenge: &[u8; super::RUNTIME_AUTH_CHALLENGE_BYTES],
+        kind: u8,
+        request_id: u64,
+        payload: &[u8],
+    ) -> [u8; super::RUNTIME_AUTH_TAG_BYTES] {
+        let result = runtime_auth_mac(key, challenge, kind, request_id, payload).finalize();
+        let mut tag = [0u8; super::RUNTIME_AUTH_TAG_BYTES];
+        tag.copy_from_slice(&result.into_bytes());
+        tag
+    }
+
+    fn runtime_auth_verify(
+        key: &[u8; super::RUNTIME_AUTH_KEY_BYTES],
+        challenge: &[u8; super::RUNTIME_AUTH_CHALLENGE_BYTES],
+        kind: u8,
+        request_id: u64,
+        payload: &[u8],
+        tag: &[u8],
+    ) -> bool {
+        runtime_auth_mac(key, challenge, kind, request_id, payload)
+            .verify_slice(tag)
+            .is_ok()
+    }
+
+    fn random_runtime_auth_challenge(
+    ) -> Result<[u8; super::RUNTIME_AUTH_CHALLENGE_BYTES], RuntimeFdBrokerError> {
+        let mut challenge = [0u8; super::RUNTIME_AUTH_CHALLENGE_BYTES];
+        let mut offset = 0usize;
+        while offset < challenge.len() {
+            let read = unsafe {
+                libc::getrandom(
+                    challenge[offset..].as_mut_ptr().cast::<libc::c_void>(),
+                    challenge.len() - offset,
+                    0,
+                )
+            };
+            if read == -1 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                if error.raw_os_error() == Some(libc::ENOSYS) {
+                    return Err(RuntimeFdBrokerError::UnsupportedPlatform(
+                        "authenticated runtime exchanges require Linux getrandom".to_owned(),
+                    ));
+                }
+                return Err(RuntimeFdBrokerError::io(
+                    "cannot generate authenticated runtime session challenge",
+                    error,
+                ));
+            }
+            if read == 0 {
+                return Err(RuntimeFdBrokerError::Protocol(
+                    "authenticated runtime session challenge generation made no progress".to_owned(),
+                ));
+            }
+            offset += read as usize;
+        }
+        Ok(challenge)
     }
 
     #[derive(Debug)]

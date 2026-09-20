@@ -318,7 +318,7 @@ mod tests {
         };
         let json = report_json(&report);
         assert!(json.contains(
-            "\"cow_volume_diffs\":[{\"target_encoding\":\"hex\",\"target\":\"2f7374617465ff\",\"diff\":{\"encoded_bytes\":23"
+            "\"cow_volume_diffs\":[{\"source_encoding\":\"hex\",\"source\":\"2f7372762f7374617465ff\",\"target_encoding\":\"hex\",\"target\":\"2f7374617465ff\",\"base_identity\":null,\"diff\":{\"encoded_bytes\":23"
         ));
         assert!(
             json.contains("\"kind\":\"remove\",\"path_encoding\":\"hex\",\"path\":\"2f6f6c64\"")

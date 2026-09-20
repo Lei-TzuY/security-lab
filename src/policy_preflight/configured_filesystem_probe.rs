@@ -395,9 +395,7 @@ mod linux_x86_64 {
                     return ConfiguredFilesystemProbe::unavailable("executable_needed_elf", None);
                 }
             };
-            if needed.len() != 1
-                || needed[0].as_slice() != dependency.as_os_str().as_bytes()
-            {
+            if needed.len() != 1 || needed[0].as_slice() != dependency.as_os_str().as_bytes() {
                 return ConfiguredFilesystemProbe::unavailable(
                     "executable_needed_closure_mismatch",
                     None,

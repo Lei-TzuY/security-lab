@@ -295,23 +295,17 @@ volume.cow_bytes = 1048576
     let widened = run_json(&first, &expanded);
     assert_eq!(widened.status.code(), Some(5));
     let stdout = String::from_utf8(widened.stdout).expect("utf8 output");
-    assert!(stdout.contains(
-        r#""field":"filesystem.copy_on_write_volume","class":"widened""#
-    ));
+    assert!(stdout.contains(r#""field":"filesystem.copy_on_write_volume","class":"widened""#));
 
     let reduced = run_json(&expanded, &first);
     assert_eq!(reduced.status.code(), Some(0));
     let stdout = String::from_utf8(reduced.stdout).expect("utf8 output");
-    assert!(stdout.contains(
-        r#""field":"filesystem.copy_on_write_volume","class":"reduced""#
-    ));
+    assert!(stdout.contains(r#""field":"filesystem.copy_on_write_volume","class":"reduced""#));
 
     let incomparable = run_json(&expanded, &changed);
     assert_eq!(incomparable.status.code(), Some(6));
     let stdout = String::from_utf8(incomparable.stdout).expect("utf8 output");
-    assert!(stdout.contains(
-        r#""field":"filesystem.copy_on_write_volume","class":"incomparable""#
-    ));
+    assert!(stdout.contains(r#""field":"filesystem.copy_on_write_volume","class":"incomparable""#));
 }
 
 #[test]

@@ -25,9 +25,31 @@ pub(crate) fn report_json(report: &RunReport) -> String {
         if index != 0 {
             output.push(',');
         }
-        output.push_str("{\"target_encoding\":\"hex\",\"target\":\"");
+        output.push_str("{\"source_encoding\":\"hex\",\"source\":\"");
+        push_hex(&mut output, &volume.source);
+        output.push_str("\",\"target_encoding\":\"hex\",\"target\":\"");
         push_hex(&mut output, &volume.target);
-        output.push_str("\",\"diff\":");
+        output.push_str("\",\"base_identity\":");
+        match (volume.base_identity, volume.base_identity_limits) {
+            (Some(identity), Some(limits)) => {
+                output.push_str("{\"sha256\":\"");
+                push_hex(&mut output, &identity.sha256);
+                output.push_str("\",\"encoded_bytes\":");
+                write!(&mut output, "{}", identity.encoded_bytes)
+                    .expect("write to String cannot fail");
+                output.push_str(",\"nodes\":");
+                write!(&mut output, "{}", identity.nodes).expect("write to String cannot fail");
+                output.push_str(",\"limit_bytes\":");
+                write!(&mut output, "{}", limits.max_bytes)
+                    .expect("write to String cannot fail");
+                output.push_str(",\"limit_nodes\":");
+                write!(&mut output, "{}", limits.max_nodes)
+                    .expect("write to String cannot fail");
+                output.push('}');
+            }
+            _ => output.push_str("null"),
+        }
+        output.push_str(",\"diff\":");
         push_cow_diff(&mut output, &volume.diff);
         output.push('}');
     }

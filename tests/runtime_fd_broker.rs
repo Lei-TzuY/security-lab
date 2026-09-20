@@ -22,6 +22,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{self, Command};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::thread;
 
 static NEXT_PATH: AtomicU64 = AtomicU64::new(1);
@@ -621,6 +622,189 @@ fn prepared_host_unix_stream_connects_exact_peer_and_reuses_one_shot_grant_state
 }
 
 #[test]
+fn transferred_host_unix_stream_can_be_revoked_after_grant() {
+    let service_path = unique_path("runtime-host-unix-revocable-service.sock");
+    let broker_path = unique_path("runtime-host-unix-revocable-broker.sock");
+    let _ = std::fs::remove_file(&service_path);
+    let _ = std::fs::remove_file(&broker_path);
+
+    let listener = UnixListener::bind(&service_path).expect("bind revocable host UNIX service");
+    let expected_uid = unsafe { libc::geteuid() };
+    let expected_gid = unsafe { libc::getegid() };
+    let grant = RuntimeFdBroker::prepare_host_unix_stream(
+        &service_path,
+        Some((expected_uid, expected_gid)),
+    )
+    .expect("prepare revocable host UNIX stream");
+    let (mut service, _) = listener
+        .accept()
+        .expect("accept revocable host UNIX stream");
+
+    let broker = RuntimeFdBroker::bind(&broker_path).expect("bind revocable runtime broker");
+    let mut client = UnixStream::connect(broker.path()).expect("connect revocable runtime broker");
+    let mut session = broker.accept().expect("accept revocable runtime broker");
+    client.write_all(b"R").unwrap();
+    session.wait_for_ready(b'R').unwrap();
+    let mut controller = session
+        .send_revocable_host_unix_stream(grant)
+        .expect("transfer revocable host UNIX stream");
+    let received = receive_one_fd(&client);
+
+    let credentials = controller.peer_credentials();
+    assert!(credentials.pid() > 0);
+    assert_eq!(credentials.uid(), expected_uid);
+    assert_eq!(credentials.gid(), expected_gid);
+    assert!(!controller.is_revoked());
+    assert!(!controller.is_failed());
+
+    let request = b"before-host-revoke\n";
+    assert_eq!(
+        unsafe {
+            libc::send(
+                received.raw(),
+                request.as_ptr().cast::<libc::c_void>(),
+                request.len(),
+                libc::MSG_NOSIGNAL,
+            )
+        },
+        request.len() as isize
+    );
+    let mut observed = vec![0u8; request.len()];
+    service.read_exact(&mut observed).unwrap();
+    assert_eq!(observed, request);
+    service.write_all(b"before-host-revoke-ok\n").unwrap();
+    assert_eq!(
+        read_exact_fd(received.raw(), b"before-host-revoke-ok\n".len()),
+        b"before-host-revoke-ok\n"
+    );
+
+    controller
+        .revoke()
+        .expect("revoke transferred host UNIX stream");
+    assert!(controller.is_revoked());
+    assert!(!controller.is_failed());
+
+    let mut byte = [0u8; 1];
+    assert_eq!(
+        unsafe {
+            libc::read(
+                received.raw(),
+                byte.as_mut_ptr().cast::<libc::c_void>(),
+                byte.len(),
+            )
+        },
+        0,
+        "target descriptor did not observe EOF after trusted shutdown"
+    );
+    assert_eq!(
+        unsafe {
+            libc::send(
+                received.raw(),
+                b"x".as_ptr().cast::<libc::c_void>(),
+                1,
+                libc::MSG_NOSIGNAL,
+            )
+        },
+        -1,
+        "target descriptor unexpectedly retained send authority after revocation"
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::EPIPE)
+    );
+    assert!(matches!(
+        controller.revoke(),
+        Err(RuntimeFdBrokerError::Protocol(message))
+            if message.contains("revoked exactly once")
+    ));
+
+    let second_path = unique_path("runtime-host-unix-revocable-second.sock");
+    let _ = std::fs::remove_file(&second_path);
+    let second_listener = UnixListener::bind(&second_path).unwrap();
+    let second_grant = RuntimeFdBroker::prepare_host_unix_stream(&second_path, None).unwrap();
+    let _second_service = second_listener.accept().unwrap();
+    assert!(matches!(
+        session.send_host_unix_stream(second_grant),
+        Err(RuntimeFdBrokerError::Protocol(message)) if message.contains("exactly one")
+    ));
+
+    drop(received);
+    drop(controller);
+    drop(session);
+    drop(client);
+    drop(broker);
+    drop(service);
+    drop(listener);
+    drop(second_listener);
+    std::fs::remove_file(&service_path).unwrap();
+    std::fs::remove_file(&second_path).unwrap();
+}
+
+#[test]
+fn dropping_active_host_unix_revocation_controller_fails_closed() {
+    let service_path = unique_path("runtime-host-unix-drop-revoke-service.sock");
+    let broker_path = unique_path("runtime-host-unix-drop-revoke-broker.sock");
+    let _ = std::fs::remove_file(&service_path);
+    let _ = std::fs::remove_file(&broker_path);
+
+    let listener = UnixListener::bind(&service_path).expect("bind drop-revoke host UNIX service");
+    let grant = RuntimeFdBroker::prepare_host_unix_stream(&service_path, None)
+        .expect("prepare drop-revoke host UNIX stream");
+    let (_service, _) = listener
+        .accept()
+        .expect("accept drop-revoke host UNIX stream");
+
+    let broker = RuntimeFdBroker::bind(&broker_path).expect("bind drop-revoke runtime broker");
+    let mut client =
+        UnixStream::connect(broker.path()).expect("connect drop-revoke runtime broker");
+    let mut session = broker.accept().expect("accept drop-revoke runtime broker");
+    client.write_all(b"R").unwrap();
+    session.wait_for_ready(b'R').unwrap();
+
+    let controller = session
+        .send_revocable_host_unix_stream(grant)
+        .expect("transfer drop-revoke host UNIX stream");
+    let received = receive_one_fd(&client);
+    drop(controller);
+
+    let mut byte = [0u8; 1];
+    assert_eq!(
+        unsafe {
+            libc::read(
+                received.raw(),
+                byte.as_mut_ptr().cast::<libc::c_void>(),
+                byte.len(),
+            )
+        },
+        0,
+        "dropping active revocation controller did not shut down target receive authority"
+    );
+    assert_eq!(
+        unsafe {
+            libc::send(
+                received.raw(),
+                b"x".as_ptr().cast::<libc::c_void>(),
+                1,
+                libc::MSG_NOSIGNAL,
+            )
+        },
+        -1,
+        "dropping active revocation controller left target send authority active"
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::EPIPE)
+    );
+
+    drop(received);
+    drop(session);
+    drop(client);
+    drop(broker);
+    drop(listener);
+    std::fs::remove_file(&service_path).unwrap();
+}
+
+#[test]
 fn host_unix_reconnect_controller_grants_two_fresh_connections_and_exhausts_bound() {
     let service_path = unique_path("runtime-host-unix-reconnect-service.sock");
     let broker_path = unique_path("runtime-host-unix-reconnect-broker.sock");
@@ -748,6 +932,26 @@ fn host_unix_reconnect_controller_requires_readiness_before_connect_and_fails_te
     drop(broker);
     drop(listener);
     std::fs::remove_file(&service_path).unwrap();
+}
+
+fn build_revocable_host_unix_probe_root() -> PathBuf {
+    let root = unique_path("runtime-host-unix-revocable-root");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("work")).expect("create revocable host UNIX work directory");
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/runtime_host_unix_revocable_probe.S");
+    let output = root.join("revocable-probe");
+    let status = Command::new("cc")
+        .args(["-nostdlib", "-static", "-Wl,--build-id=none", "-o"])
+        .arg(&output)
+        .arg(&source)
+        .status()
+        .expect("Linux x86_64 revocable host UNIX integration requires cc");
+    assert!(
+        status.success(),
+        "failed to assemble revocable host UNIX target fixture"
+    );
+    root
 }
 
 fn build_reconnect_probe_root() -> PathBuf {
@@ -922,6 +1126,117 @@ fn post_launch_host_unix_stream_grant_reaches_target_without_path_authority() {
     );
     peer.join().expect("host UNIX service thread panicked");
 
+    drop(session);
+    drop(broker);
+    std::fs::remove_file(&service_path).unwrap();
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn post_launch_host_unix_stream_revocation_wakes_target_to_eof() {
+    let root = build_revocable_host_unix_probe_root();
+    let broker_path = unique_path("runtime-host-unix-revocable-sandbox-broker.sock");
+    let service_path = unique_path("runtime-host-unix-revocable-sandbox-service.sock");
+    let _ = std::fs::remove_file(&broker_path);
+    let _ = std::fs::remove_file(&service_path);
+
+    let listener = UnixListener::bind(&service_path).expect("bind revocable sandbox service");
+    let broker = RuntimeFdBroker::bind(&broker_path).expect("bind revocable sandbox broker");
+    let text = format!(
+        "filesystem.root = {}\n\
+         identity.hostname = security-lab\n\
+         executable = /revocable-probe\n\
+         arg = {}\n\
+         working_dir = /work\n\
+         stdio.stdin = closed\n\
+         stdio.stdout = closed\n\
+         stdio.stderr = closed\n\
+         limit.wall_clock_milliseconds = 5000\n\
+         limit.cpu_seconds = 2\n\
+         limit.address_space_bytes = 134217728\n\
+         limit.file_size_bytes = 1048576\n\
+         limit.open_files = 32\n\
+         seccomp.allow = write,recvmsg,read,close,openat,exit\n",
+        root.display(),
+        service_path.display()
+    );
+    let mut policy: SandboxPolicy = text.parse().expect("parse revocable host UNIX policy");
+    broker
+        .configure_policy(&mut policy, 10)
+        .expect("configure revocable host UNIX broker policy");
+    for syscall in ["socket", "connect", "execveat"] {
+        assert!(
+            !policy.seccomp.allowed_syscalls.contains(syscall),
+            "revocable host UNIX grant must not require target {syscall} authority"
+        );
+    }
+
+    let expected_uid = unsafe { libc::geteuid() };
+    let expected_gid = unsafe { libc::getegid() };
+    let grant = RuntimeFdBroker::prepare_host_unix_stream(
+        &service_path,
+        Some((expected_uid, expected_gid)),
+    )
+    .expect("prepare revocable sandbox host UNIX stream");
+
+    let (marker_tx, marker_rx) = mpsc::channel();
+    let peer = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept revocable sandbox service");
+        let expected = b"before-host-revoke\n";
+        let mut request = vec![0u8; expected.len()];
+        stream.read_exact(&mut request).unwrap();
+        assert_eq!(request, expected);
+        marker_tx
+            .send(())
+            .expect("publish pre-revocation service marker");
+
+        let mut eof = [0u8; 1];
+        assert_eq!(
+            stream
+                .read(&mut eof)
+                .expect("read service EOF after revocation"),
+            0,
+            "service peer did not observe EOF after trusted shutdown"
+        );
+    });
+
+    let runner = thread::spawn(move || run(&policy));
+    let mut session = broker
+        .accept()
+        .expect("accept revocable sandbox broker connection");
+    if let Err(readiness_error) = session.wait_for_ready(b'R') {
+        let runner_result = runner
+            .join()
+            .expect("revocable host UNIX target runner panicked");
+        panic!(
+            "revocable host UNIX target failed before readiness: {readiness_error}; runner result: {runner_result:?}"
+        );
+    }
+    let mut controller = session
+        .send_revocable_host_unix_stream(grant)
+        .expect("transfer revocable sandbox host UNIX stream");
+    assert_eq!(controller.peer_credentials().uid(), expected_uid);
+    assert_eq!(controller.peer_credentials().gid(), expected_gid);
+
+    marker_rx
+        .recv()
+        .expect("target never reached pre-revocation service exchange");
+    controller
+        .revoke()
+        .expect("revoke transferred sandbox host UNIX stream");
+    assert!(controller.is_revoked());
+
+    assert_eq!(
+        runner
+            .join()
+            .expect("revocable host UNIX runner panicked")
+            .unwrap(),
+        ChildOutcome::Exited(0)
+    );
+    peer.join()
+        .expect("revocable host UNIX service thread panicked");
+
+    drop(controller);
     drop(session);
     drop(broker);
     std::fs::remove_file(&service_path).unwrap();

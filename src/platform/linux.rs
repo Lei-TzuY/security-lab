@@ -3277,6 +3277,8 @@ mod x86_64 {
             capture_write_fd,
             output_limit_fd,
             cow_diff_state,
+            cow_volume_diff_states,
+            cow_volume_diff_count,
             wall_clock_milliseconds,
         } = control;
         if capture_read_fd >= FIRST_NON_STDIO_FD as RawFd && libc::close(capture_read_fd) == -1 {
@@ -3413,13 +3415,39 @@ mod x86_64 {
             child_fail(launch_error, PHASE_ROOT_FCHDIR, seccomp.error_exit_syscall);
         }
 
+        let mut cow_volume_upper_fds = [-1; MAX_PERSISTENT_VOLUME_BINDINGS];
         for volume in &prepared.volumes {
-            install_volume_or_fail(
+            if let Some((slot, upper_fd)) = install_volume_or_fail(
                 volume,
                 root_tree_fd,
                 launch_error,
                 seccomp.error_exit_syscall,
-            );
+            ) {
+                if slot >= cow_volume_diff_count
+                    || slot >= MAX_PERSISTENT_VOLUME_BINDINGS
+                    || !cow_volume_upper_fds
+                        .get(slot)
+                        .is_some_and(|existing| *existing == -1)
+                {
+                    child_fail_errno(
+                        launch_error,
+                        PHASE_COW_VOLUME_DIFF_EXPORT,
+                        libc::EINVAL,
+                        seccomp.error_exit_syscall,
+                    );
+                }
+                cow_volume_upper_fds[slot] = upper_fd;
+            }
+        }
+        for upper_fd in &cow_volume_upper_fds[..cow_volume_diff_count] {
+            if *upper_fd < 3 {
+                child_fail_errno(
+                    launch_error,
+                    PHASE_COW_VOLUME_DIFF_EXPORT,
+                    libc::EINVAL,
+                    seccomp.error_exit_syscall,
+                );
+            }
         }
 
         if let (Some(scratch), Some(options)) =
@@ -3527,8 +3555,11 @@ mod x86_64 {
             prepared.cancellation_fd.as_ref().map_or(-1, |fd| fd.raw()),
             output_limit_fd,
             CowDiffControl {
-                upper_fd: cow_upper_fd,
-                state: cow_diff_state,
+                root_upper_fd: cow_upper_fd,
+                root_state: cow_diff_state,
+                volume_upper_fds: cow_volume_upper_fds,
+                volume_states: cow_volume_diff_states,
+                volume_count: cow_volume_diff_count,
             },
             TargetSupervisionPhases {
                 fork: PHASE_TARGET_FORK,
@@ -3545,6 +3576,7 @@ mod x86_64 {
                 output_limit_poll: PHASE_OUTPUT_LIMIT_POLL,
                 usage: PHASE_PROCESS_TREE_USAGE,
                 cow_diff_export: PHASE_COW_DIFF_EXPORT,
+                cow_volume_diff_export: PHASE_COW_VOLUME_DIFF_EXPORT,
             },
         );
 
@@ -4777,6 +4809,7 @@ mod x86_64 {
             PHASE_COW_VOLUME_OVERLAY_CREATE => "copy-on-write volume OverlayFS creation",
             PHASE_COW_VOLUME_OVERLAY_MOUNT => "copy-on-write volume OverlayFS mount",
             PHASE_COW_VOLUME_ATTACH => "copy-on-write volume mount attachment",
+            PHASE_COW_VOLUME_DIFF_EXPORT => "bounded copy-on-write volume diff export",
             _ => "unknown launch phase",
         };
         format!(

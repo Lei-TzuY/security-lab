@@ -55,9 +55,10 @@ pub use report::{
 };
 pub use runtime_fd_broker::{
     HostUnixPeerCredentials, HostUnixRouteGrant, HostUnixStreamRevocationController,
-    PreparedHostUnixStream, PreparedReadOnlyRegularFile, PreparedRevocableByteStream,
-    PreparedRuntimeMessageChannel, PreparedSealedRegularFileSnapshot, PreparedSealedSnapshotBundle,
-    RevocableByteStreamController, RuntimeAcknowledgedCorrelatedMessageExchangeController,
+    PreparedHostUnixSeqpacket, PreparedHostUnixStream, PreparedReadOnlyRegularFile,
+    PreparedRevocableByteStream, PreparedRuntimeMessageChannel, PreparedSealedRegularFileSnapshot,
+    PreparedSealedSnapshotBundle, RevocableByteStreamController,
+    RuntimeAcknowledgedCorrelatedMessageExchangeController,
     RuntimeAuthenticatedCorrelatedMessageExchangeController,
     RuntimeCorrelatedMessageExchangeController, RuntimeCorrelatedRequest, RuntimeFdBroker,
     RuntimeFdBrokerError, RuntimeFdSession, RuntimeHostUnixReconnectController,

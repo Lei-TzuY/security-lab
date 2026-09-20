@@ -1586,6 +1586,27 @@ Boundary: 64A is complete **direct** closure only for the already-supported one 
 
 After 64A integrates, do not add second/third direct path slots. The next execution-integrity promotion must model a bounded dependency set or real loader-resolution/transitive-closure semantics end-to-end, or move to another independent architecture frontier.
 
+## Milestone 65 — sealed direct-dependency leaf closure
+
+### Slice 65A — reject transitive `DT_NEEDED` beneath the sealed direct object
+
+**Current implementation candidate.** Extends the execution-integrity chain one real loader edge beyond 64A without adding another configured dependency slot: the sole sealed direct dependency must itself be a bounded ELF64 x86_64 `DT_NEEDED` leaf.
+
+Acceptance evidence is executable:
+
+- production first retains the 64A whole-set invariant on the content-bound main ELF, then SHA-256 verifies/copies the declared direct dependency into its sealed executable memfd;
+- the launcher parses `DT_NEEDED` from that exact sealed dependency image, not from a later mutable host pathname, and requires the complete vector to be empty before constructing the private dependency mount;
+- configured-filesystem preflight independently parses the same declared dependency after its bounded digest check and reports an explicit transitive-dependency incompatibility when any `DT_NEEDED` entry remains;
+- the existing single path-qualified dependency fixture remains a valid leaf and continues to execute through the sealed main + interpreter + dependency chain;
+- a new dependency fixture exports the symbol consumed by the main PIE but itself links to `/dependency-extra`; the main ELF therefore has exactly one valid direct edge while the sealed direct object has one transitive edge, and launch must fail before target execution with leaf-closure evidence;
+- stable rustfmt, Clippy with `-D warnings`, complete stable tests, and the Rust 1.74 suite are the integration gate.
+
+Boundary: 65A does not resolve or seal a transitive dependency. It deliberately accepts only the supported one-direct-object topology when that object is an ELF leaf and rejects deeper loader graphs. It still does not model the interpreter's own loader inputs, slashless SONAME resolution, `DT_RPATH`/`DT_RUNPATH`, loader cache/default search, multiple direct dependencies, `LD_PRELOAD`, `dlopen`, or later exec transitions.
+
+### Milestone 65 promotion rule
+
+After 65A integrates, do not farm deeper fixed recursion depths. A further execution-integrity phase must model an explicitly bounded dependency graph/resolution algorithm end-to-end, or move to another independent architecture frontier.
+
 ## Later frontiers
 
-Supplementary-group isolation with a viable mapping architecture, broader/generalized persistent-volume policy, routed/broader network authority beyond the bounded IPv4 brokers, broader host-local IPC mediation beyond the bounded one-shot read-only and sealed-byte regular-file grants, broader dynamic-loader/transitive closure or later-exec authority, and delegated aggregate cgroup accounting remain separate evidence-backed frontiers. Do not add configuration-only names without executable kernel behavior and integration evidence.
+Supplementary-group isolation with a viable mapping architecture, broader/generalized persistent-volume policy, routed/broader network authority beyond the bounded IPv4 brokers, broader host-local IPC mediation beyond the bounded one-shot read-only and sealed-byte regular-file grants, bounded dynamic-loader graph resolution or later-exec authority, and delegated aggregate cgroup accounting remain separate evidence-backed frontiers. Do not add configuration-only names without executable kernel behavior and integration evidence.

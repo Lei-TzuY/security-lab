@@ -1,4 +1,5 @@
 use super::cow_diff::{self, CowDiffState};
+use crate::policy::MAX_PERSISTENT_VOLUME_BINDINGS;
 use std::io;
 use std::ptr;
 
@@ -147,6 +148,8 @@ pub(super) struct TargetSupervisionPhases {
 pub(super) struct CowDiffControl {
     pub(super) upper_fd: libc::c_int,
     pub(super) state: *mut CowDiffState,
+    pub(super) volume_upper_fds: [libc::c_int; MAX_PERSISTENT_VOLUME_BINDINGS],
+    pub(super) volume_states: [*mut CowDiffState; MAX_PERSISTENT_VOLUME_BINDINGS],
 }
 
 pub(super) unsafe fn become_direct_target_or_reap(
@@ -161,14 +164,28 @@ pub(super) unsafe fn become_direct_target_or_reap(
     let CowDiffControl {
         upper_fd: cow_upper_fd,
         state: cow_diff_state,
+        volume_upper_fds,
+        volume_states,
     } = cow_diff;
+    let mut control_fds = [-1; MAX_PERSISTENT_VOLUME_BINDINGS + 3];
+    control_fds[0] = cancellation_fd;
+    control_fds[1] = output_limit_fd;
+    control_fds[2] = cow_upper_fd;
+    control_fds[3..].copy_from_slice(&volume_upper_fds);
     let pid = libc::syscall(libc::SYS_fork);
     if pid == -1 {
         fail(launch_error, phases.fork);
     }
     if pid == 0 {
-        for control_fd in [cancellation_fd, output_limit_fd, cow_upper_fd] {
-            if control_fd >= 3 && libc::close(control_fd) == -1 {
+        let mut child_control_fds = control_fds;
+        child_control_fds.sort_unstable();
+        let mut previous = -1;
+        for control_fd in child_control_fds {
+            if control_fd < 3 || control_fd == previous {
+                continue;
+            }
+            previous = control_fd;
+            if libc::close(control_fd) == -1 {
                 fail(launch_error, phases.close);
             }
         }
@@ -176,7 +193,7 @@ pub(super) unsafe fn become_direct_target_or_reap(
     }
     let pid = pid as libc::pid_t;
 
-    if let Err(errno) = close_nonstdio_except(cancellation_fd, output_limit_fd, cow_upper_fd) {
+    if let Err(errno) = close_nonstdio_except(&control_fds) {
         libc::syscall(libc::SYS_kill, pid, libc::SIGKILL);
         let _ = wait_specific(pid);
         let _ = kill_and_reap_remaining(launch_error, phases.kill, phases.reap);
@@ -205,8 +222,31 @@ pub(super) unsafe fn become_direct_target_or_reap(
             fail_errno(launch_error, phases.cow_diff_export, errno);
         }
     }
-    if cow_upper_fd >= 3 && libc::close(cow_upper_fd) == -1 {
-        fail(launch_error, phases.close);
+    for (upper_fd, state) in volume_upper_fds.into_iter().zip(volume_states) {
+        if state.is_null() {
+            continue;
+        }
+        if upper_fd < 3 {
+            fail_errno(launch_error, phases.cow_diff_export, libc::EINVAL);
+        }
+        if let Err(errno) = cow_diff::export_upper(upper_fd, state) {
+            fail_errno(launch_error, phases.cow_diff_export, errno);
+        }
+    }
+
+    let mut export_fds = [-1; MAX_PERSISTENT_VOLUME_BINDINGS + 1];
+    export_fds[0] = cow_upper_fd;
+    export_fds[1..].copy_from_slice(&volume_upper_fds);
+    export_fds.sort_unstable();
+    let mut previous = -1;
+    for fd in export_fds {
+        if fd < 3 || fd == previous {
+            continue;
+        }
+        previous = fd;
+        if libc::close(fd) == -1 {
+            fail(launch_error, phases.close);
+        }
     }
 
     ptr::write_volatile(ptr::addr_of_mut!((*lifecycle).status), direct_status);
@@ -453,12 +493,8 @@ fn timeval_to_micros(value: libc::timeval) -> u64 {
         .saturating_add(micros.min(999_999))
 }
 
-unsafe fn close_nonstdio_except(
-    keep_a: libc::c_int,
-    keep_b: libc::c_int,
-    keep_c: libc::c_int,
-) -> Result<(), i32> {
-    let mut keep = [keep_a, keep_b, keep_c];
+unsafe fn close_nonstdio_except(keep: &[libc::c_int]) -> Result<(), i32> {
+    let mut keep = keep.to_vec();
     keep.sort_unstable();
     let mut cursor = 3u64;
     let mut previous = -1;

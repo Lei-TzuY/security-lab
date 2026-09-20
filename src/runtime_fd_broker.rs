@@ -277,6 +277,65 @@ mod imp {
         }
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum HostUnixStreamRevocationState {
+        Active,
+        Revoked,
+        Failed,
+    }
+
+    #[derive(Debug)]
+    pub struct HostUnixStreamRevocationController {
+        stream: UnixStream,
+        credentials: HostUnixPeerCredentials,
+        state: HostUnixStreamRevocationState,
+    }
+
+    impl HostUnixStreamRevocationController {
+        pub fn peer_credentials(&self) -> HostUnixPeerCredentials {
+            self.credentials
+        }
+
+        pub fn is_revoked(&self) -> bool {
+            self.state == HostUnixStreamRevocationState::Revoked
+        }
+
+        pub fn is_failed(&self) -> bool {
+            self.state == HostUnixStreamRevocationState::Failed
+        }
+
+        /// Terminate future bidirectional I/O on the exact connected socket
+        /// object that was already transferred to the target.
+        ///
+        /// This changes socket shutdown state shared by every descriptor
+        /// reference to that socket object. It does not close the target's fd
+        /// number, roll back bytes already consumed, or undo remote side effects.
+        pub fn revoke(&mut self) -> Result<(), RuntimeFdBrokerError> {
+            if self.state != HostUnixStreamRevocationState::Active {
+                let message = match self.state {
+                    HostUnixStreamRevocationState::Revoked => {
+                        "host UNIX stream capability may be revoked exactly once"
+                    }
+                    HostUnixStreamRevocationState::Failed => {
+                        "host UNIX stream revocation controller is closed after failure"
+                    }
+                    HostUnixStreamRevocationState::Active => unreachable!(),
+                };
+                return Err(RuntimeFdBrokerError::Protocol(message.to_owned()));
+            }
+
+            if self.stream.shutdown(std::net::Shutdown::Both).is_err() {
+                self.state = HostUnixStreamRevocationState::Failed;
+                return Err(RuntimeFdBrokerError::io(
+                    "cannot revoke transferred host UNIX stream",
+                    std::io::Error::last_os_error(),
+                ));
+            }
+            self.state = HostUnixStreamRevocationState::Revoked;
+            Ok(())
+        }
+    }
+
     #[derive(Debug)]
     pub struct PreparedReadOnlyRegularFile {
         fd: RawFd,
@@ -2712,6 +2771,24 @@ mod imp {
             self.send_prepared_fd(grant.stream.as_raw_fd())
         }
 
+        /// Transfer one prepared host AF_UNIX stream while retaining trusted
+        /// shutdown authority over the same socket object after transfer.
+        pub fn send_revocable_host_unix_stream(
+            &mut self,
+            grant: PreparedHostUnixStream,
+        ) -> Result<HostUnixStreamRevocationController, RuntimeFdBrokerError> {
+            self.send_prepared_fd(grant.stream.as_raw_fd())?;
+            Ok(HostUnixStreamRevocationController {
+                credentials: HostUnixPeerCredentials {
+                    pid: grant.peer_pid,
+                    uid: grant.peer_uid,
+                    gid: grant.peer_gid,
+                },
+                stream: grant.stream,
+                state: HostUnixStreamRevocationState::Active,
+            })
+        }
+
         /// Transfer exactly one previously prepared read-only regular-file grant.
         pub fn send_readonly_regular_file(
             &mut self,
@@ -3586,6 +3663,33 @@ mod imp {
     #[derive(Debug)]
     pub struct PreparedHostUnixStream;
 
+    #[derive(Debug)]
+    pub struct HostUnixStreamRevocationController;
+
+    impl HostUnixStreamRevocationController {
+        pub fn peer_credentials(&self) -> HostUnixPeerCredentials {
+            HostUnixPeerCredentials {
+                pid: 0,
+                uid: 0,
+                gid: 0,
+            }
+        }
+
+        pub fn is_revoked(&self) -> bool {
+            false
+        }
+
+        pub fn is_failed(&self) -> bool {
+            false
+        }
+
+        pub fn revoke(&mut self) -> Result<(), RuntimeFdBrokerError> {
+            Err(RuntimeFdBrokerError::UnsupportedPlatform(
+                "revocable host UNIX stream grants currently require Linux x86_64".to_owned(),
+            ))
+        }
+    }
+
     impl PreparedHostUnixStream {
         pub fn peer_pid(&self) -> i32 {
             0
@@ -4163,6 +4267,15 @@ mod imp {
             ))
         }
 
+        pub fn send_revocable_host_unix_stream(
+            &mut self,
+            _grant: PreparedHostUnixStream,
+        ) -> Result<HostUnixStreamRevocationController, RuntimeFdBrokerError> {
+            Err(RuntimeFdBrokerError::UnsupportedPlatform(
+                "revocable host UNIX stream grants currently require Linux x86_64".to_owned(),
+            ))
+        }
+
         pub fn send_readonly_regular_file(
             &mut self,
             _grant: PreparedReadOnlyRegularFile,
@@ -4211,7 +4324,8 @@ mod imp {
 }
 
 pub use imp::{
-    PreparedHostUnixStream, PreparedReadOnlyRegularFile, PreparedRevocableByteStream,
+    HostUnixStreamRevocationController, PreparedHostUnixStream, PreparedReadOnlyRegularFile,
+    PreparedRevocableByteStream,
     PreparedRuntimeMessageChannel, PreparedSealedRegularFileSnapshot, PreparedSealedSnapshotBundle,
     RevocableByteStreamController, RuntimeAcknowledgedCorrelatedMessageExchangeController,
     RuntimeAuthenticatedCorrelatedMessageExchangeController,

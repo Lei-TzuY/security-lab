@@ -281,7 +281,10 @@ mod tests {
             stdout: None,
             cow_diff: None,
             cow_volume_diffs: vec![security_lab::CowVolumeDiff {
+                source: b"/srv/state\xff".to_vec(),
                 target: b"/state\xff".to_vec(),
+                base_identity: None,
+                base_identity_limits: None,
                 diff: CowDiff {
                     entries: vec![CowDiffEntry::Remove {
                         path: b"/old".to_vec(),

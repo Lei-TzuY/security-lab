@@ -323,6 +323,32 @@ fn fixture_root() -> &'static Path {
         std::fs::set_permissions(&dependency_output, std::fs::Permissions::from_mode(0o555))
             .expect("make fixture DT_NEEDED dependency executable");
 
+        let extra_dependency_output = root.join("dependency-extra");
+        let extra_dependency_source =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/needed_extra_dependency.S");
+        let extra_dependency_status = Command::new("cc")
+            .args([
+                "-nostdlib",
+                "-shared",
+                "-fPIC",
+                "-Wl,--build-id=none",
+                "-Wl,-soname,/dependency-extra",
+                "-o",
+            ])
+            .arg(&extra_dependency_output)
+            .arg(&extra_dependency_source)
+            .status()
+            .expect("Linux x86_64 integration tests require shared-object linker support");
+        assert!(
+            extra_dependency_status.success(),
+            "failed to assemble second path-qualified DT_NEEDED fixture dependency"
+        );
+        std::fs::set_permissions(
+            &extra_dependency_output,
+            std::fs::Permissions::from_mode(0o555),
+        )
+        .expect("make second fixture DT_NEEDED dependency executable");
+
         let dynamic_needed_output = root.join("dynamic-needed-probe");
         let dynamic_needed_source =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dynamic_needed_probe.S");
@@ -344,6 +370,29 @@ fn fixture_root() -> &'static Path {
         assert!(
             dynamic_needed_status.success(),
             "failed to assemble path-qualified DT_NEEDED dynamic fixture"
+        );
+
+        let dynamic_needed_extra_output = root.join("dynamic-needed-extra-probe");
+        let dynamic_needed_extra_status = Command::new("cc")
+            .args([
+                "-nostdlib",
+                "-fPIE",
+                "-pie",
+                "-Wl,--build-id=none",
+                "-Wl,--dynamic-linker=/loader",
+                "-Wl,-e,_start",
+                "-Wl,--no-as-needed",
+                "-o",
+            ])
+            .arg(&dynamic_needed_extra_output)
+            .arg(&dynamic_needed_source)
+            .arg(&dependency_output)
+            .arg(&extra_dependency_output)
+            .status()
+            .expect("Linux x86_64 integration tests require multi-dependency PIE linking");
+        assert!(
+            dynamic_needed_extra_status.success(),
+            "failed to assemble multi-DT_NEEDED dynamic fixture"
         );
         root
     })
@@ -492,6 +541,12 @@ fn dynamic_fixture_sha256() -> [u8; 32] {
 fn dynamic_needed_fixture_sha256() -> [u8; 32] {
     let bytes =
         std::fs::read(fixture_root().join("dynamic-needed-probe")).expect("read needed fixture");
+    Sha256::digest(bytes).into()
+}
+
+fn dynamic_needed_extra_fixture_sha256() -> [u8; 32] {
+    let bytes = std::fs::read(fixture_root().join("dynamic-needed-extra-probe"))
+        .expect("read multi-needed fixture");
     Sha256::digest(bytes).into()
 }
 
@@ -671,6 +726,25 @@ fn sealed_path_qualified_dt_needed_mismatch_fails_closed_before_target_execution
             assert!(message.contains("exactly one"));
         }
         other => panic!("unexpected DT_NEEDED path mismatch result: {other}"),
+    }
+}
+
+#[test]
+fn sealed_direct_needed_binding_rejects_additional_unbound_direct_dependency() {
+    let mut policy = policy("unused", &[], &["exit"]);
+    policy.executable = PathBuf::from("/dynamic-needed-extra-probe");
+    policy.executable_sha256 = Some(dynamic_needed_extra_fixture_sha256());
+    policy.executable_interpreter = Some(PathBuf::from("/loader"));
+    policy.executable_interpreter_sha256 = Some(fixture_loader_sha256());
+    policy.executable_needed = Some(PathBuf::from("/dependency"));
+    policy.executable_needed_sha256 = Some(fixture_needed_sha256());
+
+    match run(&policy).unwrap_err() {
+        SandboxError::SetupFailed(message) => {
+            assert!(message.contains("direct DT_NEEDED closure"));
+            assert!(message.contains("exactly one entry"));
+        }
+        other => panic!("unexpected direct dependency closure result: {other}"),
     }
 }
 

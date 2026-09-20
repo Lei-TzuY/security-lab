@@ -1226,14 +1226,14 @@ Boundary: 49A binds only the initial ELF64 x86_64 `PT_INTERP` loader selected by
 Acceptance evidence is executable:
 
 - `executable.needed` / `executable.needed_sha256` are an all-or-nothing restriction that requires both `executable.sha256` and the sealed `PT_INTERP` binding; the dependency path is absolute, not `/`, differs from the main executable/interpreter, rejects dynamic-linker `$` tokens, and cannot overlap private procfs, scratch, or persistent-volume targets;
-- the launcher parses bounded little-endian ELF64 x86_64 `PT_DYNAMIC` metadata from the already content-bound main image, resolves `DT_STRTAB` only through a containing `PT_LOAD`, bounds the dynamic/string tables and direct-needed count, requires a terminating `DT_NULL`, and requires exactly one `DT_NEEDED` string to match the configured path byte-for-byte;
+- the launcher parses bounded little-endian ELF64 x86_64 `PT_DYNAMIC` metadata from the already content-bound main image, resolves `DT_STRTAB` only through a containing `PT_LOAD`, bounds the dynamic/string tables and direct-needed count, requires a terminating `DT_NULL`, and when the binding is enabled requires the complete direct `DT_NEEDED` set to contain exactly one entry whose bytes equal the configured path;
 - the matched object is pinned beneath `filesystem.root`, required to be a regular executable, identity-revalidated while copying, SHA-256 checked under the existing 64 MiB ceiling, and retained as an immutable sealed memfd image;
 - before target execution, the child reuses the sealed-image mount path to copy only those verified bytes into private tmpfs state, clone the file, apply read-only + `nosuid` + `nodev`, and attach it exactly over the declared dependency pathname;
 - configured-filesystem preflight independently validates direct-needed membership, object shape, and digest; static authority manifest/delta surfaces include the direct-needed path+digest restriction;
 - a dynamic PIE fixture containing `DT_NEEDED=/dependency` executes through the sealed main + interpreter + dependency chain and exits 91. A one-bit dependency-digest mismatch and a configured path absent from the sealed main's direct-needed list both fail before target execution; the trusted parent proves the host dependency bytes remain unchanged;
 - the exact candidate retains all prior regressions and has passed stable rustfmt, Clippy with `-D warnings`, the complete stable suite, and the complete Rust 1.74 suite.
 
-Boundary: 49B binds at most one direct **path-qualified** `DT_NEEDED` object from the sealed main executable. It intentionally does not resolve ordinary slashless SONAME dependencies, `DT_RPATH`/`DT_RUNPATH`, `ld.so.cache`, dependency search order, transitive `DT_NEEDED` edges, dynamic-string token expansion, `LD_PRELOAD`, `dlopen`, later exec transitions, or a process-lifetime shared-library closure. The expected digest remains content evidence, not signer/provenance identity.
+Boundary: 49B/64A bind the complete direct dependency set only for sealed main executables whose direct `DT_NEEDED` topology is exactly one **path-qualified** object. If any second direct dependency is present, the binding fails closed before target execution rather than leaving that loader input mutable. This intentionally does not resolve ordinary slashless SONAME dependencies, `DT_RPATH`/`DT_RUNPATH`, `ld.so.cache`, dependency search order, transitive `DT_NEEDED` edges, dynamic-string token expansion, `LD_PRELOAD`, `dlopen`, later exec transitions, or a process-lifetime shared-library closure. The expected digest remains content evidence, not signer/provenance identity.
 
 ### Milestone 49 promotion rule
 
@@ -1565,6 +1565,27 @@ Boundary: 63A proves only that a peer possessing the shared session key emitted 
 
 After 63A integrates, do not farm acknowledgment digest algorithms, extra ACK flags, or larger outstanding-ACK counts. Further runtime work must change the host execution/liveness model materially—such as a bounded acknowledgment deadline or genuinely event-oriented concurrent host API—or move to another independent architecture frontier.
 
+## Milestone 64 — strict direct dynamic-loader closure
+
+### Slice 64A — fail closed on unbound direct `DT_NEEDED` edges
+
+**Status: complete on `main`.** Strengthens the existing 49B binding from one selected direct dependency to complete direct-dependency closure for the supported single-path topology, without adding another policy slot or pretending to resolve general loader search.
+
+Acceptance evidence is executable:
+
+- the existing `executable.needed` + digest pair remains the only configuration surface; no count/path alias is added;
+- production launch parses the sealed main ELF's complete bounded direct `DT_NEEDED` vector and requires its total length to be exactly one and that sole entry to equal the declared absolute dependency path byte-for-byte;
+- configured-filesystem preflight enforces the same whole-set invariant before checking the dependency object and digest, reporting an explicit closure mismatch rather than treating one matching entry among several as sufficient evidence;
+- the existing single-dependency dynamic fixture still executes through the sealed main + interpreter + dependency chain;
+- a new real PIE fixture contains both `DT_NEEDED=/dependency` and `DT_NEEDED=/dependency-extra`; policy binds and hashes only `/dependency`, and launch must fail before target execution with direct-closure evidence instead of silently leaving `/dependency-extra` mutable;
+- stable rustfmt, Clippy with `-D warnings`, complete stable tests, and the Rust 1.74 suite are the integration gate.
+
+Boundary: 64A is complete **direct** closure only for the already-supported one absolute path-qualified dependency topology. It deliberately rejects rather than resolves multiple direct dependencies. Slashless SONAME resolution, `DT_RPATH`/`DT_RUNPATH`, loader cache/default search, transitive dependencies, `LD_PRELOAD`, `dlopen`, and later exec remain separate future work.
+
+### Milestone 64 promotion rule
+
+After 64A integrates, do not add second/third direct path slots. The next execution-integrity promotion must model a bounded dependency set or real loader-resolution/transitive-closure semantics end-to-end, or move to another independent architecture frontier.
+
 ## Later frontiers
 
-Supplementary-group isolation with a viable mapping architecture, broader/generalized persistent-volume policy, routed/broader network authority beyond the bounded IPv4 brokers, broader host-local IPC mediation beyond the bounded one-shot read-only and sealed-byte regular-file grants, interpreter/shared-library closure or later-exec authority beyond 48A, and delegated aggregate cgroup accounting remain separate evidence-backed frontiers. Do not add configuration-only names without executable kernel behavior and integration evidence.
+Supplementary-group isolation with a viable mapping architecture, broader/generalized persistent-volume policy, routed/broader network authority beyond the bounded IPv4 brokers, broader host-local IPC mediation beyond the bounded one-shot read-only and sealed-byte regular-file grants, broader dynamic-loader/transitive closure or later-exec authority, and delegated aggregate cgroup accounting remain separate evidence-backed frontiers. Do not add configuration-only names without executable kernel behavior and integration evidence.

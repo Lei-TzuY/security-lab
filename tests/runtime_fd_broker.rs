@@ -636,7 +636,9 @@ fn transferred_host_unix_stream_can_be_revoked_after_grant() {
         Some((expected_uid, expected_gid)),
     )
     .expect("prepare revocable host UNIX stream");
-    let (mut service, _) = listener.accept().expect("accept revocable host UNIX stream");
+    let (mut service, _) = listener
+        .accept()
+        .expect("accept revocable host UNIX stream");
 
     let broker = RuntimeFdBroker::bind(&broker_path).expect("bind revocable runtime broker");
     let mut client = UnixStream::connect(broker.path()).expect("connect revocable runtime broker");
@@ -676,7 +678,9 @@ fn transferred_host_unix_stream_can_be_revoked_after_grant() {
         b"before-host-revoke-ok\n"
     );
 
-    controller.revoke().expect("revoke transferred host UNIX stream");
+    controller
+        .revoke()
+        .expect("revoke transferred host UNIX stream");
     assert!(controller.is_revoked());
     assert!(!controller.is_failed());
 
@@ -1118,20 +1122,28 @@ fn post_launch_host_unix_stream_revocation_wakes_target_to_eof() {
         let mut request = vec![0u8; expected.len()];
         stream.read_exact(&mut request).unwrap();
         assert_eq!(request, expected);
-        marker_tx.send(()).expect("publish pre-revocation service marker");
+        marker_tx
+            .send(())
+            .expect("publish pre-revocation service marker");
 
         let mut eof = [0u8; 1];
         assert_eq!(
-            stream.read(&mut eof).expect("read service EOF after revocation"),
+            stream
+                .read(&mut eof)
+                .expect("read service EOF after revocation"),
             0,
             "service peer did not observe EOF after trusted shutdown"
         );
     });
 
     let runner = thread::spawn(move || run(&policy));
-    let mut session = broker.accept().expect("accept revocable sandbox broker connection");
+    let mut session = broker
+        .accept()
+        .expect("accept revocable sandbox broker connection");
     if let Err(readiness_error) = session.wait_for_ready(b'R') {
-        let runner_result = runner.join().expect("revocable host UNIX target runner panicked");
+        let runner_result = runner
+            .join()
+            .expect("revocable host UNIX target runner panicked");
         panic!(
             "revocable host UNIX target failed before readiness: {readiness_error}; runner result: {runner_result:?}"
         );
@@ -1151,10 +1163,14 @@ fn post_launch_host_unix_stream_revocation_wakes_target_to_eof() {
     assert!(controller.is_revoked());
 
     assert_eq!(
-        runner.join().expect("revocable host UNIX runner panicked").unwrap(),
+        runner
+            .join()
+            .expect("revocable host UNIX runner panicked")
+            .unwrap(),
         ChildOutcome::Exited(0)
     );
-    peer.join().expect("revocable host UNIX service thread panicked");
+    peer.join()
+        .expect("revocable host UNIX service thread panicked");
 
     drop(controller);
     drop(session);

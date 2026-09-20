@@ -1359,6 +1359,26 @@ fn build_reconnect_probe_root() -> PathBuf {
     root
 }
 
+fn build_seqpacket_probe_root() -> PathBuf {
+    let root = unique_path("runtime-host-unix-seqpacket-root");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("work")).expect("create seqpacket work directory");
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/runtime_host_unix_seqpacket_probe.S");
+    let output = root.join("seqpacket-probe");
+    let status = Command::new("cc")
+        .args(["-nostdlib", "-static", "-Wl,--build-id=none", "-o"])
+        .arg(&output)
+        .arg(&source)
+        .status()
+        .expect("Linux x86_64 seqpacket integration requires cc");
+    assert!(
+        status.success(),
+        "failed to assemble runtime host UNIX seqpacket fixture"
+    );
+    root
+}
+
 fn build_router_probe_root() -> PathBuf {
     let root = unique_path("runtime-host-unix-router-root");
     let _ = std::fs::remove_dir_all(&root);
@@ -1534,6 +1554,104 @@ fn post_launch_host_unix_stream_grant_reaches_target_without_path_authority() {
     drop(session);
     drop(broker);
     std::fs::remove_file(&service_path).unwrap();
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn post_launch_host_unix_seqpacket_preserves_packets_without_target_connect_authority() {
+    let root = build_seqpacket_probe_root();
+    let broker_path = unique_path("runtime-host-unix-seqpacket-sandbox-broker.sock");
+    let service_path = unique_path("runtime-host-unix-seqpacket-sandbox-service.sock");
+    let _ = std::fs::remove_file(&broker_path);
+    let _ = std::fs::remove_file(&service_path);
+
+    let listener = SeqpacketListener::bind(&service_path);
+    let broker = RuntimeFdBroker::bind(&broker_path).expect("bind seqpacket sandbox broker");
+    let text = format!(
+        "filesystem.root = {}\n\
+         identity.hostname = security-lab\n\
+         executable = /seqpacket-probe\n\
+         arg = {}\n\
+         working_dir = /work\n\
+         stdio.stdin = closed\n\
+         stdio.stdout = closed\n\
+         stdio.stderr = closed\n\
+         limit.wall_clock_milliseconds = 5000\n\
+         limit.cpu_seconds = 2\n\
+         limit.address_space_bytes = 134217728\n\
+         limit.file_size_bytes = 1048576\n\
+         limit.open_files = 32\n\
+         seccomp.allow = write,recvmsg,read,close,openat,exit\n",
+        root.display(),
+        service_path.display()
+    );
+    let mut policy: SandboxPolicy = text.parse().expect("parse seqpacket sandbox policy");
+    broker
+        .configure_policy(&mut policy, 10)
+        .expect("configure seqpacket runtime broker policy");
+    for syscall in ["socket", "connect", "execveat"] {
+        assert!(
+            !policy.seccomp.allowed_syscalls.contains(syscall),
+            "host UNIX seqpacket grant must not require target {syscall} authority"
+        );
+    }
+
+    let expected_uid = unsafe { libc::geteuid() };
+    let expected_gid = unsafe { libc::getegid() };
+    let grant = RuntimeFdBroker::prepare_host_unix_seqpacket(
+        &service_path,
+        Some((expected_uid, expected_gid)),
+    )
+    .expect("prepare sandbox host UNIX seqpacket");
+    assert_eq!(grant.peer_uid(), expected_uid);
+    assert_eq!(grant.peer_gid(), expected_gid);
+
+    let peer = thread::spawn(move || {
+        let service = listener.accept();
+        assert_eq!(recv_packet(service.raw()), b"seq-one");
+        assert_eq!(recv_packet(service.raw()), b"seq-two-long");
+        for packet in [b"reply-a".as_slice(), b"reply-b-longer".as_slice()] {
+            assert_eq!(
+                unsafe {
+                    libc::send(
+                        service.raw(),
+                        packet.as_ptr().cast::<libc::c_void>(),
+                        packet.len(),
+                        libc::MSG_NOSIGNAL,
+                    )
+                },
+                packet.len() as isize
+            );
+        }
+    });
+
+    let runner = thread::spawn(move || run(&policy));
+    let mut session = broker
+        .accept()
+        .expect("accept seqpacket sandbox broker connection");
+    if let Err(readiness_error) = session.wait_for_ready(b'R') {
+        let runner_result = runner
+            .join()
+            .expect("seqpacket sandbox target runner panicked");
+        panic!(
+            "seqpacket target failed before readiness: {readiness_error}; runner result: {runner_result:?}"
+        );
+    }
+    session
+        .send_host_unix_seqpacket(grant)
+        .expect("transfer sandbox host UNIX seqpacket");
+
+    assert_eq!(
+        runner
+            .join()
+            .expect("seqpacket sandbox runner panicked")
+            .unwrap(),
+        ChildOutcome::Exited(0)
+    );
+    peer.join().expect("seqpacket host service thread panicked");
+
+    drop(session);
+    drop(broker);
     std::fs::remove_dir_all(&root).unwrap();
 }
 

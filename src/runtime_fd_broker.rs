@@ -284,6 +284,7 @@ mod imp {
         Failed,
     }
 
+    #[must_use = "retain this controller and call revoke() when confirmed host-stream revocation is required"]
     #[derive(Debug)]
     pub struct HostUnixStreamRevocationController {
         stream: UnixStream,
@@ -316,10 +317,11 @@ mod imp {
         /// object that was already transferred to the target.
         ///
         /// This changes socket shutdown state shared by every descriptor
-        /// reference to that socket object. Dropping an active controller also
-        /// attempts the same shutdown so controller loss fails closed. This does
-        /// not close the target's fd number, roll back bytes already consumed,
-        /// or undo remote side effects.
+        /// reference to that socket object. Dropping an active controller makes
+        /// a best-effort attempt at the same shutdown, but Drop cannot report
+        /// failure; callers requiring confirmed revocation must call this method
+        /// and handle its Result. This does not close the target's fd number,
+        /// roll back bytes already consumed, or undo remote side effects.
         pub fn revoke(&mut self) -> Result<(), RuntimeFdBrokerError> {
             if self.state != HostUnixStreamRevocationState::Active {
                 let message = match self.state {
@@ -3673,6 +3675,7 @@ mod imp {
     #[derive(Debug)]
     pub struct PreparedHostUnixStream;
 
+    #[must_use = "retain this controller and call revoke() when confirmed host-stream revocation is required"]
     #[derive(Debug)]
     pub struct HostUnixStreamRevocationController;
 

@@ -58,13 +58,8 @@ impl SeqpacketListener {
         let bytes = path.as_os_str().as_bytes();
         assert!(bytes.len() <= 107);
         assert!(!bytes.contains(&0));
-        let fd = unsafe {
-            libc::socket(
-                libc::AF_UNIX,
-                libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
-                0,
-            )
-        };
+        let fd =
+            unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0) };
         assert!(fd >= 0, "create AF_UNIX SOCK_SEQPACKET listener");
 
         let mut address = unsafe { std::mem::zeroed::<libc::sockaddr_un>() };
@@ -85,7 +80,11 @@ impl SeqpacketListener {
             0,
             "bind AF_UNIX SOCK_SEQPACKET listener"
         );
-        assert_eq!(unsafe { libc::listen(fd, 8) }, 0, "listen on seqpacket socket");
+        assert_eq!(
+            unsafe { libc::listen(fd, 8) },
+            0,
+            "listen on seqpacket socket"
+        );
         Self {
             fd,
             path: path.to_path_buf(),

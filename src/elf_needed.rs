@@ -12,6 +12,8 @@ const DT_NULL: i64 = 0;
 const DT_NEEDED: i64 = 1;
 const DT_STRTAB: i64 = 5;
 const DT_STRSZ: i64 = 10;
+const DT_RPATH: i64 = 15;
+const DT_RUNPATH: i64 = 29;
 const PN_XNUM: u16 = 0xffff;
 const MAX_DYNAMIC_BYTES: u64 = 1024 * 1024;
 const MAX_STRING_TABLE_BYTES: u64 = 1024 * 1024;
@@ -19,6 +21,23 @@ const MAX_NEEDED_ENTRIES: usize = 128;
 
 #[derive(Debug)]
 pub(crate) struct ElfNeededError(String);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ElfDynamicLinks {
+    pub needed: Vec<Vec<u8>>,
+    pub runpath: Option<Vec<u8>>,
+    pub rpath: Option<Vec<u8>>,
+}
+
+impl ElfDynamicLinks {
+    fn empty() -> Self {
+        Self {
+            needed: Vec::new(),
+            runpath: None,
+            rpath: None,
+        }
+    }
+}
 
 impl fmt::Display for ElfNeededError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

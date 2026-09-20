@@ -186,6 +186,12 @@ volume.writable_source = /srv/z-write
 volume.writable_source = /srv/a-write
 volume.writable_target = /z-persist
 volume.writable_target = /a-persist
+volume.cow_source = /srv/z-cow
+volume.cow_source = /srv/a-cow
+volume.cow_target = /z-cow-data
+volume.cow_target = /a-cow-data
+volume.cow_bytes = 2097152
+volume.cow_bytes = 1048576
 ",
         manifest_policy(&root)
     );
@@ -209,10 +215,15 @@ volume.writable_target = /a-persist
     assert!(stdout.contains(
         "\"writable_volumes\":[{\"access\":\"writable\",\"source\":\"/srv/a-write\",\"target\":\"/a-persist\"},{\"access\":\"writable\",\"source\":\"/srv/z-write\",\"target\":\"/z-persist\"}]"
     ));
+    assert!(stdout.contains(
+        "\"copy_on_write_volumes\":[{\"access\":\"copy_on_write\",\"source\":\"/srv/a-cow\",\"target\":\"/a-cow-data\",\"bytes\":1048576},{\"access\":\"copy_on_write\",\"source\":\"/srv/z-cow\",\"target\":\"/z-cow-data\",\"bytes\":2097152}]"
+    ));
 
     assert_eq!(human.status.code(), Some(0));
     let stdout = String::from_utf8(human.stdout).expect("human manifest is UTF-8");
-    assert!(stdout.contains("host-filesystem-volumes: read-only=2 writable=2\n"));
+    assert!(stdout.contains(
+        "host-filesystem-volumes: read-only=2 writable=2 copy-on-write=2\n"
+    ));
 }
 
 #[test]

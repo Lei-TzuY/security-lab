@@ -1605,7 +1605,30 @@ Boundary: 65A does not resolve or seal a transitive dependency. It deliberately 
 
 ### Milestone 65 promotion rule
 
-After 65A integrates, do not farm deeper fixed recursion depths. A further execution-integrity phase must model an explicitly bounded dependency graph/resolution algorithm end-to-end, or move to another independent architecture frontier.
+65A is sealed on `main`. Do not farm deeper fixed recursion depths. A further execution-integrity phase must model an explicitly bounded dependency graph/resolution algorithm end-to-end, or move to another independent architecture frontier.
+
+## Milestone 66 — bounded exact direct dependency sets
+
+### Slice 66A — seal an exact set of up to eight path-qualified direct dependencies
+
+**Status: complete on `main`.** Generalizes the 64A/65A one-direct-object topology into one bounded exact direct-dependency set without introducing fixed second/third dependency slots or claiming general loader search.
+
+Acceptance evidence is executable:
+
+- repeated `executable.needed` and `executable.needed_sha256` entries form ordered pairs at parse time and normalize into 1–8 dependency bindings; the legacy single pair remains compatible;
+- policy validation rejects unequal path/digest counts, duplicate dependency paths, more than eight bindings, mixed legacy/vector construction, missing sealed main/interpreter prerequisites, dynamic-linker token paths, and existing filesystem-overlap violations;
+- production parses the sealed main ELF's complete direct `DT_NEEDED` vector, rejects duplicate ELF entries, and requires exact set equality with the declared paths independent of declaration order;
+- every declared dependency is independently pinned, executable-shape checked, SHA-256 verified into its own sealed executable memfd, required to be a 65A leaf, and privately mounted at its declared path;
+- configured-filesystem preflight enforces the same exact-set equality plus per-member object, digest, and leaf invariants;
+- authority manifest output canonicalizes the normalized binding set, while authority-delta comparison treats absent/present as restriction changes and differing non-empty sets as incomparable;
+- a real two-direct-dependency PIE succeeds only when both exact bindings are declared, while incomplete-set and transitive-edge regressions remain fail-closed;
+- stable rustfmt, Clippy with `-D warnings`, complete stable tests, and Rust 1.74 are the integration gate.
+
+Boundary: 66A models only an exact bounded set of 1–8 absolute path-qualified direct dependencies, each of which must itself be an ELF leaf. It does not resolve slashless SONAMEs, RPATH/RUNPATH, loader cache/default search, interpreter dependency closure, transitive graphs, preload/dlopen behavior, or later exec transitions.
+
+### Milestone 66 promotion rule
+
+After 66A integrates, do not farm larger set ceilings or more declaration-order permutations. The next execution-integrity promotion must introduce a bounded loader-resolution/transitive graph model end-to-end, or move to another independent architecture frontier.
 
 ## Later frontiers
 

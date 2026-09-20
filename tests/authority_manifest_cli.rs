@@ -95,6 +95,7 @@ fn manifest_json_is_deterministic_redacted_and_static() {
     assert!(stdout.contains("\"executable_interpreter_sha256\":null"));
     assert!(stdout.contains("\"executable_needed\":null"));
     assert!(stdout.contains("\"executable_needed_sha256\":null"));
+    assert!(stdout.contains("\"executable_needed_bindings\":[]"));
     assert!(stdout.contains("\"argument_count\":1,\"environment_keys\":[\"SECRET_TOKEN\"]"));
     assert!(stdout.contains("\"private_procfs\":true"));
     assert!(stdout.contains("\"selected\":[{\"target_fd\":9,\"source_fd\":200}]"));
@@ -135,6 +136,7 @@ fn manifest_human_summarizes_authority_without_secret_values() {
     assert!(stdout.contains(
         "executable-sha256: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n"
     ));
+    assert!(stdout.contains("executable-needed-bindings: none\n"));
     assert!(stdout.contains("arguments: 1\n"));
     assert!(stdout.contains("private-procfs: enabled\n"));
     assert!(stdout.contains("environment-keys: SECRET_TOKEN\n"));
@@ -147,6 +149,29 @@ fn manifest_human_summarizes_authority_without_secret_values() {
     assert!(!stdout.contains("super-secret-argument"));
     assert!(!stdout.contains("top-secret-value"));
     assert!(!root.exists());
+}
+
+#[test]
+fn manifest_json_canonicalizes_bounded_needed_binding_set() {
+    let root = root_path("needed-set");
+    let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let second = "1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let text = format!(
+        "{}executable.interpreter = /loader\nexecutable.interpreter_sha256 = {digest}\nexecutable.needed = /z-dependency\nexecutable.needed = /a-dependency\nexecutable.needed_sha256 = {second}\nexecutable.needed_sha256 = {digest}\n",
+        manifest_policy(&root)
+    );
+    let path = write_policy("needed-set", &text);
+    let output = Command::new(binary())
+        .args(["manifest-json", path.to_str().expect("UTF-8 policy path")])
+        .output()
+        .expect("run needed-set manifest JSON");
+    let _ = fs::remove_file(path);
+
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8(output.stdout).expect("manifest JSON is UTF-8");
+    assert!(stdout.contains(
+        "\"executable_needed_bindings\":[{\"path\":\"/a-dependency\",\"sha256\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"},{\"path\":\"/z-dependency\",\"sha256\":\"1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"}]"
+    ));
 }
 
 #[test]

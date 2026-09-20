@@ -15,6 +15,7 @@ const MAX_HOSTNAME_BYTES: usize = 63;
 const MAX_SYSCALLS: usize = 128;
 const MAX_SECCOMP_ARG_RULES: usize = 64;
 const MAX_SELECTED_HANDLES: usize = 16;
+pub const MAX_EXECUTABLE_NEEDED_BINDINGS: usize = 8;
 const MAX_LANDLOCK_READ_EXECUTE_PATHS: usize = 32;
 const MAX_LANDLOCK_FILE_MUTATE_PATHS: usize = 32;
 const MAX_LANDLOCK_PATH_TOPOLOGY_MUTATE_PATHS: usize = 32;
@@ -92,6 +93,12 @@ pub struct SeccompPolicy {
     pub argument_forbidden_mask_rules: BTreeMap<String, BTreeMap<u8, SeccompArgRule>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ExecutableNeededBinding {
+    pub path: PathBuf,
+    pub sha256: [u8; 32],
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxPolicy {
     /// Host path pinned as the sandbox filesystem root before fork.
@@ -120,6 +127,9 @@ pub struct SandboxPolicy {
     /// loader are content-bound, so the dependency is selected by sealed code.
     pub executable_needed: Option<PathBuf>,
     pub executable_needed_sha256: Option<[u8; 32]>,
+    /// Optional bounded exact set of path-qualified direct DT_NEEDED bindings.
+    /// This is mutually exclusive with the legacy single pair above.
+    pub executable_needed_bindings: Vec<ExecutableNeededBinding>,
     pub args: Vec<String>,
     pub environment: BTreeMap<String, String>,
     /// Absolute path interpreted inside `root_dir`.
@@ -257,6 +267,19 @@ impl fmt::Display for PolicyError {
 impl Error for PolicyError {}
 
 impl SandboxPolicy {
+    pub fn normalized_executable_needed_bindings(&self) -> Vec<ExecutableNeededBinding> {
+        if !self.executable_needed_bindings.is_empty() {
+            return self.executable_needed_bindings.clone();
+        }
+        match (&self.executable_needed, self.executable_needed_sha256) {
+            (Some(path), Some(sha256)) => vec![ExecutableNeededBinding {
+                path: path.clone(),
+                sha256,
+            }],
+            _ => Vec::new(),
+        }
+    }
+
     pub fn validate(&self) -> Result<(), PolicyError> {
         validate_absolute_path("filesystem.root", &self.root_dir)?;
         validate_hostname(&self.hostname)?;
@@ -319,63 +342,95 @@ impl SandboxPolicy {
         }
 
         match (&self.executable_needed, self.executable_needed_sha256) {
-            (None, None) => {}
-            (Some(path), Some(_)) => {
-                validate_absolute_path("executable.needed", path)?;
-                if self.executable_sha256.is_none()
-                    || self.executable_interpreter.is_none()
-                    || self.executable_interpreter_sha256.is_none()
-                {
-                    return Err(PolicyError::new(
-                        "executable.needed requires content-bound executable.sha256 and executable.interpreter binding",
-                    ));
-                }
-                if path == Path::new("/") {
-                    return Err(PolicyError::new(
-                        "executable.needed must not replace the sandbox root",
-                    ));
-                }
-                if path == &self.executable || self.executable_interpreter.as_ref() == Some(path) {
-                    return Err(PolicyError::new(
-                        "executable.needed must differ from executable and executable.interpreter",
-                    ));
-                }
-                #[cfg(unix)]
-                if path.as_os_str().as_bytes().contains(&b'$') {
-                    return Err(PolicyError::new(
-                        "executable.needed must not contain dynamic-linker $ tokens",
-                    ));
-                }
-                let overlaps = |other: &Path| path.starts_with(other) || other.starts_with(path);
-                if self.procfs_enabled && overlaps(Path::new("/proc")) {
-                    return Err(PolicyError::new(
-                        "executable.needed must not overlap filesystem.proc",
-                    ));
-                }
-                for (other, label) in [
-                    (self.scratch_dir.as_deref(), "filesystem.scratch"),
-                    (
-                        self.readonly_volume_target.as_deref(),
-                        "volume.readonly_target",
-                    ),
-                    (
-                        self.writable_volume_target.as_deref(),
-                        "volume.writable_target",
-                    ),
-                ] {
-                    if let Some(other) = other {
-                        if overlaps(other) {
-                            return Err(PolicyError::new(format!(
-                                "executable.needed must not overlap {label}"
-                            )));
-                        }
-                    }
-                }
-            }
+            (None, None) | (Some(_), Some(_)) => {}
             _ => {
                 return Err(PolicyError::new(
                     "executable.needed and executable.needed_sha256 must be specified together",
                 ));
+            }
+        }
+        if !self.executable_needed_bindings.is_empty()
+            && (self.executable_needed.is_some() || self.executable_needed_sha256.is_some())
+        {
+            return Err(PolicyError::new(
+                "legacy executable.needed pair and executable_needed_bindings are mutually exclusive",
+            ));
+        }
+        let needed_bindings = self.normalized_executable_needed_bindings();
+        if needed_bindings.len() > MAX_EXECUTABLE_NEEDED_BINDINGS {
+            return Err(PolicyError::new(format!(
+                "too many executable.needed bindings: {} > {MAX_EXECUTABLE_NEEDED_BINDINGS}",
+                needed_bindings.len()
+            )));
+        }
+        if !needed_bindings.is_empty()
+            && (self.executable_sha256.is_none()
+                || self.executable_interpreter.is_none()
+                || self.executable_interpreter_sha256.is_none())
+        {
+            return Err(PolicyError::new(
+                "executable.needed requires content-bound executable.sha256 and executable.interpreter binding",
+            ));
+        }
+        let mut seen_needed = BTreeSet::new();
+        for binding in &needed_bindings {
+            let path = &binding.path;
+            validate_absolute_path("executable.needed", path)?;
+            if path == Path::new("/") {
+                return Err(PolicyError::new(
+                    "executable.needed must not replace the sandbox root",
+                ));
+            }
+            if path == &self.executable || self.executable_interpreter.as_ref() == Some(path) {
+                return Err(PolicyError::new(
+                    "executable.needed must differ from executable and executable.interpreter",
+                ));
+            }
+            #[cfg(unix)]
+            if path.as_os_str().as_bytes().contains(&b'$') {
+                return Err(PolicyError::new(
+                    "executable.needed must not contain dynamic-linker $ tokens",
+                ));
+            }
+            if !seen_needed.insert(path.clone()) {
+                return Err(PolicyError::new(format!(
+                    "duplicate executable.needed path: {}",
+                    path.display()
+                )));
+            }
+            let overlaps = |other: &Path| path.starts_with(other) || other.starts_with(path);
+            if self.procfs_enabled && overlaps(Path::new("/proc")) {
+                return Err(PolicyError::new(
+                    "executable.needed must not overlap filesystem.proc",
+                ));
+            }
+            for (other, label) in [
+                (self.scratch_dir.as_deref(), "filesystem.scratch"),
+                (
+                    self.readonly_volume_target.as_deref(),
+                    "volume.readonly_target",
+                ),
+                (
+                    self.writable_volume_target.as_deref(),
+                    "volume.writable_target",
+                ),
+            ] {
+                if let Some(other) = other {
+                    if overlaps(other) {
+                        return Err(PolicyError::new(format!(
+                            "executable.needed must not overlap {label}"
+                        )));
+                    }
+                }
+            }
+        }
+        for (index, left) in needed_bindings.iter().enumerate() {
+            for right in needed_bindings.iter().skip(index + 1) {
+                if left.path.starts_with(&right.path) || right.path.starts_with(&left.path) {
+                    return Err(PolicyError::new(
+                        "executable.needed paths must not overlap each other",
+                    ));
+                }
             }
         }
 
@@ -1276,8 +1331,8 @@ impl FromStr for SandboxPolicy {
         let mut executable_sha256 = None;
         let mut executable_interpreter = None;
         let mut executable_interpreter_sha256 = None;
-        let mut executable_needed = None;
-        let mut executable_needed_sha256 = None;
+        let mut executable_needed = Vec::new();
+        let mut executable_needed_sha256 = Vec::new();
         let mut args = Vec::new();
         let mut environment = BTreeMap::new();
         let mut working_dir = None;
@@ -1523,15 +1578,10 @@ impl FromStr for SandboxPolicy {
                     line_no,
                     key,
                 )?,
-                "executable.needed" => {
-                    set_once(&mut executable_needed, value.to_owned(), line_no, key)?
+                "executable.needed" => executable_needed.push(value.to_owned()),
+                "executable.needed_sha256" => {
+                    executable_needed_sha256.push(parse_sha256(value, line_no, key)?)
                 }
-                "executable.needed_sha256" => set_once(
-                    &mut executable_needed_sha256,
-                    parse_sha256(value, line_no, key)?,
-                    line_no,
-                    key,
-                )?,
                 "arg" => args.push(value.to_owned()),
                 "working_dir" => set_once(&mut working_dir, value.to_owned(), line_no, key)?,
                 "landlock.read_execute" => landlock_read_execute.push(value.to_owned()),
@@ -1796,6 +1846,33 @@ impl FromStr for SandboxPolicy {
             }
         }
 
+        if executable_needed.len() != executable_needed_sha256.len() {
+            return Err(PolicyError::new(
+                "executable.needed and executable.needed_sha256 must have the same number of entries",
+            ));
+        }
+        if executable_needed.len() > MAX_EXECUTABLE_NEEDED_BINDINGS {
+            return Err(PolicyError::new(format!(
+                "too many executable.needed bindings: {} > {MAX_EXECUTABLE_NEEDED_BINDINGS}",
+                executable_needed.len()
+            )));
+        }
+        let mut parsed_needed_bindings = executable_needed
+            .into_iter()
+            .zip(executable_needed_sha256)
+            .map(|(path, sha256)| ExecutableNeededBinding {
+                path: PathBuf::from(path),
+                sha256,
+            })
+            .collect::<Vec<_>>();
+        let (legacy_needed, legacy_needed_sha256, executable_needed_bindings) =
+            if parsed_needed_bindings.len() == 1 {
+                let binding = parsed_needed_bindings.pop().expect("one binding exists");
+                (Some(binding.path), Some(binding.sha256), Vec::new())
+            } else {
+                (None, None, parsed_needed_bindings)
+            };
+
         let policy = Self {
             root_dir: PathBuf::from(required(root_dir, "filesystem.root")?),
             cow_root_bytes,
@@ -1805,8 +1882,9 @@ impl FromStr for SandboxPolicy {
             executable_sha256,
             executable_interpreter: executable_interpreter.map(PathBuf::from),
             executable_interpreter_sha256,
-            executable_needed: executable_needed.map(PathBuf::from),
-            executable_needed_sha256,
+            executable_needed: legacy_needed,
+            executable_needed_sha256: legacy_needed_sha256,
+            executable_needed_bindings,
             args,
             environment,
             working_dir: PathBuf::from(required(working_dir, "working_dir")?),
@@ -2992,6 +3070,50 @@ mod tests {
             "{VALID}\nexecutable.sha256 = {digest}\nexecutable.interpreter = /loader\nexecutable.interpreter_sha256 = {digest}\nexecutable.needed = /dependency"
         );
         assert!(incomplete.parse::<SandboxPolicy>().is_err());
+    }
+
+    #[test]
+    fn parses_bounded_exact_needed_binding_set_and_rejects_invalid_sets() {
+        let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let second = "1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let multi = format!(
+            "{VALID}\nexecutable.sha256 = {digest}\nexecutable.interpreter = /loader\nexecutable.interpreter_sha256 = {digest}\nexecutable.needed = /dependency\nexecutable.needed = /dependency-extra\nexecutable.needed_sha256 = {digest}\nexecutable.needed_sha256 = {second}"
+        );
+        let policy: SandboxPolicy = multi.parse().unwrap();
+        assert!(policy.executable_needed.is_none());
+        assert!(policy.executable_needed_sha256.is_none());
+        assert_eq!(policy.executable_needed_bindings.len(), 2);
+        assert_eq!(
+            policy.executable_needed_bindings[0].path,
+            PathBuf::from("/dependency")
+        );
+        assert_eq!(
+            policy.executable_needed_bindings[1].path,
+            PathBuf::from("/dependency-extra")
+        );
+        assert_eq!(
+            policy.normalized_executable_needed_bindings(),
+            policy.executable_needed_bindings
+        );
+
+        let unequal = format!(
+            "{VALID}\nexecutable.sha256 = {digest}\nexecutable.interpreter = /loader\nexecutable.interpreter_sha256 = {digest}\nexecutable.needed = /dependency\nexecutable.needed = /dependency-extra\nexecutable.needed_sha256 = {digest}"
+        );
+        assert!(unequal.parse::<SandboxPolicy>().is_err());
+
+        let duplicate = format!(
+            "{VALID}\nexecutable.sha256 = {digest}\nexecutable.interpreter = /loader\nexecutable.interpreter_sha256 = {digest}\nexecutable.needed = /dependency\nexecutable.needed = /dependency\nexecutable.needed_sha256 = {digest}\nexecutable.needed_sha256 = {second}"
+        );
+        assert!(duplicate.parse::<SandboxPolicy>().is_err());
+
+        let mut oversized = format!(
+            "{VALID}\nexecutable.sha256 = {digest}\nexecutable.interpreter = /loader\nexecutable.interpreter_sha256 = {digest}\n"
+        );
+        for index in 0..=MAX_EXECUTABLE_NEEDED_BINDINGS {
+            oversized.push_str(&format!("executable.needed = /dependency-{index}\n"));
+            oversized.push_str(&format!("executable.needed_sha256 = {digest}\n"));
+        }
+        assert!(oversized.parse::<SandboxPolicy>().is_err());
     }
 
     #[test]

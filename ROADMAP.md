@@ -1721,6 +1721,30 @@ Boundary: 71A is one trusted-caller-selected connected stream object, not a targ
 
 After 71A integrates, do not farm socket-type variants or fixed extra stream slots. A further host-local IPC promotion must add a materially different lifecycle such as a bounded trusted-controller connection set/reconnect policy or another independently mediated object class, or move to another architecture frontier.
 
+## Milestone 73 — bounded host-local reconnect lifecycle
+
+### Slice 73A — trusted-controller reconnects to one exact host AF_UNIX service
+
+**Current implementation candidate.** Promotes the 71A one-shot connected-stream grant into one explicitly bounded reconnect lifecycle without changing the existing one-shot `RuntimeFdSession` contract.
+
+Acceptance evidence is executable:
+
+- `accept_host_unix_reconnect_controller(service_path, expected_peer, max_connections)` accepts one exact absolute filesystem AF_UNIX service path and a connection ceiling restricted to 2–8;
+- the controller reuses one already-verified long-lived runtime-broker control stream, but each grant round first consumes one exact target readiness byte and only then performs a fresh host-namespace `connect(2)`;
+- every fresh connection independently re-reads Linux `SO_PEERCRED` and re-applies the same optional expected UID/GID pin before the connected descriptor can enter `SCM_RIGHTS` transfer;
+- readiness mismatch, broker I/O failure, service connect failure, credential mismatch, or descriptor-transfer failure makes the whole reconnect controller terminally failed; exhausted connection bounds reject later grants;
+- the original `RuntimeFdSession` remains one-readiness/one-successful-grant and is not silently converted into a reusable session type;
+- local regressions prove two distinct fresh connections, per-round credential evidence, exact bound exhaustion, readiness-before-connect ordering, invalid-bound rejection, and terminal failure after a bad readiness byte;
+- a dedicated raw-syscall sandbox target receives two distinct connected streams over one long-lived broker fd, exchanges different exact request/response bytes on each round, closes each granted stream, and still requires `ENOENT` for the original host service pathname;
+- the target policy needs `recvmsg` plus ordinary stream I/O only and explicitly carries no `socket`, `connect`, or persistent `execveat` authority;
+- stable rustfmt, Clippy with `-D warnings`, complete stable tests, and Rust 1.74 are the integration gate.
+
+Boundary: 73A is a bounded trusted-controller reconnect loop to one fixed filesystem AF_UNIX service. It is not target-selected service discovery, multi-service routing, failover policy, backoff/retry policy after an ambiguous failed round, abstract/datagram/seqpacket mediation, cryptographic service identity, revocation of an already-transferred descriptor, or a general host IPC graph.
+
+### Milestone 73 promotion rule
+
+After 73A integrates, do not farm larger reconnect ceilings, more readiness-byte variants, or fixed additional service slots. A further host-local IPC promotion must add a materially different authority/lifecycle property such as explicitly modeled multi-service selection with independent bounds, post-transfer lifetime mediation, or another object class, or move to another architecture frontier.
+
 ## Later frontiers
 
-Supplementary-group isolation with a viable mapping architecture, routed/broader network authority beyond the bounded IPv4 brokers, broader dynamic host-local IPC mediation beyond the one-shot connected-stream grant, bounded loader search/interpreter closure or later-exec authority, per-volume COW diff/commit or stronger storage lifecycle semantics, and delegated aggregate cgroup accounting remain separate evidence-backed frontiers. Do not add configuration-only names without executable kernel behavior and integration evidence.
+Supplementary-group isolation with a viable mapping architecture, routed/broader network authority beyond the bounded IPv4 brokers, broader dynamic host-local IPC mediation beyond one exact bounded reconnect lifecycle, bounded loader search/interpreter closure or later-exec authority, per-volume COW diff/commit or stronger storage lifecycle semantics, and delegated aggregate cgroup accounting remain separate evidence-backed frontiers. Do not add configuration-only names without executable kernel behavior and integration evidence.

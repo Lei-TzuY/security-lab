@@ -243,10 +243,7 @@ fn receive_authenticated_runtime_response(
     key: &[u8; RUNTIME_AUTH_KEY_BYTES],
     challenge: &[u8; RUNTIME_AUTH_CHALLENGE_BYTES],
 ) -> (u64, Vec<u8>) {
-    let mut frame = vec![
-        0u8;
-        MAX_RUNTIME_MESSAGE_BYTES as usize + 2 + 8 + RUNTIME_AUTH_TAG_BYTES
-    ];
+    let mut frame = vec![0u8; MAX_RUNTIME_MESSAGE_BYTES as usize + 2 + 8 + RUNTIME_AUTH_TAG_BYTES];
     let received = unsafe {
         libc::recv(
             fd,

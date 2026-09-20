@@ -1663,46 +1663,30 @@ mod x86_64 {
                 })
                 .transpose()?;
 
-            let mut volumes = Vec::with_capacity(2);
-            match (
-                &policy.readonly_volume_source,
-                &policy.readonly_volume_target,
-            ) {
-                (Some(source), Some(target)) => volumes.push(prepare_volume(
+            let readonly_volumes = policy.normalized_readonly_volume_bindings();
+            let writable_volumes = policy.normalized_writable_volume_bindings();
+            let mut volumes = Vec::with_capacity(readonly_volumes.len() + writable_volumes.len());
+            for volume in &readonly_volumes {
+                volumes.push(prepare_volume(
                     root_fd.raw(),
-                    source,
-                    target,
+                    &volume.source,
+                    &volume.target,
                     "volume.readonly_source",
                     "read-only volume source",
                     "read-only volume target",
                     VolumeAccess::ReadOnly,
-                )?),
-                (None, None) => {}
-                _ => {
-                    return Err(SandboxError::InvalidPolicy(PolicyError::new(
-                        "volume.readonly_source and volume.readonly_target must be specified together",
-                    )));
-                }
+                )?);
             }
-            match (
-                &policy.writable_volume_source,
-                &policy.writable_volume_target,
-            ) {
-                (Some(source), Some(target)) => volumes.push(prepare_volume(
+            for volume in &writable_volumes {
+                volumes.push(prepare_volume(
                     root_fd.raw(),
-                    source,
-                    target,
+                    &volume.source,
+                    &volume.target,
                     "volume.writable_source",
                     "writable volume source",
                     "writable volume target",
                     VolumeAccess::Writable,
-                )?),
-                (None, None) => {}
-                _ => {
-                    return Err(SandboxError::InvalidPolicy(PolicyError::new(
-                        "volume.writable_source and volume.writable_target must be specified together",
-                    )));
-                }
+                )?);
             }
 
             let cwd_relative = sandbox_relative(&policy.working_dir)?;

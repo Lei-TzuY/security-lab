@@ -3357,14 +3357,53 @@ landlock.file_mutate = /state-b/subdir"
                     source: PathBuf::from("/srv/base-a"),
                     target: PathBuf::from("/state-a"),
                     bytes: 1048576,
+                    diff_bytes: None,
                 },
                 CopyOnWriteVolumeBinding {
                     source: PathBuf::from("/srv/base-b"),
                     target: PathBuf::from("/state-b"),
                     bytes: 2097152,
+                    diff_bytes: None,
                 },
             ]
         );
+
+        let with_diff = format!(
+            "{base}
+volume.cow_source = /srv/base-a
+volume.cow_source = /srv/base-b
+volume.cow_target = /state-a
+volume.cow_target = /state-b
+volume.cow_bytes = 1048576
+volume.cow_bytes = 2097152
+volume.cow_diff_bytes = 4096
+volume.cow_diff_bytes = 8192"
+        );
+        let policy: SandboxPolicy = with_diff.parse().unwrap();
+        assert_eq!(policy.copy_on_write_volume_bindings[0].diff_bytes, Some(4096));
+        assert_eq!(policy.copy_on_write_volume_bindings[1].diff_bytes, Some(8192));
+
+        let partial_diff = format!(
+            "{base}
+volume.cow_source = /srv/base-a
+volume.cow_source = /srv/base-b
+volume.cow_target = /state-a
+volume.cow_target = /state-b
+volume.cow_bytes = 1048576
+volume.cow_bytes = 2097152
+volume.cow_diff_bytes = 4096"
+        );
+        assert!(partial_diff.parse::<SandboxPolicy>().is_err());
+
+        let too_small_diff = format!(
+            "{base}
+volume.cow_source = /srv/base
+volume.cow_target = /state
+volume.cow_bytes = 1048576
+volume.cow_diff_bytes = {}",
+            MIN_COW_DIFF_BYTES - 1
+        );
+        assert!(too_small_diff.parse::<SandboxPolicy>().is_err());
 
         let unequal = format!(
             "{base}

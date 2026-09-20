@@ -1863,6 +1863,28 @@ Boundary: 79A authorizes target choice only among the trusted caller's fixed ind
 
 After 79A integrates, do not farm larger route-count ceilings, larger selector widths, or fixed extra routing aliases. A further host-local IPC promotion must add a materially different property such as application-level grant acknowledgment/revocation coordination, cryptographic service identity, another mediated socket/object class, or move to another architecture frontier.
 
+## Milestone 80 — exact host UNIX seqpacket capability
+
+### Slice 80A — one-shot filesystem AF_UNIX SOCK_SEQPACKET grant
+
+**Current implementation candidate.** Adds a materially different host-local socket object class without widening the existing stream, reconnect, router, or generic runtime-message contracts.
+
+Acceptance evidence is executable:
+
+- the trusted caller selects one exact absolute filesystem AF_UNIX pathname and may optionally pin the connected peer's Linux `SO_PEERCRED` UID/GID before transfer;
+- preparation creates `AF_UNIX/SOCK_SEQPACKET|SOCK_CLOEXEC`, connects in the trusted host namespace, records peer PID/UID/GID, and rejects invalid bounded pathnames or credential mismatch before the object becomes transferable;
+- transfer occurs only after the existing exact readiness handshake and consumes the ordinary one-shot `RuntimeFdSession` state, so a successful seqpacket grant cannot be followed by a second grant on that session;
+- the target receives only the already-connected socket object through `SCM_RIGHTS`; no target `socket`, `connect`, host-path lookup, or persistent `execveat` authority is required;
+- local kernel evidence sends two differently sized request packets and two differently sized response packets and requires every receive to preserve one exact packet boundary;
+- a raw-syscall sandbox oracle repeats that two-packet exchange through the transferred descriptor and independently requires `ENOENT` for the original host service pathname from inside the chroot;
+- stable rustfmt, Clippy with `-D warnings`, complete stable tests, and Rust 1.74 are the integration gate.
+
+Boundary: 80A grants one already-connected exact filesystem `SOCK_SEQPACKET` object exactly once. It does not provide target-supplied pathnames, service discovery, reconnect/routing, datagram mediation, abstract-namespace access, application-message authentication, grant revocation, or a general IPC transport abstraction.
+
+### Milestone 80 promotion rule
+
+After 80A integrates, do not farm additional fixed socket types or packet-count variants. A further host-local IPC promotion must add a materially stronger lifecycle, identity, or protocol property, or move to another independent architecture frontier.
+
 ## Later frontiers
 
 Supplementary-group isolation with a viable mapping architecture, routed/broader network authority beyond the bounded IPv4 brokers, richer host-local IPC semantics beyond bounded exact service routing/revocation, bounded loader search/interpreter closure or later-exec authority, persisted-trust or durable/versioned authenticated COW publication semantics, and delegated aggregate cgroup accounting remain separate evidence-backed frontiers. Do not add configuration-only names without executable kernel behavior and integration evidence.

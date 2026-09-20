@@ -638,6 +638,10 @@ fn push_cow_volume_array(
         write!(output, "{}", binding.bytes).expect("write to String cannot fail");
         output.push_str(",\"diff_bytes\":");
         push_optional_u64(output, binding.diff_bytes);
+        output.push_str(",\"base_identity_bytes\":");
+        push_optional_u64(output, binding.base_identity_bytes);
+        output.push_str(",\"base_identity_nodes\":");
+        push_optional_u64(output, binding.base_identity_nodes);
         output.push('}');
     }
     output.push(']');

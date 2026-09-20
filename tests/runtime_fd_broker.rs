@@ -1191,6 +1191,26 @@ fn build_reconnect_probe_root() -> PathBuf {
     root
 }
 
+fn build_router_probe_root() -> PathBuf {
+    let root = unique_path("runtime-host-unix-router-root");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("work")).expect("create router work directory");
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/runtime_host_unix_router_probe.S");
+    let output = root.join("router-probe");
+    let status = Command::new("cc")
+        .args(["-nostdlib", "-static", "-Wl,--build-id=none", "-o"])
+        .arg(&output)
+        .arg(&source)
+        .status()
+        .expect("Linux x86_64 router integration requires cc");
+    assert!(
+        status.success(),
+        "failed to assemble runtime host UNIX router fixture"
+    );
+    root
+}
+
 fn build_probe_root() -> PathBuf {
     let root = unique_path("runtime-rights-root");
     let _ = std::fs::remove_dir_all(&root);
@@ -1552,6 +1572,107 @@ fn post_launch_host_unix_reconnects_twice_without_target_connect_authority() {
     drop(controller);
     drop(broker);
     std::fs::remove_file(&service_path).unwrap();
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn post_launch_host_unix_router_selects_two_services_without_target_connect_authority() {
+    let root = build_router_probe_root();
+    let broker_path = unique_path("runtime-host-unix-router-sandbox-broker.sock");
+    let service_a_path = unique_path("runtime-host-unix-router-sandbox-a.sock");
+    let service_b_path = unique_path("runtime-host-unix-router-sandbox-b.sock");
+    for path in [&broker_path, &service_a_path, &service_b_path] {
+        let _ = std::fs::remove_file(path);
+    }
+
+    let listener_a = UnixListener::bind(&service_a_path).expect("bind router sandbox service A");
+    let listener_b = UnixListener::bind(&service_b_path).expect("bind router sandbox service B");
+    let broker = RuntimeFdBroker::bind(&broker_path).expect("bind router sandbox broker");
+    let text = format!(
+        "filesystem.root = {}\n\
+         identity.hostname = security-lab\n\
+         executable = /router-probe\n\
+         arg = {}\n\
+         arg = {}\n\
+         working_dir = /work\n\
+         stdio.stdin = closed\n\
+         stdio.stdout = closed\n\
+         stdio.stderr = closed\n\
+         limit.wall_clock_milliseconds = 5000\n\
+         limit.cpu_seconds = 2\n\
+         limit.address_space_bytes = 134217728\n\
+         limit.file_size_bytes = 1048576\n\
+         limit.open_files = 32\n\
+         seccomp.allow = write,recvmsg,read,close,openat,exit\n",
+        root.display(),
+        service_a_path.display(),
+        service_b_path.display()
+    );
+    let mut policy: SandboxPolicy = text.parse().expect("parse router sandbox policy");
+    broker
+        .configure_policy(&mut policy, 10)
+        .expect("configure router runtime broker policy");
+    for syscall in ["socket", "connect", "execveat"] {
+        assert!(
+            !policy.seccomp.allowed_syscalls.contains(syscall),
+            "bounded router must not require target {syscall} authority"
+        );
+    }
+
+    let peer_a = thread::spawn(move || {
+        let (mut stream, _) = listener_a.accept().expect("accept router service A");
+        let mut request = vec![0u8; b"runtime-router-a\n".len()];
+        stream.read_exact(&mut request).unwrap();
+        assert_eq!(request, b"runtime-router-a\n");
+        stream.write_all(b"runtime-router-a-ok\n").unwrap();
+    });
+    let peer_b = thread::spawn(move || {
+        let (mut stream, _) = listener_b.accept().expect("accept router service B");
+        let mut request = vec![0u8; b"runtime-router-b\n".len()];
+        stream.read_exact(&mut request).unwrap();
+        assert_eq!(request, b"runtime-router-b\n");
+        stream.write_all(b"runtime-router-b-ok\n").unwrap();
+    });
+
+    let runner = thread::spawn(move || run(&policy));
+    let expected_peer = Some((unsafe { libc::geteuid() }, unsafe { libc::getegid() }));
+    let mut controller = broker
+        .accept_host_unix_router_controller(vec![
+            RuntimeHostUnixRoute::new(&service_a_path, expected_peer, 1),
+            RuntimeHostUnixRoute::new(&service_b_path, expected_peer, 1),
+        ])
+        .expect("accept sandbox router controller");
+
+    for expected_route in 0..=1 {
+        let grant = match controller.grant_next(b'R') {
+            Ok(grant) => grant,
+            Err(error) => {
+                let runner_result = runner.join().expect("router target runner panicked");
+                panic!(
+                    "router round {expected_route} failed before grant: {error}; runner result: {runner_result:?}"
+                );
+            }
+        };
+        assert_eq!(grant.route_index(), expected_route);
+        assert_eq!(grant.credentials().uid(), unsafe { libc::geteuid() });
+        assert_eq!(grant.credentials().gid(), unsafe { libc::getegid() });
+        assert!(grant.credentials().pid() > 0);
+    }
+    assert!(controller.is_complete());
+    assert_eq!(controller.total_granted_connections(), 2);
+
+    assert_eq!(
+        runner.join().expect("router runner panicked").unwrap(),
+        ChildOutcome::Exited(0)
+    );
+    peer_a.join().expect("router service A thread panicked");
+    peer_b.join().expect("router service B thread panicked");
+
+    drop(controller);
+    drop(broker);
+    for path in [service_a_path, service_b_path] {
+        std::fs::remove_file(path).unwrap();
+    }
     std::fs::remove_dir_all(&root).unwrap();
 }
 

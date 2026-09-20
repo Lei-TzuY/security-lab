@@ -1545,7 +1545,7 @@ Boundary: 62A provides shared-key frame authentication plus per-session freshnes
 
 ### Slice 63A — one-response acknowledgment barrier
 
-**Current implementation candidate.** Composes 62A instead of duplicating its transport and adds a distinct peer-evidence step after each authenticated response publication.
+**Status: complete on `main`.** Composes 62A instead of duplicating its transport and adds a distinct peer-evidence step after each authenticated response publication.
 
 Acceptance evidence is executable:
 

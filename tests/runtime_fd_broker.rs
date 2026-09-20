@@ -633,11 +633,7 @@ fn host_unix_reconnect_controller_grants_two_fresh_connections_and_exhausts_boun
     let expected_uid = unsafe { libc::geteuid() };
     let expected_gid = unsafe { libc::getegid() };
     let mut controller = broker
-        .accept_host_unix_reconnect_controller(
-            &service_path,
-            Some((expected_uid, expected_gid)),
-            2,
-        )
+        .accept_host_unix_reconnect_controller(&service_path, Some((expected_uid, expected_gid)), 2)
         .expect("accept bounded reconnect controller");
 
     assert_eq!(controller.max_connections(), 2);
@@ -646,8 +642,16 @@ fn host_unix_reconnect_controller_grants_two_fresh_connections_and_exhausts_boun
     assert!(!controller.is_failed());
 
     for (round, request, reply) in [
-        (1u8, b"reconnect-one\n".as_slice(), b"reconnect-one-ok\n".as_slice()),
-        (2u8, b"reconnect-two\n".as_slice(), b"reconnect-two-ok\n".as_slice()),
+        (
+            1u8,
+            b"reconnect-one\n".as_slice(),
+            b"reconnect-one-ok\n".as_slice(),
+        ),
+        (
+            2u8,
+            b"reconnect-two\n".as_slice(),
+            b"reconnect-two-ok\n".as_slice(),
+        ),
     ] {
         client.write_all(b"R").unwrap();
         let credentials = controller
@@ -986,11 +990,7 @@ fn post_launch_host_unix_reconnects_twice_without_target_connect_authority() {
     let expected_uid = unsafe { libc::geteuid() };
     let expected_gid = unsafe { libc::getegid() };
     let mut controller = broker
-        .accept_host_unix_reconnect_controller(
-            &service_path,
-            Some((expected_uid, expected_gid)),
-            2,
-        )
+        .accept_host_unix_reconnect_controller(&service_path, Some((expected_uid, expected_gid)), 2)
         .expect("accept sandbox reconnect controller");
 
     for round in 1..=2 {

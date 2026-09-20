@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::io;
 use std::os::unix::io::RawFd;
@@ -98,6 +99,92 @@ fn validate_range(
             "{label} extends beyond the ELF image"
         )));
     }
+    Ok(())
+}
+
+fn display_needed_name(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+fn validate_path_qualified_needed_name(
+    parent: Option<&[u8]>,
+    name: &[u8],
+) -> Result<(), ElfNeededError> {
+    if name.first() != Some(&b'/') || name == b"/" || name.contains(&b'$') {
+        let parent = parent
+            .map(display_needed_name)
+            .unwrap_or_else(|| "<main executable>".to_owned());
+        return Err(ElfNeededError(format!(
+            "{parent} has non-literal path-qualified DT_NEEDED entry {:?}",
+            display_needed_name(name)
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_exact_dependency_graph(
+    root_needed: &[Vec<u8>],
+    dependency_needed: &BTreeMap<Vec<u8>, Vec<Vec<u8>>>,
+) -> Result<(), ElfNeededError> {
+    let mut root_seen = BTreeSet::new();
+    let mut queue = VecDeque::new();
+    for edge in root_needed {
+        validate_path_qualified_needed_name(None, edge)?;
+        if !root_seen.insert(edge.clone()) {
+            return Err(ElfNeededError(format!(
+                "main executable contains duplicate DT_NEEDED edge {}",
+                display_needed_name(edge)
+            )));
+        }
+        if !dependency_needed.contains_key(edge) {
+            return Err(ElfNeededError(format!(
+                "main executable DT_NEEDED edge {} is not present in the declared sealed dependency graph",
+                display_needed_name(edge)
+            )));
+        }
+        queue.push_back(edge.clone());
+    }
+
+    let mut reachable = BTreeSet::new();
+    while let Some(node) = queue.pop_front() {
+        if !reachable.insert(node.clone()) {
+            continue;
+        }
+        let children = dependency_needed
+            .get(&node)
+            .expect("queued dependency graph node is declared");
+        let mut child_seen = BTreeSet::new();
+        for edge in children {
+            validate_path_qualified_needed_name(Some(&node), edge)?;
+            if !child_seen.insert(edge.clone()) {
+                return Err(ElfNeededError(format!(
+                    "sealed dependency {} contains duplicate DT_NEEDED edge {}",
+                    display_needed_name(&node),
+                    display_needed_name(edge)
+                )));
+            }
+            if !dependency_needed.contains_key(edge) {
+                return Err(ElfNeededError(format!(
+                    "sealed dependency {} requires undeclared DT_NEEDED edge {}",
+                    display_needed_name(&node),
+                    display_needed_name(edge)
+                )));
+            }
+            queue.push_back(edge.clone());
+        }
+    }
+
+    if reachable.len() != dependency_needed.len() {
+        let unreachable = dependency_needed
+            .keys()
+            .find(|path| !reachable.contains(*path))
+            .expect("graph cardinality mismatch has an unreachable node");
+        return Err(ElfNeededError(format!(
+            "declared sealed dependency {} is unreachable from the main executable",
+            display_needed_name(unreachable)
+        )));
+    }
+
     Ok(())
 }
 
@@ -287,4 +374,51 @@ pub(crate) fn read_elf64_x86_64_dt_needed(fd: RawFd) -> Result<Vec<Vec<u8>>, Elf
         result.push(tail[..end].to_vec());
     }
     Ok(result)
+}
+
+#[cfg(test)]
+mod graph_tests {
+    use super::validate_exact_dependency_graph;
+    use std::collections::BTreeMap;
+
+    fn bytes(value: &str) -> Vec<u8> {
+        value.as_bytes().to_vec()
+    }
+
+    #[test]
+    fn exact_dependency_graph_accepts_reachable_transitive_nodes_and_cycles() {
+        let root = vec![bytes("/a")];
+        let mut graph = BTreeMap::new();
+        graph.insert(bytes("/a"), vec![bytes("/b")]);
+        graph.insert(bytes("/b"), vec![bytes("/a")]);
+        validate_exact_dependency_graph(&root, &graph).unwrap();
+    }
+
+    #[test]
+    fn exact_dependency_graph_rejects_undeclared_and_unreachable_nodes() {
+        let root = vec![bytes("/a")];
+        let mut missing = BTreeMap::new();
+        missing.insert(bytes("/a"), vec![bytes("/b")]);
+        let err = validate_exact_dependency_graph(&root, &missing).unwrap_err();
+        assert!(err.to_string().contains("requires undeclared DT_NEEDED edge /b"));
+
+        let mut unreachable = BTreeMap::new();
+        unreachable.insert(bytes("/a"), Vec::new());
+        unreachable.insert(bytes("/unused"), Vec::new());
+        let err = validate_exact_dependency_graph(&root, &unreachable).unwrap_err();
+        assert!(err.to_string().contains("is unreachable from the main executable"));
+    }
+
+    #[test]
+    fn exact_dependency_graph_rejects_non_literal_or_duplicate_edges() {
+        let mut graph = BTreeMap::new();
+        graph.insert(bytes("/a"), Vec::new());
+
+        let err = validate_exact_dependency_graph(&[bytes("liba.so")], &graph).unwrap_err();
+        assert!(err.to_string().contains("non-literal path-qualified DT_NEEDED"));
+
+        let err =
+            validate_exact_dependency_graph(&[bytes("/a"), bytes("/a")], &graph).unwrap_err();
+        assert!(err.to_string().contains("duplicate DT_NEEDED edge /a"));
+    }
 }

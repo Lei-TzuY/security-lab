@@ -1611,7 +1611,7 @@ Boundary: 65A does not resolve or seal a transitive dependency. It deliberately 
 
 ### Slice 66A — seal an exact set of up to eight path-qualified direct dependencies
 
-**Current implementation candidate.** Generalizes the 64A/65A one-direct-object topology into one bounded exact direct-dependency set without introducing fixed second/third dependency slots or claiming general loader search.
+**Status: complete on `main`.** Generalizes the 64A/65A one-direct-object topology into one bounded exact direct-dependency set without introducing fixed second/third dependency slots or claiming general loader search.
 
 Acceptance evidence is executable:
 

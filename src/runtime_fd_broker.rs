@@ -4606,6 +4606,6 @@ pub use imp::{
     RuntimeAcknowledgedCorrelatedMessageExchangeController,
     RuntimeAuthenticatedCorrelatedMessageExchangeController,
     RuntimeCorrelatedMessageExchangeController, RuntimeFdBroker, RuntimeFdSession,
-    RuntimeHostUnixReconnectController, RuntimeMessageExchangeController,
-    RuntimeMultiMessageExchangeController,
+    RuntimeHostUnixReconnectController, RuntimeHostUnixRouterController,
+    RuntimeMessageExchangeController, RuntimeMultiMessageExchangeController,
 };

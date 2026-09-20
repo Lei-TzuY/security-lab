@@ -30,7 +30,7 @@ mod x86_64 {
         ProcessTreeUsage, ResourceLimits, RunReport, SandboxError, SandboxPolicy,
     };
     use sha2::{Digest, Sha256};
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::ffi::CString;
     use std::io;
     use std::net::Ipv4Addr;
@@ -1360,32 +1360,15 @@ mod x86_64 {
             let needed_bindings = policy.normalized_executable_needed_bindings();
             let mut dependencies = Vec::with_capacity(needed_bindings.len());
             if !needed_bindings.is_empty() {
-                let needed = elf_needed::read_elf64_x86_64_dt_needed(executable_fd.raw()).map_err(
-                    |error| {
-                        SandboxError::SetupFailed(format!(
-                            "cannot parse content-bound executable DT_NEEDED: {error}"
-                        ))
-                    },
-                )?;
-                let mut observed = BTreeSet::new();
-                for entry in &needed {
-                    if !observed.insert(entry.clone()) {
-                        return Err(SandboxError::SetupFailed(
-                            "content-bound executable contains duplicate direct DT_NEEDED entries"
-                                .to_owned(),
-                        ));
-                    }
-                }
-                let declared = needed_bindings
-                    .iter()
-                    .map(|binding| binding.path.as_os_str().as_bytes().to_vec())
-                    .collect::<BTreeSet<_>>();
-                if observed != declared {
-                    return Err(SandboxError::SetupFailed(format!(
-                        "content-bound executable direct DT_NEEDED set does not exactly match {} declared executable.needed bindings",
-                        needed_bindings.len()
-                    )));
-                }
+                let root_needed =
+                    elf_needed::read_elf64_x86_64_dt_needed(executable_fd.raw()).map_err(
+                        |error| {
+                            SandboxError::SetupFailed(format!(
+                                "cannot parse content-bound executable DT_NEEDED: {error}"
+                            ))
+                        },
+                    )?;
+                let mut dependency_graph = BTreeMap::new();
 
                 for binding in &needed_bindings {
                     let path = &binding.path;
@@ -1393,7 +1376,7 @@ mod x86_64 {
                         root_fd.raw(),
                         path,
                         (libc::O_PATH | libc::O_CLOEXEC) as u64,
-                        "ELF direct dependency",
+                        "ELF dependency graph node",
                     )?;
                     validate_executable_fd(pinned.raw(), path)?;
                     let image_fd = prepare_verified_executable_image(
@@ -1401,28 +1384,30 @@ mod x86_64 {
                         path,
                         pinned,
                         binding.sha256,
-                        "ELF direct dependency",
+                        "ELF dependency graph node",
                         "executable.needed_sha256",
                         "security-lab-needed",
                     )?;
-                    let transitive_needed = elf_needed::read_elf64_x86_64_dt_needed(image_fd.raw())
+                    let node_needed = elf_needed::read_elf64_x86_64_dt_needed(image_fd.raw())
                         .map_err(|error| {
                             SandboxError::SetupFailed(format!(
-                                "cannot parse sealed direct dependency DT_NEEDED: {error}"
+                                "cannot parse sealed dependency {} DT_NEEDED: {error}",
+                                path.display()
                             ))
                         })?;
-                    if !transitive_needed.is_empty() {
-                        return Err(SandboxError::SetupFailed(format!(
-                            "sealed direct dependency {} must be a DT_NEEDED leaf but declares {} transitive dependency entries",
-                            path.display(),
-                            transitive_needed.len()
-                        )));
-                    }
+                    dependency_graph.insert(path.as_os_str().as_bytes().to_vec(), node_needed);
                     dependencies.push(PreparedSealedMount {
                         image_fd,
                         target_relative: sandbox_relative(path)?,
                     });
                 }
+
+                elf_needed::validate_exact_dependency_graph(&root_needed, &dependency_graph)
+                    .map_err(|error| {
+                        SandboxError::SetupFailed(format!(
+                            "sealed dependency graph closure validation failed: {error}"
+                        ))
+                    })?;
             }
 
             let mut landlock_read_execute = Vec::with_capacity(policy.landlock_read_execute.len());

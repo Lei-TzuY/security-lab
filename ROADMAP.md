@@ -1656,7 +1656,7 @@ After 67A integrates, do not farm larger volume-count ceilings or fixed third/fo
 
 ### Slice 68A — close a bounded reachable graph of sealed path-qualified DT_NEEDED nodes
 
-**Current implementation candidate.** Promotes the 66A exact direct set into one bounded transitive graph without adding fixed depth slots or claiming general dynamic-loader name resolution.
+**Status: complete on `main`.** Promotes the 66A exact direct set into one bounded transitive graph without adding fixed depth slots or claiming general dynamic-loader name resolution.
 
 Acceptance evidence is executable:
 

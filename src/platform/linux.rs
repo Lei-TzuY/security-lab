@@ -1368,8 +1368,19 @@ mod x86_64 {
                             ))
                         },
                     )?;
-                let mut dependency_graph = BTreeMap::new();
+                let declared = needed_bindings
+                    .iter()
+                    .map(|binding| binding.path.as_os_str().as_bytes().to_vec())
+                    .collect::<BTreeSet<_>>();
+                elf_needed::validate_dependency_graph_roots(&root_needed, &declared).map_err(
+                    |error| {
+                        SandboxError::SetupFailed(format!(
+                            "sealed dependency graph root validation failed: {error}"
+                        ))
+                    },
+                )?;
 
+                let mut dependency_graph = BTreeMap::new();
                 for binding in &needed_bindings {
                     let path = &binding.path;
                     let pinned = open_beneath_root(

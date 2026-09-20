@@ -522,29 +522,31 @@ mod linux_x86_64 {
                 return result;
             }
         }
-        if let (Some(source), Some(target)) = (
-            &policy.readonly_volume_source,
-            &policy.readonly_volume_target,
-        ) {
-            if let Err(result) = require_host_directory(source, "readonly_volume_source_open") {
+        for volume in policy.normalized_readonly_volume_bindings() {
+            if let Err(result) =
+                require_host_directory(&volume.source, "readonly_volume_source_open")
+            {
                 return result;
             }
-            if let Err(result) =
-                require_beneath_directory(root.raw(), target, "readonly_volume_target_open")
-            {
+            if let Err(result) = require_beneath_directory(
+                root.raw(),
+                &volume.target,
+                "readonly_volume_target_open",
+            ) {
                 return result;
             }
         }
-        if let (Some(source), Some(target)) = (
-            &policy.writable_volume_source,
-            &policy.writable_volume_target,
-        ) {
-            if let Err(result) = require_host_directory(source, "writable_volume_source_open") {
+        for volume in policy.normalized_writable_volume_bindings() {
+            if let Err(result) =
+                require_host_directory(&volume.source, "writable_volume_source_open")
+            {
                 return result;
             }
-            if let Err(result) =
-                require_beneath_directory(root.raw(), target, "writable_volume_target_open")
-            {
+            if let Err(result) = require_beneath_directory(
+                root.raw(),
+                &volume.target,
+                "writable_volume_target_open",
+            ) {
                 return result;
             }
         }

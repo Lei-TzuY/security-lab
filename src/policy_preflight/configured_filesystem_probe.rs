@@ -36,6 +36,7 @@ mod linux_x86_64 {
     use crate::elf_needed;
     use security_lab::SandboxPolicy;
     use sha2::{Digest, Sha256};
+    use std::collections::BTreeSet;
     use std::ffi::CString;
     use std::io;
     use std::os::unix::ffi::OsStrExt;
@@ -373,9 +374,8 @@ mod linux_x86_64 {
             }
         }
 
-        if let (Some(dependency), Some(expected_sha256)) =
-            (&policy.executable_needed, policy.executable_needed_sha256)
-        {
+        let needed_bindings = policy.normalized_executable_needed_bindings();
+        if !needed_bindings.is_empty() {
             let executable_readable = match open_beneath(
                 root.raw(),
                 &policy.executable,
@@ -395,96 +395,113 @@ mod linux_x86_64 {
                     return ConfiguredFilesystemProbe::unavailable("executable_needed_elf", None);
                 }
             };
-            if needed.len() != 1 || needed[0].as_slice() != dependency.as_os_str().as_bytes() {
+            let mut observed = BTreeSet::new();
+            for entry in &needed {
+                if !observed.insert(entry.clone()) {
+                    return ConfiguredFilesystemProbe::unavailable(
+                        "executable_needed_duplicate_elf_entry",
+                        None,
+                    );
+                }
+            }
+            let declared = needed_bindings
+                .iter()
+                .map(|binding| binding.path.as_os_str().as_bytes().to_vec())
+                .collect::<BTreeSet<_>>();
+            if observed != declared {
                 return ConfiguredFilesystemProbe::unavailable(
                     "executable_needed_closure_mismatch",
                     None,
                 );
             }
 
-            let object = match open_beneath(
-                root.raw(),
-                dependency,
-                (libc::O_RDONLY | libc::O_CLOEXEC) as u64,
-            ) {
-                Ok(fd) => fd,
-                Err(error) => {
-                    return ConfiguredFilesystemProbe::unavailable(
-                        "executable_needed_open",
-                        Some(error),
-                    );
-                }
-            };
-            let mut object_stat = unsafe { std::mem::zeroed::<libc::stat>() };
-            if unsafe { libc::fstat(object.raw(), &mut object_stat) } != 0 {
-                return ConfiguredFilesystemProbe::unavailable(
-                    "executable_needed_stat",
-                    Some(errno()),
-                );
-            }
-            if object_stat.st_mode & libc::S_IFMT != libc::S_IFREG
-                || object_stat.st_mode & 0o111 == 0
-                || object_stat.st_size <= 0
-                || object_stat.st_size as u64 > MAX_EXECUTABLE_DIGEST_BYTES
-            {
-                return ConfiguredFilesystemProbe::unavailable("executable_needed_shape", None);
-            }
-            let mut hasher = Sha256::new();
-            let mut total = 0u64;
-            let mut buffer = [0u8; 64 * 1024];
-            loop {
-                let read = unsafe {
-                    libc::read(
-                        object.raw(),
-                        buffer.as_mut_ptr().cast::<libc::c_void>(),
-                        buffer.len(),
-                    )
-                };
-                if read == -1 {
-                    let error = errno();
-                    if error == libc::EINTR {
-                        continue;
-                    }
-                    return ConfiguredFilesystemProbe::unavailable(
-                        "executable_needed_digest_read",
-                        Some(error),
-                    );
-                }
-                if read == 0 {
-                    break;
-                }
-                total = match total.checked_add(read as u64) {
-                    Some(total) if total <= MAX_EXECUTABLE_DIGEST_BYTES => total,
-                    _ => {
+            for binding in &needed_bindings {
+                let dependency = &binding.path;
+                let object = match open_beneath(
+                    root.raw(),
+                    dependency,
+                    (libc::O_RDONLY | libc::O_CLOEXEC) as u64,
+                ) {
+                    Ok(fd) => fd,
+                    Err(error) => {
                         return ConfiguredFilesystemProbe::unavailable(
-                            "executable_needed_digest_size",
-                            None,
+                            "executable_needed_open",
+                            Some(error),
                         );
                     }
                 };
-                hasher.update(&buffer[..read as usize]);
-            }
-            let actual: [u8; 32] = hasher.finalize().into();
-            if actual != expected_sha256 {
-                return ConfiguredFilesystemProbe::unavailable(
-                    "executable_needed_digest_mismatch",
-                    None,
-                );
-            }
-            let transitive_needed = match elf_needed::read_elf64_x86_64_dt_needed(object.raw()) {
-                Ok(needed) => needed,
-                Err(_) => {
+                let mut object_stat = unsafe { std::mem::zeroed::<libc::stat>() };
+                if unsafe { libc::fstat(object.raw(), &mut object_stat) } != 0 {
                     return ConfiguredFilesystemProbe::unavailable(
-                        "executable_needed_dependency_elf",
+                        "executable_needed_stat",
+                        Some(errno()),
+                    );
+                }
+                if object_stat.st_mode & libc::S_IFMT != libc::S_IFREG
+                    || object_stat.st_mode & 0o111 == 0
+                    || object_stat.st_size <= 0
+                    || object_stat.st_size as u64 > MAX_EXECUTABLE_DIGEST_BYTES
+                {
+                    return ConfiguredFilesystemProbe::unavailable("executable_needed_shape", None);
+                }
+                let mut hasher = Sha256::new();
+                let mut total = 0u64;
+                let mut buffer = [0u8; 64 * 1024];
+                loop {
+                    let read = unsafe {
+                        libc::read(
+                            object.raw(),
+                            buffer.as_mut_ptr().cast::<libc::c_void>(),
+                            buffer.len(),
+                        )
+                    };
+                    if read == -1 {
+                        let error = errno();
+                        if error == libc::EINTR {
+                            continue;
+                        }
+                        return ConfiguredFilesystemProbe::unavailable(
+                            "executable_needed_digest_read",
+                            Some(error),
+                        );
+                    }
+                    if read == 0 {
+                        break;
+                    }
+                    total = match total.checked_add(read as u64) {
+                        Some(total) if total <= MAX_EXECUTABLE_DIGEST_BYTES => total,
+                        _ => {
+                            return ConfiguredFilesystemProbe::unavailable(
+                                "executable_needed_digest_size",
+                                None,
+                            );
+                        }
+                    };
+                    hasher.update(&buffer[..read as usize]);
+                }
+                let actual: [u8; 32] = hasher.finalize().into();
+                if actual != binding.sha256 {
+                    return ConfiguredFilesystemProbe::unavailable(
+                        "executable_needed_digest_mismatch",
                         None,
                     );
                 }
-            };
-            if !transitive_needed.is_empty() {
-                return ConfiguredFilesystemProbe::unavailable(
-                    "executable_needed_transitive_dependency",
-                    None,
-                );
+                let transitive_needed =
+                    match elf_needed::read_elf64_x86_64_dt_needed(object.raw()) {
+                        Ok(needed) => needed,
+                        Err(_) => {
+                            return ConfiguredFilesystemProbe::unavailable(
+                                "executable_needed_dependency_elf",
+                                None,
+                            );
+                        }
+                    };
+                if !transitive_needed.is_empty() {
+                    return ConfiguredFilesystemProbe::unavailable(
+                        "executable_needed_transitive_dependency",
+                        None,
+                    );
+                }
             }
         }
 

@@ -399,8 +399,18 @@ mod linux_x86_64 {
                         );
                     }
                 };
-            let mut dependency_graph = BTreeMap::new();
+            let declared = needed_bindings
+                .iter()
+                .map(|binding| binding.path.as_os_str().as_bytes().to_vec())
+                .collect::<BTreeSet<_>>();
+            if elf_needed::validate_dependency_graph_roots(&root_needed, &declared).is_err() {
+                return ConfiguredFilesystemProbe::unavailable(
+                    "executable_needed_graph_roots",
+                    None,
+                );
+            }
 
+            let mut dependency_graph = BTreeMap::new();
             for binding in &needed_bindings {
                 let dependency = &binding.path;
                 let object = match open_beneath(

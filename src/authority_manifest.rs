@@ -36,6 +36,20 @@ pub(crate) fn to_json(policy: &SandboxPolicy) -> String {
         Some(digest) => push_json_string(&mut output, &sha256_hex(digest)),
         None => output.push_str("null"),
     }
+    output.push_str(",\"executable_needed_bindings\":[");
+    let mut needed_bindings = policy.normalized_executable_needed_bindings();
+    needed_bindings.sort();
+    for (index, binding) in needed_bindings.iter().enumerate() {
+        if index != 0 {
+            output.push(',');
+        }
+        output.push_str("{\"path\":");
+        push_path(&mut output, &binding.path);
+        output.push_str(",\"sha256\":");
+        push_json_string(&mut output, &sha256_hex(binding.sha256));
+        output.push('}');
+    }
+    output.push(']');
     output.push_str(",\"working_dir\":");
     push_path(&mut output, &policy.working_dir);
     output.push_str(",\"argument_count\":");
@@ -393,6 +407,22 @@ pub(crate) fn to_human(policy: &SandboxPolicy) -> String {
             .executable_needed_sha256
             .map(sha256_hex)
             .unwrap_or_else(|| "none".to_owned())
+    )
+    .expect("write to String cannot fail");
+    let mut needed_bindings = policy.normalized_executable_needed_bindings();
+    needed_bindings.sort();
+    writeln!(
+        &mut output,
+        "executable-needed-bindings: {}",
+        if needed_bindings.is_empty() {
+            "none".to_owned()
+        } else {
+            needed_bindings
+                .iter()
+                .map(|binding| format!("{}@{}", binding.path.display(), sha256_hex(binding.sha256)))
+                .collect::<Vec<_>>()
+                .join(",")
+        }
     )
     .expect("write to String cannot fail");
     writeln!(&mut output, "working-dir: {}", policy.working_dir.display())

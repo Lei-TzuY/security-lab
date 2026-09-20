@@ -324,11 +324,11 @@ mod imp {
                 return Err(RuntimeFdBrokerError::Protocol(message.to_owned()));
             }
 
-            if self.stream.shutdown(std::net::Shutdown::Both).is_err() {
+            if let Err(error) = self.stream.shutdown(std::net::Shutdown::Both) {
                 self.state = HostUnixStreamRevocationState::Failed;
                 return Err(RuntimeFdBrokerError::io(
                     "cannot revoke transferred host UNIX stream",
-                    std::io::Error::last_os_error(),
+                    error,
                 ));
             }
             self.state = HostUnixStreamRevocationState::Revoked;

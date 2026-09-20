@@ -221,9 +221,7 @@ volume.cow_bytes = 1048576
 
     assert_eq!(human.status.code(), Some(0));
     let stdout = String::from_utf8(human.stdout).expect("human manifest is UTF-8");
-    assert!(stdout.contains(
-        "host-filesystem-volumes: read-only=2 writable=2 copy-on-write=2\n"
-    ));
+    assert!(stdout.contains("host-filesystem-volumes: read-only=2 writable=2 copy-on-write=2\n"));
 }
 
 #[test]

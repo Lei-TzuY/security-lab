@@ -528,11 +528,9 @@ mod linux_x86_64 {
             {
                 return result;
             }
-            if let Err(result) = require_beneath_directory(
-                root.raw(),
-                &volume.target,
-                "readonly_volume_target_open",
-            ) {
+            if let Err(result) =
+                require_beneath_directory(root.raw(), &volume.target, "readonly_volume_target_open")
+            {
                 return result;
             }
         }
@@ -542,11 +540,9 @@ mod linux_x86_64 {
             {
                 return result;
             }
-            if let Err(result) = require_beneath_directory(
-                root.raw(),
-                &volume.target,
-                "writable_volume_target_open",
-            ) {
+            if let Err(result) =
+                require_beneath_directory(root.raw(), &volume.target, "writable_volume_target_open")
+            {
                 return result;
             }
         }

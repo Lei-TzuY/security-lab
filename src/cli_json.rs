@@ -17,21 +17,21 @@ pub(crate) fn report_json(report: &RunReport) -> String {
     }
     output.push_str(",\"cow_diff\":");
     match &report.cow_diff {
-        Some(diff) => {
-            output.push_str("{\"encoded_bytes\":");
-            write!(&mut output, "{}", diff.encoded_bytes).expect("write to String cannot fail");
-            output.push_str(",\"entries\":[");
-            for (index, entry) in diff.entries.iter().enumerate() {
-                if index != 0 {
-                    output.push(',');
-                }
-                push_cow_diff_entry(&mut output, entry);
-            }
-            output.push_str("]}");
-        }
+        Some(diff) => push_cow_diff(&mut output, diff),
         None => output.push_str("null"),
     }
-    output.push_str(",\"reaped_descendants\":");
+    output.push_str(",\"cow_volume_diffs\":[");
+    for (index, volume) in report.cow_volume_diffs.iter().enumerate() {
+        if index != 0 {
+            output.push(',');
+        }
+        output.push_str("{\"target_encoding\":\"hex\",\"target\":\"");
+        push_hex(&mut output, &volume.target);
+        output.push_str("\",\"diff\":");
+        push_cow_diff(&mut output, &volume.diff);
+        output.push('}');
+    }
+    output.push_str("],\"reaped_descendants\":");
     write!(&mut output, "{}", report.reaped_descendants).expect("write to String cannot fail");
     output.push_str(",\"process_tree_usage\":{\"user_cpu_micros\":");
     write!(&mut output, "{}", report.process_tree_usage.user_cpu_micros)
@@ -111,6 +111,19 @@ pub(crate) fn outcome_exit_code(outcome: ChildOutcome) -> i32 {
         ChildOutcome::Cancelled => 130,
         ChildOutcome::OutputLimitExceeded => 122,
     }
+}
+
+fn push_cow_diff(output: &mut String, diff: &CowDiff) {
+    output.push_str("{\"encoded_bytes\":");
+    write!(output, "{}", diff.encoded_bytes).expect("write to String cannot fail");
+    output.push_str(",\"entries\":[");
+    for (index, entry) in diff.entries.iter().enumerate() {
+        if index != 0 {
+            output.push(',');
+        }
+        push_cow_diff_entry(output, entry);
+    }
+    output.push_str("]}");
 }
 
 fn push_cow_diff_entry(output: &mut String, entry: &CowDiffEntry) {
@@ -215,6 +228,7 @@ mod tests {
                 truncated: true,
             }),
             cow_diff: None,
+            cow_volume_diffs: Vec::new(),
             reaped_descendants: 3,
             process_tree_usage: ProcessTreeUsage {
                 user_cpu_micros: 11,
@@ -249,6 +263,7 @@ mod tests {
                 ],
                 encoded_bytes: 64,
             }),
+            cow_volume_diffs: Vec::new(),
             reaped_descendants: 0,
             process_tree_usage: ProcessTreeUsage::default(),
             enforcement: EnforcementReceipt::default(),
@@ -275,6 +290,7 @@ mod tests {
                 truncated: true,
             }),
             cow_diff: None,
+            cow_volume_diffs: Vec::new(),
             reaped_descendants: 1,
             process_tree_usage: ProcessTreeUsage::default(),
             enforcement: EnforcementReceipt::default(),

@@ -40,8 +40,8 @@ pub use policy::{
     StdioPolicy, MAX_EXECUTABLE_NEEDED_BINDINGS, MAX_PERSISTENT_VOLUME_BINDINGS,
 };
 pub use report::{
-    CapturedOutput, ChildOutcome, CowDiff, CowDiffEntry, EnforcementReceipt, ProcessTreeUsage,
-    RunReport,
+    CapturedOutput, ChildOutcome, CowDiff, CowDiffEntry, CowVolumeDiff, EnforcementReceipt,
+    ProcessTreeUsage, RunReport,
 };
 pub use runtime_fd_broker::{
     HostUnixPeerCredentials, HostUnixStreamRevocationController, PreparedHostUnixStream,

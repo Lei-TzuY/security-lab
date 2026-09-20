@@ -40,11 +40,9 @@ pub(crate) fn report_json(report: &RunReport) -> String {
                 output.push_str(",\"nodes\":");
                 write!(&mut output, "{}", identity.nodes).expect("write to String cannot fail");
                 output.push_str(",\"limit_bytes\":");
-                write!(&mut output, "{}", limits.max_bytes)
-                    .expect("write to String cannot fail");
+                write!(&mut output, "{}", limits.max_bytes).expect("write to String cannot fail");
                 output.push_str(",\"limit_nodes\":");
-                write!(&mut output, "{}", limits.max_nodes)
-                    .expect("write to String cannot fail");
+                write!(&mut output, "{}", limits.max_nodes).expect("write to String cannot fail");
                 output.push('}');
             }
             _ => output.push_str("null"),

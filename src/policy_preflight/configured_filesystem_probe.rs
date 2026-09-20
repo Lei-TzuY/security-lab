@@ -395,13 +395,11 @@ mod linux_x86_64 {
                     return ConfiguredFilesystemProbe::unavailable("executable_needed_elf", None);
                 }
             };
-            let matches = needed
-                .iter()
-                .filter(|entry| entry.as_slice() == dependency.as_os_str().as_bytes())
-                .count();
-            if matches != 1 {
+            if needed.len() != 1
+                || needed[0].as_slice() != dependency.as_os_str().as_bytes()
+            {
                 return ConfiguredFilesystemProbe::unavailable(
-                    "executable_needed_path_mismatch",
+                    "executable_needed_closure_mismatch",
                     None,
                 );
             }

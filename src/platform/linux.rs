@@ -1364,9 +1364,7 @@ mod x86_64 {
                                 "cannot parse content-bound executable DT_NEEDED: {error}"
                             ))
                         })?;
-                    if needed.len() != 1
-                        || needed[0].as_slice() != path.as_os_str().as_bytes()
-                    {
+                    if needed.len() != 1 || needed[0].as_slice() != path.as_os_str().as_bytes() {
                         return Err(SandboxError::SetupFailed(format!(
                             "content-bound executable direct DT_NEEDED closure must contain exactly one entry and it must match executable.needed {}",
                             path.display()

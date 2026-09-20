@@ -3540,8 +3540,7 @@ mod x86_64 {
             upper_fd: -1,
             state: ptr::null_mut(),
         };
-        let mut cow_diff_controls =
-            [empty_cow_diff; MAX_PERSISTENT_VOLUME_BINDINGS + 1];
+        let mut cow_diff_controls = [empty_cow_diff; MAX_PERSISTENT_VOLUME_BINDINGS + 1];
         let mut cow_diff_control_count = 0usize;
         if !cow_diff_state.is_null() {
             if cow_upper_fd < FIRST_NON_STDIO_FD as RawFd {

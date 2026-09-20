@@ -4325,9 +4325,9 @@ mod imp {
 
 pub use imp::{
     HostUnixStreamRevocationController, PreparedHostUnixStream, PreparedReadOnlyRegularFile,
-    PreparedRevocableByteStream,
-    PreparedRuntimeMessageChannel, PreparedSealedRegularFileSnapshot, PreparedSealedSnapshotBundle,
-    RevocableByteStreamController, RuntimeAcknowledgedCorrelatedMessageExchangeController,
+    PreparedRevocableByteStream, PreparedRuntimeMessageChannel, PreparedSealedRegularFileSnapshot,
+    PreparedSealedSnapshotBundle, RevocableByteStreamController,
+    RuntimeAcknowledgedCorrelatedMessageExchangeController,
     RuntimeAuthenticatedCorrelatedMessageExchangeController,
     RuntimeCorrelatedMessageExchangeController, RuntimeFdBroker, RuntimeFdSession,
     RuntimeHostUnixReconnectController, RuntimeMessageExchangeController,

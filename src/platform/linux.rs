@@ -1360,12 +1360,13 @@ mod x86_64 {
             let needed_bindings = policy.normalized_executable_needed_bindings();
             let mut dependencies = Vec::with_capacity(needed_bindings.len());
             if !needed_bindings.is_empty() {
-                let needed = elf_needed::read_elf64_x86_64_dt_needed(executable_fd.raw())
-                    .map_err(|error| {
+                let needed = elf_needed::read_elf64_x86_64_dt_needed(executable_fd.raw()).map_err(
+                    |error| {
                         SandboxError::SetupFailed(format!(
                             "cannot parse content-bound executable DT_NEEDED: {error}"
                         ))
-                    })?;
+                    },
+                )?;
                 let mut observed = BTreeSet::new();
                 for entry in &needed {
                     if !observed.insert(entry.clone()) {
@@ -1404,8 +1405,8 @@ mod x86_64 {
                         "executable.needed_sha256",
                         "security-lab-needed",
                     )?;
-                    let transitive_needed =
-                        elf_needed::read_elf64_x86_64_dt_needed(image_fd.raw()).map_err(|error| {
+                    let transitive_needed = elf_needed::read_elf64_x86_64_dt_needed(image_fd.raw())
+                        .map_err(|error| {
                             SandboxError::SetupFailed(format!(
                                 "cannot parse sealed direct dependency DT_NEEDED: {error}"
                             ))

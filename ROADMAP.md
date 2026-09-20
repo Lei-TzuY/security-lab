@@ -1745,6 +1745,29 @@ Boundary: 73A is a bounded trusted-controller reconnect loop to one fixed filesy
 
 After 73A integrates, do not farm larger reconnect ceilings, more readiness-byte variants, or fixed additional service slots. A further host-local IPC promotion must add a materially different authority/lifecycle property such as explicitly modeled multi-service selection with independent bounds, post-transfer lifetime mediation, or another object class, or move to another architecture frontier.
 
+## Milestone 74 — post-transfer host-stream lifetime mediation
+
+### Slice 74A — revoke one transferred host AF_UNIX stream object
+
+**Current implementation candidate.** Adds opt-in trusted-controller revocation for one already-prepared 71A connected stream without changing the ordinary one-shot transfer or the 73A bounded reconnect controller.
+
+Acceptance evidence is executable:
+
+- `RuntimeFdSession::send_revocable_host_unix_stream(grant)` consumes the same readiness-gated one-successful-grant state transition as the existing one-shot host-stream transfer and returns a controller only after successful `SCM_RIGHTS` publication;
+- the controller retains a trusted descriptor for the same connected socket object plus the already-observed `SO_PEERCRED` PID/UID/GID evidence;
+- `revoke()` performs exactly one `shutdown(SHUT_RDWR)`; a second explicit revoke is a protocol error and a shutdown error terminally marks the controller failed;
+- dropping a still-active controller attempts the same bidirectional shutdown, so accidental controller loss fails closed instead of silently abandoning revocation authority;
+- local kernel regressions prove the transferred descriptor exchanges bytes before revocation, then observes EOF on reads and `EPIPE` on `MSG_NOSIGNAL` sends after explicit revoke, and the same EOF/EPIPE state after active-controller drop;
+- a dedicated raw-syscall sandbox target reaches the exact prepared host service before revocation, blocks in `read`, wakes to EOF after trusted shutdown, and still requires `ENOENT` for the original host service pathname;
+- the target policy continues to require only the existing broker `recvmsg` plus ordinary stream I/O and explicitly carries no target `socket`, `connect`, or persistent `execveat` authority;
+- stable rustfmt, Clippy with `-D warnings`, complete stable tests, and Rust 1.74 are the integration gate.
+
+Boundary: 74A changes only the shutdown state of one already-authorized connected AF_UNIX socket object. It does not close or invalidate the target's numeric descriptor, retract bytes already consumed, undo remote service side effects, cryptographically authenticate the service, revoke unrelated descriptors/connections, add target-selected service discovery, or provide a general descriptor-revocation framework.
+
+### Milestone 74 promotion rule
+
+After 74A integrates, do not farm shutdown-mode variants or revocation aliases. A further host-local IPC promotion must add a materially different capability such as independently bounded multi-service selection/routing, explicit application-level revocation acknowledgment, or another mediated object class.
+
 ## Later frontiers
 
-Supplementary-group isolation with a viable mapping architecture, routed/broader network authority beyond the bounded IPv4 brokers, broader dynamic host-local IPC mediation beyond one exact bounded reconnect lifecycle, bounded loader search/interpreter closure or later-exec authority, per-volume COW diff/commit or stronger storage lifecycle semantics, and delegated aggregate cgroup accounting remain separate evidence-backed frontiers. Do not add configuration-only names without executable kernel behavior and integration evidence.
+Supplementary-group isolation with a viable mapping architecture, routed/broader network authority beyond the bounded IPv4 brokers, broader dynamic host-local IPC mediation beyond one exact bounded reconnect/revocation lifecycle, bounded loader search/interpreter closure or later-exec authority, per-volume COW diff/commit or stronger storage lifecycle semantics, and delegated aggregate cgroup accounting remain separate evidence-backed frontiers. Do not add configuration-only names without executable kernel behavior and integration evidence.

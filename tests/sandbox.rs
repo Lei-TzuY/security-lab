@@ -1872,10 +1872,8 @@ fn copy_on_write_volume_diffs_are_isolated_and_target_sorted() {
 
 #[test]
 fn copy_on_write_volume_diff_omits_unrequested_volume() {
-    let first = std::env::temp_dir().join(format!(
-        "security-lab-cow-diff-requested-{}",
-        process::id()
-    ));
+    let first =
+        std::env::temp_dir().join(format!("security-lab-cow-diff-requested-{}", process::id()));
     let second = std::env::temp_dir().join(format!(
         "security-lab-cow-diff-unrequested-{}",
         process::id()

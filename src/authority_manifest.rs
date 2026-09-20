@@ -104,6 +104,8 @@ pub(crate) fn to_json(policy: &SandboxPolicy) -> String {
         policy.normalized_writable_volume_bindings(),
         "writable",
     );
+    output.push_str(",\"copy_on_write_volumes\":");
+    push_cow_volume_array(&mut output, policy.copy_on_write_volume_bindings.clone());
     output.push('}');
 
     output.push_str(",\"network\":{\"isolated_loopback_enabled\":");
@@ -468,9 +470,10 @@ pub(crate) fn to_human(policy: &SandboxPolicy) -> String {
     .expect("write to String cannot fail");
     writeln!(
         &mut output,
-        "host-filesystem-volumes: read-only={} writable={}",
+        "host-filesystem-volumes: read-only={} writable={} copy-on-write={}",
         policy.normalized_readonly_volume_bindings().len(),
-        policy.normalized_writable_volume_bindings().len()
+        policy.normalized_writable_volume_bindings().len(),
+        policy.copy_on_write_volume_bindings.len()
     )
     .expect("write to String cannot fail");
     writeln!(
@@ -612,6 +615,27 @@ fn push_volume_array(
         push_path(output, &binding.source);
         output.push_str(",\"target\":");
         push_path(output, &binding.target);
+        output.push('}');
+    }
+    output.push(']');
+}
+
+fn push_cow_volume_array(
+    output: &mut String,
+    mut bindings: Vec<security_lab::CopyOnWriteVolumeBinding>,
+) {
+    bindings.sort();
+    output.push('[');
+    for (index, binding) in bindings.iter().enumerate() {
+        if index != 0 {
+            output.push(',');
+        }
+        output.push_str("{\"access\":\"copy_on_write\",\"source\":");
+        push_path(output, &binding.source);
+        output.push_str(",\"target\":");
+        push_path(output, &binding.target);
+        output.push_str(",\"bytes\":");
+        write!(output, "{}", binding.bytes).expect("write to String cannot fail");
         output.push('}');
     }
     output.push(']');

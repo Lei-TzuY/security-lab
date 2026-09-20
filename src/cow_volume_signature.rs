@@ -349,6 +349,31 @@ mod tests {
     }
 
     #[test]
+    fn evidence_digest_and_signature_match_fixed_vector() {
+        let seed = [0x51; SNAPSHOT_ED25519_SIGNING_KEY_BYTES];
+        let evidence = sign_cow_volume_diff_ed25519(&bound_diff(), &seed).unwrap();
+        assert_eq!(
+            hex(&evidence.evidence_sha256),
+            "4e881df34e4da49ba3c7fe3ae4196677b054cbeecd1ae345b914e7ea816477f6"
+        );
+        assert_eq!(
+            hex(&evidence.public_key),
+            "c050c5637a44fa8629fff3cccce2300cb362a63d99d95fc54145266f4332445a"
+        );
+        assert_eq!(
+            hex(&evidence.signature),
+            "b01400ef841430a9e5176c768ccf62583d207d34adc5b1c36519a7f34d94ceec507edf886d852609f12021072e18c207b683eab92176b96ffb62d5d286c1a208"
+        );
+
+        let mut corrupted = evidence;
+        corrupted.signature[0] ^= 0x80;
+        assert!(matches!(
+            verify_cow_volume_diff_ed25519(&bound_diff(), &corrupted),
+            Err(CowVolumeEd25519Error::VerificationFailed)
+        ));
+    }
+
+    #[test]
     fn unbound_or_incomplete_report_cannot_be_signed() {
         let seed = [0x52; SNAPSHOT_ED25519_SIGNING_KEY_BYTES];
         let mut diff = bound_diff();
@@ -368,6 +393,15 @@ mod tests {
             sign_cow_volume_diff_ed25519(&diff, &seed),
             Err(CowVolumeEd25519Error::IncompleteBinding)
         ));
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            write!(&mut out, "{byte:02x}").expect("write to String cannot fail");
+        }
+        out
     }
 
     #[test]

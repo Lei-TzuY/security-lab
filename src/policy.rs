@@ -986,7 +986,9 @@ impl SandboxPolicy {
         for volume in &writable_volumes {
             validate_absolute_path("volume.writable_source", &volume.source)?;
             validate_absolute_path("volume.writable_target", &volume.target)?;
-            if volume.source.starts_with(&self.root_dir) || self.root_dir.starts_with(&volume.source) {
+            if volume.source.starts_with(&self.root_dir)
+                || self.root_dir.starts_with(&volume.source)
+            {
                 return Err(PolicyError::new(
                     "volume.writable_source must not overlap filesystem.root",
                 ));

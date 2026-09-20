@@ -636,6 +636,8 @@ fn push_cow_volume_array(
         push_path(output, &binding.target);
         output.push_str(",\"bytes\":");
         write!(output, "{}", binding.bytes).expect("write to String cannot fail");
+        output.push_str(",\"diff_bytes\":");
+        push_optional_u64(output, binding.diff_bytes);
         output.push('}');
     }
     output.push(']');

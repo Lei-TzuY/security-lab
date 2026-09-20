@@ -1939,6 +1939,22 @@ mod x86_64 {
                     "cannot allocate bounded copy-on-write diff state: {err}"
                 ))
             })?;
+        let mut cow_volume_diffs = Vec::new();
+        for volume in &policy.copy_on_write_volume_bindings {
+            if let Some(limit) = volume.diff_bytes {
+                let shared = SharedCowDiff::new(limit).map_err(|err| {
+                    SandboxError::SetupFailed(format!(
+                        "cannot allocate bounded copy-on-write volume diff state for {}: {err}",
+                        volume.target.display()
+                    ))
+                })?;
+                cow_volume_diffs.push((volume.target.clone(), shared));
+            }
+        }
+        let mut cow_volume_diff_states = [ptr::null_mut(); MAX_PERSISTENT_VOLUME_BINDINGS];
+        for (index, (_, shared)) in cow_volume_diffs.iter().enumerate() {
+            cow_volume_diff_states[index] = shared.raw();
+        }
         let output_limit_event = policy
             .stdout_total_bytes
             .map(|_| create_output_limit_eventfd())
@@ -1966,6 +1982,8 @@ mod x86_64 {
             cow_diff_state: cow_diff
                 .as_ref()
                 .map_or(ptr::null_mut(), SharedCowDiff::raw),
+            cow_volume_diff_states,
+            cow_volume_diff_count: cow_volume_diffs.len(),
             wall_clock_milliseconds: policy.wall_clock_milliseconds.unwrap_or(0),
         };
 
@@ -2017,6 +2035,7 @@ mod x86_64 {
                 outcome,
                 stdout: None,
                 cow_diff: None,
+                cow_volume_diffs: Vec::new(),
                 reaped_descendants: 0,
                 process_tree_usage: ProcessTreeUsage::default(),
                 enforcement: EnforcementReceipt::default(),
@@ -2040,10 +2059,21 @@ mod x86_64 {
         };
         let outcome = resolve_lifecycle_outcome(&lifecycle_record, output_limit_observed)?;
         let cow_diff = cow_diff.as_ref().map(SharedCowDiff::snapshot).transpose()?;
+        let mut cow_volume_diffs = cow_volume_diffs
+            .iter()
+            .map(|(target, shared)| {
+                Ok(CopyOnWriteVolumeDiff {
+                    target: target.clone(),
+                    diff: shared.snapshot()?,
+                })
+            })
+            .collect::<Result<Vec<_>, SandboxError>>()?;
+        cow_volume_diffs.sort_by(|left, right| left.target.cmp(&right.target));
         Ok(RunReport {
             outcome,
             stdout,
             cow_diff,
+            cow_volume_diffs,
             reaped_descendants: lifecycle_record.reaped_descendants,
             process_tree_usage: ProcessTreeUsage {
                 user_cpu_micros: lifecycle_record.user_cpu_micros,

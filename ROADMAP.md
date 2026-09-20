@@ -1790,8 +1790,31 @@ Boundary: 75A is observation of private post-run COW upper state, not target fil
 
 ### Milestone 75 promotion rule
 
-After 75A integrates, do not farm more output aliases, larger diff ceilings, or fixed extra report channels. A further storage promotion must add a materially different lifecycle capability such as explicitly bounded host-side commit/publication semantics with precondition evidence, stronger source/snapshot binding, or another independent storage primitive.
+75A is sealed on `main`. Do not farm more output aliases, larger diff ceilings, or fixed extra report channels. A further storage promotion must add a materially different lifecycle capability such as explicitly bounded host-side commit/publication semantics with precondition evidence, stronger source/snapshot binding, or another independent storage primitive.
+
+## Milestone 76 — guarded COW snapshot publication
+
+### Slice 76A — bind per-volume COW publication to launch-time canonical lower identity
+
+**Current implementation candidate.** Extends 75A's observation-only per-volume diff into one explicit guarded new-snapshot publication path without overwriting or mutating the configured host lower.
+
+Acceptance evidence is executable:
+
+- a COW-volume binding may request paired `volume.cow_base_identity_bytes` and `volume.cow_base_identity_nodes` only when per-volume diff export is already enabled; text policy requires both lists to be omitted or supplied once per COW volume, with byte limits bounded to 1 byte–1 GiB and node limits to 1–100,000;
+- the launcher derives the base identity from the exact pre-fork pinned source directory descriptor before namespace execution, using the existing bounded canonical snapshot identity rather than re-resolving the configured pathname;
+- `CowVolumeDiff` carries exact raw configured source-path bytes, sandbox target bytes, optional launch identity, and the exact identity limits alongside the existing canonical diff; legacy 75A diff-only reports remain observation-only;
+- `run-json` exposes source bytes, target bytes, launch identity accounting, and limits deterministically; static manifests expose the optional identity ceilings, while authority-delta analysis models larger ceilings/additional bound exports as wider observation authority;
+- `publish_cow_volume_diff_atomic` rejects an unbound observation-only report, requires caller base-path bytes to exactly match the report source bytes, and then reuses expected-base replay so both the current base identity and the exact materialized staging-copy identity must match the launch identity before any diff entry is applied;
+- the publication path inherits the existing destination-parent exclusion, canonical diff validation, explicit replay budgets, fd-relative no-follow staging, cleanup-on-failure, and single `renameat2(RENAME_NOREPLACE)` publication of one previously absent destination;
+- end-to-end sandbox evidence proves a bound diff publishes a new snapshot while leaving the lower unchanged, a post-launch base mutation is rejected with `BaseIdentityMismatch`, an observation-only diff is rejected with `UnboundDiff`, and a caller base-path mismatch is rejected before replay;
+- stable rustfmt, Clippy with `-D warnings`, complete stable tests, and Rust 1.74 are the integration gate.
+
+Boundary: 76A publishes a new snapshot only; it never writes back into or overwrites the configured lower. The launch identity commits to the supported canonical content/topology/mode model, not inode/device identity or object continuity, so a source pathname replaced with another canonically identical tree is not distinguished. It is not authenticity/provenance, hostile-writer point-in-time freezing, fsync-backed durability/crash recovery, an overwrite transaction, a multi-writer merge protocol, or a general version-control/commit system.
+
+### Milestone 76 promotion rule
+
+After 76A integrates, do not farm publication aliases, wider identity ceilings, or overwrite variants. A further storage promotion must add a materially different lifecycle guarantee such as authenticated provenance for the bound diff/base evidence, durable/versioned publication semantics, or another independently bounded storage primitive.
 
 ## Later frontiers
 
-Supplementary-group isolation with a viable mapping architecture, routed/broader network authority beyond the bounded IPv4 brokers, broader dynamic host-local IPC mediation beyond one exact bounded reconnect/revocation lifecycle, bounded loader search/interpreter closure or later-exec authority, stronger COW commit/publication lifecycle semantics, and delegated aggregate cgroup accounting remain separate evidence-backed frontiers. Do not add configuration-only names without executable kernel behavior and integration evidence.
+Supplementary-group isolation with a viable mapping architecture, routed/broader network authority beyond the bounded IPv4 brokers, broader dynamic host-local IPC mediation beyond one exact bounded reconnect/revocation lifecycle, bounded loader search/interpreter closure or later-exec authority, authenticated or durable/versioned COW publication semantics, and delegated aggregate cgroup accounting remain separate evidence-backed frontiers. Do not add configuration-only names without executable kernel behavior and integration evidence.

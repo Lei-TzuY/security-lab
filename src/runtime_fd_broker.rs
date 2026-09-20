@@ -2808,6 +2808,16 @@ mod imp {
             prepare_host_unix_stream(path.as_ref(), expected_peer)
         }
 
+        /// Connect one exact filesystem-path AF_UNIX SOCK_SEQPACKET endpoint
+        /// in the trusted host namespace and optionally pin its SO_PEERCRED
+        /// UID/GID before the socket becomes transferable.
+        pub fn prepare_host_unix_seqpacket(
+            path: impl AsRef<Path>,
+            expected_peer: Option<(u32, u32)>,
+        ) -> Result<PreparedHostUnixSeqpacket, RuntimeFdBrokerError> {
+            prepare_host_unix_seqpacket(path.as_ref(), expected_peer)
+        }
+
         /// Pin one regular-file source as a separate read-only open file
         /// description suitable for later SCM_RIGHTS transfer.
         ///
@@ -3029,6 +3039,15 @@ mod imp {
             self.send_prepared_fd(grant.stream.as_raw_fd())
         }
 
+        /// Transfer exactly one previously prepared connected host AF_UNIX
+        /// SOCK_SEQPACKET object after the ordinary readiness handshake.
+        pub fn send_host_unix_seqpacket(
+            &mut self,
+            grant: PreparedHostUnixSeqpacket,
+        ) -> Result<(), RuntimeFdBrokerError> {
+            self.send_prepared_fd(grant.fd)
+        }
+
         /// Transfer one prepared host AF_UNIX stream while retaining trusted
         /// shutdown authority over the same socket object after transfer.
         pub fn send_revocable_host_unix_stream(
@@ -3212,6 +3231,69 @@ mod imp {
             peer_uid,
             peer_gid,
         })
+    }
+
+    fn prepare_host_unix_seqpacket(
+        path: &Path,
+        expected_peer: Option<(u32, u32)>,
+    ) -> Result<PreparedHostUnixSeqpacket, RuntimeFdBrokerError> {
+        validate_socket_path(path)?;
+        let fd = unsafe {
+            libc::socket(
+                libc::AF_UNIX,
+                libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+                0,
+            )
+        };
+        if fd == -1 {
+            return Err(RuntimeFdBrokerError::io(
+                "cannot create runtime host UNIX seqpacket socket",
+                std::io::Error::last_os_error(),
+            ));
+        }
+        let mut grant = PreparedHostUnixSeqpacket {
+            fd,
+            peer_pid: 0,
+            peer_uid: 0,
+            peer_gid: 0,
+        };
+        let bytes = path.as_os_str().as_bytes();
+        let mut address = unsafe { std::mem::zeroed::<libc::sockaddr_un>() };
+        address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        for (index, byte) in bytes.iter().enumerate() {
+            address.sun_path[index] = *byte as libc::c_char;
+        }
+        let address_len =
+            (std::mem::size_of::<libc::sa_family_t>() + bytes.len() + 1) as libc::socklen_t;
+        if unsafe {
+            libc::connect(
+                grant.fd,
+                (&address as *const libc::sockaddr_un).cast::<libc::sockaddr>(),
+                address_len,
+            )
+        } == -1
+        {
+            return Err(RuntimeFdBrokerError::io(
+                "cannot connect runtime host UNIX seqpacket",
+                std::io::Error::last_os_error(),
+            ));
+        }
+        let (peer_pid, peer_uid, peer_gid) = peer_credentials(grant.fd)?;
+        if let Some((expected_uid, expected_gid)) = expected_peer {
+            if peer_uid != expected_uid || peer_gid != expected_gid {
+                return Err(RuntimeFdBrokerError::HostUnixPeerCredentialMismatch {
+                    expected_uid,
+                    expected_gid,
+                    actual_pid: peer_pid,
+                    actual_uid: peer_uid,
+                    actual_gid: peer_gid,
+                });
+            }
+        }
+        grant.peer_pid = peer_pid;
+        grant.peer_uid = peer_uid;
+        grant.peer_gid = peer_gid;
+        Ok(grant)
     }
 
     fn prepare_readonly_regular_file(

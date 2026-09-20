@@ -48,6 +48,87 @@ impl TestFd {
     }
 }
 
+struct SeqpacketListener {
+    fd: RawFd,
+    path: PathBuf,
+}
+
+impl SeqpacketListener {
+    fn bind(path: &Path) -> Self {
+        let bytes = path.as_os_str().as_bytes();
+        assert!(bytes.len() <= 107);
+        assert!(!bytes.contains(&0));
+        let fd = unsafe {
+            libc::socket(
+                libc::AF_UNIX,
+                libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+                0,
+            )
+        };
+        assert!(fd >= 0, "create AF_UNIX SOCK_SEQPACKET listener");
+
+        let mut address = unsafe { std::mem::zeroed::<libc::sockaddr_un>() };
+        address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        for (index, byte) in bytes.iter().enumerate() {
+            address.sun_path[index] = *byte as libc::c_char;
+        }
+        let address_len =
+            (std::mem::size_of::<libc::sa_family_t>() + bytes.len() + 1) as libc::socklen_t;
+        assert_eq!(
+            unsafe {
+                libc::bind(
+                    fd,
+                    (&address as *const libc::sockaddr_un).cast::<libc::sockaddr>(),
+                    address_len,
+                )
+            },
+            0,
+            "bind AF_UNIX SOCK_SEQPACKET listener"
+        );
+        assert_eq!(unsafe { libc::listen(fd, 8) }, 0, "listen on seqpacket socket");
+        Self {
+            fd,
+            path: path.to_path_buf(),
+        }
+    }
+
+    fn accept(&self) -> TestFd {
+        let fd = unsafe {
+            libc::accept4(
+                self.fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                libc::SOCK_CLOEXEC,
+            )
+        };
+        assert!(fd >= 0, "accept AF_UNIX SOCK_SEQPACKET connection");
+        TestFd(fd)
+    }
+}
+
+impl Drop for SeqpacketListener {
+    fn drop(&mut self) {
+        unsafe {
+            libc::close(self.fd);
+        }
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn recv_packet(fd: RawFd) -> Vec<u8> {
+    let mut buffer = [0u8; 256];
+    let read = unsafe {
+        libc::recv(
+            fd,
+            buffer.as_mut_ptr().cast::<libc::c_void>(),
+            buffer.len(),
+            0,
+        )
+    };
+    assert!(read > 0, "receive AF_UNIX SOCK_SEQPACKET packet");
+    buffer[..read as usize].to_vec()
+}
+
 #[repr(C, align(8))]
 struct OneFdControl([u8; 24]);
 
@@ -619,6 +700,93 @@ fn prepared_host_unix_stream_connects_exact_peer_and_reuses_one_shot_grant_state
     drop(second_listener);
     std::fs::remove_file(&service_path).unwrap();
     std::fs::remove_file(&second_listener_path).unwrap();
+}
+
+#[test]
+fn prepared_host_unix_seqpacket_preserves_packet_boundaries_after_transfer() {
+    let service_path = unique_path("runtime-host-unix-seqpacket-local-service.sock");
+    let broker_path = unique_path("runtime-host-unix-seqpacket-local-broker.sock");
+    let _ = std::fs::remove_file(&service_path);
+    let _ = std::fs::remove_file(&broker_path);
+
+    let listener = SeqpacketListener::bind(&service_path);
+    let expected_uid = unsafe { libc::geteuid() };
+    let expected_gid = unsafe { libc::getegid() };
+    let grant = RuntimeFdBroker::prepare_host_unix_seqpacket(
+        &service_path,
+        Some((expected_uid, expected_gid)),
+    )
+    .expect("prepare exact host UNIX seqpacket");
+    assert_eq!(grant.peer_uid(), expected_uid);
+    assert_eq!(grant.peer_gid(), expected_gid);
+    assert!(grant.peer_pid() > 0);
+    let service = listener.accept();
+
+    let broker = RuntimeFdBroker::bind(&broker_path).expect("bind seqpacket runtime broker");
+    let mut client = UnixStream::connect(broker.path()).expect("connect seqpacket runtime broker");
+    let mut session = broker.accept().expect("accept seqpacket runtime broker");
+    client.write_all(b"R").unwrap();
+    session.wait_for_ready(b'R').unwrap();
+    session
+        .send_host_unix_seqpacket(grant)
+        .expect("send prepared host UNIX seqpacket");
+    let received = receive_one_fd(&client);
+
+    for packet in [b"packet-one".as_slice(), b"packet-two-longer".as_slice()] {
+        assert_eq!(
+            unsafe {
+                libc::send(
+                    received.raw(),
+                    packet.as_ptr().cast::<libc::c_void>(),
+                    packet.len(),
+                    libc::MSG_NOSIGNAL,
+                )
+            },
+            packet.len() as isize
+        );
+    }
+    assert_eq!(recv_packet(service.raw()), b"packet-one");
+    assert_eq!(recv_packet(service.raw()), b"packet-two-longer");
+
+    for packet in [b"reply-a".as_slice(), b"reply-b-different".as_slice()] {
+        assert_eq!(
+            unsafe {
+                libc::send(
+                    service.raw(),
+                    packet.as_ptr().cast::<libc::c_void>(),
+                    packet.len(),
+                    libc::MSG_NOSIGNAL,
+                )
+            },
+            packet.len() as isize
+        );
+    }
+    assert_eq!(recv_packet(received.raw()), b"reply-a");
+    assert_eq!(recv_packet(received.raw()), b"reply-b-different");
+
+    let wrong_uid = expected_uid.wrapping_add(1);
+    assert!(matches!(
+        RuntimeFdBroker::prepare_host_unix_seqpacket(
+            &service_path,
+            Some((wrong_uid, expected_gid))
+        ),
+        Err(RuntimeFdBrokerError::HostUnixPeerCredentialMismatch {
+            expected_uid: uid,
+            expected_gid: gid,
+            ..
+        }) if uid == wrong_uid && gid == expected_gid
+    ));
+    assert!(matches!(
+        RuntimeFdBroker::prepare_host_unix_seqpacket("relative.sock", None),
+        Err(RuntimeFdBrokerError::InvalidConfiguration(_))
+    ));
+
+    drop(received);
+    drop(session);
+    drop(client);
+    drop(broker);
+    drop(service);
+    drop(listener);
 }
 
 #[test]

@@ -189,9 +189,9 @@ fn bounded_needed_binding_set_is_order_independent_exact_restriction() {
     let reduced = run_json(&baseline, &first);
     assert_eq!(reduced.status.code(), Some(0));
     let stdout = String::from_utf8(reduced.stdout).expect("utf8 output");
-    assert!(stdout.contains(
-        "\"field\":\"execution.executable_needed_binding\",\"class\":\"reduced\""
-    ));
+    assert!(
+        stdout.contains("\"field\":\"execution.executable_needed_binding\",\"class\":\"reduced\"")
+    );
 
     let same = run_json(&first, &reordered);
     assert_eq!(same.status.code(), Some(0));
@@ -201,9 +201,8 @@ fn bounded_needed_binding_set_is_order_independent_exact_restriction() {
     let incomparable = run_json(&first, &changed);
     assert_eq!(incomparable.status.code(), Some(6));
     let stdout = String::from_utf8(incomparable.stdout).expect("utf8 output");
-    assert!(stdout.contains(
-        "\"field\":\"execution.executable_needed_binding\",\"class\":\"incomparable\""
-    ));
+    assert!(stdout
+        .contains("\"field\":\"execution.executable_needed_binding\",\"class\":\"incomparable\""));
 }
 
 #[test]

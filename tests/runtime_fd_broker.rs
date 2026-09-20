@@ -620,6 +620,132 @@ fn prepared_host_unix_stream_connects_exact_peer_and_reuses_one_shot_grant_state
     std::fs::remove_file(&second_listener_path).unwrap();
 }
 
+#[test]
+fn host_unix_reconnect_controller_grants_two_fresh_connections_and_exhausts_bound() {
+    let service_path = unique_path("runtime-host-unix-reconnect-service.sock");
+    let broker_path = unique_path("runtime-host-unix-reconnect-broker.sock");
+    let _ = std::fs::remove_file(&service_path);
+    let _ = std::fs::remove_file(&broker_path);
+
+    let listener = UnixListener::bind(&service_path).expect("bind reconnect host UNIX service");
+    let broker = RuntimeFdBroker::bind(&broker_path).expect("bind reconnect runtime broker");
+    let mut client = UnixStream::connect(broker.path()).expect("connect reconnect runtime broker");
+    let expected_uid = unsafe { libc::geteuid() };
+    let expected_gid = unsafe { libc::getegid() };
+    let mut controller = broker
+        .accept_host_unix_reconnect_controller(
+            &service_path,
+            Some((expected_uid, expected_gid)),
+            2,
+        )
+        .expect("accept bounded reconnect controller");
+
+    assert_eq!(controller.max_connections(), 2);
+    assert_eq!(controller.granted_connections(), 0);
+    assert!(!controller.is_complete());
+    assert!(!controller.is_failed());
+
+    for (round, request, reply) in [
+        (1u8, b"reconnect-one\n".as_slice(), b"reconnect-one-ok\n".as_slice()),
+        (2u8, b"reconnect-two\n".as_slice(), b"reconnect-two-ok\n".as_slice()),
+    ] {
+        client.write_all(b"R").unwrap();
+        let credentials = controller
+            .grant_next(b'R')
+            .expect("grant fresh reconnect stream");
+        assert!(credentials.pid() > 0);
+        assert_eq!(credentials.uid(), expected_uid);
+        assert_eq!(credentials.gid(), expected_gid);
+        assert_eq!(controller.granted_connections(), round as u32);
+
+        let (mut service, _) = listener.accept().expect("accept fresh service connection");
+        let received = receive_one_fd(&client);
+
+        assert_eq!(
+            unsafe {
+                libc::write(
+                    received.raw(),
+                    request.as_ptr().cast::<libc::c_void>(),
+                    request.len(),
+                )
+            },
+            request.len() as isize
+        );
+        let mut observed = vec![0u8; request.len()];
+        service.read_exact(&mut observed).unwrap();
+        assert_eq!(observed, request);
+        service.write_all(reply).unwrap();
+        assert_eq!(read_exact_fd(received.raw(), reply.len()), reply);
+    }
+
+    assert!(controller.is_complete());
+    assert!(!controller.is_failed());
+    assert!(matches!(
+        controller.grant_next(b'R'),
+        Err(RuntimeFdBrokerError::Protocol(message))
+            if message.contains("exhausted its connection bound")
+    ));
+
+    drop(controller);
+    drop(client);
+    drop(broker);
+    drop(listener);
+    std::fs::remove_file(&service_path).unwrap();
+}
+
+#[test]
+fn host_unix_reconnect_controller_requires_readiness_before_connect_and_fails_terminally() {
+    let service_path = unique_path("runtime-host-unix-reconnect-ordering.sock");
+    let broker_path = unique_path("runtime-host-unix-reconnect-ordering-broker.sock");
+    let _ = std::fs::remove_file(&service_path);
+    let _ = std::fs::remove_file(&broker_path);
+
+    let listener = UnixListener::bind(&service_path).expect("bind ordering host UNIX service");
+    listener
+        .set_nonblocking(true)
+        .expect("make ordering listener nonblocking");
+    let broker = RuntimeFdBroker::bind(&broker_path).expect("bind ordering runtime broker");
+    let mut client = UnixStream::connect(broker.path()).expect("connect ordering runtime broker");
+    let mut controller = broker
+        .accept_host_unix_reconnect_controller(&service_path, None, 2)
+        .expect("accept ordering reconnect controller");
+
+    assert!(matches!(
+        listener.accept(),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+    ));
+
+    client.write_all(b"X").unwrap();
+    assert!(matches!(
+        controller.grant_next(b'R'),
+        Err(RuntimeFdBrokerError::Protocol(message))
+            if message.contains("expected reconnect readiness byte")
+    ));
+    assert!(controller.is_failed());
+    assert_eq!(controller.granted_connections(), 0);
+    assert!(matches!(
+        listener.accept(),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+    ));
+    assert!(matches!(
+        controller.grant_next(b'R'),
+        Err(RuntimeFdBrokerError::Protocol(message))
+            if message.contains("closed after a failed round")
+    ));
+
+    assert!(matches!(
+        broker.accept_host_unix_reconnect_controller(&service_path, None, 1),
+        Err(RuntimeFdBrokerError::InvalidConfiguration(message))
+            if message.contains("connection bound must be between")
+    ));
+
+    drop(controller);
+    drop(client);
+    drop(broker);
+    drop(listener);
+    std::fs::remove_file(&service_path).unwrap();
+}
+
 fn build_probe_root() -> PathBuf {
     let root = unique_path("runtime-rights-root");
     let _ = std::fs::remove_dir_all(&root);

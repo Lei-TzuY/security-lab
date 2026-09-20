@@ -1932,6 +1932,34 @@ fn copy_on_write_volume_diff_guarded_publication_binds_exact_launch_base() {
         max_bytes: 1024 * 1024,
         max_nodes: 100,
     };
+
+    let unbound = report
+        .cow_volume_diffs
+        .iter()
+        .find(|diff| diff.target == b"/cowb")
+        .expect("unbound COW volume diff");
+    match publish_cow_volume_diff_atomic(&second, &destination, unbound, replay_limits).unwrap_err() {
+        CowVolumePublicationError::UnboundDiff => {}
+        other => panic!("unexpected observation-only publication result: {other}"),
+    }
+    assert!(!destination.exists());
+
+    let wrong_base =
+        std::env::temp_dir().join(format!("security-lab-cow-publish-wrong-{}", process::id()));
+    let _ = std::fs::remove_dir_all(&wrong_base);
+    std::fs::create_dir_all(&wrong_base).unwrap();
+    match publish_cow_volume_diff_atomic(&wrong_base, &destination, bound, replay_limits)
+        .unwrap_err()
+    {
+        CowVolumePublicationError::SourcePathMismatch { expected, actual } => {
+            assert_eq!(expected, first.as_os_str().as_bytes());
+            assert_eq!(actual, wrong_base.as_os_str().as_bytes());
+        }
+        other => panic!("unexpected wrong-base publication result: {other}"),
+    }
+    assert!(!destination.exists());
+    let _ = std::fs::remove_dir_all(&wrong_base);
+
     let published =
         publish_cow_volume_diff_atomic(&first, &destination, bound, replay_limits).unwrap();
     assert_eq!(published.target, b"/cowa");

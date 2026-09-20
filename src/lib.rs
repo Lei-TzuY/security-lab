@@ -6,6 +6,7 @@
 mod cancellation;
 mod cow_diff_apply;
 mod cow_volume_publication;
+mod cow_volume_signature;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod elf_interpreter;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -37,6 +38,11 @@ pub use cow_diff_apply::{
 };
 pub use cow_volume_publication::{
     publish_cow_volume_diff_atomic, CowVolumePublicationError, CowVolumePublicationReport,
+};
+pub use cow_volume_signature::{
+    publish_cow_volume_diff_trusted_ed25519_atomic, sign_cow_volume_diff_ed25519,
+    verify_cow_volume_diff_ed25519, CowVolumeEd25519Error, CowVolumeEd25519Signature,
+    CowVolumeTrustedPublicationError, CowVolumeTrustedPublicationReport,
 };
 pub use policy::{
     CopyOnWriteVolumeBinding, ExecutableNeededBinding, PersistentVolumeBinding, PolicyError,

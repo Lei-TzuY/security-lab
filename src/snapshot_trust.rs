@@ -224,7 +224,7 @@ impl SnapshotTrustPolicy {
         Self::new(next_generation, keys)
     }
 
-    fn resolve_active(
+    pub(crate) fn resolve_active(
         &self,
         signer: SnapshotTrustKeyId,
     ) -> Result<&[u8; SNAPSHOT_ED25519_PUBLIC_KEY_BYTES], SnapshotTrustError> {

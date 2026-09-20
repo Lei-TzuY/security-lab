@@ -1813,8 +1813,32 @@ Boundary: 76A publishes a new snapshot only; it never writes back into or overwr
 
 ### Milestone 76 promotion rule
 
-After 76A integrates, do not farm publication aliases, wider identity ceilings, or overwrite variants. A further storage promotion must add a materially different lifecycle guarantee such as authenticated provenance for the bound diff/base evidence, durable/versioned publication semantics, or another independently bounded storage primitive.
+76A is sealed on `main`. Do not farm publication aliases, wider identity ceilings, or overwrite variants. A further storage promotion must add a materially different lifecycle guarantee such as authenticated provenance for the bound diff/base evidence, durable/versioned publication semantics, or another independently bounded storage primitive.
+
+## Milestone 77 — trusted COW publication evidence
+
+### Slice 77A — authenticate the complete guarded publication report under an explicit signer policy
+
+**Status: complete on `main`.** Connects the existing Ed25519 and bounded signer-trust machinery to 76A without weakening any of its base-freshness, replay, or no-replace publication gates.
+
+Acceptance evidence is executable:
+
+- `sign_cow_volume_diff_ed25519` accepts only a 76A report carrying both launch-time base identity and exact identity limits; observation-only or internally incomplete reports fail before signing;
+- a versioned/domain-separated SHA-256 evidence stream commits to exact source and sandbox-target bytes, base identity digest/encoded-byte/node accounting, identity byte/node limits, diff `encoded_bytes`, ordered record count, and every supported diff record including type, path, mode, regular-file bytes, and symlink target;
+- Ed25519 signs a separate versioned domain plus that evidence digest under one exact caller-supplied 32-byte signing seed; strict verification recomputes the digest from the supplied report and rejects any field mutation or signature corruption;
+- a deterministic fixed test vector locks the evidence digest, public key, and signature bytes for one complete report so the canonical cryptographic mapping is not merely self-consistent;
+- `publish_cow_volume_diff_trusted_ed25519_atomic` first resolves the requested signer through the existing bounded `SnapshotTrustPolicy`, requires that active policy key to equal the signature public key, and strictly verifies the complete evidence before any 76A filesystem publication step;
+- unknown/revoked signers fail before base/destination inspection, while an active signer can publish a real launcher-produced bound diff; changing the signed diff payload leaves the destination absent and fails at signature evidence instead of reaching replay;
+- successful trusted publication returns the unchanged 76A publication report plus the exact trust-policy identity, signer key ID, and evidence digest used for the decision;
+- the existing 76A source-path match, current-base identity, materialized-staging identity, bounded diff replay, destination-subtree exclusion, and single `RENAME_NOREPLACE` publication remain mandatory after authentication;
+- stable rustfmt, Clippy with `-D warnings`, complete stable tests, and Rust 1.74 are the integration gate.
+
+Boundary: 77A establishes cryptographic signature validity for the exact modeled 76A evidence under an active key in the caller-supplied trust-policy snapshot. It does not establish certificate-chain/human/organizational identity, key ownership/custody, hardware or remote attestation, persisted anti-rollback of the trust-policy snapshot, hostile-writer point-in-time freezing, fsync-backed publication durability, overwrite transactions, or inode/device object continuity.
+
+### Milestone 77 promotion rule
+
+After 77A integrates, do not add alternate signature aliases or larger evidence fields. A further provenance/lifecycle promotion must materially strengthen authority persistence or publication semantics, such as gating trusted COW publication through authenticated persisted trust-state, or durably/versionedly publishing the authenticated result through the existing snapshot-store lifecycle.
 
 ## Later frontiers
 
-Supplementary-group isolation with a viable mapping architecture, routed/broader network authority beyond the bounded IPv4 brokers, broader dynamic host-local IPC mediation beyond one exact bounded reconnect/revocation lifecycle, bounded loader search/interpreter closure or later-exec authority, authenticated or durable/versioned COW publication semantics, and delegated aggregate cgroup accounting remain separate evidence-backed frontiers. Do not add configuration-only names without executable kernel behavior and integration evidence.
+Supplementary-group isolation with a viable mapping architecture, routed/broader network authority beyond the bounded IPv4 brokers, broader dynamic host-local IPC mediation beyond one exact bounded reconnect/revocation lifecycle, bounded loader search/interpreter closure or later-exec authority, persisted-trust or durable/versioned authenticated COW publication semantics, and delegated aggregate cgroup accounting remain separate evidence-backed frontiers. Do not add configuration-only names without executable kernel behavior and integration evidence.

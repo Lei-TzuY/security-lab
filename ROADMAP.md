@@ -1843,7 +1843,7 @@ After 77A integrates, do not add alternate signature aliases or larger evidence 
 
 ### Slice 79A — target selects among an exact trusted AF_UNIX service allowlist
 
-**Current implementation candidate.** Promotes the 73A single-service reconnect lifecycle into bounded target selection across a small fixed allowlist without granting target pathname lookup or socket creation authority.
+**Status: complete on `main`.** Promotes the 73A single-service reconnect lifecycle into bounded target selection across a small fixed allowlist without granting target pathname lookup or socket creation authority.
 
 Acceptance evidence is executable:
 

@@ -741,6 +741,69 @@ fn transferred_host_unix_stream_can_be_revoked_after_grant() {
 }
 
 #[test]
+fn dropping_active_host_unix_revocation_controller_fails_closed() {
+    let service_path = unique_path("runtime-host-unix-drop-revoke-service.sock");
+    let broker_path = unique_path("runtime-host-unix-drop-revoke-broker.sock");
+    let _ = std::fs::remove_file(&service_path);
+    let _ = std::fs::remove_file(&broker_path);
+
+    let listener = UnixListener::bind(&service_path).expect("bind drop-revoke host UNIX service");
+    let grant = RuntimeFdBroker::prepare_host_unix_stream(&service_path, None)
+        .expect("prepare drop-revoke host UNIX stream");
+    let (_service, _) = listener
+        .accept()
+        .expect("accept drop-revoke host UNIX stream");
+
+    let broker = RuntimeFdBroker::bind(&broker_path).expect("bind drop-revoke runtime broker");
+    let mut client = UnixStream::connect(broker.path()).expect("connect drop-revoke runtime broker");
+    let mut session = broker.accept().expect("accept drop-revoke runtime broker");
+    client.write_all(b"R").unwrap();
+    session.wait_for_ready(b'R').unwrap();
+
+    let controller = session
+        .send_revocable_host_unix_stream(grant)
+        .expect("transfer drop-revoke host UNIX stream");
+    let received = receive_one_fd(&client);
+    drop(controller);
+
+    let mut byte = [0u8; 1];
+    assert_eq!(
+        unsafe {
+            libc::read(
+                received.raw(),
+                byte.as_mut_ptr().cast::<libc::c_void>(),
+                byte.len(),
+            )
+        },
+        0,
+        "dropping active revocation controller did not shut down target receive authority"
+    );
+    assert_eq!(
+        unsafe {
+            libc::send(
+                received.raw(),
+                b"x".as_ptr().cast::<libc::c_void>(),
+                1,
+                libc::MSG_NOSIGNAL,
+            )
+        },
+        -1,
+        "dropping active revocation controller left target send authority active"
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::EPIPE)
+    );
+
+    drop(received);
+    drop(session);
+    drop(client);
+    drop(broker);
+    drop(listener);
+    std::fs::remove_file(&service_path).unwrap();
+}
+
+#[test]
 fn host_unix_reconnect_controller_grants_two_fresh_connections_and_exhausts_bound() {
     let service_path = unique_path("runtime-host-unix-reconnect-service.sock");
     let broker_path = unique_path("runtime-host-unix-reconnect-broker.sock");

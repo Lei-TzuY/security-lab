@@ -6,7 +6,6 @@ _start:
     test %r13, %r13
     je .fail
     sub $192, %rsp
-    mov %rsp, %r15
     mov $-1, %r12
 
     # Round 1 readiness.
@@ -19,10 +18,44 @@ _start:
     cmp $1, %rax
     jne .fail_restore
 
-    call receive_one_fd
-    test %eax, %eax
+    # Receive exactly one SCM_RIGHTS descriptor with MSG_CMSG_CLOEXEC.
+    xor %eax, %eax
+    mov %rax, 0(%rsp)
+    mov %rax, 8(%rsp)
+    lea 64(%rsp), %rax
+    mov %rax, 16(%rsp)
+    movq $1, 24(%rsp)
+    lea 80(%rsp), %rax
+    mov %rax, 32(%rsp)
+    movq $24, 40(%rsp)
+    movq $0, 48(%rsp)
+    lea 144(%rsp), %rax
+    mov %rax, 64(%rsp)
+    movq $1, 72(%rsp)
+    movq $0, 80(%rsp)
+    movq $0, 88(%rsp)
+    movq $0, 96(%rsp)
+
+    mov $47, %eax
+    mov $10, %edi
+    mov %rsp, %rsi
+    mov $0x40000000, %edx
+    syscall
+    cmp $1, %rax
+    jne .fail_restore
+    cmpb $70, 144(%rsp)
+    jne .fail_restore
+    testl $8, 48(%rsp)
+    jne .fail_restore
+    cmpq $20, 80(%rsp)
+    jne .fail_restore
+    cmpl $1, 88(%rsp)
+    jne .fail_restore
+    cmpl $1, 92(%rsp)
+    jne .fail_restore
+    mov 96(%rsp), %r12d
+    test %r12d, %r12d
     js .fail_restore
-    mov %eax, %r12d
 
     mov $1, %eax
     mov %r12d, %edi
@@ -69,10 +102,44 @@ _start:
     cmp $1, %rax
     jne .fail_restore
 
-    call receive_one_fd
-    test %eax, %eax
+    # Receive exactly one SCM_RIGHTS descriptor with MSG_CMSG_CLOEXEC.
+    xor %eax, %eax
+    mov %rax, 0(%rsp)
+    mov %rax, 8(%rsp)
+    lea 64(%rsp), %rax
+    mov %rax, 16(%rsp)
+    movq $1, 24(%rsp)
+    lea 80(%rsp), %rax
+    mov %rax, 32(%rsp)
+    movq $24, 40(%rsp)
+    movq $0, 48(%rsp)
+    lea 144(%rsp), %rax
+    mov %rax, 64(%rsp)
+    movq $1, 72(%rsp)
+    movq $0, 80(%rsp)
+    movq $0, 88(%rsp)
+    movq $0, 96(%rsp)
+
+    mov $47, %eax
+    mov $10, %edi
+    mov %rsp, %rsi
+    mov $0x40000000, %edx
+    syscall
+    cmp $1, %rax
+    jne .fail_restore
+    cmpb $70, 144(%rsp)
+    jne .fail_restore
+    testl $8, 48(%rsp)
+    jne .fail_restore
+    cmpq $20, 80(%rsp)
+    jne .fail_restore
+    cmpl $1, 88(%rsp)
+    jne .fail_restore
+    cmpl $1, 92(%rsp)
+    jne .fail_restore
+    mov 96(%rsp), %r12d
+    test %r12d, %r12d
     js .fail_restore
-    mov %eax, %r12d
 
     mov $1, %eax
     mov %r12d, %edi
@@ -129,54 +196,6 @@ _start:
     xor %edi, %edi
     mov $60, %eax
     syscall
-
-# Returns received fd in eax, or -1 on any malformed ancillary message.
-receive_one_fd:
-    # CALL pushes a return address. Keep all msghdr/iovec/cmsg state anchored
-    # to the caller's reserved 192-byte frame through the stable r15 base.
-    xor %eax, %eax
-    mov %rax, 0(%r15)
-    mov %rax, 8(%r15)
-    lea 64(%r15), %rax
-    mov %rax, 16(%r15)
-    movq $1, 24(%r15)
-    lea 80(%r15), %rax
-    mov %rax, 32(%r15)
-    movq $24, 40(%r15)
-    movq $0, 48(%r15)
-
-    lea 144(%r15), %rax
-    mov %rax, 64(%r15)
-    movq $1, 72(%r15)
-    movq $0, 80(%r15)
-    movq $0, 88(%r15)
-    movq $0, 96(%r15)
-
-    mov $47, %eax
-    mov $10, %edi
-    mov %r15, %rsi
-    mov $0x40000000, %edx
-    syscall
-    cmp $1, %rax
-    jne .receive_fail
-    cmpb $70, 144(%r15)
-    jne .receive_fail
-    testl $8, 48(%r15)
-    jne .receive_fail
-    cmpq $20, 80(%r15)
-    jne .receive_fail
-    cmpl $1, 88(%r15)
-    jne .receive_fail
-    cmpl $1, 92(%r15)
-    jne .receive_fail
-    mov 96(%r15), %eax
-    test %eax, %eax
-    js .receive_fail
-    ret
-
-.receive_fail:
-    mov $-1, %eax
-    ret
 
 .fail_close:
     mov $3, %eax

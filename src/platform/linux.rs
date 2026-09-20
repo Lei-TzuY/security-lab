@@ -24,10 +24,11 @@ mod x86_64 {
     };
     use crate::elf_interpreter;
     use crate::elf_needed;
-    use crate::policy::{StdioMode, StdioPolicy};
+    use crate::policy::{StdioMode, StdioPolicy, MAX_PERSISTENT_VOLUME_BINDINGS};
     use crate::{
-        CancellationToken, CapturedOutput, ChildOutcome, EnforcementReceipt, PolicyError,
-        ProcessTreeUsage, ResourceLimits, RunReport, SandboxError, SandboxPolicy,
+        CancellationToken, CapturedOutput, ChildOutcome, CopyOnWriteVolumeDiff,
+        EnforcementReceipt, PolicyError, ProcessTreeUsage, ResourceLimits, RunReport,
+        SandboxError, SandboxPolicy,
     };
     use sha2::{Digest, Sha256};
     use std::collections::{BTreeMap, BTreeSet};
@@ -200,6 +201,7 @@ mod x86_64 {
     const PHASE_COW_VOLUME_OVERLAY_CREATE: u32 = 83;
     const PHASE_COW_VOLUME_OVERLAY_MOUNT: u32 = 84;
     const PHASE_COW_VOLUME_ATTACH: u32 = 85;
+    const PHASE_COW_VOLUME_DIFF_EXPORT: u32 = 86;
 
     const SYS_LANDLOCK_CREATE_RULESET: libc::c_long = 444;
     const SYS_LANDLOCK_ADD_RULE: libc::c_long = 445;
@@ -335,6 +337,7 @@ mod x86_64 {
         target_relative: CString,
         access: VolumeAccess,
         cow_size: Option<CString>,
+        cow_diff_slot: Option<usize>,
     }
 
     struct PreparedSealedMount {
@@ -918,6 +921,7 @@ mod x86_64 {
         target: &Path,
         access: VolumeAccess,
         cow_bytes: Option<u64>,
+        cow_diff_slot: Option<usize>,
     ) -> Result<PreparedVolume, SandboxError> {
         let (source_field, source_label, target_label) = match access {
             VolumeAccess::ReadOnly => (
@@ -952,6 +956,7 @@ mod x86_64 {
             cow_size: cow_bytes
                 .map(|bytes| cstring_bytes("volume.cow_bytes", bytes.to_string().as_bytes()))
                 .transpose()?,
+            cow_diff_slot,
         })
     }
 
@@ -1696,6 +1701,7 @@ mod x86_64 {
                     &volume.target,
                     VolumeAccess::ReadOnly,
                     None,
+                    None,
                 )?);
             }
             for volume in &writable_volumes {
@@ -1705,15 +1711,17 @@ mod x86_64 {
                     &volume.target,
                     VolumeAccess::Writable,
                     None,
+                    None,
                 )?);
             }
-            for volume in cow_volumes {
+            for (index, volume) in cow_volumes.iter().enumerate() {
                 volumes.push(prepare_volume(
                     root_fd.raw(),
                     &volume.source,
                     &volume.target,
                     VolumeAccess::CopyOnWrite,
                     Some(volume.bytes),
+                    volume.diff_bytes.map(|_| index),
                 )?);
             }
 
@@ -1845,6 +1853,8 @@ mod x86_64 {
         capture_write_fd: RawFd,
         output_limit_fd: RawFd,
         cow_diff_state: *mut CowDiffState,
+        cow_volume_diff_states: [*mut CowDiffState; MAX_PERSISTENT_VOLUME_BINDINGS],
+        cow_volume_diff_count: usize,
         wall_clock_milliseconds: u64,
     }
 

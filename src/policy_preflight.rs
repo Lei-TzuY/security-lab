@@ -689,9 +689,12 @@ seccomp.allow = execveat,exit
 
     #[test]
     fn copy_on_write_volume_remains_explicitly_unprobed_without_real_mount_namespace() {
-        let policy = policy(
-            "volume.cow_source = /srv/base\nvolume.cow_target = /data\nvolume.cow_bytes = 16777216",
-        );
+        let policy: SandboxPolicy = format!(
+            "{}\nvolume.cow_source = /srv/base\nvolume.cow_target = /data\nvolume.cow_bytes = 16777216\n",
+            BASE.replace("filesystem.root = /", "filesystem.root = /sandbox/root")
+        )
+        .parse()
+        .expect("valid preflight policy with disjoint COW source");
         let evaluated = evaluate_with_core(&policy, host(None), RequirementStatus::Supported);
         assert_eq!(
             evaluated.copy_on_write_volume_status(),
@@ -731,7 +734,7 @@ seccomp.allow = execveat,exit
         assert_eq!(report.exit_code(), 0);
         assert_eq!(
             report.to_json(),
-            "{\"ok\":true,\"preflight\":{\"kind\":\"policy_host_capability_match\",\"policy_preflight\":true,\"launch_attempted\":false,\"launch_preflight_complete\":false,\"status\":\"satisfied\",\"sandbox_target\":{\"status\":\"supported\",\"target_os\":\"linux\",\"target_arch\":\"x86_64\"},\"mandatory_launch_core\":{\"status\":\"supported\",\"reason\":null},\"landlock\":{\"status\":\"supported\",\"required_abi\":6,\"observed_abi\":7,\"errno\":null},\"deadline\":{\"status\":\"supported\",\"pidfd_open\":{\"available\":true,\"errno\":null},\"timerfd_monotonic\":{\"available\":true,\"errno\":null}},\"stdout_output_limit\":{\"status\":\"supported\",\"pidfd_open\":{\"available\":true,\"errno\":null},\"eventfd\":{\"available\":true,\"errno\":null}},\"time_namespace\":{\"status\":\"not_requested\",\"reason\":null},\"private_procfs\":{\"status\":\"not_requested\",\"reason\":null},\"copy_on_write_root\":{\"status\":\"not_requested\",\"reason\":null}}}"
+            "{\"ok\":true,\"preflight\":{\"kind\":\"policy_host_capability_match\",\"policy_preflight\":true,\"launch_attempted\":false,\"launch_preflight_complete\":false,\"status\":\"satisfied\",\"sandbox_target\":{\"status\":\"supported\",\"target_os\":\"linux\",\"target_arch\":\"x86_64\"},\"mandatory_launch_core\":{\"status\":\"supported\",\"reason\":null},\"landlock\":{\"status\":\"supported\",\"required_abi\":6,\"observed_abi\":7,\"errno\":null},\"deadline\":{\"status\":\"supported\",\"pidfd_open\":{\"available\":true,\"errno\":null},\"timerfd_monotonic\":{\"available\":true,\"errno\":null}},\"stdout_output_limit\":{\"status\":\"supported\",\"pidfd_open\":{\"available\":true,\"errno\":null},\"eventfd\":{\"available\":true,\"errno\":null}},\"time_namespace\":{\"status\":\"not_requested\",\"reason\":null},\"private_procfs\":{\"status\":\"not_requested\",\"reason\":null},\"copy_on_write_root\":{\"status\":\"not_requested\",\"reason\":null},\"copy_on_write_volume\":{\"status\":\"not_requested\",\"reason\":null}}}"
         );
     }
 

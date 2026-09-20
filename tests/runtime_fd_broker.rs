@@ -726,7 +726,7 @@ fn post_launch_host_unix_stream_grant_reaches_target_without_path_authority() {
          limit.address_space_bytes = 134217728\n\
          limit.file_size_bytes = 1048576\n\
          limit.open_files = 32\n\
-         seccomp.allow = execveat,write,recvmsg,read,close,openat,exit\n",
+         seccomp.allow = write,recvmsg,read,close,openat,exit\n",
         root.display(),
         service_path.display()
     );
@@ -734,6 +734,12 @@ fn post_launch_host_unix_stream_grant_reaches_target_without_path_authority() {
     broker
         .configure_policy(&mut policy, 10)
         .expect("configure runtime broker policy");
+    for syscall in ["socket", "connect", "execveat"] {
+        assert!(
+            !policy.seccomp.allowed_syscalls.contains(syscall),
+            "host UNIX object grant must not require target {syscall} authority"
+        );
+    }
 
     let grant = RuntimeFdBroker::prepare_host_unix_stream(
         &service_path,

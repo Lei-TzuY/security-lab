@@ -1,6 +1,8 @@
 use sha2::{Digest, Sha256};
 use std::error::Error;
 use std::fmt;
+#[cfg(target_os = "linux")]
+use std::os::unix::io::RawFd;
 use std::path::Path;
 
 const MAX_IDENTITY_BYTES: u64 = 1024 * 1024 * 1024;
@@ -105,6 +107,15 @@ pub fn snapshot_sha256(
                 .to_owned(),
         ))
     }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn snapshot_sha256_fd(
+    root_fd: RawFd,
+    limits: SnapshotIdentityLimits,
+) -> Result<SnapshotIdentity, SnapshotIdentityError> {
+    validate_limits(limits)?;
+    linux::snapshot_sha256_fd(root_fd, limits)
 }
 
 fn validate_limits(limits: SnapshotIdentityLimits) -> Result<(), SnapshotIdentityError> {
@@ -284,6 +295,39 @@ mod linux {
         identity.consume_node()?;
         identity.record_directory(b"/", root_stat.st_mode & 0o7777)?;
         hash_directory(root_fd.raw(), &[], 0, &mut identity)?;
+        Ok(identity.finish())
+    }
+
+    pub(super) fn snapshot_sha256_fd(
+        root_fd: RawFd,
+        limits: SnapshotIdentityLimits,
+    ) -> Result<SnapshotIdentity, SnapshotIdentityError> {
+        let dot = CString::new(".").expect("dot has no embedded NUL");
+        let readable_fd = unsafe {
+            libc::openat(
+                root_fd,
+                dot.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if readable_fd == -1 {
+            return Err(io_error(
+                "reopen pinned snapshot root",
+                io::Error::last_os_error(),
+            ));
+        }
+        let readable_fd = Fd(readable_fd);
+        let root_stat = stat_fd(readable_fd.raw(), "stat pinned snapshot root")?;
+        if root_stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
+            return Err(SnapshotIdentityError::InvalidInput(
+                "pinned snapshot root is not a directory".to_owned(),
+            ));
+        }
+
+        let mut identity = CanonicalHasher::new(limits)?;
+        identity.consume_node()?;
+        identity.record_directory(b"/", root_stat.st_mode & 0o7777)?;
+        hash_directory(readable_fd.raw(), &[], 0, &mut identity)?;
         Ok(identity.finish())
     }
 

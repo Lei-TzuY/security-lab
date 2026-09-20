@@ -25,6 +25,7 @@ mod x86_64 {
     use crate::elf_interpreter;
     use crate::elf_needed;
     use crate::policy::{StdioMode, StdioPolicy};
+    use crate::snapshot_identity::{self, SnapshotIdentity, SnapshotIdentityLimits};
     use crate::{
         CancellationToken, CapturedOutput, ChildOutcome, CowVolumeDiff, EnforcementReceipt,
         PolicyError, ProcessTreeUsage, ResourceLimits, RunReport, SandboxError, SandboxPolicy,
@@ -337,6 +338,8 @@ mod x86_64 {
         access: VolumeAccess,
         cow_size: Option<CString>,
         cow_diff_index: Option<usize>,
+        base_identity: Option<SnapshotIdentity>,
+        base_identity_limits: Option<SnapshotIdentityLimits>,
     }
 
     struct PreparedSealedMount {
@@ -921,6 +924,7 @@ mod x86_64 {
         access: VolumeAccess,
         cow_bytes: Option<u64>,
         cow_diff_index: Option<usize>,
+        base_identity_limits: Option<SnapshotIdentityLimits>,
     ) -> Result<PreparedVolume, SandboxError> {
         let (source_field, source_label, target_label) = match access {
             VolumeAccess::ReadOnly => (
@@ -940,6 +944,15 @@ mod x86_64 {
             ),
         };
         let source_fd = open_host_directory(source, source_label)?;
+        let base_identity = base_identity_limits
+            .map(|limits| snapshot_identity::snapshot_sha256_fd(source_fd.raw(), limits))
+            .transpose()
+            .map_err(|error| {
+                SandboxError::SetupFailed(format!(
+                    "cannot bind copy-on-write volume base identity for {}: {error}",
+                    source.display()
+                ))
+            })?;
         let target_check = open_beneath_root(
             root_fd,
             target,
@@ -956,6 +969,8 @@ mod x86_64 {
                 .map(|bytes| cstring_bytes("volume.cow_bytes", bytes.to_string().as_bytes()))
                 .transpose()?,
             cow_diff_index,
+            base_identity,
+            base_identity_limits,
         })
     }
 
@@ -1701,6 +1716,7 @@ mod x86_64 {
                     VolumeAccess::ReadOnly,
                     None,
                     None,
+                    None,
                 )?);
             }
             for volume in &writable_volumes {
@@ -1711,9 +1727,25 @@ mod x86_64 {
                     VolumeAccess::Writable,
                     None,
                     None,
+                    None,
                 )?);
             }
             for (cow_index, volume) in cow_volumes.iter().enumerate() {
+                let base_identity_limits = match (
+                    volume.base_identity_bytes,
+                    volume.base_identity_nodes,
+                ) {
+                    (Some(max_bytes), Some(max_nodes)) => Some(SnapshotIdentityLimits {
+                        max_bytes,
+                        max_nodes,
+                    }),
+                    (None, None) => None,
+                    _ => {
+                        return Err(SandboxError::InvalidPolicy(PolicyError::new(
+                            "volume.cow_base_identity_bytes and volume.cow_base_identity_nodes must be specified together",
+                        )));
+                    }
+                };
                 volumes.push(prepare_volume(
                     root_fd.raw(),
                     &volume.source,
@@ -1721,6 +1753,7 @@ mod x86_64 {
                     VolumeAccess::CopyOnWrite,
                     Some(volume.bytes),
                     Some(cow_index),
+                    base_identity_limits,
                 )?);
             }
 
@@ -1921,6 +1954,16 @@ mod x86_64 {
         )?;
         ensure_landlock_supported(policy)?;
         let prepared = PreparedLaunch::new(policy, cancellation)?;
+        let cow_volume_base_evidence = (0..policy.copy_on_write_volume_bindings.len())
+            .map(|index| {
+                prepared
+                    .volumes
+                    .iter()
+                    .find(|volume| volume.cow_diff_index == Some(index))
+                    .map(|volume| (volume.base_identity, volume.base_identity_limits))
+                    .unwrap_or((None, None))
+            })
+            .collect::<Vec<_>>();
         let seccomp = compile_seccomp(policy, prepared.executable_fd.raw())?;
         let launch_state = SharedLaunchState::new()?;
         let lifecycle = SharedTargetLifecycle::new().map_err(|err| {
@@ -2061,14 +2104,19 @@ mod x86_64 {
         let outcome = resolve_lifecycle_outcome(&lifecycle_record, output_limit_observed)?;
         let cow_diff = cow_diff.as_ref().map(SharedCowDiff::snapshot).transpose()?;
         let mut cow_volume_diff_reports = Vec::new();
-        for (binding, state) in policy
+        for (index, (binding, state)) in policy
             .copy_on_write_volume_bindings
             .iter()
             .zip(cow_volume_diffs.iter())
+            .enumerate()
         {
             if let Some(state) = state {
+                let (base_identity, base_identity_limits) = cow_volume_base_evidence[index];
                 cow_volume_diff_reports.push(CowVolumeDiff {
+                    source: binding.source.as_os_str().as_bytes().to_vec(),
                     target: binding.target.as_os_str().as_bytes().to_vec(),
+                    base_identity,
+                    base_identity_limits,
                     diff: state.snapshot()?,
                 });
             }

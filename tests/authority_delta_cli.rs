@@ -345,6 +345,67 @@ volume.cow_bytes = 1048576
 }
 
 #[test]
+fn copy_on_write_volume_base_identity_export_is_separate_observation_authority() {
+    let root = unique_absent_root("cow-volume-base-identity");
+    let base = base_policy(&root);
+    let mounted = format!(
+        "{base}volume.cow_source = /srv/base
+volume.cow_target = /state
+volume.cow_bytes = 1048576
+volume.cow_diff_bytes = 4096
+"
+    );
+    let bound = format!(
+        "{mounted}volume.cow_base_identity_bytes = 1048576
+volume.cow_base_identity_nodes = 200
+"
+    );
+    let larger = format!(
+        "{mounted}volume.cow_base_identity_bytes = 2097152
+volume.cow_base_identity_nodes = 400
+"
+    );
+    let mixed = format!(
+        "{mounted}volume.cow_base_identity_bytes = 2097152
+volume.cow_base_identity_nodes = 100
+"
+    );
+
+    let mounted = TempPolicy::new("cow-identity-unbound", &mounted);
+    let bound = TempPolicy::new("cow-identity-bound", &bound);
+    let larger = TempPolicy::new("cow-identity-larger", &larger);
+    let mixed = TempPolicy::new("cow-identity-mixed", &mixed);
+
+    let widened = run_json(&mounted, &bound);
+    assert_eq!(widened.status.code(), Some(5));
+    let stdout = String::from_utf8(widened.stdout).expect("utf8 output");
+    assert!(stdout.contains(
+        r#""field":"filesystem.copy_on_write_volume_base_identity_export","class":"widened""#
+    ));
+
+    let reduced = run_json(&bound, &mounted);
+    assert_eq!(reduced.status.code(), Some(0));
+    let stdout = String::from_utf8(reduced.stdout).expect("utf8 output");
+    assert!(stdout.contains(
+        r#""field":"filesystem.copy_on_write_volume_base_identity_export","class":"reduced""#
+    ));
+
+    let enlarged = run_json(&bound, &larger);
+    assert_eq!(enlarged.status.code(), Some(5));
+    let stdout = String::from_utf8(enlarged.stdout).expect("utf8 output");
+    assert!(stdout.contains(
+        r#""field":"filesystem.copy_on_write_volume_base_identity_export","class":"widened""#
+    ));
+
+    let incomparable = run_json(&bound, &mixed);
+    assert_eq!(incomparable.status.code(), Some(6));
+    let stdout = String::from_utf8(incomparable.stdout).expect("utf8 output");
+    assert!(stdout.contains(
+        r#""field":"filesystem.copy_on_write_volume_base_identity_export","class":"incomparable""#
+    ));
+}
+
+#[test]
 fn copy_on_write_root_is_modeled_as_ephemeral_write_authority() {
     let root = unique_absent_root("cow-root");
     let baseline_text = base_policy(&root);

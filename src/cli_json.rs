@@ -25,9 +25,29 @@ pub(crate) fn report_json(report: &RunReport) -> String {
         if index != 0 {
             output.push(',');
         }
-        output.push_str("{\"target_encoding\":\"hex\",\"target\":\"");
+        output.push_str("{\"source_encoding\":\"hex\",\"source\":\"");
+        push_hex(&mut output, &volume.source);
+        output.push_str("\",\"target_encoding\":\"hex\",\"target\":\"");
         push_hex(&mut output, &volume.target);
-        output.push_str("\",\"diff\":");
+        output.push_str("\",\"base_identity\":");
+        match (volume.base_identity, volume.base_identity_limits) {
+            (Some(identity), Some(limits)) => {
+                output.push_str("{\"sha256\":\"");
+                push_hex(&mut output, &identity.sha256);
+                output.push_str("\",\"encoded_bytes\":");
+                write!(&mut output, "{}", identity.encoded_bytes)
+                    .expect("write to String cannot fail");
+                output.push_str(",\"nodes\":");
+                write!(&mut output, "{}", identity.nodes).expect("write to String cannot fail");
+                output.push_str(",\"limit_bytes\":");
+                write!(&mut output, "{}", limits.max_bytes).expect("write to String cannot fail");
+                output.push_str(",\"limit_nodes\":");
+                write!(&mut output, "{}", limits.max_nodes).expect("write to String cannot fail");
+                output.push('}');
+            }
+            _ => output.push_str("null"),
+        }
+        output.push_str(",\"diff\":");
         push_cow_diff(&mut output, &volume.diff);
         output.push('}');
     }
@@ -281,7 +301,10 @@ mod tests {
             stdout: None,
             cow_diff: None,
             cow_volume_diffs: vec![security_lab::CowVolumeDiff {
+                source: b"/srv/state\xff".to_vec(),
                 target: b"/state\xff".to_vec(),
+                base_identity: None,
+                base_identity_limits: None,
                 diff: CowDiff {
                     entries: vec![CowDiffEntry::Remove {
                         path: b"/old".to_vec(),
@@ -295,7 +318,7 @@ mod tests {
         };
         let json = report_json(&report);
         assert!(json.contains(
-            "\"cow_volume_diffs\":[{\"target_encoding\":\"hex\",\"target\":\"2f7374617465ff\",\"diff\":{\"encoded_bytes\":23"
+            "\"cow_volume_diffs\":[{\"source_encoding\":\"hex\",\"source\":\"2f7372762f7374617465ff\",\"target_encoding\":\"hex\",\"target\":\"2f7374617465ff\",\"base_identity\":null,\"diff\":{\"encoded_bytes\":23"
         ));
         assert!(
             json.contains("\"kind\":\"remove\",\"path_encoding\":\"hex\",\"path\":\"2f6f6c64\"")

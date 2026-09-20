@@ -1569,7 +1569,7 @@ After 63A integrates, do not farm acknowledgment digest algorithms, extra ACK fl
 
 ### Slice 64A — fail closed on unbound direct `DT_NEEDED` edges
 
-**Current implementation candidate.** Strengthens the existing 49B binding from one selected direct dependency to complete direct-dependency closure for the supported single-path topology, without adding another policy slot or pretending to resolve general loader search.
+**Status: complete on `main`.** Strengthens the existing 49B binding from one selected direct dependency to complete direct-dependency closure for the supported single-path topology, without adding another policy slot or pretending to resolve general loader search.
 
 Acceptance evidence is executable:
 

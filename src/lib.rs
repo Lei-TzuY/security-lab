@@ -36,9 +36,8 @@ pub use cow_diff_apply::{
 };
 pub use policy::{
     CopyOnWriteVolumeBinding, ExecutableNeededBinding, PersistentVolumeBinding, PolicyError,
-    ResourceLimits, SandboxPolicy,
-    SeccompArgRangeRule, SeccompArgRule, SeccompPolicy, StdioMode, StdioPolicy,
-    MAX_EXECUTABLE_NEEDED_BINDINGS, MAX_PERSISTENT_VOLUME_BINDINGS,
+    ResourceLimits, SandboxPolicy, SeccompArgRangeRule, SeccompArgRule, SeccompPolicy, StdioMode,
+    StdioPolicy, MAX_EXECUTABLE_NEEDED_BINDINGS, MAX_PERSISTENT_VOLUME_BINDINGS,
 };
 pub use report::{
     CapturedOutput, ChildOutcome, CowDiff, CowDiffEntry, EnforcementReceipt, ProcessTreeUsage,

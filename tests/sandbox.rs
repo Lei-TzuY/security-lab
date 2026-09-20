@@ -1,10 +1,10 @@
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 
 use security_lab::{
-    run, run_report, run_report_with_cancel, CancellationToken, ChildOutcome, CowDiffEntry,
-    CopyOnWriteVolumeBinding, ExecutableNeededBinding, PersistentVolumeBinding, ResourceLimits,
-    SandboxError, SandboxPolicy,
-    SeccompArgRangeRule, SeccompArgRule, SeccompPolicy, StdioMode, StdioPolicy,
+    run, run_report, run_report_with_cancel, CancellationToken, ChildOutcome,
+    CopyOnWriteVolumeBinding, CowDiffEntry, ExecutableNeededBinding, PersistentVolumeBinding,
+    ResourceLimits, SandboxError, SandboxPolicy, SeccompArgRangeRule, SeccompArgRule,
+    SeccompPolicy, StdioMode, StdioPolicy,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -533,8 +533,8 @@ fn cow_volume_source() -> &'static Path {
     static SOURCE: OnceLock<PathBuf> = OnceLock::new();
     SOURCE
         .get_or_init(|| {
-            let source = std::env::temp_dir()
-                .join(format!("security-lab-cow-volume-{}", process::id()));
+            let source =
+                std::env::temp_dir().join(format!("security-lab-cow-volume-{}", process::id()));
             let _ = std::fs::remove_dir_all(&source);
             std::fs::create_dir_all(&source).expect("create copy-on-write volume source");
             std::fs::write(source.join("original"), b"host-original\n")
@@ -1780,11 +1780,7 @@ fn copy_on_write_persistent_volume_is_private_and_ephemeral() {
     std::fs::write(&original, b"host-original\n").unwrap();
 
     for _ in 0..2 {
-        let mut mounted = policy(
-            "unused",
-            &[],
-            &["openat", "read", "write", "close", "exit"],
-        );
+        let mut mounted = policy("unused", &[], &["openat", "read", "write", "close", "exit"]);
         mounted.executable = PathBuf::from("/cow-volume-probe");
         mounted.copy_on_write_volume_bindings = vec![CopyOnWriteVolumeBinding {
             source: source.clone(),

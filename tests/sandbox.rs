@@ -1792,6 +1792,8 @@ fn copy_on_write_persistent_volume_is_private_and_ephemeral() {
             target: PathBuf::from("/cowdata"),
             bytes: 1024 * 1024,
             diff_bytes: None,
+            base_identity_bytes: None,
+            base_identity_nodes: None,
         }];
 
         assert_eq!(run(&mounted).unwrap(), ChildOutcome::Exited(0));
@@ -1814,6 +1816,8 @@ fn copy_on_write_persistent_volume_enforces_private_byte_ceiling() {
         target: PathBuf::from("/cowdata"),
         bytes: 4096,
         diff_bytes: None,
+            base_identity_bytes: None,
+            base_identity_nodes: None,
     }];
 
     assert_eq!(run(&mounted).unwrap(), ChildOutcome::Exited(0));
@@ -1837,12 +1841,16 @@ fn copy_on_write_volume_diffs_are_isolated_and_target_sorted() {
             target: PathBuf::from("/cowb"),
             bytes: 1024 * 1024,
             diff_bytes: Some(4096),
+            base_identity_bytes: None,
+            base_identity_nodes: None,
         },
         CopyOnWriteVolumeBinding {
             source: first.clone(),
             target: PathBuf::from("/cowa"),
             bytes: 1024 * 1024,
             diff_bytes: Some(4096),
+            base_identity_bytes: None,
+            base_identity_nodes: None,
         },
     ];
 
@@ -1891,12 +1899,16 @@ fn copy_on_write_volume_diff_omits_unrequested_volume() {
             target: PathBuf::from("/cowa"),
             bytes: 1024 * 1024,
             diff_bytes: Some(4096),
+            base_identity_bytes: None,
+            base_identity_nodes: None,
         },
         CopyOnWriteVolumeBinding {
             source: second.clone(),
             target: PathBuf::from("/cowb"),
             bytes: 1024 * 1024,
             diff_bytes: None,
+            base_identity_bytes: None,
+            base_identity_nodes: None,
         },
     ];
 
@@ -1933,6 +1945,8 @@ fn copy_on_write_volume_diff_overflow_fails_closed() {
         target: PathBuf::from("/cowdata"),
         bytes: 1024 * 1024,
         diff_bytes: Some(64),
+            base_identity_bytes: None,
+            base_identity_nodes: None,
     }];
 
     match run_report(&mounted).unwrap_err() {

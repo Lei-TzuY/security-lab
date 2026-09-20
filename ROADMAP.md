@@ -1590,7 +1590,7 @@ After 64A integrates, do not add second/third direct path slots. The next execut
 
 ### Slice 65A — reject transitive `DT_NEEDED` beneath the sealed direct object
 
-**Current implementation candidate.** Extends the execution-integrity chain one real loader edge beyond 64A without adding another configured dependency slot: the sole sealed direct dependency must itself be a bounded ELF64 x86_64 `DT_NEEDED` leaf.
+**Status: complete on `main`.** Extends the execution-integrity chain one real loader edge beyond 64A without adding another configured dependency slot: the sole sealed direct dependency must itself be a bounded ELF64 x86_64 `DT_NEEDED` leaf.
 
 Acceptance evidence is executable:
 

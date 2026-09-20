@@ -20,13 +20,8 @@ pub struct CowVolumePublicationReport {
 pub enum CowVolumePublicationError {
     UnboundDiff,
     IncompleteBinding,
-    SourcePathMismatch {
-        expected: Vec<u8>,
-        actual: Vec<u8>,
-    },
-    Apply {
-        source: CowDiffApplyError,
-    },
+    SourcePathMismatch { expected: Vec<u8>, actual: Vec<u8> },
+    Apply { source: CowDiffApplyError },
 }
 
 impl fmt::Display for CowVolumePublicationError {
@@ -35,9 +30,9 @@ impl fmt::Display for CowVolumePublicationError {
             Self::UnboundDiff => f.write_str(
                 "COW volume diff is observation-only and has no launch-time base identity binding",
             ),
-            Self::IncompleteBinding => f.write_str(
-                "COW volume diff has inconsistent base identity evidence",
-            ),
+            Self::IncompleteBinding => {
+                f.write_str("COW volume diff has inconsistent base identity evidence")
+            }
             Self::SourcePathMismatch { expected, actual } => write!(
                 f,
                 "COW volume publication source path mismatch: expected={:?} actual={:?}",
@@ -89,14 +84,12 @@ pub fn publish_cow_volume_diff_atomic(
         });
     }
 
-    let (expected_base, identity_limits) = match (
-        volume_diff.base_identity,
-        volume_diff.base_identity_limits,
-    ) {
-        (Some(identity), Some(limits)) => (identity, limits),
-        (None, None) => return Err(CowVolumePublicationError::UnboundDiff),
-        _ => return Err(CowVolumePublicationError::IncompleteBinding),
-    };
+    let (expected_base, identity_limits) =
+        match (volume_diff.base_identity, volume_diff.base_identity_limits) {
+            (Some(identity), Some(limits)) => (identity, limits),
+            (None, None) => return Err(CowVolumePublicationError::UnboundDiff),
+            _ => return Err(CowVolumePublicationError::IncompleteBinding),
+        };
 
     let replay = apply_cow_diff_atomic_with_expected_base(
         base,

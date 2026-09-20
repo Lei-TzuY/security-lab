@@ -290,8 +290,8 @@ impl Error for RuntimeFdBrokerError {
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod imp {
     use super::{
-        File, HostUnixPeerCredentials, Path, RuntimeCorrelatedRequest, RuntimeFdBrokerError,
-        SandboxPolicy,
+        File, HostUnixPeerCredentials, HostUnixRouteGrant, Path, RuntimeCorrelatedRequest,
+        RuntimeFdBrokerError, RuntimeHostUnixRoute, SandboxPolicy,
     };
     use hmac::{Hmac, Mac};
     use sha2::{Digest, Sha256};
@@ -2387,6 +2387,117 @@ mod imp {
         failed: bool,
     }
 
+    #[derive(Debug)]
+    pub struct RuntimeHostUnixRouterController {
+        stream: UnixStream,
+        routes: Vec<RuntimeHostUnixRoute>,
+        granted_connections: Vec<u32>,
+        total_granted_connections: u32,
+        failed: bool,
+    }
+
+    impl RuntimeHostUnixRouterController {
+        pub fn route_count(&self) -> usize {
+            self.routes.len()
+        }
+
+        pub fn granted_connections(&self, route_index: usize) -> Option<u32> {
+            self.granted_connections.get(route_index).copied()
+        }
+
+        pub fn max_connections(&self, route_index: usize) -> Option<u32> {
+            self.routes
+                .get(route_index)
+                .map(RuntimeHostUnixRoute::max_connections)
+        }
+
+        pub fn total_granted_connections(&self) -> u32 {
+            self.total_granted_connections
+        }
+
+        pub fn is_complete(&self) -> bool {
+            !self.failed
+                && self
+                    .routes
+                    .iter()
+                    .zip(&self.granted_connections)
+                    .all(|(route, granted)| *granted == route.max_connections)
+        }
+
+        pub fn is_failed(&self) -> bool {
+            self.failed
+        }
+
+        pub fn grant_next(
+            &mut self,
+            expected_ready: u8,
+        ) -> Result<HostUnixRouteGrant, RuntimeFdBrokerError> {
+            if self.failed {
+                return Err(RuntimeFdBrokerError::Protocol(
+                    "runtime host UNIX router controller is closed after a failed round".to_owned(),
+                ));
+            }
+            if self.is_complete() {
+                return Err(RuntimeFdBrokerError::Protocol(
+                    "runtime host UNIX router controller exhausted all route bounds".to_owned(),
+                ));
+            }
+
+            let mut request = [0u8; 2];
+            if let Err(error) = self.stream.read_exact(&mut request) {
+                self.failed = true;
+                return Err(RuntimeFdBrokerError::io(
+                    "cannot read runtime host UNIX route request",
+                    error,
+                ));
+            }
+            if request[0] != expected_ready {
+                self.failed = true;
+                return Err(RuntimeFdBrokerError::Protocol(format!(
+                    "expected router readiness byte 0x{expected_ready:02x}, got 0x{:02x}",
+                    request[0]
+                )));
+            }
+            let route_index = request[1] as usize;
+            let Some(route) = self.routes.get(route_index) else {
+                self.failed = true;
+                return Err(RuntimeFdBrokerError::Protocol(format!(
+                    "runtime host UNIX router selected unknown route index {route_index}"
+                )));
+            };
+            if self.granted_connections[route_index] >= route.max_connections {
+                self.failed = true;
+                return Err(RuntimeFdBrokerError::Protocol(format!(
+                    "runtime host UNIX router route {route_index} exhausted its connection bound"
+                )));
+            }
+
+            let grant = match prepare_host_unix_stream(&route.service_path, route.expected_peer) {
+                Ok(grant) => grant,
+                Err(error) => {
+                    self.failed = true;
+                    return Err(error);
+                }
+            };
+            let credentials = HostUnixPeerCredentials {
+                pid: grant.peer_pid,
+                uid: grant.peer_uid,
+                gid: grant.peer_gid,
+            };
+            if let Err(error) = send_fds(self.stream.as_raw_fd(), &[grant.stream.as_raw_fd()]) {
+                self.failed = true;
+                return Err(error);
+            }
+
+            self.granted_connections[route_index] += 1;
+            self.total_granted_connections += 1;
+            Ok(HostUnixRouteGrant {
+                route_index,
+                credentials,
+            })
+        }
+    }
+
     impl RuntimeHostUnixReconnectController {
         pub fn max_connections(&self) -> u32 {
             self.max_connections
@@ -2554,6 +2665,58 @@ mod imp {
         /// it is a separate opt-in state machine with an explicit 2-8 connection
         /// ceiling. The service is not connected until each target readiness byte
         /// has been consumed.
+        /// Accept the target broker channel as a bounded router across 2-4
+        /// pre-authorized exact host filesystem AF_UNIX services.
+        ///
+        /// Each target round sends [readiness, route_index]. Only after that
+        /// request is consumed does the trusted controller connect to the
+        /// selected route, revalidate its optional SO_PEERCRED pin, and transfer
+        /// the connected stream. Every route carries its own 1-8 connection
+        /// ceiling.
+        pub fn accept_host_unix_router_controller(
+            &self,
+            routes: Vec<RuntimeHostUnixRoute>,
+        ) -> Result<RuntimeHostUnixRouterController, RuntimeFdBrokerError> {
+            if !(super::MIN_RUNTIME_HOST_UNIX_ROUTER_SERVICES
+                ..=super::MAX_RUNTIME_HOST_UNIX_ROUTER_SERVICES)
+                .contains(&routes.len())
+            {
+                return Err(RuntimeFdBrokerError::InvalidConfiguration(format!(
+                    "runtime host UNIX router service count must be between {} and {}",
+                    super::MIN_RUNTIME_HOST_UNIX_ROUTER_SERVICES,
+                    super::MAX_RUNTIME_HOST_UNIX_ROUTER_SERVICES
+                )));
+            }
+            let mut seen_paths = BTreeSet::new();
+            for route in &routes {
+                validate_socket_path(&route.service_path)?;
+                if !(super::MIN_RUNTIME_HOST_UNIX_ROUTE_CONNECTIONS
+                    ..=super::MAX_RUNTIME_HOST_UNIX_ROUTE_CONNECTIONS)
+                    .contains(&route.max_connections)
+                {
+                    return Err(RuntimeFdBrokerError::InvalidConfiguration(format!(
+                        "runtime host UNIX router per-route connection bound must be between {} and {}",
+                        super::MIN_RUNTIME_HOST_UNIX_ROUTE_CONNECTIONS,
+                        super::MAX_RUNTIME_HOST_UNIX_ROUTE_CONNECTIONS
+                    )));
+                }
+                if !seen_paths.insert(route.service_path.clone()) {
+                    return Err(RuntimeFdBrokerError::InvalidConfiguration(
+                        "runtime host UNIX router service paths must be unique".to_owned(),
+                    ));
+                }
+            }
+            let granted_connections = vec![0; routes.len()];
+            let stream = self.accept_trusted_stream()?;
+            Ok(RuntimeHostUnixRouterController {
+                stream,
+                routes,
+                granted_connections,
+                total_granted_connections: 0,
+                failed: false,
+            })
+        }
+
         pub fn accept_host_unix_reconnect_controller(
             &self,
             service_path: impl AsRef<Path>,
@@ -3721,8 +3884,8 @@ mod imp {
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
 mod imp {
     use super::{
-        File, HostUnixPeerCredentials, Path, RuntimeCorrelatedRequest, RuntimeFdBrokerError,
-        SandboxPolicy,
+        File, HostUnixPeerCredentials, HostUnixRouteGrant, Path, RuntimeCorrelatedRequest,
+        RuntimeFdBrokerError, RuntimeHostUnixRoute, SandboxPolicy,
     };
 
     #[derive(Debug)]
@@ -4119,6 +4282,44 @@ mod imp {
     #[derive(Debug)]
     pub struct RuntimeHostUnixReconnectController;
 
+    #[derive(Debug)]
+    pub struct RuntimeHostUnixRouterController;
+
+    impl RuntimeHostUnixRouterController {
+        pub fn route_count(&self) -> usize {
+            0
+        }
+
+        pub fn granted_connections(&self, _route_index: usize) -> Option<u32> {
+            None
+        }
+
+        pub fn max_connections(&self, _route_index: usize) -> Option<u32> {
+            None
+        }
+
+        pub fn total_granted_connections(&self) -> u32 {
+            0
+        }
+
+        pub fn is_complete(&self) -> bool {
+            false
+        }
+
+        pub fn is_failed(&self) -> bool {
+            false
+        }
+
+        pub fn grant_next(
+            &mut self,
+            _expected_ready: u8,
+        ) -> Result<HostUnixRouteGrant, RuntimeFdBrokerError> {
+            Err(RuntimeFdBrokerError::UnsupportedPlatform(
+                "runtime host UNIX router controllers currently require Linux x86_64".to_owned(),
+            ))
+        }
+    }
+
     impl RuntimeHostUnixReconnectController {
         pub fn max_connections(&self) -> u32 {
             0
@@ -4170,6 +4371,15 @@ mod imp {
         pub fn accept(&self) -> Result<RuntimeFdSession, RuntimeFdBrokerError> {
             Err(RuntimeFdBrokerError::UnsupportedPlatform(
                 "runtime FD mediation currently requires Linux x86_64".to_owned(),
+            ))
+        }
+
+        pub fn accept_host_unix_router_controller(
+            &self,
+            _routes: Vec<RuntimeHostUnixRoute>,
+        ) -> Result<RuntimeHostUnixRouterController, RuntimeFdBrokerError> {
+            Err(RuntimeFdBrokerError::UnsupportedPlatform(
+                "runtime host UNIX router controllers currently require Linux x86_64".to_owned(),
             ))
         }
 

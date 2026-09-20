@@ -340,9 +340,8 @@ volume.cow_bytes = 1048576
     let enlarged = run_json(&exported, &larger);
     assert_eq!(enlarged.status.code(), Some(5));
     let stdout = String::from_utf8(enlarged.stdout).expect("utf8 output");
-    assert!(stdout.contains(
-        r#""field":"filesystem.copy_on_write_volume_diff_export","class":"widened""#
-    ));
+    assert!(stdout
+        .contains(r#""field":"filesystem.copy_on_write_volume_diff_export","class":"widened""#));
 }
 
 #[test]

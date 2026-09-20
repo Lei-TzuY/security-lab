@@ -186,28 +186,16 @@ pub(crate) fn compare(baseline: &SandboxPolicy, candidate: &SandboxPolicy) -> Au
     compare_copy_on_write_root(baseline, candidate, &mut changes);
     compare_copy_on_write_diff(baseline, candidate, &mut changes);
     compare_scratch(baseline, candidate, &mut changes);
-    compare_optional_capability(
+    compare_capability_set(
         "filesystem.read_only_volume",
-        baseline
-            .readonly_volume_source
-            .as_ref()
-            .zip(baseline.readonly_volume_target.as_ref()),
-        candidate
-            .readonly_volume_source
-            .as_ref()
-            .zip(candidate.readonly_volume_target.as_ref()),
+        baseline.normalized_readonly_volume_bindings(),
+        candidate.normalized_readonly_volume_bindings(),
         &mut changes,
     );
-    compare_optional_capability(
+    compare_capability_set(
         "filesystem.writable_volume",
-        baseline
-            .writable_volume_source
-            .as_ref()
-            .zip(baseline.writable_volume_target.as_ref()),
-        candidate
-            .writable_volume_source
-            .as_ref()
-            .zip(candidate.writable_volume_target.as_ref()),
+        baseline.normalized_writable_volume_bindings(),
+        candidate.normalized_writable_volume_bindings(),
         &mut changes,
     );
 
@@ -708,6 +696,26 @@ fn compare_optional_capability<T: PartialEq>(
         (Some(_), None) => DeltaClass::Reduced,
         (Some(base), Some(new)) if base == new => DeltaClass::Unchanged,
         (Some(_), Some(_)) => DeltaClass::Incomparable,
+    };
+    push_change(field, class, changes);
+}
+
+fn compare_capability_set<T: Ord>(
+    field: &'static str,
+    baseline: Vec<T>,
+    candidate: Vec<T>,
+    changes: &mut Vec<Change>,
+) {
+    let baseline = baseline.into_iter().collect::<BTreeSet<_>>();
+    let candidate = candidate.into_iter().collect::<BTreeSet<_>>();
+    let class = if baseline == candidate {
+        DeltaClass::Unchanged
+    } else if baseline.is_subset(&candidate) {
+        DeltaClass::Widened
+    } else if candidate.is_subset(&baseline) {
+        DeltaClass::Reduced
+    } else {
+        DeltaClass::Incomparable
     };
     push_change(field, class, changes);
 }

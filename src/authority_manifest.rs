@@ -469,8 +469,8 @@ pub(crate) fn to_human(policy: &SandboxPolicy) -> String {
     writeln!(
         &mut output,
         "host-filesystem-volumes: read-only={} writable={}",
-        policy.readonly_volume_source.is_some() as u8,
-        policy.writable_volume_source.is_some() as u8
+        policy.normalized_readonly_volume_bindings().len(),
+        policy.normalized_writable_volume_bindings().len()
     )
     .expect("write to String cannot fail");
     writeln!(

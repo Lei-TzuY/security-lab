@@ -16,6 +16,30 @@ pub const MAX_RUNTIME_MESSAGE_RESPONSE_WAIT_MILLISECONDS: u64 = 86_400_000;
 pub const MAX_RUNTIME_MULTI_MESSAGE_SESSION_MILLISECONDS: u64 = 86_400_000;
 pub const MIN_RUNTIME_MULTI_MESSAGE_ROUNDS: u32 = 2;
 pub const MAX_RUNTIME_MULTI_MESSAGE_ROUNDS: u32 = 32;
+pub const MIN_RUNTIME_CORRELATED_REQUESTS: u32 = 2;
+pub const MAX_RUNTIME_CORRELATED_REQUESTS: u32 = 32;
+pub const MIN_RUNTIME_CORRELATED_IN_FLIGHT: u32 = 2;
+pub const MAX_RUNTIME_CORRELATED_IN_FLIGHT: u32 = 8;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeCorrelatedRequest {
+    request_id: u64,
+    payload: Vec<u8>,
+}
+
+impl RuntimeCorrelatedRequest {
+    pub fn request_id(&self) -> u64 {
+        self.request_id
+    }
+
+    pub fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+
+    pub fn into_payload(self) -> Vec<u8> {
+        self.payload
+    }
+}
 
 #[derive(Debug)]
 pub enum RuntimeFdBrokerError {
@@ -48,6 +72,12 @@ pub enum RuntimeFdBrokerError {
     },
     RuntimeSessionTimedOut {
         limit_milliseconds: u64,
+    },
+    RuntimeDuplicateRequestId {
+        request_id: u64,
+    },
+    RuntimeUnknownRequestId {
+        request_id: u64,
     },
     UnexpectedPeer {
         expected_pid: i32,
@@ -115,6 +145,14 @@ impl fmt::Display for RuntimeFdBrokerError {
                 f,
                 "runtime FD broker multi-message session lifetime exceeded {limit_milliseconds} ms"
             ),
+            Self::RuntimeDuplicateRequestId { request_id } => write!(
+                f,
+                "runtime FD broker correlated request id {request_id} was already observed"
+            ),
+            Self::RuntimeUnknownRequestId { request_id } => write!(
+                f,
+                "runtime FD broker correlated response references non-pending request id {request_id}"
+            ),
             Self::UnexpectedPeer {
                 expected_pid,
                 expected_uid,
@@ -144,7 +182,8 @@ impl Error for RuntimeFdBrokerError {
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod imp {
-    use super::{File, Path, RuntimeFdBrokerError, SandboxPolicy};
+    use super::{File, Path, RuntimeCorrelatedRequest, RuntimeFdBrokerError, SandboxPolicy};
+    use std::collections::BTreeSet;
     use std::ffi::CString;
     use std::io::Read;
     use std::os::unix::ffi::OsStrExt;
@@ -396,6 +435,28 @@ mod imp {
         max_rounds: u32,
         completed_rounds: u32,
         session_deadline: Option<SessionDeadlineTimer>,
+    }
+
+    #[derive(Debug)]
+    pub struct RuntimeCorrelatedMessageExchangeController {
+        fd: RawFd,
+        max_request_bytes: u64,
+        max_response_bytes: u64,
+        max_requests: u32,
+        max_in_flight: u32,
+        received_requests: u32,
+        completed_responses: u32,
+        seen_request_ids: BTreeSet<u64>,
+        pending_request_ids: BTreeSet<u64>,
+        failed: bool,
+    }
+
+    impl Drop for RuntimeCorrelatedMessageExchangeController {
+        fn drop(&mut self) {
+            unsafe {
+                libc::close(self.fd);
+            }
+        }
     }
 
     #[derive(Debug)]
@@ -1254,6 +1315,197 @@ mod imp {
         }
     }
 
+    impl RuntimeCorrelatedMessageExchangeController {
+        pub fn is_complete(&self) -> bool {
+            !self.failed
+                && self.received_requests == self.max_requests
+                && self.completed_responses == self.max_requests
+                && self.pending_request_ids.is_empty()
+        }
+
+        pub fn received_requests(&self) -> u32 {
+            self.received_requests
+        }
+
+        pub fn completed_responses(&self) -> u32 {
+            self.completed_responses
+        }
+
+        pub fn pending_requests(&self) -> u32 {
+            self.pending_request_ids.len() as u32
+        }
+
+        pub fn max_requests(&self) -> u32 {
+            self.max_requests
+        }
+
+        pub fn max_in_flight(&self) -> u32 {
+            self.max_in_flight
+        }
+
+        fn reject_if_failed(&self) -> Result<(), RuntimeFdBrokerError> {
+            if self.failed {
+                return Err(RuntimeFdBrokerError::Protocol(
+                    "runtime correlated exchange is closed after a protocol or I/O failure"
+                        .to_owned(),
+                ));
+            }
+            Ok(())
+        }
+
+        pub fn receive_request(
+            &mut self,
+        ) -> Result<RuntimeCorrelatedRequest, RuntimeFdBrokerError> {
+            self.reject_if_failed()?;
+            if self.received_requests == self.max_requests {
+                return Err(RuntimeFdBrokerError::Protocol(
+                    "runtime correlated exchange reached its configured request limit".to_owned(),
+                ));
+            }
+            if self.pending_request_ids.len() as u32 == self.max_in_flight {
+                return Err(RuntimeFdBrokerError::InvalidConfiguration(
+                    "runtime correlated exchange reached its in-flight request limit; publish a response before receiving another request".to_owned(),
+                ));
+            }
+
+            let capacity = self.max_request_bytes as usize + 9;
+            let mut bytes = vec![0u8; capacity];
+            let mut iovec = libc::iovec {
+                iov_base: bytes.as_mut_ptr().cast::<libc::c_void>(),
+                iov_len: bytes.len(),
+            };
+            let mut message = unsafe { std::mem::zeroed::<libc::msghdr>() };
+            message.msg_iov = &mut iovec;
+            message.msg_iovlen = 1;
+
+            loop {
+                message.msg_flags = 0;
+                let received = unsafe { libc::recvmsg(self.fd, &mut message, 0) };
+                if received == -1 {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() == Some(libc::EINTR) {
+                        continue;
+                    }
+                    self.failed = true;
+                    return Err(RuntimeFdBrokerError::io(
+                        "cannot receive runtime correlated request",
+                        error,
+                    ));
+                }
+                if received == 0 {
+                    self.failed = true;
+                    return Err(RuntimeFdBrokerError::Protocol(
+                        "runtime correlated request must arrive before peer shutdown".to_owned(),
+                    ));
+                }
+                if message.msg_flags & libc::MSG_TRUNC != 0
+                    || received as u64 > self.max_request_bytes + 8
+                {
+                    self.failed = true;
+                    return Err(RuntimeFdBrokerError::RuntimeRequestTooLarge {
+                        max_bytes: self.max_request_bytes,
+                    });
+                }
+                if received < 9 {
+                    self.failed = true;
+                    return Err(RuntimeFdBrokerError::Protocol(
+                        "runtime correlated request requires an 8-byte request id and a non-empty payload"
+                            .to_owned(),
+                    ));
+                }
+
+                let received = received as usize;
+                let mut request_id_bytes = [0u8; 8];
+                request_id_bytes.copy_from_slice(&bytes[..8]);
+                let request_id = u64::from_le_bytes(request_id_bytes);
+                if !self.seen_request_ids.insert(request_id) {
+                    self.failed = true;
+                    return Err(RuntimeFdBrokerError::RuntimeDuplicateRequestId { request_id });
+                }
+                if !self.pending_request_ids.insert(request_id) {
+                    self.failed = true;
+                    return Err(RuntimeFdBrokerError::Protocol(
+                        "runtime correlated request pending-set insertion was inconsistent"
+                            .to_owned(),
+                    ));
+                }
+                self.received_requests += 1;
+                let payload = bytes[8..received].to_vec();
+                return Ok(RuntimeCorrelatedRequest {
+                    request_id,
+                    payload,
+                });
+            }
+        }
+
+        pub fn send_response(
+            &mut self,
+            request_id: u64,
+            bytes: &[u8],
+        ) -> Result<(), RuntimeFdBrokerError> {
+            self.reject_if_failed()?;
+            if !self.pending_request_ids.contains(&request_id) {
+                self.failed = true;
+                return Err(RuntimeFdBrokerError::RuntimeUnknownRequestId { request_id });
+            }
+            if bytes.is_empty() {
+                self.failed = true;
+                return Err(RuntimeFdBrokerError::Protocol(
+                    "runtime correlated response must be non-empty".to_owned(),
+                ));
+            }
+            if bytes.len() as u64 > self.max_response_bytes {
+                self.failed = true;
+                return Err(RuntimeFdBrokerError::RuntimeResponseTooLarge {
+                    max_bytes: self.max_response_bytes,
+                });
+            }
+
+            let mut frame = Vec::with_capacity(8 + bytes.len());
+            frame.extend_from_slice(&request_id.to_le_bytes());
+            frame.extend_from_slice(bytes);
+            loop {
+                let sent = unsafe {
+                    libc::send(
+                        self.fd,
+                        frame.as_ptr().cast::<libc::c_void>(),
+                        frame.len(),
+                        libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT,
+                    )
+                };
+                if sent == frame.len() as isize {
+                    self.pending_request_ids.remove(&request_id);
+                    self.completed_responses += 1;
+                    return Ok(());
+                }
+                if sent == -1 {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() == Some(libc::EINTR) {
+                        continue;
+                    }
+                    self.failed = true;
+                    if error.raw_os_error() == Some(libc::EAGAIN)
+                        || error.raw_os_error() == Some(libc::EWOULDBLOCK)
+                    {
+                        return Err(RuntimeFdBrokerError::Protocol(
+                            "runtime correlated response publication would block; the controller does not buffer responses"
+                                .to_owned(),
+                        ));
+                    }
+                    return Err(RuntimeFdBrokerError::io(
+                        "cannot send runtime correlated response",
+                        error,
+                    ));
+                }
+
+                self.failed = true;
+                return Err(RuntimeFdBrokerError::Protocol(format!(
+                    "runtime correlated response sent unexpected packet length {sent}"
+                )));
+            }
+        }
+    }
+
     #[derive(Debug)]
     pub struct RuntimeFdBroker {
         path: PathBuf,
@@ -1485,6 +1737,33 @@ mod imp {
                 max_request_bytes,
                 max_response_bytes,
                 max_rounds,
+            )
+        }
+
+        /// Prepare one bounded correlated request/response session.
+        ///
+        /// Each packet carries an 8-byte little-endian request id followed by a
+        /// non-empty bounded payload. The controller may accept multiple unique
+        /// requests before responding and may publish responses out of request
+        /// order by id, while bounding both total requests and simultaneous
+        /// in-flight requests.
+        pub fn prepare_runtime_correlated_exchange(
+            max_request_bytes: u64,
+            max_response_bytes: u64,
+            max_requests: u32,
+            max_in_flight: u32,
+        ) -> Result<
+            (
+                PreparedRuntimeMessageChannel,
+                RuntimeCorrelatedMessageExchangeController,
+            ),
+            RuntimeFdBrokerError,
+        > {
+            prepare_runtime_correlated_exchange(
+                max_request_bytes,
+                max_response_bytes,
+                max_requests,
+                max_in_flight,
             )
         }
     }
@@ -1980,6 +2259,83 @@ mod imp {
         ))
     }
 
+    fn prepare_runtime_correlated_exchange(
+        max_request_bytes: u64,
+        max_response_bytes: u64,
+        max_requests: u32,
+        max_in_flight: u32,
+    ) -> Result<
+        (
+            PreparedRuntimeMessageChannel,
+            RuntimeCorrelatedMessageExchangeController,
+        ),
+        RuntimeFdBrokerError,
+    > {
+        if max_request_bytes == 0 || max_request_bytes > super::MAX_RUNTIME_MESSAGE_BYTES {
+            return Err(RuntimeFdBrokerError::InvalidConfiguration(format!(
+                "runtime correlated max_request_bytes must be between 1 and {}",
+                super::MAX_RUNTIME_MESSAGE_BYTES
+            )));
+        }
+        if max_response_bytes == 0 || max_response_bytes > super::MAX_RUNTIME_MESSAGE_BYTES {
+            return Err(RuntimeFdBrokerError::InvalidConfiguration(format!(
+                "runtime correlated max_response_bytes must be between 1 and {}",
+                super::MAX_RUNTIME_MESSAGE_BYTES
+            )));
+        }
+        if !(super::MIN_RUNTIME_CORRELATED_REQUESTS..=super::MAX_RUNTIME_CORRELATED_REQUESTS)
+            .contains(&max_requests)
+        {
+            return Err(RuntimeFdBrokerError::InvalidConfiguration(format!(
+                "runtime correlated max_requests must be between {} and {}",
+                super::MIN_RUNTIME_CORRELATED_REQUESTS,
+                super::MAX_RUNTIME_CORRELATED_REQUESTS
+            )));
+        }
+        if !(super::MIN_RUNTIME_CORRELATED_IN_FLIGHT..=super::MAX_RUNTIME_CORRELATED_IN_FLIGHT)
+            .contains(&max_in_flight)
+            || max_in_flight > max_requests
+        {
+            return Err(RuntimeFdBrokerError::InvalidConfiguration(format!(
+                "runtime correlated max_in_flight must be between {} and {}, and may not exceed max_requests",
+                super::MIN_RUNTIME_CORRELATED_IN_FLIGHT,
+                super::MAX_RUNTIME_CORRELATED_IN_FLIGHT
+            )));
+        }
+
+        let mut fds = [-1; 2];
+        if unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+                0,
+                fds.as_mut_ptr(),
+            )
+        } == -1
+        {
+            return Err(RuntimeFdBrokerError::io(
+                "cannot create runtime correlated exchange socketpair",
+                std::io::Error::last_os_error(),
+            ));
+        }
+
+        Ok((
+            PreparedRuntimeMessageChannel { fd: fds[0] },
+            RuntimeCorrelatedMessageExchangeController {
+                fd: fds[1],
+                max_request_bytes,
+                max_response_bytes,
+                max_requests,
+                max_in_flight,
+                received_requests: 0,
+                completed_responses: 0,
+                seen_request_ids: BTreeSet::new(),
+                pending_request_ids: BTreeSet::new(),
+                failed: false,
+            },
+        ))
+    }
+
     fn prepare_runtime_multi_message_exchange(
         max_request_bytes: u64,
         max_response_bytes: u64,
@@ -2168,7 +2524,7 @@ mod imp {
 
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
 mod imp {
-    use super::{File, Path, RuntimeFdBrokerError, SandboxPolicy};
+    use super::{File, Path, RuntimeCorrelatedRequest, RuntimeFdBrokerError, SandboxPolicy};
 
     #[derive(Debug)]
     pub struct PreparedReadOnlyRegularFile;
@@ -2193,6 +2549,53 @@ mod imp {
 
     #[derive(Debug)]
     pub struct RuntimeMultiMessageExchangeController;
+
+    #[derive(Debug)]
+    pub struct RuntimeCorrelatedMessageExchangeController;
+
+    impl RuntimeCorrelatedMessageExchangeController {
+        pub fn is_complete(&self) -> bool {
+            false
+        }
+
+        pub fn received_requests(&self) -> u32 {
+            0
+        }
+
+        pub fn completed_responses(&self) -> u32 {
+            0
+        }
+
+        pub fn pending_requests(&self) -> u32 {
+            0
+        }
+
+        pub fn max_requests(&self) -> u32 {
+            0
+        }
+
+        pub fn max_in_flight(&self) -> u32 {
+            0
+        }
+
+        pub fn receive_request(
+            &mut self,
+        ) -> Result<RuntimeCorrelatedRequest, RuntimeFdBrokerError> {
+            Err(RuntimeFdBrokerError::UnsupportedPlatform(
+                "runtime correlated exchanges currently require Linux x86_64".to_owned(),
+            ))
+        }
+
+        pub fn send_response(
+            &mut self,
+            _request_id: u64,
+            _bytes: &[u8],
+        ) -> Result<(), RuntimeFdBrokerError> {
+            Err(RuntimeFdBrokerError::UnsupportedPlatform(
+                "runtime correlated exchanges currently require Linux x86_64".to_owned(),
+            ))
+        }
+    }
 
     impl RuntimeMultiMessageExchangeController {
         pub fn is_complete(&self) -> bool {
@@ -2428,6 +2831,23 @@ mod imp {
                 "runtime multi-message exchanges currently require Linux x86_64".to_owned(),
             ))
         }
+
+        pub fn prepare_runtime_correlated_exchange(
+            _max_request_bytes: u64,
+            _max_response_bytes: u64,
+            _max_requests: u32,
+            _max_in_flight: u32,
+        ) -> Result<
+            (
+                PreparedRuntimeMessageChannel,
+                RuntimeCorrelatedMessageExchangeController,
+            ),
+            RuntimeFdBrokerError,
+        > {
+            Err(RuntimeFdBrokerError::UnsupportedPlatform(
+                "runtime correlated exchanges currently require Linux x86_64".to_owned(),
+            ))
+        }
     }
 
     impl RuntimeFdSession {
@@ -2487,6 +2907,6 @@ mod imp {
 pub use imp::{
     PreparedReadOnlyRegularFile, PreparedRevocableByteStream, PreparedRuntimeMessageChannel,
     PreparedSealedRegularFileSnapshot, PreparedSealedSnapshotBundle, RevocableByteStreamController,
-    RuntimeFdBroker, RuntimeFdSession, RuntimeMessageExchangeController,
-    RuntimeMultiMessageExchangeController,
+    RuntimeCorrelatedMessageExchangeController, RuntimeFdBroker, RuntimeFdSession,
+    RuntimeMessageExchangeController, RuntimeMultiMessageExchangeController,
 };

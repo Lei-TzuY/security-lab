@@ -45,12 +45,15 @@ pub use report::{
 pub use runtime_fd_broker::{
     PreparedReadOnlyRegularFile, PreparedRevocableByteStream, PreparedRuntimeMessageChannel,
     PreparedSealedRegularFileSnapshot, PreparedSealedSnapshotBundle, RevocableByteStreamController,
-    RuntimeFdBroker, RuntimeFdBrokerError, RuntimeFdSession, RuntimeMessageExchangeController,
-    RuntimeMultiMessageExchangeController, MAX_RUNTIME_MESSAGE_BYTES,
+    RuntimeCorrelatedMessageExchangeController, RuntimeCorrelatedRequest, RuntimeFdBroker,
+    RuntimeFdBrokerError, RuntimeFdSession, RuntimeMessageExchangeController,
+    RuntimeMultiMessageExchangeController, MAX_RUNTIME_CORRELATED_IN_FLIGHT,
+    MAX_RUNTIME_CORRELATED_REQUESTS, MAX_RUNTIME_MESSAGE_BYTES,
     MAX_RUNTIME_MESSAGE_REQUEST_WAIT_MILLISECONDS, MAX_RUNTIME_MESSAGE_RESPONSE_WAIT_MILLISECONDS,
     MAX_RUNTIME_MULTI_MESSAGE_ROUNDS, MAX_RUNTIME_MULTI_MESSAGE_SESSION_MILLISECONDS,
     MAX_RUNTIME_REVOCABLE_STREAM_BYTES, MAX_RUNTIME_SEALED_BUNDLE_BYTES,
     MAX_RUNTIME_SEALED_BUNDLE_ITEMS, MAX_RUNTIME_SEALED_SNAPSHOT_BYTES,
+    MIN_RUNTIME_CORRELATED_IN_FLIGHT, MIN_RUNTIME_CORRELATED_REQUESTS,
     MIN_RUNTIME_MULTI_MESSAGE_ROUNDS, MIN_RUNTIME_SEALED_BUNDLE_ITEMS,
 };
 pub use snapshot_archive::{

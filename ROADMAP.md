@@ -1474,7 +1474,7 @@ Boundary: 59A bounds only the trusted controller's wait until the complete respo
 
 ### Slice 60A — one non-resettable monotonic whole-session budget
 
-**Current verified candidate.** Adds one lifecycle-wide liveness bound across the existing bounded multi-round controller rather than another per-operation timeout variant.
+**Status: complete on `main`.** Adds one lifecycle-wide liveness bound across the existing bounded multi-round controller rather than another per-operation timeout variant.
 
 Acceptance evidence is executable:
 
@@ -1490,7 +1490,31 @@ Boundary: 60A starts its budget when the trusted caller explicitly invokes `star
 
 ### Milestone 60 promotion rule
 
-After 60A integrates, request, response-publication, and whole-session time bounds are sealed. Do not farm reset modes, alternate units, clock aliases, or more timeout wrappers. Promote to a materially different protocol property such as explicit correlation/multiplexing, authenticated application semantics, or another independent authority frontier.
+60A is sealed on `main`. Request, response-publication, and whole-session time bounds are complete at this laboratory scope. Do not farm reset modes, alternate units, clock aliases, or more timeout wrappers.
+
+## Milestone 61 — bounded correlated in-flight runtime exchange
+
+### Slice 61A — explicit request IDs and out-of-order response correlation
+
+**Current verified candidate.** Adds a materially different protocol property over the existing readiness-gated private `SOCK_SEQPACKET` capability without changing sandbox grant authority.
+
+Acceptance evidence is executable:
+
+- `prepare_runtime_correlated_exchange(max_request_bytes, max_response_bytes, max_requests, max_in_flight)` keeps request and response payload ceilings at 1 byte–64 KiB, bounds total accepted requests to 2–32, and bounds simultaneous pending requests to 2–8 with `max_in_flight <= max_requests`;
+- each request/response packet is exactly an 8-byte little-endian `u64` request ID followed by a non-empty payload, preserving kernel packet boundaries instead of adding a stream parser;
+- the controller retains every observed request ID for the session and tracks the pending subset separately. A duplicate request ID returns typed `RuntimeDuplicateRequestId` and terminally closes the controller;
+- trusted responses name the request ID they complete and may be published out of request order. An unknown or already-completed ID returns typed `RuntimeUnknownRequestId` and terminally closes the controller;
+- reaching the configured in-flight ceiling rejects another controller receive before `recvmsg`, so the queued target packet remains untouched until a response frees a slot;
+- correlated response publication is one atomic `MSG_DONTWAIT|MSG_NOSIGNAL` packet. A would-block condition is a terminal protocol failure rather than hidden controller buffering;
+- broker-level integration performs the real readiness handshake and `SCM_RIGHTS` endpoint grant, accepts request IDs 41 and 42 concurrently, publishes response 42 first, admits ID 43 after that slot is freed, then publishes 43 before 41; target-side receives prove each exact response ID/payload pairing and final controller completion;
+- dedicated regressions prove duplicate request IDs and unknown response IDs are terminal, configuration bounds fail closed, and all existing sandbox/runtime regressions remain green;
+- exact candidate stable format/Clippy/full tests and the complete Rust 1.74 suite are green.
+
+Boundary: 61A is bounded correlation over one already-granted endpoint. It does not compose the 56B/59A/60A deadline APIs into this controller, provide target acknowledgment/processing evidence, authenticate requests, prevent replay across sessions, expose an async/concurrent trusted-host API, buffer responses under backpressure, or provide an unbounded/general RPC transport. Its executable correlation evidence is at the real broker/controller integration layer rather than a new dedicated raw-target fixture.
+
+### Milestone 61 promotion rule
+
+After 61A integrates, do not farm ID widths, larger caps, or more response-order permutations. Promote only to a materially different protocol authority property such as authenticated application framing/replay resistance, or to another independent architecture frontier.
 
 ## Later frontiers
 

@@ -1867,7 +1867,7 @@ After 79A integrates, do not farm larger route-count ceilings, larger selector w
 
 ### Slice 80A — one-shot filesystem AF_UNIX SOCK_SEQPACKET grant
 
-**Current implementation candidate.** Adds a materially different host-local socket object class without widening the existing stream, reconnect, router, or generic runtime-message contracts.
+**Validated implementation.** Adds a materially different host-local socket object class without widening the existing stream, reconnect, router, or generic runtime-message contracts.
 
 Acceptance evidence is executable:
 

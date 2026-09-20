@@ -3119,6 +3119,104 @@ mod tests {
     }
 
     #[test]
+    fn parses_bounded_persistent_volume_sets_and_rejects_invalid_sets() {
+        let base = volume_valid();
+        let multi = format!(
+            "{base}
+volume.readonly_source = /srv/read-a
+volume.readonly_source = /srv/read-b
+volume.readonly_target = /data-a
+volume.readonly_target = /data-b
+volume.writable_source = /srv/write-a
+volume.writable_source = /srv/write-b
+volume.writable_target = /persist-a
+volume.writable_target = /persist-b
+landlock.file_mutate = /persist-b/subdir"
+        );
+        let policy: SandboxPolicy = multi.parse().unwrap();
+        assert!(policy.readonly_volume_source.is_none());
+        assert!(policy.readonly_volume_target.is_none());
+        assert!(policy.writable_volume_source.is_none());
+        assert!(policy.writable_volume_target.is_none());
+        assert_eq!(
+            policy.normalized_readonly_volume_bindings(),
+            vec![
+                PersistentVolumeBinding {
+                    source: PathBuf::from("/srv/read-a"),
+                    target: PathBuf::from("/data-a"),
+                },
+                PersistentVolumeBinding {
+                    source: PathBuf::from("/srv/read-b"),
+                    target: PathBuf::from("/data-b"),
+                },
+            ]
+        );
+        assert_eq!(
+            policy.normalized_writable_volume_bindings(),
+            vec![
+                PersistentVolumeBinding {
+                    source: PathBuf::from("/srv/write-a"),
+                    target: PathBuf::from("/persist-a"),
+                },
+                PersistentVolumeBinding {
+                    source: PathBuf::from("/srv/write-b"),
+                    target: PathBuf::from("/persist-b"),
+                },
+            ]
+        );
+
+        let unequal = format!(
+            "{base}
+volume.readonly_source = /srv/read-a
+volume.readonly_source = /srv/read-b
+volume.readonly_target = /data-a"
+        );
+        assert!(unequal.parse::<SandboxPolicy>().is_err());
+
+        let overlap = format!(
+            "{base}
+volume.readonly_source = /srv/read-a
+volume.readonly_target = /data
+volume.writable_source = /srv/write-a
+volume.writable_target = /data/state"
+        );
+        let err = overlap.parse::<SandboxPolicy>().unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("persistent volume targets must not overlap"));
+
+        let source_overlap = format!(
+            "{base}
+volume.readonly_source = /srv/shared
+volume.readonly_target = /data-a
+volume.writable_source = /srv/shared/state
+volume.writable_target = /persist-a"
+        );
+        let err = source_overlap.parse::<SandboxPolicy>().unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("persistent volume sources must not overlap"));
+
+        let mut oversized = base.clone();
+        for index in 0..=MAX_PERSISTENT_VOLUME_BINDINGS {
+            oversized.push_str(&format!(
+                "
+volume.readonly_source = /srv/read-{index}
+volume.readonly_target = /data-{index}"
+            ));
+        }
+        assert!(oversized.parse::<SandboxPolicy>().is_err());
+
+        let mut mixed = policy;
+        mixed.readonly_volume_source = Some(PathBuf::from("/srv/legacy"));
+        mixed.readonly_volume_target = Some(PathBuf::from("/legacy"));
+        let err = mixed.validate().unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("legacy read-only volume pair and readonly_volume_bindings are mutually exclusive"));
+    }
+
+    #[test]
     fn rejects_incomplete_or_unsafe_writable_volume() {
         let base = volume_valid();
         let incomplete = format!("{base}\nvolume.writable_source = /srv/state");

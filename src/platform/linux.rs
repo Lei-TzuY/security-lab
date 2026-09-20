@@ -26,8 +26,9 @@ mod x86_64 {
     use crate::elf_needed;
     use crate::policy::{StdioMode, StdioPolicy};
     use crate::{
-        CancellationToken, CapturedOutput, ChildOutcome, EnforcementReceipt, PolicyError,
-        ProcessTreeUsage, ResourceLimits, RunReport, SandboxError, SandboxPolicy,
+        CancellationToken, CapturedOutput, ChildOutcome, CowVolumeDiff, EnforcementReceipt,
+        PolicyError, ProcessTreeUsage, ResourceLimits, RunReport, SandboxError, SandboxPolicy,
+        MAX_PERSISTENT_VOLUME_BINDINGS,
     };
     use sha2::{Digest, Sha256};
     use std::collections::{BTreeMap, BTreeSet};
@@ -335,6 +336,7 @@ mod x86_64 {
         target_relative: CString,
         access: VolumeAccess,
         cow_size: Option<CString>,
+        cow_diff_index: Option<usize>,
     }
 
     struct PreparedSealedMount {
@@ -918,6 +920,7 @@ mod x86_64 {
         target: &Path,
         access: VolumeAccess,
         cow_bytes: Option<u64>,
+        cow_diff_index: Option<usize>,
     ) -> Result<PreparedVolume, SandboxError> {
         let (source_field, source_label, target_label) = match access {
             VolumeAccess::ReadOnly => (
@@ -952,6 +955,7 @@ mod x86_64 {
             cow_size: cow_bytes
                 .map(|bytes| cstring_bytes("volume.cow_bytes", bytes.to_string().as_bytes()))
                 .transpose()?,
+            cow_diff_index,
         })
     }
 
@@ -1696,6 +1700,7 @@ mod x86_64 {
                     &volume.target,
                     VolumeAccess::ReadOnly,
                     None,
+                    None,
                 )?);
             }
             for volume in &writable_volumes {
@@ -1705,15 +1710,17 @@ mod x86_64 {
                     &volume.target,
                     VolumeAccess::Writable,
                     None,
+                    None,
                 )?);
             }
-            for volume in cow_volumes {
+            for (cow_index, volume) in cow_volumes.iter().enumerate() {
                 volumes.push(prepare_volume(
                     root_fd.raw(),
                     &volume.source,
                     &volume.target,
                     VolumeAccess::CopyOnWrite,
                     Some(volume.bytes),
+                    Some(cow_index),
                 )?);
             }
 
@@ -1845,6 +1852,7 @@ mod x86_64 {
         capture_write_fd: RawFd,
         output_limit_fd: RawFd,
         cow_diff_state: *mut CowDiffState,
+        cow_volume_diff_states: [*mut CowDiffState; MAX_PERSISTENT_VOLUME_BINDINGS],
         wall_clock_milliseconds: u64,
     }
 
@@ -1929,6 +1937,26 @@ mod x86_64 {
                     "cannot allocate bounded copy-on-write diff state: {err}"
                 ))
             })?;
+        let mut cow_volume_diffs = Vec::with_capacity(policy.copy_on_write_volume_bindings.len());
+        for binding in &policy.copy_on_write_volume_bindings {
+            cow_volume_diffs.push(
+                binding
+                    .diff_bytes
+                    .map(SharedCowDiff::new)
+                    .transpose()
+                    .map_err(|err| {
+                        SandboxError::SetupFailed(format!(
+                            "cannot allocate bounded copy-on-write volume diff state: {err}"
+                        ))
+                    })?,
+            );
+        }
+        let mut cow_volume_diff_states =
+            [ptr::null_mut::<CowDiffState>(); MAX_PERSISTENT_VOLUME_BINDINGS];
+        for (index, state) in cow_volume_diffs.iter().enumerate() {
+            cow_volume_diff_states[index] =
+                state.as_ref().map_or(ptr::null_mut(), SharedCowDiff::raw);
+        }
         let output_limit_event = policy
             .stdout_total_bytes
             .map(|_| create_output_limit_eventfd())
@@ -1956,6 +1984,7 @@ mod x86_64 {
             cow_diff_state: cow_diff
                 .as_ref()
                 .map_or(ptr::null_mut(), SharedCowDiff::raw),
+            cow_volume_diff_states,
             wall_clock_milliseconds: policy.wall_clock_milliseconds.unwrap_or(0),
         };
 
@@ -2007,6 +2036,7 @@ mod x86_64 {
                 outcome,
                 stdout: None,
                 cow_diff: None,
+                cow_volume_diffs: Vec::new(),
                 reaped_descendants: 0,
                 process_tree_usage: ProcessTreeUsage::default(),
                 enforcement: EnforcementReceipt::default(),
@@ -2030,10 +2060,25 @@ mod x86_64 {
         };
         let outcome = resolve_lifecycle_outcome(&lifecycle_record, output_limit_observed)?;
         let cow_diff = cow_diff.as_ref().map(SharedCowDiff::snapshot).transpose()?;
+        let mut cow_volume_diff_reports = Vec::new();
+        for (binding, state) in policy
+            .copy_on_write_volume_bindings
+            .iter()
+            .zip(cow_volume_diffs.iter())
+        {
+            if let Some(state) = state {
+                cow_volume_diff_reports.push(CowVolumeDiff {
+                    target: binding.target.as_os_str().as_bytes().to_vec(),
+                    diff: state.snapshot()?,
+                });
+            }
+        }
+        cow_volume_diff_reports.sort_by(|left, right| left.target.cmp(&right.target));
         Ok(RunReport {
             outcome,
             stdout,
             cow_diff,
+            cow_volume_diffs: cow_volume_diff_reports,
             reaped_descendants: lifecycle_record.reaped_descendants,
             process_tree_usage: ProcessTreeUsage {
                 user_cpu_micros: lifecycle_record.user_cpu_micros,
@@ -3237,6 +3282,7 @@ mod x86_64 {
             capture_write_fd,
             output_limit_fd,
             cow_diff_state,
+            cow_volume_diff_states,
             wall_clock_milliseconds,
         } = control;
         if capture_read_fd >= FIRST_NON_STDIO_FD as RawFd && libc::close(capture_read_fd) == -1 {
@@ -3373,13 +3419,23 @@ mod x86_64 {
             child_fail(launch_error, PHASE_ROOT_FCHDIR, seccomp.error_exit_syscall);
         }
 
+        let mut cow_volume_upper_fds = [-1; MAX_PERSISTENT_VOLUME_BINDINGS];
         for volume in &prepared.volumes {
-            install_volume_or_fail(
+            let retain_cow_upper = volume
+                .cow_diff_index
+                .is_some_and(|index| !cow_volume_diff_states[index].is_null());
+            if let Some(upper_fd) = install_volume_or_fail(
                 volume,
                 root_tree_fd,
+                retain_cow_upper,
                 launch_error,
                 seccomp.error_exit_syscall,
-            );
+            ) {
+                let index = volume
+                    .cow_diff_index
+                    .expect("retained COW upper has a binding index");
+                cow_volume_upper_fds[index] = upper_fd;
+            }
         }
 
         if let (Some(scratch), Some(options)) =
@@ -3480,16 +3536,52 @@ mod x86_64 {
         if prepared.procfs_enabled {
             mount_private_procfs_or_fail(launch_error, seccomp.error_exit_syscall);
         }
+        let empty_cow_diff = CowDiffControl {
+            upper_fd: -1,
+            state: ptr::null_mut(),
+        };
+        let mut cow_diff_controls = [empty_cow_diff; MAX_PERSISTENT_VOLUME_BINDINGS + 1];
+        let mut cow_diff_control_count = 0usize;
+        if !cow_diff_state.is_null() {
+            if cow_upper_fd < FIRST_NON_STDIO_FD as RawFd {
+                child_fail_errno(
+                    launch_error,
+                    PHASE_COW_DIFF_EXPORT,
+                    libc::EINVAL,
+                    seccomp.error_exit_syscall,
+                );
+            }
+            cow_diff_controls[cow_diff_control_count] = CowDiffControl {
+                upper_fd: cow_upper_fd,
+                state: cow_diff_state,
+            };
+            cow_diff_control_count += 1;
+        }
+        for index in 0..MAX_PERSISTENT_VOLUME_BINDINGS {
+            let state = cow_volume_diff_states[index];
+            if state.is_null() {
+                continue;
+            }
+            let upper_fd = cow_volume_upper_fds[index];
+            if upper_fd < FIRST_NON_STDIO_FD as RawFd {
+                child_fail_errno(
+                    launch_error,
+                    PHASE_COW_DIFF_EXPORT,
+                    libc::EINVAL,
+                    seccomp.error_exit_syscall,
+                );
+            }
+            cow_diff_controls[cow_diff_control_count] = CowDiffControl { upper_fd, state };
+            cow_diff_control_count += 1;
+        }
+
         pid_lifecycle::become_direct_target_or_reap(
             target_lifecycle,
             launch_error,
             wall_clock_milliseconds,
             prepared.cancellation_fd.as_ref().map_or(-1, |fd| fd.raw()),
             output_limit_fd,
-            CowDiffControl {
-                upper_fd: cow_upper_fd,
-                state: cow_diff_state,
-            },
+            &cow_diff_controls[..cow_diff_control_count],
             TargetSupervisionPhases {
                 fork: PHASE_TARGET_FORK,
                 kill: PHASE_PROCESS_TREE_KILL,
@@ -3815,7 +3907,7 @@ mod x86_64 {
         cow_size: &CString,
         launch_error: *mut LaunchErrorRecord,
         error_exit_syscall: libc::c_long,
-    ) -> RawFd {
+    ) -> (RawFd, RawFd) {
         let state_fsfd = libc::syscall(
             libc::SYS_fsopen,
             b"tmpfs\0".as_ptr().cast::<libc::c_char>(),
@@ -3990,18 +4082,19 @@ mod x86_64 {
         }
         let overlay_fd = overlay_fd as RawFd;
 
-        for fd in [overlay_fsfd, work_fd, upper_fd, state_mount_fd] {
+        for fd in [overlay_fsfd, work_fd, state_mount_fd] {
             close_setup_fd(fd);
         }
-        overlay_fd
+        (overlay_fd, upper_fd)
     }
 
     unsafe fn install_volume_or_fail(
         volume: &PreparedVolume,
         root_tree_fd: RawFd,
+        retain_cow_upper: bool,
         launch_error: *mut LaunchErrorRecord,
         error_exit_syscall: libc::c_long,
-    ) {
+    ) -> Option<RawFd> {
         let source_how = OpenHow {
             flags: (libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
             mode: 0,
@@ -4084,7 +4177,7 @@ mod x86_64 {
         }
         let target_fd = target_fd as RawFd;
 
-        let attach_fd = if volume.access == VolumeAccess::CopyOnWrite {
+        let (attach_fd, cow_upper_fd) = if volume.access == VolumeAccess::CopyOnWrite {
             construct_cow_volume_overlay_or_fail(
                 volume_tree_fd,
                 volume
@@ -4095,7 +4188,7 @@ mod x86_64 {
                 error_exit_syscall,
             )
         } else {
-            volume_tree_fd
+            (volume_tree_fd, -1)
         };
         let attach_phase = if volume.access == VolumeAccess::CopyOnWrite {
             PHASE_COW_VOLUME_ATTACH
@@ -4118,11 +4211,22 @@ mod x86_64 {
         if attach_fd != volume_tree_fd {
             close_setup_fd(attach_fd);
         }
+        let retained_cow_upper = if cow_upper_fd >= FIRST_NON_STDIO_FD as RawFd {
+            if retain_cow_upper {
+                Some(cow_upper_fd)
+            } else {
+                close_setup_fd(cow_upper_fd);
+                None
+            }
+        } else {
+            None
+        };
         for fd in [target_fd, volume_tree_fd, current_source_fd] {
             if libc::close(fd) == -1 {
                 child_fail(launch_error, attach_phase, error_exit_syscall);
             }
         }
+        retained_cow_upper
     }
 
     unsafe fn open_stdout_redirect_or_fail(

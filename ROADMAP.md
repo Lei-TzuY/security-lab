@@ -1768,6 +1768,30 @@ Boundary: 74A changes only the shutdown state of one already-authorized connecte
 
 After 74A integrates, do not farm shutdown-mode variants or revocation aliases. A further host-local IPC promotion must add a materially different capability such as independently bounded multi-service selection/routing, explicit application-level revocation acknowledgment, or another mediated object class.
 
+## Milestone 75 — bounded per-volume COW diff observation
+
+### Slice 75A — export requested COW-volume upper trees after process-tree convergence
+
+**Status: complete on `main`.** Extends the existing 69A private COW-volume capability with an independently bounded observation channel; it does not change the target's mount authority or add a commit path.
+
+Acceptance evidence is executable:
+
+- each `CopyOnWriteVolumeBinding` may carry an independent `diff_bytes` ceiling in the same 64-byte–16-MiB canonical export range as the existing root COW diff;
+- text policies accept repeatable `volume.cow_diff_bytes` only when omitted entirely or supplied once for every declared COW volume, while programmatic bindings may request export selectively with `diff_bytes: Some(_)` / `None`;
+- only requested COW volumes retain launcher-owned upper-directory descriptors after mount attachment; unrequested uppers are closed immediately and do not become a report channel;
+- the direct target child closes every retained upper descriptor before untrusted setup/exec, while launcher-owned namespace PID 1 retains only the requested descriptors;
+- PID 1 exports requested uppers only after the direct target has terminated and all remaining descendants have been killed/reaped, reusing the existing canonical COW diff serializer and fail-closed overflow/object-kind rules;
+- `RunReport.cow_volume_diffs` returns only requested bindings, each paired with exact raw sandbox target bytes and sorted canonically by target; `run-json` exposes the same deterministic structure;
+- static authority manifests expose each binding's optional diff ceiling, while authority-delta analysis models diff observation separately from mount/mutation authority and treats larger ceilings/additional exports as widening;
+- multi-volume regressions prove target/channel separation, canonical target ordering, omission of an unrequested binding, unchanged host lowers, and fail-closed diff overflow;
+- stable rustfmt, Clippy with `-D warnings`, complete stable tests, and Rust 1.74 are the integration gate.
+
+Boundary: 75A is observation of private post-run COW upper state, not target filesystem authority and not a commit/replay operation. It does not retain unrequested uppers, does not export before descendant convergence, does not make the canonical diff cryptographically authenticated, and does not imply point-in-time source freezing, crash durability, or host-side publication.
+
+### Milestone 75 promotion rule
+
+After 75A integrates, do not farm more output aliases, larger diff ceilings, or fixed extra report channels. A further storage promotion must add a materially different lifecycle capability such as explicitly bounded host-side commit/publication semantics with precondition evidence, stronger source/snapshot binding, or another independent storage primitive.
+
 ## Later frontiers
 
-Supplementary-group isolation with a viable mapping architecture, routed/broader network authority beyond the bounded IPv4 brokers, broader dynamic host-local IPC mediation beyond one exact bounded reconnect/revocation lifecycle, bounded loader search/interpreter closure or later-exec authority, per-volume COW diff/commit or stronger storage lifecycle semantics, and delegated aggregate cgroup accounting remain separate evidence-backed frontiers. Do not add configuration-only names without executable kernel behavior and integration evidence.
+Supplementary-group isolation with a viable mapping architecture, routed/broader network authority beyond the bounded IPv4 brokers, broader dynamic host-local IPC mediation beyond one exact bounded reconnect/revocation lifecycle, bounded loader search/interpreter closure or later-exec authority, stronger COW commit/publication lifecycle semantics, and delegated aggregate cgroup accounting remain separate evidence-backed frontiers. Do not add configuration-only names without executable kernel behavior and integration evidence.

@@ -309,6 +309,42 @@ volume.cow_bytes = 1048576
 }
 
 #[test]
+fn copy_on_write_volume_diff_export_is_separate_observation_authority() {
+    let root = unique_absent_root("cow-volume-diff");
+    let base = base_policy(&root);
+    let mounted = format!(
+        "{base}volume.cow_source = /srv/base
+volume.cow_target = /state
+volume.cow_bytes = 1048576
+"
+    );
+    let exported = format!("{mounted}volume.cow_diff_bytes = 4096\n");
+    let larger = format!("{mounted}volume.cow_diff_bytes = 8192\n");
+
+    let mounted = TempPolicy::new("cow-mounted", &mounted);
+    let exported = TempPolicy::new("cow-exported", &exported);
+    let larger = TempPolicy::new("cow-exported-larger", &larger);
+
+    let widened = run_json(&mounted, &exported);
+    assert_eq!(widened.status.code(), Some(5));
+    let stdout = String::from_utf8(widened.stdout).expect("utf8 output");
+    assert!(stdout
+        .contains(r#""field":"filesystem.copy_on_write_volume_diff_export","class":"widened""#));
+
+    let reduced = run_json(&exported, &mounted);
+    assert_eq!(reduced.status.code(), Some(0));
+    let stdout = String::from_utf8(reduced.stdout).expect("utf8 output");
+    assert!(stdout
+        .contains(r#""field":"filesystem.copy_on_write_volume_diff_export","class":"reduced""#));
+
+    let enlarged = run_json(&exported, &larger);
+    assert_eq!(enlarged.status.code(), Some(5));
+    let stdout = String::from_utf8(enlarged.stdout).expect("utf8 output");
+    assert!(stdout
+        .contains(r#""field":"filesystem.copy_on_write_volume_diff_export","class":"widened""#));
+}
+
+#[test]
 fn copy_on_write_root_is_modeled_as_ephemeral_write_authority() {
     let root = unique_absent_root("cow-root");
     let baseline_text = base_policy(&root);

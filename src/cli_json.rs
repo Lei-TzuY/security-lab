@@ -17,20 +17,21 @@ pub(crate) fn report_json(report: &RunReport) -> String {
     }
     output.push_str(",\"cow_diff\":");
     match &report.cow_diff {
-        Some(diff) => {
-            output.push_str("{\"encoded_bytes\":");
-            write!(&mut output, "{}", diff.encoded_bytes).expect("write to String cannot fail");
-            output.push_str(",\"entries\":[");
-            for (index, entry) in diff.entries.iter().enumerate() {
-                if index != 0 {
-                    output.push(',');
-                }
-                push_cow_diff_entry(&mut output, entry);
-            }
-            output.push_str("]}");
-        }
+        Some(diff) => push_cow_diff(&mut output, diff),
         None => output.push_str("null"),
     }
+    output.push_str(",\"cow_volume_diffs\":[");
+    for (index, volume) in report.cow_volume_diffs.iter().enumerate() {
+        if index != 0 {
+            output.push(',');
+        }
+        output.push_str("{\"target_encoding\":\"hex\",\"target\":\"");
+        push_hex(&mut output, &volume.target);
+        output.push_str("\",\"diff\":");
+        push_cow_diff(&mut output, &volume.diff);
+        output.push('}');
+    }
+    output.push(']');
     output.push_str(",\"reaped_descendants\":");
     write!(&mut output, "{}", report.reaped_descendants).expect("write to String cannot fail");
     output.push_str(",\"process_tree_usage\":{\"user_cpu_micros\":");
@@ -111,6 +112,19 @@ pub(crate) fn outcome_exit_code(outcome: ChildOutcome) -> i32 {
         ChildOutcome::Cancelled => 130,
         ChildOutcome::OutputLimitExceeded => 122,
     }
+}
+
+fn push_cow_diff(output: &mut String, diff: &security_lab::CowDiff) {
+    output.push_str("{\"encoded_bytes\":");
+    write!(output, "{}", diff.encoded_bytes).expect("write to String cannot fail");
+    output.push_str(",\"entries\":[");
+    for (index, entry) in diff.entries.iter().enumerate() {
+        if index != 0 {
+            output.push(',');
+        }
+        push_cow_diff_entry(output, entry);
+    }
+    output.push_str("]}");
 }
 
 fn push_cow_diff_entry(output: &mut String, entry: &CowDiffEntry) {
@@ -215,6 +229,7 @@ mod tests {
                 truncated: true,
             }),
             cow_diff: None,
+            cow_volume_diffs: Vec::new(),
             reaped_descendants: 3,
             process_tree_usage: ProcessTreeUsage {
                 user_cpu_micros: 11,
@@ -226,7 +241,7 @@ mod tests {
 
         assert_eq!(
             report_json(&report),
-            "{\"ok\":true,\"outcome\":{\"kind\":\"exited\",\"code\":7},\"stdout\":{\"encoding\":\"hex\",\"data\":\"0022ff\",\"truncated\":true},\"cow_diff\":null,\"reaped_descendants\":3,\"process_tree_usage\":{\"user_cpu_micros\":11,\"system_cpu_micros\":22,\"max_child_rss_kib\":33},\"enforcement\":{\"base_namespaces\":false,\"time_namespace_offsets\":false,\"hostname\":false,\"private_mount_propagation\":false,\"readonly_root\":false,\"copy_on_write_root\":false,\"chroot\":false,\"fd_sanitization\":false,\"private_procfs\":false,\"rlimits\":false,\"capabilities_reduced\":false,\"no_new_privs\":false,\"landlock\":false,\"seccomp\":false}}"
+            "{\"ok\":true,\"outcome\":{\"kind\":\"exited\",\"code\":7},\"stdout\":{\"encoding\":\"hex\",\"data\":\"0022ff\",\"truncated\":true},\"cow_diff\":null,\"cow_volume_diffs\":[],\"reaped_descendants\":3,\"process_tree_usage\":{\"user_cpu_micros\":11,\"system_cpu_micros\":22,\"max_child_rss_kib\":33},\"enforcement\":{\"base_namespaces\":false,\"time_namespace_offsets\":false,\"hostname\":false,\"private_mount_propagation\":false,\"readonly_root\":false,\"copy_on_write_root\":false,\"chroot\":false,\"fd_sanitization\":false,\"private_procfs\":false,\"rlimits\":false,\"capabilities_reduced\":false,\"no_new_privs\":false,\"landlock\":false,\"seccomp\":false}}"
         );
     }
 
@@ -249,6 +264,7 @@ mod tests {
                 ],
                 encoded_bytes: 64,
             }),
+            cow_volume_diffs: Vec::new(),
             reaped_descendants: 0,
             process_tree_usage: ProcessTreeUsage::default(),
             enforcement: EnforcementReceipt::default(),
@@ -256,6 +272,34 @@ mod tests {
         let json = report_json(&report);
         assert!(json.contains("\"kind\":\"ensure_directory\",\"path_encoding\":\"hex\",\"path\":\"2f7374617465\",\"mode\":488"));
         assert!(json.contains("\"kind\":\"upsert_file\",\"path_encoding\":\"hex\",\"path\":\"2f73746174652f6974656d\",\"mode\":384,\"data_encoding\":\"hex\",\"data\":\"6f6b\""));
+    }
+
+    #[test]
+    fn serializes_per_volume_cow_diff_with_raw_target_bytes() {
+        let report = RunReport {
+            outcome: ChildOutcome::Exited(0),
+            stdout: None,
+            cow_diff: None,
+            cow_volume_diffs: vec![security_lab::CowVolumeDiff {
+                target: b"/state\xff".to_vec(),
+                diff: CowDiff {
+                    entries: vec![CowDiffEntry::Remove {
+                        path: b"/old".to_vec(),
+                    }],
+                    encoded_bytes: 23,
+                },
+            }],
+            reaped_descendants: 0,
+            process_tree_usage: ProcessTreeUsage::default(),
+            enforcement: EnforcementReceipt::default(),
+        };
+        let json = report_json(&report);
+        assert!(json.contains(
+            "\"cow_volume_diffs\":[{\"target_encoding\":\"hex\",\"target\":\"2f7374617465ff\",\"diff\":{\"encoded_bytes\":23"
+        ));
+        assert!(
+            json.contains("\"kind\":\"remove\",\"path_encoding\":\"hex\",\"path\":\"2f6f6c64\"")
+        );
     }
 
     #[test]
@@ -275,6 +319,7 @@ mod tests {
                 truncated: true,
             }),
             cow_diff: None,
+            cow_volume_diffs: Vec::new(),
             reaped_descendants: 1,
             process_tree_usage: ProcessTreeUsage::default(),
             enforcement: EnforcementReceipt::default(),

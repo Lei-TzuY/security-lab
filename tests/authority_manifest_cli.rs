@@ -192,6 +192,8 @@ volume.cow_target = /z-cow-data
 volume.cow_target = /a-cow-data
 volume.cow_bytes = 2097152
 volume.cow_bytes = 1048576
+volume.cow_diff_bytes = 8192
+volume.cow_diff_bytes = 4096
 ",
         manifest_policy(&root)
     );
@@ -216,7 +218,7 @@ volume.cow_bytes = 1048576
         "\"writable_volumes\":[{\"access\":\"writable\",\"source\":\"/srv/a-write\",\"target\":\"/a-persist\"},{\"access\":\"writable\",\"source\":\"/srv/z-write\",\"target\":\"/z-persist\"}]"
     ));
     assert!(stdout.contains(
-        "\"copy_on_write_volumes\":[{\"access\":\"copy_on_write\",\"source\":\"/srv/a-cow\",\"target\":\"/a-cow-data\",\"bytes\":1048576},{\"access\":\"copy_on_write\",\"source\":\"/srv/z-cow\",\"target\":\"/z-cow-data\",\"bytes\":2097152}]"
+        "\"copy_on_write_volumes\":[{\"access\":\"copy_on_write\",\"source\":\"/srv/a-cow\",\"target\":\"/a-cow-data\",\"bytes\":1048576,\"diff_bytes\":4096},{\"access\":\"copy_on_write\",\"source\":\"/srv/z-cow\",\"target\":\"/z-cow-data\",\"bytes\":2097152,\"diff_bytes\":8192}]"
     ));
 
     assert_eq!(human.status.code(), Some(0));

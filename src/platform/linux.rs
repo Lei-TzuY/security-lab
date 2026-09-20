@@ -26,8 +26,9 @@ mod x86_64 {
     use crate::elf_needed;
     use crate::policy::{StdioMode, StdioPolicy};
     use crate::{
-        CancellationToken, CapturedOutput, ChildOutcome, EnforcementReceipt, PolicyError,
-        ProcessTreeUsage, ResourceLimits, RunReport, SandboxError, SandboxPolicy,
+        CancellationToken, CapturedOutput, ChildOutcome, CowVolumeDiff, EnforcementReceipt,
+        PolicyError, ProcessTreeUsage, ResourceLimits, RunReport, SandboxError, SandboxPolicy,
+        MAX_PERSISTENT_VOLUME_BINDINGS,
     };
     use sha2::{Digest, Sha256};
     use std::collections::{BTreeMap, BTreeSet};
@@ -335,6 +336,7 @@ mod x86_64 {
         target_relative: CString,
         access: VolumeAccess,
         cow_size: Option<CString>,
+        cow_diff_index: Option<usize>,
     }
 
     struct PreparedSealedMount {
@@ -918,6 +920,7 @@ mod x86_64 {
         target: &Path,
         access: VolumeAccess,
         cow_bytes: Option<u64>,
+        cow_diff_index: Option<usize>,
     ) -> Result<PreparedVolume, SandboxError> {
         let (source_field, source_label, target_label) = match access {
             VolumeAccess::ReadOnly => (
@@ -952,6 +955,7 @@ mod x86_64 {
             cow_size: cow_bytes
                 .map(|bytes| cstring_bytes("volume.cow_bytes", bytes.to_string().as_bytes()))
                 .transpose()?,
+            cow_diff_index,
         })
     }
 
@@ -1696,6 +1700,7 @@ mod x86_64 {
                     &volume.target,
                     VolumeAccess::ReadOnly,
                     None,
+                    None,
                 )?);
             }
             for volume in &writable_volumes {
@@ -1705,15 +1710,17 @@ mod x86_64 {
                     &volume.target,
                     VolumeAccess::Writable,
                     None,
+                    None,
                 )?);
             }
-            for volume in cow_volumes {
+            for (cow_index, volume) in cow_volumes.iter().enumerate() {
                 volumes.push(prepare_volume(
                     root_fd.raw(),
                     &volume.source,
                     &volume.target,
                     VolumeAccess::CopyOnWrite,
                     Some(volume.bytes),
+                    Some(cow_index),
                 )?);
             }
 

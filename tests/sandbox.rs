@@ -1786,6 +1786,7 @@ fn copy_on_write_persistent_volume_is_private_and_ephemeral() {
             source: source.clone(),
             target: PathBuf::from("/cowdata"),
             bytes: 1024 * 1024,
+            diff_bytes: None,
         }];
 
         assert_eq!(run(&mounted).unwrap(), ChildOutcome::Exited(0));
@@ -1807,6 +1808,7 @@ fn copy_on_write_persistent_volume_enforces_private_byte_ceiling() {
         source,
         target: PathBuf::from("/cowdata"),
         bytes: 4096,
+        diff_bytes: None,
     }];
 
     assert_eq!(run(&mounted).unwrap(), ChildOutcome::Exited(0));

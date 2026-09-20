@@ -4036,7 +4036,10 @@ mod x86_64 {
         }
         let volume_tree_fd = volume_tree_fd as RawFd;
 
-        if matches!(volume.access, VolumeAccess::ReadOnly | VolumeAccess::CopyOnWrite) {
+        if matches!(
+            volume.access,
+            VolumeAccess::ReadOnly | VolumeAccess::CopyOnWrite
+        ) {
             let volume_attr = MountAttr {
                 attr_set: MOUNT_ATTR_RDONLY,
                 attr_clr: 0,

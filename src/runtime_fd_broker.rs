@@ -2048,19 +2048,23 @@ mod imp {
         ///
         /// The acknowledgment frame is fixed-size:
         /// `A || version=1 || request_id_le || sha256(response) || hmac_tag`.
-        /// No later request is consumed while this barrier is outstanding.
+        /// While this barrier is outstanding, the acknowledgment must be the
+        /// peer's next packet; any request or other frame is a terminal protocol
+        /// violation rather than a packet the controller can reorder or skip.
         pub fn receive_acknowledgment(&mut self) -> Result<u64, RuntimeFdBrokerError> {
             self.controller.reject_if_failed()?;
-            let (expected_request_id, expected_response_sha256) =
-                match self.awaiting_acknowledgment.as_ref() {
-                    Some(expectation) => (expectation.request_id, expectation.response_sha256),
-                    None => {
-                        return Err(RuntimeFdBrokerError::InvalidConfiguration(
-                            "acknowledged runtime exchange has no published response awaiting acknowledgment"
-                                .to_owned(),
-                        ));
-                    }
-                };
+            let (expected_request_id, expected_response_sha256) = match self
+                .awaiting_acknowledgment
+                .as_ref()
+            {
+                Some(expectation) => (expectation.request_id, expectation.response_sha256),
+                None => {
+                    return Err(RuntimeFdBrokerError::InvalidConfiguration(
+                        "acknowledged runtime exchange has no published response awaiting acknowledgment"
+                            .to_owned(),
+                    ));
+                }
+            };
 
             const ACK_FRAME_BYTES: usize = 2 + 8 + 32 + super::RUNTIME_AUTH_TAG_BYTES;
             let mut frame = [0u8; ACK_FRAME_BYTES];
@@ -2093,21 +2097,20 @@ mod imp {
                             .to_owned(),
                     ));
                 }
-                if message.msg_flags & libc::MSG_TRUNC != 0
-                    || received as usize != ACK_FRAME_BYTES
+                if received >= 2
+                    && (frame[0] != RUNTIME_AUTH_ACKNOWLEDGMENT_KIND
+                        || frame[1] != RUNTIME_AUTH_PROTOCOL_VERSION)
                 {
                     self.controller.failed = true;
                     return Err(RuntimeFdBrokerError::Protocol(
-                        "authenticated runtime response acknowledgment has invalid packet length"
+                        "authenticated runtime response acknowledgment must be the peer's next packet"
                             .to_owned(),
                     ));
                 }
-                if frame[0] != RUNTIME_AUTH_ACKNOWLEDGMENT_KIND
-                    || frame[1] != RUNTIME_AUTH_PROTOCOL_VERSION
-                {
+                if message.msg_flags & libc::MSG_TRUNC != 0 || received as usize != ACK_FRAME_BYTES {
                     self.controller.failed = true;
                     return Err(RuntimeFdBrokerError::Protocol(
-                        "authenticated runtime response acknowledgment has an unsupported frame type or version"
+                        "authenticated runtime response acknowledgment has invalid packet length"
                             .to_owned(),
                     ));
                 }
@@ -2130,8 +2133,7 @@ mod imp {
                     self.controller.failed = true;
                     return Err(RuntimeFdBrokerError::RuntimeAuthenticationFailed);
                 }
-                if request_id != expected_request_id
-                    || response_sha256 != expected_response_sha256
+                if request_id != expected_request_id || response_sha256 != expected_response_sha256
                 {
                     self.controller.failed = true;
                     return Err(RuntimeFdBrokerError::RuntimeAcknowledgmentMismatch {

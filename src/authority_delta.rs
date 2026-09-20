@@ -148,16 +148,14 @@ pub(crate) fn compare(baseline: &SandboxPolicy, candidate: &SandboxPolicy) -> Au
             .zip(candidate.executable_interpreter_sha256.as_ref()),
         &mut changes,
     );
-    compare_optional_restriction(
+    let mut baseline_needed = baseline.normalized_executable_needed_bindings();
+    let mut candidate_needed = candidate.normalized_executable_needed_bindings();
+    baseline_needed.sort();
+    candidate_needed.sort();
+    compare_exact_set_restriction(
         "execution.executable_needed_binding",
-        baseline
-            .executable_needed
-            .as_ref()
-            .zip(baseline.executable_needed_sha256.as_ref()),
-        candidate
-            .executable_needed
-            .as_ref()
-            .zip(candidate.executable_needed_sha256.as_ref()),
+        &baseline_needed,
+        &candidate_needed,
         &mut changes,
     );
     compare_exact_incomparable(
@@ -726,6 +724,22 @@ fn compare_optional_restriction<T: PartialEq>(
         (Some(_), None) => DeltaClass::Widened,
         (Some(base), Some(new)) if base == new => DeltaClass::Unchanged,
         (Some(_), Some(_)) => DeltaClass::Incomparable,
+    };
+    push_change(field, class, changes);
+}
+
+fn compare_exact_set_restriction<T: PartialEq>(
+    field: &'static str,
+    baseline: &[T],
+    candidate: &[T],
+    changes: &mut Vec<Change>,
+) {
+    let class = match (baseline.is_empty(), candidate.is_empty()) {
+        (true, true) => DeltaClass::Unchanged,
+        (true, false) => DeltaClass::Reduced,
+        (false, true) => DeltaClass::Widened,
+        (false, false) if baseline == candidate => DeltaClass::Unchanged,
+        (false, false) => DeltaClass::Incomparable,
     };
     push_change(field, class, changes);
 }

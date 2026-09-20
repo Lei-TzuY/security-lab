@@ -916,12 +916,26 @@ mod x86_64 {
         root_fd: RawFd,
         source: &Path,
         target: &Path,
-        source_field: &str,
-        source_label: &str,
-        target_label: &str,
         access: VolumeAccess,
         cow_bytes: Option<u64>,
     ) -> Result<PreparedVolume, SandboxError> {
+        let (source_field, source_label, target_label) = match access {
+            VolumeAccess::ReadOnly => (
+                "volume.readonly_source",
+                "read-only volume source",
+                "read-only volume target",
+            ),
+            VolumeAccess::Writable => (
+                "volume.writable_source",
+                "writable volume source",
+                "writable volume target",
+            ),
+            VolumeAccess::CopyOnWrite => (
+                "volume.cow_source",
+                "copy-on-write volume source",
+                "copy-on-write volume target",
+            ),
+        };
         let source_fd = open_host_directory(source, source_label)?;
         let target_check = open_beneath_root(
             root_fd,
@@ -1680,9 +1694,6 @@ mod x86_64 {
                     root_fd.raw(),
                     &volume.source,
                     &volume.target,
-                    "volume.readonly_source",
-                    "read-only volume source",
-                    "read-only volume target",
                     VolumeAccess::ReadOnly,
                     None,
                 )?);
@@ -1692,9 +1703,6 @@ mod x86_64 {
                     root_fd.raw(),
                     &volume.source,
                     &volume.target,
-                    "volume.writable_source",
-                    "writable volume source",
-                    "writable volume target",
                     VolumeAccess::Writable,
                     None,
                 )?);
@@ -1704,9 +1712,6 @@ mod x86_64 {
                     root_fd.raw(),
                     &volume.source,
                     &volume.target,
-                    "volume.cow_source",
-                    "copy-on-write volume source",
-                    "copy-on-write volume target",
                     VolumeAccess::CopyOnWrite,
                     Some(volume.bytes),
                 )?);

@@ -3,7 +3,7 @@ use std::error::Error;
 use std::fmt;
 use std::fs::File;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub const MAX_RUNTIME_SEALED_SNAPSHOT_BYTES: u64 = 64 * 1024 * 1024;
 pub const MIN_RUNTIME_SEALED_BUNDLE_ITEMS: usize = 2;
@@ -25,6 +25,59 @@ pub const RUNTIME_AUTH_CHALLENGE_BYTES: usize = 32;
 pub const RUNTIME_AUTH_TAG_BYTES: usize = 32;
 pub const MIN_RUNTIME_HOST_UNIX_RECONNECT_CONNECTIONS: u32 = 2;
 pub const MAX_RUNTIME_HOST_UNIX_RECONNECT_CONNECTIONS: u32 = 8;
+pub const MIN_RUNTIME_HOST_UNIX_ROUTER_SERVICES: usize = 2;
+pub const MAX_RUNTIME_HOST_UNIX_ROUTER_SERVICES: usize = 4;
+pub const MIN_RUNTIME_HOST_UNIX_ROUTE_CONNECTIONS: u32 = 1;
+pub const MAX_RUNTIME_HOST_UNIX_ROUTE_CONNECTIONS: u32 = 8;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeHostUnixRoute {
+    service_path: PathBuf,
+    expected_peer: Option<(u32, u32)>,
+    max_connections: u32,
+}
+
+impl RuntimeHostUnixRoute {
+    pub fn new(
+        service_path: impl Into<PathBuf>,
+        expected_peer: Option<(u32, u32)>,
+        max_connections: u32,
+    ) -> Self {
+        Self {
+            service_path: service_path.into(),
+            expected_peer,
+            max_connections,
+        }
+    }
+
+    pub fn service_path(&self) -> &Path {
+        &self.service_path
+    }
+
+    pub fn expected_peer(&self) -> Option<(u32, u32)> {
+        self.expected_peer
+    }
+
+    pub fn max_connections(&self) -> u32 {
+        self.max_connections
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostUnixRouteGrant {
+    route_index: usize,
+    credentials: HostUnixPeerCredentials,
+}
+
+impl HostUnixRouteGrant {
+    pub fn route_index(&self) -> usize {
+        self.route_index
+    }
+
+    pub fn credentials(&self) -> HostUnixPeerCredentials {
+        self.credentials
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HostUnixPeerCredentials {

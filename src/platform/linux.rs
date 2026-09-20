@@ -1360,14 +1360,12 @@ mod x86_64 {
             let needed_bindings = policy.normalized_executable_needed_bindings();
             let mut dependencies = Vec::with_capacity(needed_bindings.len());
             if !needed_bindings.is_empty() {
-                let root_needed =
-                    elf_needed::read_elf64_x86_64_dt_needed(executable_fd.raw()).map_err(
-                        |error| {
-                            SandboxError::SetupFailed(format!(
-                                "cannot parse content-bound executable DT_NEEDED: {error}"
-                            ))
-                        },
-                    )?;
+                let root_needed = elf_needed::read_elf64_x86_64_dt_needed(executable_fd.raw())
+                    .map_err(|error| {
+                        SandboxError::SetupFailed(format!(
+                            "cannot parse content-bound executable DT_NEEDED: {error}"
+                        ))
+                    })?;
                 let declared = needed_bindings
                     .iter()
                     .map(|binding| binding.path.as_os_str().as_bytes().to_vec())

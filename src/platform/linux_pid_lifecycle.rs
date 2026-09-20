@@ -144,6 +144,7 @@ pub(super) struct TargetSupervisionPhases {
 /// optionally enforces a monotonic wall-clock deadline, kills and reaps every
 /// remaining descendant, publishes the target lifecycle, and exits without
 /// ever inheriting the target seccomp policy.
+#[derive(Clone, Copy)]
 pub(super) struct CowDiffControl {
     pub(super) upper_fd: libc::c_int,
     pub(super) state: *mut CowDiffState,
@@ -177,9 +178,7 @@ pub(super) unsafe fn become_direct_target_or_reap(
     }
     let pid = pid as libc::pid_t;
 
-    if let Err(errno) =
-        close_nonstdio_except(cancellation_fd, output_limit_fd, cow_diffs)
-    {
+    if let Err(errno) = close_nonstdio_except(cancellation_fd, output_limit_fd, cow_diffs) {
         libc::syscall(libc::SYS_kill, pid, libc::SIGKILL);
         let _ = wait_specific(pid);
         let _ = kill_and_reap_remaining(launch_error, phases.kill, phases.reap);

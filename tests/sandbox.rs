@@ -1,11 +1,13 @@
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 
 use security_lab::{
-    publish_cow_volume_diff_atomic, run, run_report, run_report_with_cancel, CancellationToken,
-    ChildOutcome, CopyOnWriteVolumeBinding, CowDiffApplyError, CowDiffApplyLimits, CowDiffEntry,
-    CowVolumePublicationError, ExecutableNeededBinding, PersistentVolumeBinding, ResourceLimits,
-    SandboxError, SandboxPolicy, SeccompArgRangeRule, SeccompArgRule, SeccompPolicy, StdioMode,
-    StdioPolicy,
+    publish_cow_volume_diff_atomic, publish_cow_volume_diff_trusted_ed25519_atomic, run, run_report,
+    run_report_with_cancel, sign_cow_volume_diff_ed25519, CancellationToken, ChildOutcome,
+    CopyOnWriteVolumeBinding, CowDiffApplyError, CowDiffApplyLimits, CowDiffEntry,
+    CowVolumePublicationError, CowVolumeTrustedPublicationError, ExecutableNeededBinding,
+    PersistentVolumeBinding, ResourceLimits, SandboxError, SandboxPolicy, SeccompArgRangeRule,
+    SeccompArgRule, SeccompPolicy, SnapshotTrustKey, SnapshotTrustKeyId, SnapshotTrustKeyState,
+    SnapshotTrustPolicy, StdioMode, StdioPolicy, SNAPSHOT_ED25519_SIGNING_KEY_BYTES,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -1985,6 +1987,97 @@ fn copy_on_write_volume_diff_guarded_publication_binds_exact_launch_base() {
     let _ = std::fs::remove_dir_all(second);
     let _ = std::fs::remove_dir_all(destination);
     let _ = std::fs::remove_dir_all(stale_destination);
+}
+
+#[test]
+fn copy_on_write_volume_diff_trusted_ed25519_publication_authenticates_exact_report() {
+    let source =
+        std::env::temp_dir().join(format!("security-lab-cow-trusted-source-{}", process::id()));
+    let destination = std::env::temp_dir().join(format!(
+        "security-lab-cow-trusted-published-{}",
+        process::id()
+    ));
+    let rejected_destination = std::env::temp_dir().join(format!(
+        "security-lab-cow-trusted-rejected-{}",
+        process::id()
+    ));
+    for path in [&source, &destination, &rejected_destination] {
+        let _ = std::fs::remove_dir_all(path);
+    }
+    std::fs::create_dir_all(&source).unwrap();
+
+    let mut mounted = policy("unused", &[], &["openat", "write", "close", "exit"]);
+    mounted.executable = PathBuf::from("/cow-volume-diff-probe");
+    mounted.copy_on_write_volume_bindings = vec![CopyOnWriteVolumeBinding {
+        source: source.clone(),
+        target: PathBuf::from("/cowa"),
+        bytes: 1024 * 1024,
+        diff_bytes: Some(4096),
+        base_identity_bytes: Some(1024 * 1024),
+        base_identity_nodes: Some(100),
+    }];
+
+    let report = run_report(&mounted).unwrap();
+    let bound = report.cow_volume_diffs.first().expect("bound COW volume diff");
+    let seed = [0x77; SNAPSHOT_ED25519_SIGNING_KEY_BYTES];
+    let evidence = sign_cow_volume_diff_ed25519(bound, &seed).unwrap();
+    let signer = SnapshotTrustKeyId::from_public_key(&evidence.public_key);
+    let trust_policy = SnapshotTrustPolicy::new(
+        7,
+        vec![SnapshotTrustKey {
+            public_key: evidence.public_key,
+            state: SnapshotTrustKeyState::Active,
+        }],
+    )
+    .unwrap();
+    let replay_limits = CowDiffApplyLimits {
+        max_bytes: 1024 * 1024,
+        max_nodes: 100,
+    };
+
+    let published = publish_cow_volume_diff_trusted_ed25519_atomic(
+        &source,
+        &destination,
+        bound,
+        &evidence,
+        &trust_policy,
+        signer,
+        replay_limits,
+    )
+    .unwrap();
+    assert_eq!(published.trust.policy, trust_policy.identity());
+    assert_eq!(published.trust.signer, signer);
+    assert_eq!(published.evidence_sha256, evidence.evidence_sha256);
+    assert_eq!(
+        std::fs::read(destination.join("first")).unwrap(),
+        b"alpha\n"
+    );
+    assert!(!source.join("first").exists());
+
+    let mut tampered = bound.clone();
+    match &mut tampered.diff.entries[0] {
+        CowDiffEntry::UpsertFile { bytes, .. } => bytes.push(b'!'),
+        other => panic!("unexpected trusted COW diff entry: {other:?}"),
+    }
+    match publish_cow_volume_diff_trusted_ed25519_atomic(
+        &source,
+        &rejected_destination,
+        &tampered,
+        &evidence,
+        &trust_policy,
+        signer,
+        replay_limits,
+    )
+    .unwrap_err()
+    {
+        CowVolumeTrustedPublicationError::Signature(_) => {}
+        other => panic!("unexpected tampered trusted publication result: {other}"),
+    }
+    assert!(!rejected_destination.exists());
+
+    let _ = std::fs::remove_dir_all(source);
+    let _ = std::fs::remove_dir_all(destination);
+    let _ = std::fs::remove_dir_all(rejected_destination);
 }
 
 #[test]

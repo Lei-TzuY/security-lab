@@ -23,6 +23,29 @@ pub const MAX_RUNTIME_CORRELATED_IN_FLIGHT: u32 = 8;
 pub const RUNTIME_AUTH_KEY_BYTES: usize = 32;
 pub const RUNTIME_AUTH_CHALLENGE_BYTES: usize = 32;
 pub const RUNTIME_AUTH_TAG_BYTES: usize = 32;
+pub const MIN_RUNTIME_HOST_UNIX_RECONNECT_CONNECTIONS: u32 = 2;
+pub const MAX_RUNTIME_HOST_UNIX_RECONNECT_CONNECTIONS: u32 = 8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostUnixPeerCredentials {
+    pid: i32,
+    uid: u32,
+    gid: u32,
+}
+
+impl HostUnixPeerCredentials {
+    pub fn pid(&self) -> i32 {
+        self.pid
+    }
+
+    pub fn uid(&self) -> u32 {
+        self.uid
+    }
+
+    pub fn gid(&self) -> u32 {
+        self.gid
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeCorrelatedRequest {
@@ -213,7 +236,10 @@ impl Error for RuntimeFdBrokerError {
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod imp {
-    use super::{File, Path, RuntimeCorrelatedRequest, RuntimeFdBrokerError, SandboxPolicy};
+    use super::{
+        File, HostUnixPeerCredentials, Path, RuntimeCorrelatedRequest, RuntimeFdBrokerError,
+        SandboxPolicy,
+    };
     use hmac::{Hmac, Mac};
     use sha2::{Digest, Sha256};
     use std::collections::BTreeSet;
@@ -2227,6 +2253,94 @@ mod imp {
         state: RuntimeFdSessionState,
     }
 
+    #[derive(Debug)]
+    pub struct RuntimeHostUnixReconnectController {
+        stream: UnixStream,
+        service_path: PathBuf,
+        expected_peer: Option<(u32, u32)>,
+        max_connections: u32,
+        granted_connections: u32,
+        failed: bool,
+    }
+
+    impl RuntimeHostUnixReconnectController {
+        pub fn max_connections(&self) -> u32 {
+            self.max_connections
+        }
+
+        pub fn granted_connections(&self) -> u32 {
+            self.granted_connections
+        }
+
+        pub fn is_complete(&self) -> bool {
+            !self.failed && self.granted_connections == self.max_connections
+        }
+
+        pub fn is_failed(&self) -> bool {
+            self.failed
+        }
+
+        /// Wait for one target readiness byte, then connect a fresh stream to
+        /// the exact trusted service path and transfer only that connected
+        /// object. Each round re-checks SO_PEERCRED before SCM_RIGHTS transfer.
+        ///
+        /// Any readiness, connect, credential, or transfer failure closes the
+        /// controller terminally so an ambiguous round is never retried.
+        pub fn grant_next(
+            &mut self,
+            expected_ready: u8,
+        ) -> Result<HostUnixPeerCredentials, RuntimeFdBrokerError> {
+            if self.failed {
+                return Err(RuntimeFdBrokerError::Protocol(
+                    "runtime host UNIX reconnect controller is closed after a failed round"
+                        .to_owned(),
+                ));
+            }
+            if self.granted_connections >= self.max_connections {
+                return Err(RuntimeFdBrokerError::Protocol(
+                    "runtime host UNIX reconnect controller exhausted its connection bound"
+                        .to_owned(),
+                ));
+            }
+
+            let mut ready = [0u8; 1];
+            if let Err(error) = self.stream.read_exact(&mut ready) {
+                self.failed = true;
+                return Err(RuntimeFdBrokerError::io(
+                    "cannot read runtime host UNIX reconnect readiness",
+                    error,
+                ));
+            }
+            if ready[0] != expected_ready {
+                self.failed = true;
+                return Err(RuntimeFdBrokerError::Protocol(format!(
+                    "expected reconnect readiness byte 0x{expected_ready:02x}, got 0x{:02x}",
+                    ready[0]
+                )));
+            }
+
+            let grant = match prepare_host_unix_stream(&self.service_path, self.expected_peer) {
+                Ok(grant) => grant,
+                Err(error) => {
+                    self.failed = true;
+                    return Err(error);
+                }
+            };
+            let credentials = HostUnixPeerCredentials {
+                pid: grant.peer_pid,
+                uid: grant.peer_uid,
+                gid: grant.peer_gid,
+            };
+            if let Err(error) = send_fds(self.stream.as_raw_fd(), &[grant.stream.as_raw_fd()]) {
+                self.failed = true;
+                return Err(error);
+            }
+
+            self.granted_connections += 1;
+            Ok(credentials)
+        }
+    }
+
     impl RuntimeFdBroker {
         /// Bind one host pathname AF_UNIX listener owned by the trusted caller.
         ///
@@ -2302,6 +2416,50 @@ mod imp {
         /// broker object. This closes accidental or cross-process queue capture;
         /// code inside the trusted caller process remains in the trust boundary.
         pub fn accept(&self) -> Result<RuntimeFdSession, RuntimeFdBrokerError> {
+            let stream = self.accept_trusted_stream()?;
+            Ok(RuntimeFdSession {
+                stream,
+                state: RuntimeFdSessionState::AwaitingReady,
+            })
+        }
+
+        /// Accept the already-configured target broker channel as a bounded
+        /// reconnect controller for one exact host filesystem AF_UNIX service.
+        ///
+        /// The controller preserves the existing one-shot RuntimeFdSession ABI:
+        /// it is a separate opt-in state machine with an explicit 2-8 connection
+        /// ceiling. The service is not connected until each target readiness byte
+        /// has been consumed.
+        pub fn accept_host_unix_reconnect_controller(
+            &self,
+            service_path: impl AsRef<Path>,
+            expected_peer: Option<(u32, u32)>,
+            max_connections: u32,
+        ) -> Result<RuntimeHostUnixReconnectController, RuntimeFdBrokerError> {
+            if !(super::MIN_RUNTIME_HOST_UNIX_RECONNECT_CONNECTIONS
+                ..=super::MAX_RUNTIME_HOST_UNIX_RECONNECT_CONNECTIONS)
+                .contains(&max_connections)
+            {
+                return Err(RuntimeFdBrokerError::InvalidConfiguration(format!(
+                    "runtime host UNIX reconnect connection bound must be between {} and {}",
+                    super::MIN_RUNTIME_HOST_UNIX_RECONNECT_CONNECTIONS,
+                    super::MAX_RUNTIME_HOST_UNIX_RECONNECT_CONNECTIONS
+                )));
+            }
+            let service_path = service_path.as_ref();
+            validate_socket_path(service_path)?;
+            let stream = self.accept_trusted_stream()?;
+            Ok(RuntimeHostUnixReconnectController {
+                stream,
+                service_path: service_path.to_path_buf(),
+                expected_peer,
+                max_connections,
+                granted_connections: 0,
+                failed: false,
+            })
+        }
+
+        fn accept_trusted_stream(&self) -> Result<UnixStream, RuntimeFdBrokerError> {
             let (stream, _) = self.listener.accept().map_err(|error| {
                 RuntimeFdBrokerError::io("cannot accept runtime FD broker connection", error)
             })?;
@@ -2316,10 +2474,7 @@ mod imp {
                     actual_gid: gid,
                 });
             }
-            Ok(RuntimeFdSession {
-                stream,
-                state: RuntimeFdSessionState::AwaitingReady,
-            })
+            Ok(stream)
         }
 
         /// Connect one exact host filesystem-path AF_UNIX stream before transfer.
@@ -3423,7 +3578,10 @@ mod imp {
 
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
 mod imp {
-    use super::{File, Path, RuntimeCorrelatedRequest, RuntimeFdBrokerError, SandboxPolicy};
+    use super::{
+        File, HostUnixPeerCredentials, Path, RuntimeCorrelatedRequest, RuntimeFdBrokerError,
+        SandboxPolicy,
+    };
 
     #[derive(Debug)]
     pub struct PreparedHostUnixStream;
@@ -3788,6 +3946,36 @@ mod imp {
     #[derive(Debug)]
     pub struct RuntimeFdSession;
 
+    #[derive(Debug)]
+    pub struct RuntimeHostUnixReconnectController;
+
+    impl RuntimeHostUnixReconnectController {
+        pub fn max_connections(&self) -> u32 {
+            0
+        }
+
+        pub fn granted_connections(&self) -> u32 {
+            0
+        }
+
+        pub fn is_complete(&self) -> bool {
+            false
+        }
+
+        pub fn is_failed(&self) -> bool {
+            false
+        }
+
+        pub fn grant_next(
+            &mut self,
+            _expected_ready: u8,
+        ) -> Result<HostUnixPeerCredentials, RuntimeFdBrokerError> {
+            Err(RuntimeFdBrokerError::UnsupportedPlatform(
+                "runtime host UNIX reconnect controllers currently require Linux x86_64".to_owned(),
+            ))
+        }
+    }
+
     impl RuntimeFdBroker {
         pub fn bind(_path: impl AsRef<Path>) -> Result<Self, RuntimeFdBrokerError> {
             Err(RuntimeFdBrokerError::UnsupportedPlatform(
@@ -3812,6 +4000,17 @@ mod imp {
         pub fn accept(&self) -> Result<RuntimeFdSession, RuntimeFdBrokerError> {
             Err(RuntimeFdBrokerError::UnsupportedPlatform(
                 "runtime FD mediation currently requires Linux x86_64".to_owned(),
+            ))
+        }
+
+        pub fn accept_host_unix_reconnect_controller(
+            &self,
+            _service_path: impl AsRef<Path>,
+            _expected_peer: Option<(u32, u32)>,
+            _max_connections: u32,
+        ) -> Result<RuntimeHostUnixReconnectController, RuntimeFdBrokerError> {
+            Err(RuntimeFdBrokerError::UnsupportedPlatform(
+                "runtime host UNIX reconnect controllers currently require Linux x86_64".to_owned(),
             ))
         }
 
@@ -4017,5 +4216,6 @@ pub use imp::{
     RevocableByteStreamController, RuntimeAcknowledgedCorrelatedMessageExchangeController,
     RuntimeAuthenticatedCorrelatedMessageExchangeController,
     RuntimeCorrelatedMessageExchangeController, RuntimeFdBroker, RuntimeFdSession,
-    RuntimeMessageExchangeController, RuntimeMultiMessageExchangeController,
+    RuntimeHostUnixReconnectController, RuntimeMessageExchangeController,
+    RuntimeMultiMessageExchangeController,
 };

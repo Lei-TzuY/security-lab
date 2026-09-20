@@ -25,6 +25,7 @@
 #   3 receive an ordered two-FD sealed snapshot bundle and reject truncated ancillary control
 #   4 receive a write-disabled runtime stream, read bounded bytes, then observe revoke EOF
 #   5 exchange one bounded request/response packet over a runtime SOCK_SEQPACKET channel
+#   6 receive two separately readiness-gated read-only regular-file grants
 #   1 prove launcher bootstrap execveat is one-shot when target execveat is not granted
 #   2 prove an explicit target execveat grant still permits a later exec
 #   q accept one connection through a launcher-brokered host-loopback TCP listening fd
@@ -104,6 +105,8 @@ _start:
     je .brokered_revocable_runtime_stream
     cmp $53, %al
     je .brokered_runtime_message_exchange
+    cmp $54, %al
+    je .brokered_multi_grant_session
     cmp $49, %al
     je .bootstrap_execveat_one_shot
     cmp $50, %al
@@ -1519,6 +1522,207 @@ _start:
     mov %r12d, %edi
     syscall
 .brokered_runtime_message_exchange_restore:
+    add $192, %rsp
+    jmp .fail29
+
+
+.brokered_multi_grant_session:
+    # argv[2]/argv[3] are original host pathnames; both must remain hidden.
+    mov 24(%rsp), %r13
+    mov 32(%rsp), %r14
+    test %r13, %r13
+    je .fail29
+    test %r14, %r14
+    je .fail29
+    sub $192, %rsp
+    mov $-1, %r12
+
+    # First readiness gates the first independent grant.
+    movb $82, 175(%rsp)
+    mov $1, %eax
+    mov $10, %edi
+    lea 175(%rsp), %rsi
+    mov $1, %edx
+    syscall
+    cmp $1, %rax
+    jne .brokered_multi_grant_fail
+
+    # Receive one descriptor.
+    xor %eax, %eax
+    mov %rax, 0(%rsp)
+    mov %rax, 8(%rsp)
+    lea 64(%rsp), %rax
+    mov %rax, 16(%rsp)
+    movq $1, 24(%rsp)
+    lea 80(%rsp), %rax
+    mov %rax, 32(%rsp)
+    movq $24, 40(%rsp)
+    movq $0, 48(%rsp)
+    lea 176(%rsp), %rax
+    mov %rax, 64(%rsp)
+    movq $1, 72(%rsp)
+    movq $0, 80(%rsp)
+    movq $0, 88(%rsp)
+    movq $0, 96(%rsp)
+
+    mov $47, %eax
+    mov $10, %edi
+    mov %rsp, %rsi
+    mov $0x40000000, %edx
+    syscall
+    cmp $1, %rax
+    jne .brokered_multi_grant_fail
+    cmpb $70, 176(%rsp)
+    jne .brokered_multi_grant_fail
+    testl $8, 48(%rsp)
+    jne .brokered_multi_grant_fail
+    cmpq $20, 80(%rsp)
+    jne .brokered_multi_grant_fail
+    cmpl $1, 88(%rsp)
+    jne .brokered_multi_grant_fail
+    cmpl $1, 92(%rsp)
+    jne .brokered_multi_grant_fail
+    mov 96(%rsp), %r12d
+    test %r12d, %r12d
+    js .brokered_multi_grant_fail
+
+    # Read-only access and exact first payload.
+    mov $1, %eax
+    mov %r12d, %edi
+    lea runtime_multi_grant_first(%rip), %rsi
+    mov $1, %edx
+    syscall
+    cmp $-9, %rax
+    jne .brokered_multi_grant_fail
+    xor %eax, %eax
+    mov %r12d, %edi
+    lea 112(%rsp), %rsi
+    mov $runtime_multi_grant_first_len, %edx
+    syscall
+    cmp $runtime_multi_grant_first_len, %rax
+    jne .brokered_multi_grant_fail
+    lea 112(%rsp), %rsi
+    lea runtime_multi_grant_first(%rip), %rdi
+    mov $runtime_multi_grant_first_len, %ecx
+    repe cmpsb
+    jne .brokered_multi_grant_fail
+    mov $3, %eax
+    mov %r12d, %edi
+    syscall
+    test %rax, %rax
+    js .brokered_multi_grant_fail
+    mov $-1, %r12
+
+    # The second capability is not sent until this second post-first-grant
+    # readiness event is observed by the trusted host.
+    movb $83, 175(%rsp)
+    mov $1, %eax
+    mov $10, %edi
+    lea 175(%rsp), %rsi
+    mov $1, %edx
+    syscall
+    cmp $1, %rax
+    jne .brokered_multi_grant_fail
+
+    # Reset the recvmsg structures and receive exactly one second descriptor.
+    xor %eax, %eax
+    mov %rax, 0(%rsp)
+    mov %rax, 8(%rsp)
+    lea 64(%rsp), %rax
+    mov %rax, 16(%rsp)
+    movq $1, 24(%rsp)
+    lea 80(%rsp), %rax
+    mov %rax, 32(%rsp)
+    movq $24, 40(%rsp)
+    movq $0, 48(%rsp)
+    lea 176(%rsp), %rax
+    mov %rax, 64(%rsp)
+    movq $1, 72(%rsp)
+    movq $0, 80(%rsp)
+    movq $0, 88(%rsp)
+    movq $0, 96(%rsp)
+
+    mov $47, %eax
+    mov $10, %edi
+    mov %rsp, %rsi
+    mov $0x40000000, %edx
+    syscall
+    cmp $1, %rax
+    jne .brokered_multi_grant_fail
+    cmpb $70, 176(%rsp)
+    jne .brokered_multi_grant_fail
+    testl $8, 48(%rsp)
+    jne .brokered_multi_grant_fail
+    cmpq $20, 80(%rsp)
+    jne .brokered_multi_grant_fail
+    cmpl $1, 88(%rsp)
+    jne .brokered_multi_grant_fail
+    cmpl $1, 92(%rsp)
+    jne .brokered_multi_grant_fail
+    mov 96(%rsp), %r12d
+    test %r12d, %r12d
+    js .brokered_multi_grant_fail
+
+    mov $1, %eax
+    mov %r12d, %edi
+    lea runtime_multi_grant_second(%rip), %rsi
+    mov $1, %edx
+    syscall
+    cmp $-9, %rax
+    jne .brokered_multi_grant_fail
+    xor %eax, %eax
+    mov %r12d, %edi
+    lea 112(%rsp), %rsi
+    mov $runtime_multi_grant_second_len, %edx
+    syscall
+    cmp $runtime_multi_grant_second_len, %rax
+    jne .brokered_multi_grant_fail
+    lea 112(%rsp), %rsi
+    lea runtime_multi_grant_second(%rip), %rdi
+    mov $runtime_multi_grant_second_len, %ecx
+    repe cmpsb
+    jne .brokered_multi_grant_fail
+    mov $3, %eax
+    mov %r12d, %edi
+    syscall
+    test %rax, %rax
+    js .brokered_multi_grant_fail
+    mov $-1, %r12
+
+    # Neither grant reveals its original host pathname.
+    mov $257, %eax
+    mov $-100, %edi
+    mov %r13, %rsi
+    xor %edx, %edx
+    xor %r10d, %r10d
+    syscall
+    cmp $-2, %rax
+    jne .brokered_multi_grant_fail
+    mov $257, %eax
+    mov $-100, %edi
+    mov %r14, %rsi
+    xor %edx, %edx
+    xor %r10d, %r10d
+    syscall
+    cmp $-2, %rax
+    jne .brokered_multi_grant_fail
+
+    mov $3, %eax
+    mov $10, %edi
+    syscall
+    test %rax, %rax
+    js .brokered_multi_grant_fail
+    add $192, %rsp
+    xor %edi, %edi
+    jmp .exit
+
+.brokered_multi_grant_fail:
+    test %r12d, %r12d
+    js .brokered_multi_grant_restore
+    mov $3, %eax
+    mov %r12d, %edi
+    syscall
+.brokered_multi_grant_restore:
     add $192, %rsp
     jmp .fail29
 
@@ -3423,6 +3627,12 @@ brokered_host_unix_message:
 runtime_fd_handoff_marker:
     .ascii "runtime-fd-handoff-ok\n"
 .set runtime_fd_handoff_marker_len, . - runtime_fd_handoff_marker
+runtime_multi_grant_first:
+    .ascii "runtime-multi-grant-first\n"
+.set runtime_multi_grant_first_len, . - runtime_multi_grant_first
+runtime_multi_grant_second:
+    .ascii "runtime-multi-grant-second\n"
+.set runtime_multi_grant_second_len, . - runtime_multi_grant_second
 runtime_bundle_first:
     .ascii "runtime-bundle-first\n"
 .set runtime_bundle_first_len, . - runtime_bundle_first

@@ -20,6 +20,8 @@ pub const MIN_RUNTIME_CORRELATED_REQUESTS: u32 = 2;
 pub const MAX_RUNTIME_CORRELATED_REQUESTS: u32 = 32;
 pub const MIN_RUNTIME_CORRELATED_IN_FLIGHT: u32 = 2;
 pub const MAX_RUNTIME_CORRELATED_IN_FLIGHT: u32 = 8;
+pub const MIN_RUNTIME_MULTI_GRANTS: u32 = 2;
+pub const MAX_RUNTIME_MULTI_GRANTS: u32 = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeCorrelatedRequest {
@@ -1545,6 +1547,22 @@ mod imp {
         state: RuntimeFdSessionState,
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum RuntimeFdMultiGrantSessionState {
+        AwaitingReady,
+        Ready,
+        Complete,
+        Failed,
+    }
+
+    #[derive(Debug)]
+    pub struct RuntimeFdMultiGrantSession {
+        stream: UnixStream,
+        max_grants: u32,
+        grants_sent: u32,
+        state: RuntimeFdMultiGrantSessionState,
+    }
+
     impl RuntimeFdBroker {
         /// Bind one host pathname AF_UNIX listener owned by the trusted caller.
         ///
@@ -1615,11 +1633,7 @@ mod imp {
             Ok(())
         }
 
-        /// Accept the launcher-created broker connection and require it to come
-        /// from the exact process and effective credentials that created this
-        /// broker object. This closes accidental or cross-process queue capture;
-        /// code inside the trusted caller process remains in the trust boundary.
-        pub fn accept(&self) -> Result<RuntimeFdSession, RuntimeFdBrokerError> {
+        fn accept_verified_stream(&self) -> Result<UnixStream, RuntimeFdBrokerError> {
             let (stream, _) = self.listener.accept().map_err(|error| {
                 RuntimeFdBrokerError::io("cannot accept runtime FD broker connection", error)
             })?;
@@ -1634,9 +1648,43 @@ mod imp {
                     actual_gid: gid,
                 });
             }
+            Ok(stream)
+        }
+
+        /// Accept the launcher-created broker connection and require it to come
+        /// from the exact process and effective credentials that created this
+        /// broker object. This closes accidental or cross-process queue capture;
+        /// code inside the trusted caller process remains in the trust boundary.
+        pub fn accept(&self) -> Result<RuntimeFdSession, RuntimeFdBrokerError> {
             Ok(RuntimeFdSession {
-                stream,
+                stream: self.accept_verified_stream()?,
                 state: RuntimeFdSessionState::AwaitingReady,
+            })
+        }
+
+        /// Accept one bounded post-exec multi-grant session.
+        ///
+        /// The exact launcher PID/UID/GID peer check is identical to accept().
+        /// Each individual read-only regular-file grant requires a fresh target
+        /// readiness byte and the session permanently completes at max_grants.
+        pub fn accept_multi_grant(
+            &self,
+            max_grants: u32,
+        ) -> Result<RuntimeFdMultiGrantSession, RuntimeFdBrokerError> {
+            if !(super::MIN_RUNTIME_MULTI_GRANTS..=super::MAX_RUNTIME_MULTI_GRANTS)
+                .contains(&max_grants)
+            {
+                return Err(RuntimeFdBrokerError::InvalidConfiguration(format!(
+                    "runtime multi-grant max_grants must be between {} and {}",
+                    super::MIN_RUNTIME_MULTI_GRANTS,
+                    super::MAX_RUNTIME_MULTI_GRANTS
+                )));
+            }
+            Ok(RuntimeFdMultiGrantSession {
+                stream: self.accept_verified_stream()?,
+                max_grants,
+                grants_sent: 0,
+                state: RuntimeFdMultiGrantSessionState::AwaitingReady,
             })
         }
 
@@ -1878,6 +1926,95 @@ mod imp {
                 }
                 Err(error) => {
                     self.state = RuntimeFdSessionState::Failed;
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    impl RuntimeFdMultiGrantSession {
+        pub fn grants_sent(&self) -> u32 {
+            self.grants_sent
+        }
+
+        pub fn max_grants(&self) -> u32 {
+            self.max_grants
+        }
+
+        pub fn is_complete(&self) -> bool {
+            self.state == RuntimeFdMultiGrantSessionState::Complete
+        }
+
+        /// Consume one exact readiness byte for the next grant.
+        pub fn wait_for_ready(&mut self, expected: u8) -> Result<(), RuntimeFdBrokerError> {
+            if self.state != RuntimeFdMultiGrantSessionState::AwaitingReady {
+                let message = match self.state {
+                    RuntimeFdMultiGrantSessionState::Ready => {
+                        "runtime multi-grant readiness is already consumed for the current grant"
+                    }
+                    RuntimeFdMultiGrantSessionState::Complete => {
+                        "runtime multi-grant session reached its configured grant limit"
+                    }
+                    RuntimeFdMultiGrantSessionState::Failed => {
+                        "runtime multi-grant session is closed after a protocol or I/O failure"
+                    }
+                    RuntimeFdMultiGrantSessionState::AwaitingReady => unreachable!(),
+                };
+                return Err(RuntimeFdBrokerError::Protocol(message.to_owned()));
+            }
+
+            let mut byte = [0u8; 1];
+            if let Err(error) = self.stream.read_exact(&mut byte) {
+                self.state = RuntimeFdMultiGrantSessionState::Failed;
+                return Err(RuntimeFdBrokerError::io(
+                    "cannot read runtime multi-grant readiness",
+                    error,
+                ));
+            }
+            if byte[0] != expected {
+                self.state = RuntimeFdMultiGrantSessionState::Failed;
+                return Err(RuntimeFdBrokerError::Protocol(format!(
+                    "expected multi-grant readiness byte 0x{expected:02x}, got 0x{:02x}",
+                    byte[0]
+                )));
+            }
+            self.state = RuntimeFdMultiGrantSessionState::Ready;
+            Ok(())
+        }
+
+        /// Transfer one independently prepared attenuated regular-file capability.
+        pub fn send_readonly_regular_file(
+            &mut self,
+            grant: PreparedReadOnlyRegularFile,
+        ) -> Result<(), RuntimeFdBrokerError> {
+            if self.state != RuntimeFdMultiGrantSessionState::Ready {
+                let message = match self.state {
+                    RuntimeFdMultiGrantSessionState::AwaitingReady => {
+                        "runtime multi-grant transfer requires a fresh readiness handshake"
+                    }
+                    RuntimeFdMultiGrantSessionState::Complete => {
+                        "runtime multi-grant session reached its configured grant limit"
+                    }
+                    RuntimeFdMultiGrantSessionState::Failed => {
+                        "runtime multi-grant session is closed after a protocol or I/O failure"
+                    }
+                    RuntimeFdMultiGrantSessionState::Ready => unreachable!(),
+                };
+                return Err(RuntimeFdBrokerError::Protocol(message.to_owned()));
+            }
+
+            match send_fds(self.stream.as_raw_fd(), &[grant.fd]) {
+                Ok(()) => {
+                    self.grants_sent += 1;
+                    self.state = if self.grants_sent == self.max_grants {
+                        RuntimeFdMultiGrantSessionState::Complete
+                    } else {
+                        RuntimeFdMultiGrantSessionState::AwaitingReady
+                    };
+                    Ok(())
+                }
+                Err(error) => {
+                    self.state = RuntimeFdMultiGrantSessionState::Failed;
                     Err(error)
                 }
             }
@@ -2737,6 +2874,38 @@ mod imp {
     #[derive(Debug)]
     pub struct RuntimeFdSession;
 
+    #[derive(Debug)]
+    pub struct RuntimeFdMultiGrantSession;
+
+    impl RuntimeFdMultiGrantSession {
+        pub fn grants_sent(&self) -> u32 {
+            0
+        }
+
+        pub fn max_grants(&self) -> u32 {
+            0
+        }
+
+        pub fn is_complete(&self) -> bool {
+            false
+        }
+
+        pub fn wait_for_ready(&mut self, _expected: u8) -> Result<(), RuntimeFdBrokerError> {
+            Err(RuntimeFdBrokerError::UnsupportedPlatform(
+                "runtime multi-grant sessions currently require Linux x86_64".to_owned(),
+            ))
+        }
+
+        pub fn send_readonly_regular_file(
+            &mut self,
+            _grant: PreparedReadOnlyRegularFile,
+        ) -> Result<(), RuntimeFdBrokerError> {
+            Err(RuntimeFdBrokerError::UnsupportedPlatform(
+                "runtime multi-grant sessions currently require Linux x86_64".to_owned(),
+            ))
+        }
+    }
+
     impl RuntimeFdBroker {
         pub fn bind(_path: impl AsRef<Path>) -> Result<Self, RuntimeFdBrokerError> {
             Err(RuntimeFdBrokerError::UnsupportedPlatform(
@@ -2761,6 +2930,15 @@ mod imp {
         pub fn accept(&self) -> Result<RuntimeFdSession, RuntimeFdBrokerError> {
             Err(RuntimeFdBrokerError::UnsupportedPlatform(
                 "runtime FD mediation currently requires Linux x86_64".to_owned(),
+            ))
+        }
+
+        pub fn accept_multi_grant(
+            &self,
+            _max_grants: u32,
+        ) -> Result<RuntimeFdMultiGrantSession, RuntimeFdBrokerError> {
+            Err(RuntimeFdBrokerError::UnsupportedPlatform(
+                "runtime multi-grant sessions currently require Linux x86_64".to_owned(),
             ))
         }
 
@@ -2907,6 +3085,6 @@ mod imp {
 pub use imp::{
     PreparedReadOnlyRegularFile, PreparedRevocableByteStream, PreparedRuntimeMessageChannel,
     PreparedSealedRegularFileSnapshot, PreparedSealedSnapshotBundle, RevocableByteStreamController,
-    RuntimeCorrelatedMessageExchangeController, RuntimeFdBroker, RuntimeFdSession,
-    RuntimeMessageExchangeController, RuntimeMultiMessageExchangeController,
+    RuntimeCorrelatedMessageExchangeController, RuntimeFdBroker, RuntimeFdMultiGrantSession,
+    RuntimeFdSession, RuntimeMessageExchangeController, RuntimeMultiMessageExchangeController,
 };

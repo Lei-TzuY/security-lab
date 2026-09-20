@@ -4,11 +4,11 @@ use security_lab::{
     run, ChildOutcome, RuntimeFdBroker, RuntimeFdBrokerError, SandboxPolicy,
     MAX_RUNTIME_CORRELATED_IN_FLIGHT, MAX_RUNTIME_CORRELATED_REQUESTS, MAX_RUNTIME_MESSAGE_BYTES,
     MAX_RUNTIME_MESSAGE_REQUEST_WAIT_MILLISECONDS, MAX_RUNTIME_MESSAGE_RESPONSE_WAIT_MILLISECONDS,
-    MAX_RUNTIME_MULTI_MESSAGE_ROUNDS, MAX_RUNTIME_MULTI_MESSAGE_SESSION_MILLISECONDS,
-    MAX_RUNTIME_REVOCABLE_STREAM_BYTES, MAX_RUNTIME_SEALED_BUNDLE_BYTES,
+    MAX_RUNTIME_MULTI_GRANTS, MAX_RUNTIME_MULTI_MESSAGE_ROUNDS,
+    MAX_RUNTIME_MULTI_MESSAGE_SESSION_MILLISECONDS, MAX_RUNTIME_REVOCABLE_STREAM_BYTES, MAX_RUNTIME_SEALED_BUNDLE_BYTES,
     MAX_RUNTIME_SEALED_BUNDLE_ITEMS, MAX_RUNTIME_SEALED_SNAPSHOT_BYTES,
     MIN_RUNTIME_CORRELATED_IN_FLIGHT, MIN_RUNTIME_CORRELATED_REQUESTS,
-    MIN_RUNTIME_MULTI_MESSAGE_ROUNDS,
+    MIN_RUNTIME_MULTI_GRANTS, MIN_RUNTIME_MULTI_MESSAGE_ROUNDS,
 };
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
@@ -332,6 +332,87 @@ fn broker_attenuates_rw_regular_file_to_readonly_independent_description() {
     std::fs::remove_dir(&directory_path).expect("remove broker source directory");
 }
 
+#[test]
+fn bounded_multi_grant_session_requires_fresh_readiness_and_exact_limit() {
+    let socket_path = unique_path("runtime-multi-grant-local.sock");
+    let first_path = unique_path("runtime-multi-grant-first");
+    let second_path = unique_path("runtime-multi-grant-second");
+    let _ = std::fs::remove_file(&socket_path);
+    let _ = std::fs::remove_file(&first_path);
+    let _ = std::fs::remove_file(&second_path);
+    let first_bytes = b"runtime-multi-grant-first\n";
+    let second_bytes = b"runtime-multi-grant-second\n";
+    std::fs::write(&first_path, first_bytes).unwrap();
+    std::fs::write(&second_path, second_bytes).unwrap();
+
+    let broker = RuntimeFdBroker::bind(&socket_path).unwrap();
+    assert!(matches!(
+        broker.accept_multi_grant(MIN_RUNTIME_MULTI_GRANTS - 1),
+        Err(RuntimeFdBrokerError::InvalidConfiguration(_))
+    ));
+    assert!(matches!(
+        broker.accept_multi_grant(MAX_RUNTIME_MULTI_GRANTS + 1),
+        Err(RuntimeFdBrokerError::InvalidConfiguration(_))
+    ));
+
+    let mut client = UnixStream::connect(broker.path()).unwrap();
+    let mut session = broker.accept_multi_grant(2).unwrap();
+    assert_eq!(session.grants_sent(), 0);
+    assert_eq!(session.max_grants(), 2);
+    assert!(!session.is_complete());
+
+    let first = File::open(&first_path).unwrap();
+    let premature = RuntimeFdBroker::prepare_readonly_regular_file(&first).unwrap();
+    assert!(matches!(
+        session.send_readonly_regular_file(premature),
+        Err(RuntimeFdBrokerError::Protocol(message)) if message.contains("fresh readiness")
+    ));
+
+    client.write_all(b"R").unwrap();
+    session.wait_for_ready(b'R').unwrap();
+    let first_grant = RuntimeFdBroker::prepare_readonly_regular_file(&first).unwrap();
+    session.send_readonly_regular_file(first_grant).unwrap();
+    let received_first = receive_one_fd(&client);
+    assert_eq!(read_exact_fd(received_first.raw(), first_bytes.len()), first_bytes);
+    assert_eq!(session.grants_sent(), 1);
+    assert!(!session.is_complete());
+
+    let second = File::open(&second_path).unwrap();
+    let premature_second = RuntimeFdBroker::prepare_readonly_regular_file(&second).unwrap();
+    assert!(matches!(
+        session.send_readonly_regular_file(premature_second),
+        Err(RuntimeFdBrokerError::Protocol(message)) if message.contains("fresh readiness")
+    ));
+
+    client.write_all(b"S").unwrap();
+    session.wait_for_ready(b'S').unwrap();
+    let second_grant = RuntimeFdBroker::prepare_readonly_regular_file(&second).unwrap();
+    session.send_readonly_regular_file(second_grant).unwrap();
+    let received_second = receive_one_fd(&client);
+    assert_eq!(
+        read_exact_fd(received_second.raw(), second_bytes.len()),
+        second_bytes
+    );
+    assert_eq!(session.grants_sent(), 2);
+    assert!(session.is_complete());
+
+    assert!(matches!(
+        session.wait_for_ready(b'T'),
+        Err(RuntimeFdBrokerError::Protocol(message)) if message.contains("grant limit")
+    ));
+    let extra = RuntimeFdBroker::prepare_readonly_regular_file(&first).unwrap();
+    assert!(matches!(
+        session.send_readonly_regular_file(extra),
+        Err(RuntimeFdBrokerError::Protocol(message)) if message.contains("grant limit")
+    ));
+
+    drop(session);
+    drop(client);
+    drop(broker);
+    std::fs::remove_file(&first_path).unwrap();
+    std::fs::remove_file(&second_path).unwrap();
+}
+
 fn build_probe_root() -> PathBuf {
     let root = unique_path("runtime-rights-root");
     let _ = std::fs::remove_dir_all(&root);
@@ -411,6 +492,68 @@ fn mediated_grant_arrives_only_after_exec_and_host_path_stays_hidden() {
     drop(broker);
     std::fs::remove_file(&marker_path).expect("remove runtime broker marker");
     std::fs::remove_dir_all(&root).expect("remove runtime broker root");
+}
+
+#[test]
+fn bounded_multi_grant_session_reaches_real_target_in_two_readiness_gated_steps() {
+    let root = build_probe_root();
+    let socket_path = unique_path("runtime-multi-grant-sandbox.sock");
+    let first_path = unique_path("runtime-multi-grant-sandbox-first");
+    let second_path = unique_path("runtime-multi-grant-sandbox-second");
+    let _ = std::fs::remove_file(&socket_path);
+    let _ = std::fs::remove_file(&first_path);
+    let _ = std::fs::remove_file(&second_path);
+    std::fs::write(&first_path, b"runtime-multi-grant-first\n").unwrap();
+    std::fs::write(&second_path, b"runtime-multi-grant-second\n").unwrap();
+
+    let broker = RuntimeFdBroker::bind(&socket_path).unwrap();
+    let text = format!(
+        "filesystem.root = {}\n\
+         identity.hostname = security-lab\n\
+         executable = /probe\n\
+         arg = 6\n\
+         arg = {}\n\
+         arg = {}\n\
+         working_dir = /work\n\
+         stdio.stdin = closed\n\
+         stdio.stdout = closed\n\
+         stdio.stderr = closed\n\
+         limit.wall_clock_milliseconds = 3000\n\
+         limit.cpu_seconds = 2\n\
+         limit.address_space_bytes = 134217728\n\
+         limit.file_size_bytes = 1048576\n\
+         limit.open_files = 32\n\
+         seccomp.allow = execveat,write,recvmsg,read,close,openat,exit\n",
+        root.display(),
+        first_path.display(),
+        second_path.display(),
+    );
+    let mut policy: SandboxPolicy = text.parse().unwrap();
+    broker.configure_policy(&mut policy, 10).unwrap();
+
+    let first = File::open(&first_path).unwrap();
+    let second = File::open(&second_path).unwrap();
+    let first_grant = RuntimeFdBroker::prepare_readonly_regular_file(&first).unwrap();
+    let second_grant = RuntimeFdBroker::prepare_readonly_regular_file(&second).unwrap();
+    let runner = thread::spawn(move || run(&policy));
+
+    let mut session = broker.accept_multi_grant(2).unwrap();
+    session.wait_for_ready(b'R').unwrap();
+    session.send_readonly_regular_file(first_grant).unwrap();
+    session.wait_for_ready(b'S').unwrap();
+    session.send_readonly_regular_file(second_grant).unwrap();
+    assert!(session.is_complete());
+
+    let outcome = runner.join().unwrap().unwrap();
+    assert_eq!(outcome, ChildOutcome::Exited(0));
+    assert_eq!(unsafe { libc::lseek(first.as_raw_fd(), 0, libc::SEEK_CUR) }, 0);
+    assert_eq!(unsafe { libc::lseek(second.as_raw_fd(), 0, libc::SEEK_CUR) }, 0);
+
+    drop(session);
+    drop(broker);
+    std::fs::remove_file(&first_path).unwrap();
+    std::fs::remove_file(&second_path).unwrap();
+    std::fs::remove_dir_all(&root).unwrap();
 }
 
 #[test]

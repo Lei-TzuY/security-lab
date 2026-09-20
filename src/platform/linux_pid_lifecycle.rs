@@ -493,8 +493,10 @@ fn timeval_to_micros(value: libc::timeval) -> u64 {
         .saturating_add(micros.min(999_999))
 }
 
-unsafe fn close_nonstdio_except(keep: &[libc::c_int]) -> Result<(), i32> {
-    let mut keep = keep.to_vec();
+unsafe fn close_nonstdio_except(
+    keep: &[libc::c_int; MAX_PERSISTENT_VOLUME_BINDINGS + 3],
+) -> Result<(), i32> {
+    let mut keep = *keep;
     keep.sort_unstable();
     let mut cursor = 3u64;
     let mut previous = -1;

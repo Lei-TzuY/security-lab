@@ -122,12 +122,11 @@ fn validate_path_qualified_needed_name(
     Ok(())
 }
 
-pub(crate) fn validate_exact_dependency_graph(
+pub(crate) fn validate_dependency_graph_roots(
     root_needed: &[Vec<u8>],
-    dependency_needed: &BTreeMap<Vec<u8>, Vec<Vec<u8>>>,
+    declared: &BTreeSet<Vec<u8>>,
 ) -> Result<(), ElfNeededError> {
     let mut root_seen = BTreeSet::new();
-    let mut queue = VecDeque::new();
     for edge in root_needed {
         validate_path_qualified_needed_name(None, edge)?;
         if !root_seen.insert(edge.clone()) {
@@ -136,15 +135,24 @@ pub(crate) fn validate_exact_dependency_graph(
                 display_needed_name(edge)
             )));
         }
-        if !dependency_needed.contains_key(edge) {
+        if !declared.contains(edge) {
             return Err(ElfNeededError(format!(
                 "main executable DT_NEEDED edge {} is not present in the declared sealed dependency graph",
                 display_needed_name(edge)
             )));
         }
-        queue.push_back(edge.clone());
     }
+    Ok(())
+}
 
+pub(crate) fn validate_exact_dependency_graph(
+    root_needed: &[Vec<u8>],
+    dependency_needed: &BTreeMap<Vec<u8>, Vec<Vec<u8>>>,
+) -> Result<(), ElfNeededError> {
+    let declared = dependency_needed.keys().cloned().collect::<BTreeSet<_>>();
+    validate_dependency_graph_roots(root_needed, &declared)?;
+
+    let mut queue = root_needed.iter().cloned().collect::<VecDeque<_>>();
     let mut reachable = BTreeSet::new();
     while let Some(node) = queue.pop_front() {
         if !reachable.insert(node.clone()) {
@@ -392,6 +400,16 @@ mod graph_tests {
         graph.insert(bytes("/a"), vec![bytes("/b")]);
         graph.insert(bytes("/b"), vec![bytes("/a")]);
         validate_exact_dependency_graph(&root, &graph).unwrap();
+    }
+
+    #[test]
+    fn dependency_graph_roots_reject_missing_direct_edges_before_node_access() {
+        let root = vec![bytes("/required")];
+        let declared = [bytes("/different")].into_iter().collect();
+        let err = super::validate_dependency_graph_roots(&root, &declared).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("main executable DT_NEEDED edge /required is not present"));
     }
 
     #[test]

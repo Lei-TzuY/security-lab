@@ -1731,19 +1731,21 @@ mod x86_64 {
                 )?);
             }
             for (cow_index, volume) in cow_volumes.iter().enumerate() {
-                let base_identity_limits =
-                    match (volume.base_identity_bytes, volume.base_identity_nodes) {
-                        (Some(max_bytes), Some(max_nodes)) => Some(SnapshotIdentityLimits {
-                            max_bytes,
-                            max_nodes,
-                        }),
-                        (None, None) => None,
-                        _ => {
-                            return Err(SandboxError::InvalidPolicy(PolicyError::new(
-                                "volume.cow_base_identity_bytes and volume.cow_base_identity_nodes must be specified together",
-                            )));
-                        }
-                    };
+                let base_identity_limits = match (
+                    volume.base_identity_bytes,
+                    volume.base_identity_nodes,
+                ) {
+                    (Some(max_bytes), Some(max_nodes)) => Some(SnapshotIdentityLimits {
+                        max_bytes,
+                        max_nodes,
+                    }),
+                    (None, None) => None,
+                    _ => {
+                        return Err(SandboxError::InvalidPolicy(PolicyError::new(
+                            "volume.cow_base_identity_bytes and volume.cow_base_identity_nodes must be specified together",
+                        )));
+                    }
+                };
                 volumes.push(prepare_volume(
                     root_fd.raw(),
                     &volume.source,

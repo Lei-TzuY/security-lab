@@ -6,6 +6,7 @@ _start:
     test %r13, %r13
     je .fail
     sub $192, %rsp
+    mov %rsp, %r15
     mov $-1, %r12
 
     # Round 1 readiness.
@@ -131,27 +132,29 @@ _start:
 
 # Returns received fd in eax, or -1 on any malformed ancillary message.
 receive_one_fd:
+    # CALL pushes a return address. Keep all msghdr/iovec/cmsg state anchored
+    # to the caller's reserved 192-byte frame through the stable r15 base.
     xor %eax, %eax
-    mov %rax, 0(%rsp)
-    mov %rax, 8(%rsp)
-    lea 64(%rsp), %rax
-    mov %rax, 16(%rsp)
-    movq $1, 24(%rsp)
-    lea 80(%rsp), %rax
-    mov %rax, 32(%rsp)
-    movq $24, 40(%rsp)
-    movq $0, 48(%rsp)
+    mov %rax, 0(%r15)
+    mov %rax, 8(%r15)
+    lea 64(%r15), %rax
+    mov %rax, 16(%r15)
+    movq $1, 24(%r15)
+    lea 80(%r15), %rax
+    mov %rax, 32(%r15)
+    movq $24, 40(%r15)
+    movq $0, 48(%r15)
 
-    lea 144(%rsp), %rax
-    mov %rax, 64(%rsp)
-    movq $1, 72(%rsp)
-    movq $0, 80(%rsp)
-    movq $0, 88(%rsp)
-    movq $0, 96(%rsp)
+    lea 144(%r15), %rax
+    mov %rax, 64(%r15)
+    movq $1, 72(%r15)
+    movq $0, 80(%r15)
+    movq $0, 88(%r15)
+    movq $0, 96(%r15)
 
     mov $47, %eax
     mov $10, %edi
-    mov %rsp, %rsi
+    mov %r15, %rsi
     mov $0x40000000, %edx
     syscall
     cmp $1, %rax

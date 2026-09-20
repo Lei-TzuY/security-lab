@@ -709,12 +709,22 @@ fn compare_bounded_cow_volume_set(
     let baseline = baseline
         .copy_on_write_volume_bindings
         .iter()
-        .map(|binding| ((binding.source.clone(), binding.target.clone()), binding.bytes))
+        .map(|binding| {
+            (
+                (binding.source.clone(), binding.target.clone()),
+                binding.bytes,
+            )
+        })
         .collect::<BTreeMap<_, _>>();
     let candidate = candidate
         .copy_on_write_volume_bindings
         .iter()
-        .map(|binding| ((binding.source.clone(), binding.target.clone()), binding.bytes))
+        .map(|binding| {
+            (
+                (binding.source.clone(), binding.target.clone()),
+                binding.bytes,
+            )
+        })
         .collect::<BTreeMap<_, _>>();
 
     let candidate_covers_baseline = baseline.iter().all(|(key, bytes)| {

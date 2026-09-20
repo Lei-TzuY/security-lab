@@ -1938,7 +1938,8 @@ fn copy_on_write_volume_diff_guarded_publication_binds_exact_launch_base() {
         .iter()
         .find(|diff| diff.target == b"/cowb")
         .expect("unbound COW volume diff");
-    match publish_cow_volume_diff_atomic(&second, &destination, unbound, replay_limits).unwrap_err() {
+    match publish_cow_volume_diff_atomic(&second, &destination, unbound, replay_limits).unwrap_err()
+    {
         CowVolumePublicationError::UnboundDiff => {}
         other => panic!("unexpected observation-only publication result: {other}"),
     }

@@ -1794,8 +1794,8 @@ fn copy_on_write_persistent_volume_is_private_and_ephemeral() {
             target: PathBuf::from("/cowdata"),
             bytes: 1024 * 1024,
             diff_bytes: None,
-        base_identity_bytes: None,
-        base_identity_nodes: None,
+            base_identity_bytes: None,
+            base_identity_nodes: None,
         }];
 
         assert_eq!(run(&mounted).unwrap(), ChildOutcome::Exited(0));
@@ -1843,16 +1843,16 @@ fn copy_on_write_volume_diffs_are_isolated_and_target_sorted() {
             target: PathBuf::from("/cowb"),
             bytes: 1024 * 1024,
             diff_bytes: Some(4096),
-        base_identity_bytes: None,
-        base_identity_nodes: None,
+            base_identity_bytes: None,
+            base_identity_nodes: None,
         },
         CopyOnWriteVolumeBinding {
             source: first.clone(),
             target: PathBuf::from("/cowa"),
             bytes: 1024 * 1024,
             diff_bytes: Some(4096),
-        base_identity_bytes: None,
-        base_identity_nodes: None,
+            base_identity_bytes: None,
+            base_identity_nodes: None,
         },
     ];
 
@@ -1904,8 +1904,8 @@ fn copy_on_write_volume_diff_guarded_publication_binds_exact_launch_base() {
             target: PathBuf::from("/cowb"),
             bytes: 1024 * 1024,
             diff_bytes: Some(4096),
-        base_identity_bytes: None,
-        base_identity_nodes: None,
+            base_identity_bytes: None,
+            base_identity_nodes: None,
         },
         CopyOnWriteVolumeBinding {
             source: first.clone(),
@@ -1979,16 +1979,16 @@ fn copy_on_write_volume_diff_omits_unrequested_volume() {
             target: PathBuf::from("/cowa"),
             bytes: 1024 * 1024,
             diff_bytes: Some(4096),
-        base_identity_bytes: None,
-        base_identity_nodes: None,
+            base_identity_bytes: None,
+            base_identity_nodes: None,
         },
         CopyOnWriteVolumeBinding {
             source: second.clone(),
             target: PathBuf::from("/cowb"),
             bytes: 1024 * 1024,
             diff_bytes: None,
-        base_identity_bytes: None,
-        base_identity_nodes: None,
+            base_identity_bytes: None,
+            base_identity_nodes: None,
         },
     ];
 

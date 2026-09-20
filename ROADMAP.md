@@ -1756,7 +1756,7 @@ Acceptance evidence is executable:
 - `RuntimeFdSession::send_revocable_host_unix_stream(grant)` consumes the same readiness-gated one-successful-grant state transition as the existing one-shot host-stream transfer and returns a controller only after successful `SCM_RIGHTS` publication;
 - the controller retains a trusted descriptor for the same connected socket object plus the already-observed `SO_PEERCRED` PID/UID/GID evidence;
 - `revoke()` performs exactly one `shutdown(SHUT_RDWR)`; a second explicit revoke is a protocol error and a shutdown error terminally marks the controller failed;
-- dropping a still-active controller attempts the same bidirectional shutdown, so accidental controller loss fails closed instead of silently abandoning revocation authority;
+- dropping a still-active controller makes a best-effort attempt at the same bidirectional shutdown; because Drop cannot surface failure, confirmed revocation requires an explicit successful `revoke()`;
 - local kernel regressions prove the transferred descriptor exchanges bytes before revocation, then observes EOF on reads and `EPIPE` on `MSG_NOSIGNAL` sends after explicit revoke, and the same EOF/EPIPE state after active-controller drop;
 - a dedicated raw-syscall sandbox target reaches the exact prepared host service before revocation, blocks in `read`, wakes to EOF after trusted shutdown, and still requires `ENOENT` for the original host service pathname;
 - the target policy continues to require only the existing broker `recvmsg` plus ordinary stream I/O and explicitly carries no target `socket`, `connect`, or persistent `execveat` authority;

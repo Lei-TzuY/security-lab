@@ -3238,13 +3238,8 @@ mod imp {
         expected_peer: Option<(u32, u32)>,
     ) -> Result<PreparedHostUnixSeqpacket, RuntimeFdBrokerError> {
         validate_socket_path(path)?;
-        let fd = unsafe {
-            libc::socket(
-                libc::AF_UNIX,
-                libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
-                0,
-            )
-        };
+        let fd =
+            unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0) };
         if fd == -1 {
             return Err(RuntimeFdBrokerError::io(
                 "cannot create runtime host UNIX seqpacket socket",
@@ -4748,9 +4743,8 @@ mod imp {
 
 pub use imp::{
     HostUnixStreamRevocationController, PreparedHostUnixSeqpacket, PreparedHostUnixStream,
-    PreparedReadOnlyRegularFile,
-    PreparedRevocableByteStream, PreparedRuntimeMessageChannel, PreparedSealedRegularFileSnapshot,
-    PreparedSealedSnapshotBundle, RevocableByteStreamController,
+    PreparedReadOnlyRegularFile, PreparedRevocableByteStream, PreparedRuntimeMessageChannel,
+    PreparedSealedRegularFileSnapshot, PreparedSealedSnapshotBundle, RevocableByteStreamController,
     RuntimeAcknowledgedCorrelatedMessageExchangeController,
     RuntimeAuthenticatedCorrelatedMessageExchangeController,
     RuntimeCorrelatedMessageExchangeController, RuntimeFdBroker, RuntimeFdSession,

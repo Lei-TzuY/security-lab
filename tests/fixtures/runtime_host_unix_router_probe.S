@@ -142,41 +142,43 @@ _start:
     syscall
 
 receive_one_fd:
+    # call pushed an 8-byte return address; recover the caller's scratch base.
+    lea 8(%rsp), %rbx
     xor %eax, %eax
-    mov %rax, 0(%rsp)
-    mov %rax, 8(%rsp)
-    lea 64(%rsp), %rax
-    mov %rax, 16(%rsp)
-    movq $1, 24(%rsp)
-    lea 80(%rsp), %rax
-    mov %rax, 32(%rsp)
-    movq $24, 40(%rsp)
-    movq $0, 48(%rsp)
-    lea 144(%rsp), %rax
-    mov %rax, 64(%rsp)
-    movq $1, 72(%rsp)
-    movq $0, 80(%rsp)
-    movq $0, 88(%rsp)
-    movq $0, 96(%rsp)
+    mov %rax, 0(%rbx)
+    mov %rax, 8(%rbx)
+    lea 64(%rbx), %rax
+    mov %rax, 16(%rbx)
+    movq $1, 24(%rbx)
+    lea 80(%rbx), %rax
+    mov %rax, 32(%rbx)
+    movq $24, 40(%rbx)
+    movq $0, 48(%rbx)
+    lea 144(%rbx), %rax
+    mov %rax, 64(%rbx)
+    movq $1, 72(%rbx)
+    movq $0, 80(%rbx)
+    movq $0, 88(%rbx)
+    movq $0, 96(%rbx)
 
     mov $47, %eax
     mov $10, %edi
-    mov %rsp, %rsi
+    mov %rbx, %rsi
     mov $0x40000000, %edx
     syscall
     cmp $1, %rax
     jne .receive_fail
-    cmpb $70, 144(%rsp)
+    cmpb $70, 144(%rbx)
     jne .receive_fail
-    testl $8, 48(%rsp)
+    testl $8, 48(%rbx)
     jne .receive_fail
-    cmpq $20, 80(%rsp)
+    cmpq $20, 80(%rbx)
     jne .receive_fail
-    cmpl $1, 88(%rsp)
+    cmpl $1, 88(%rbx)
     jne .receive_fail
-    cmpl $1, 92(%rsp)
+    cmpl $1, 92(%rbx)
     jne .receive_fail
-    mov 96(%rsp), %r12d
+    mov 96(%rbx), %r12d
     ret
 
 .receive_fail:

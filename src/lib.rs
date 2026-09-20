@@ -5,6 +5,7 @@
 
 mod cancellation;
 mod cow_diff_apply;
+mod cow_volume_publication;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod elf_interpreter;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -33,6 +34,9 @@ pub use cancellation::CancellationToken;
 pub use cow_diff_apply::{
     apply_cow_diff_atomic, apply_cow_diff_atomic_with_expected_base, CowDiffApplyBoundReport,
     CowDiffApplyError, CowDiffApplyLimits, CowDiffApplyReport,
+};
+pub use cow_volume_publication::{
+    publish_cow_volume_diff_atomic, CowVolumePublicationError, CowVolumePublicationReport,
 };
 pub use policy::{
     CopyOnWriteVolumeBinding, ExecutableNeededBinding, PersistentVolumeBinding, PolicyError,

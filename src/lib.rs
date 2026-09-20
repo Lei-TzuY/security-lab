@@ -45,6 +45,7 @@ pub use report::{
 pub use runtime_fd_broker::{
     PreparedReadOnlyRegularFile, PreparedRevocableByteStream, PreparedRuntimeMessageChannel,
     PreparedSealedRegularFileSnapshot, PreparedSealedSnapshotBundle, RevocableByteStreamController,
+    RuntimeAuthenticatedCorrelatedMessageExchangeController,
     RuntimeCorrelatedMessageExchangeController, RuntimeCorrelatedRequest, RuntimeFdBroker,
     RuntimeFdBrokerError, RuntimeFdSession, RuntimeMessageExchangeController,
     RuntimeMultiMessageExchangeController, MAX_RUNTIME_CORRELATED_IN_FLIGHT,
@@ -55,6 +56,7 @@ pub use runtime_fd_broker::{
     MAX_RUNTIME_SEALED_BUNDLE_ITEMS, MAX_RUNTIME_SEALED_SNAPSHOT_BYTES,
     MIN_RUNTIME_CORRELATED_IN_FLIGHT, MIN_RUNTIME_CORRELATED_REQUESTS,
     MIN_RUNTIME_MULTI_MESSAGE_ROUNDS, MIN_RUNTIME_SEALED_BUNDLE_ITEMS,
+    RUNTIME_AUTH_CHALLENGE_BYTES, RUNTIME_AUTH_KEY_BYTES, RUNTIME_AUTH_TAG_BYTES,
 };
 pub use snapshot_archive::{
     materialize_snapshot_archive_atomic, materialize_snapshot_archive_ed25519_atomic,

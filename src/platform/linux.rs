@@ -30,6 +30,7 @@ mod x86_64 {
         ProcessTreeUsage, ResourceLimits, RunReport, SandboxError, SandboxPolicy,
     };
     use sha2::{Digest, Sha256};
+    use std::collections::BTreeSet;
     use std::ffi::CString;
     use std::io;
     use std::net::Ipv4Addr;
@@ -1211,7 +1212,7 @@ mod x86_64 {
         cow_diff_requested: bool,
         executable_fd: OwnedFd,
         interpreter: Option<PreparedSealedMount>,
-        dependency: Option<PreparedSealedMount>,
+        dependencies: Vec<PreparedSealedMount>,
         selected_handles: Vec<PreparedSelectedHandle>,
         selected_storage_floor: RawFd,
         landlock: PreparedLandlock,
@@ -1356,20 +1357,37 @@ mod x86_64 {
                 }
             };
 
-            let dependency = match (&policy.executable_needed, policy.executable_needed_sha256) {
-                (Some(path), Some(expected_sha256)) => {
-                    let needed = elf_needed::read_elf64_x86_64_dt_needed(executable_fd.raw())
-                        .map_err(|error| {
-                            SandboxError::SetupFailed(format!(
-                                "cannot parse content-bound executable DT_NEEDED: {error}"
-                            ))
-                        })?;
-                    if needed.len() != 1 || needed[0].as_slice() != path.as_os_str().as_bytes() {
-                        return Err(SandboxError::SetupFailed(format!(
-                            "content-bound executable direct DT_NEEDED closure must contain exactly one entry and it must match executable.needed {}",
-                            path.display()
-                        )));
+            let needed_bindings = policy.normalized_executable_needed_bindings();
+            let mut dependencies = Vec::with_capacity(needed_bindings.len());
+            if !needed_bindings.is_empty() {
+                let needed = elf_needed::read_elf64_x86_64_dt_needed(executable_fd.raw())
+                    .map_err(|error| {
+                        SandboxError::SetupFailed(format!(
+                            "cannot parse content-bound executable DT_NEEDED: {error}"
+                        ))
+                    })?;
+                let mut observed = BTreeSet::new();
+                for entry in &needed {
+                    if !observed.insert(entry.clone()) {
+                        return Err(SandboxError::SetupFailed(
+                            "content-bound executable contains duplicate direct DT_NEEDED entries"
+                                .to_owned(),
+                        ));
                     }
+                }
+                let declared = needed_bindings
+                    .iter()
+                    .map(|binding| binding.path.as_os_str().as_bytes().to_vec())
+                    .collect::<BTreeSet<_>>();
+                if observed != declared {
+                    return Err(SandboxError::SetupFailed(format!(
+                        "content-bound executable direct DT_NEEDED set does not exactly match {} declared executable.needed bindings",
+                        needed_bindings.len()
+                    )));
+                }
+
+                for binding in &needed_bindings {
+                    let path = &binding.path;
                     let pinned = open_beneath_root(
                         root_fd.raw(),
                         path,
@@ -1381,13 +1399,13 @@ mod x86_64 {
                         root_fd.raw(),
                         path,
                         pinned,
-                        expected_sha256,
+                        binding.sha256,
                         "ELF direct dependency",
                         "executable.needed_sha256",
                         "security-lab-needed",
                     )?;
-                    let transitive_needed = elf_needed::read_elf64_x86_64_dt_needed(image_fd.raw())
-                        .map_err(|error| {
+                    let transitive_needed =
+                        elf_needed::read_elf64_x86_64_dt_needed(image_fd.raw()).map_err(|error| {
                             SandboxError::SetupFailed(format!(
                                 "cannot parse sealed direct dependency DT_NEEDED: {error}"
                             ))
@@ -1399,18 +1417,12 @@ mod x86_64 {
                             transitive_needed.len()
                         )));
                     }
-                    Some(PreparedSealedMount {
+                    dependencies.push(PreparedSealedMount {
                         image_fd,
                         target_relative: sandbox_relative(path)?,
-                    })
+                    });
                 }
-                (None, None) => None,
-                _ => {
-                    return Err(SandboxError::InvalidPolicy(PolicyError::new(
-                        "executable.needed and executable.needed_sha256 must be specified together",
-                    )));
-                }
-            };
+            }
 
             let mut landlock_read_execute = Vec::with_capacity(policy.landlock_read_execute.len());
             for path in &policy.landlock_read_execute {
@@ -1772,7 +1784,7 @@ mod x86_64 {
                 cow_diff_requested: policy.cow_diff_bytes.is_some(),
                 executable_fd,
                 interpreter,
-                dependency,
+                dependencies,
                 selected_handles,
                 selected_storage_floor,
                 landlock: PreparedLandlock {
@@ -3386,7 +3398,7 @@ mod x86_64 {
                 seccomp.error_exit_syscall,
             );
         }
-        if let Some(dependency) = &prepared.dependency {
+        for dependency in &prepared.dependencies {
             install_sealed_image_or_fail(
                 dependency,
                 NEEDED_MOUNT_PHASES,

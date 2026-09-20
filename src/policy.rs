@@ -30,6 +30,10 @@ const MIN_COW_ROOT_BYTES: u64 = 4096;
 const MAX_COW_ROOT_BYTES: u64 = 1024 * 1024 * 1024;
 const MIN_COW_DIFF_BYTES: u64 = 64;
 const MAX_COW_DIFF_BYTES: u64 = 16 * 1024 * 1024;
+const MIN_COW_BASE_IDENTITY_BYTES: u64 = 1;
+const MAX_COW_BASE_IDENTITY_BYTES: u64 = 1024 * 1024 * 1024;
+const MIN_COW_BASE_IDENTITY_NODES: u64 = 1;
+const MAX_COW_BASE_IDENTITY_NODES: u64 = 100_000;
 const MIN_CAPTURE_BYTES: u64 = 1;
 const MAX_CAPTURE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_STDOUT_TOTAL_BYTES: u64 = 1024 * 1024 * 1024;
@@ -114,6 +118,10 @@ pub struct CopyOnWriteVolumeBinding {
     /// Optional bounded canonical export ceiling for this volume's private
     /// OverlayFS upper tree after process-tree convergence.
     pub diff_bytes: Option<u64>,
+    /// Optional bounded canonical host-lower identity limits captured before
+    /// sandbox launch. Both fields are all-or-nothing and require diff export.
+    pub base_identity_bytes: Option<u64>,
+    pub base_identity_nodes: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1043,6 +1051,35 @@ impl SandboxPolicy {
                     )));
                 }
             }
+            match (volume.base_identity_bytes, volume.base_identity_nodes) {
+                (None, None) => {}
+                (Some(max_bytes), Some(max_nodes)) => {
+                    if volume.diff_bytes.is_none() {
+                        return Err(PolicyError::new(
+                            "volume.cow_base_identity_* requires volume.cow_diff_bytes",
+                        ));
+                    }
+                    if !(MIN_COW_BASE_IDENTITY_BYTES..=MAX_COW_BASE_IDENTITY_BYTES)
+                        .contains(&max_bytes)
+                    {
+                        return Err(PolicyError::new(format!(
+                            "volume.cow_base_identity_bytes must be between {MIN_COW_BASE_IDENTITY_BYTES} and {MAX_COW_BASE_IDENTITY_BYTES}"
+                        )));
+                    }
+                    if !(MIN_COW_BASE_IDENTITY_NODES..=MAX_COW_BASE_IDENTITY_NODES)
+                        .contains(&max_nodes)
+                    {
+                        return Err(PolicyError::new(format!(
+                            "volume.cow_base_identity_nodes must be between {MIN_COW_BASE_IDENTITY_NODES} and {MAX_COW_BASE_IDENTITY_NODES}"
+                        )));
+                    }
+                }
+                _ => {
+                    return Err(PolicyError::new(
+                        "volume.cow_base_identity_bytes and volume.cow_base_identity_nodes must be specified together",
+                    ));
+                }
+            }
             if volume.source.starts_with(&self.root_dir)
                 || self.root_dir.starts_with(&volume.source)
             {
@@ -1515,6 +1552,8 @@ impl FromStr for SandboxPolicy {
         let mut cow_volume_target = Vec::new();
         let mut cow_volume_bytes = Vec::new();
         let mut cow_volume_diff_bytes = Vec::new();
+        let mut cow_volume_base_identity_bytes = Vec::new();
+        let mut cow_volume_base_identity_nodes = Vec::new();
         let mut scratch_dir = None;
         let mut scratch_bytes = None;
         let mut stdin = None;
@@ -1703,6 +1742,12 @@ impl FromStr for SandboxPolicy {
                 "volume.cow_bytes" => cow_volume_bytes.push(parse_u64(value, line_no, key)?),
                 "volume.cow_diff_bytes" => {
                     cow_volume_diff_bytes.push(parse_u64(value, line_no, key)?)
+                }
+                "volume.cow_base_identity_bytes" => {
+                    cow_volume_base_identity_bytes.push(parse_u64(value, line_no, key)?)
+                }
+                "volume.cow_base_identity_nodes" => {
+                    cow_volume_base_identity_nodes.push(parse_u64(value, line_no, key)?)
                 }
                 "filesystem.scratch" => set_once(&mut scratch_dir, value.to_owned(), line_no, key)?,
                 "filesystem.scratch_bytes" => set_once(
@@ -2046,6 +2091,23 @@ impl FromStr for SandboxPolicy {
                 "volume.cow_diff_bytes must be omitted entirely or have one entry for every copy-on-write volume",
             ));
         }
+        if cow_volume_base_identity_bytes.len() != cow_volume_base_identity_nodes.len() {
+            return Err(PolicyError::new(
+                "volume.cow_base_identity_bytes and volume.cow_base_identity_nodes must have the same number of entries",
+            ));
+        }
+        if !cow_volume_base_identity_bytes.is_empty()
+            && cow_volume_base_identity_bytes.len() != cow_volume_source.len()
+        {
+            return Err(PolicyError::new(
+                "volume.cow_base_identity_* must be omitted entirely or have one entry for every copy-on-write volume",
+            ));
+        }
+        if !cow_volume_base_identity_bytes.is_empty() && cow_volume_diff_bytes.is_empty() {
+            return Err(PolicyError::new(
+                "volume.cow_base_identity_* requires volume.cow_diff_bytes",
+            ));
+        }
         let volume_count = readonly_volume_source
             .len()
             .checked_add(writable_volume_source.len())
@@ -2097,17 +2159,31 @@ impl FromStr for SandboxPolicy {
                 .map(Some)
                 .collect::<Vec<_>>()
         };
+        let cow_identity_limits = if cow_volume_base_identity_bytes.is_empty() {
+            vec![(None, None); cow_volume_source.len()]
+        } else {
+            cow_volume_base_identity_bytes
+                .into_iter()
+                .zip(cow_volume_base_identity_nodes)
+                .map(|(bytes, nodes)| (Some(bytes), Some(nodes)))
+                .collect::<Vec<_>>()
+        };
         let copy_on_write_volume_bindings = cow_volume_source
             .into_iter()
             .zip(cow_volume_target)
             .zip(cow_volume_bytes)
             .zip(cow_diff_limits)
+            .zip(cow_identity_limits)
             .map(
-                |(((source, target), bytes), diff_bytes)| CopyOnWriteVolumeBinding {
-                    source: PathBuf::from(source),
-                    target: PathBuf::from(target),
-                    bytes,
-                    diff_bytes,
+                |((((source, target), bytes), diff_bytes), (base_identity_bytes, base_identity_nodes))| {
+                    CopyOnWriteVolumeBinding {
+                        source: PathBuf::from(source),
+                        target: PathBuf::from(target),
+                        bytes,
+                        diff_bytes,
+                        base_identity_bytes,
+                        base_identity_nodes,
+                    }
                 },
             )
             .collect::<Vec<_>>();
@@ -3363,12 +3439,16 @@ landlock.file_mutate = /state-b/subdir"
                     target: PathBuf::from("/state-a"),
                     bytes: 1048576,
                     diff_bytes: None,
+                    base_identity_bytes: None,
+                    base_identity_nodes: None,
                 },
                 CopyOnWriteVolumeBinding {
                     source: PathBuf::from("/srv/base-b"),
                     target: PathBuf::from("/state-b"),
                     bytes: 2097152,
                     diff_bytes: None,
+                    base_identity_bytes: None,
+                    base_identity_nodes: None,
                 },
             ]
         );
@@ -3393,6 +3473,51 @@ volume.cow_diff_bytes = 8192"
             policy.copy_on_write_volume_bindings[1].diff_bytes,
             Some(8192)
         );
+
+        let with_bound_identity = format!(
+            "{base}
+volume.cow_source = /srv/base-a
+volume.cow_source = /srv/base-b
+volume.cow_target = /state-a
+volume.cow_target = /state-b
+volume.cow_bytes = 1048576
+volume.cow_bytes = 2097152
+volume.cow_diff_bytes = 4096
+volume.cow_diff_bytes = 8192
+volume.cow_base_identity_bytes = 1048576
+volume.cow_base_identity_bytes = 2097152
+volume.cow_base_identity_nodes = 100
+volume.cow_base_identity_nodes = 200"
+        );
+        let policy: SandboxPolicy = with_bound_identity.parse().unwrap();
+        assert_eq!(
+            policy.copy_on_write_volume_bindings[0].base_identity_bytes,
+            Some(1048576)
+        );
+        assert_eq!(
+            policy.copy_on_write_volume_bindings[1].base_identity_nodes,
+            Some(200)
+        );
+
+        let identity_without_diff = format!(
+            "{base}
+volume.cow_source = /srv/base
+volume.cow_target = /state
+volume.cow_bytes = 1048576
+volume.cow_base_identity_bytes = 1048576
+volume.cow_base_identity_nodes = 100"
+        );
+        assert!(identity_without_diff.parse::<SandboxPolicy>().is_err());
+
+        let partial_identity = format!(
+            "{base}
+volume.cow_source = /srv/base
+volume.cow_target = /state
+volume.cow_bytes = 1048576
+volume.cow_diff_bytes = 4096
+volume.cow_base_identity_bytes = 1048576"
+        );
+        assert!(partial_identity.parse::<SandboxPolicy>().is_err());
 
         let partial_diff = format!(
             "{base}

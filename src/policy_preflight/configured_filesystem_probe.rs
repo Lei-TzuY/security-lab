@@ -486,16 +486,16 @@ mod linux_x86_64 {
                         None,
                     );
                 }
-                let transitive_needed =
-                    match elf_needed::read_elf64_x86_64_dt_needed(object.raw()) {
-                        Ok(needed) => needed,
-                        Err(_) => {
-                            return ConfiguredFilesystemProbe::unavailable(
-                                "executable_needed_dependency_elf",
-                                None,
-                            );
-                        }
-                    };
+                let transitive_needed = match elf_needed::read_elf64_x86_64_dt_needed(object.raw())
+                {
+                    Ok(needed) => needed,
+                    Err(_) => {
+                        return ConfiguredFilesystemProbe::unavailable(
+                            "executable_needed_dependency_elf",
+                            None,
+                        );
+                    }
+                };
                 if !transitive_needed.is_empty() {
                     return ConfiguredFilesystemProbe::unavailable(
                         "executable_needed_transitive_dependency",

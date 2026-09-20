@@ -24,10 +24,10 @@ mod x86_64 {
     };
     use crate::elf_interpreter;
     use crate::elf_needed;
-    use crate::policy::{StdioMode, StdioPolicy};
+    use crate::policy::{StdioMode, StdioPolicy, MAX_PERSISTENT_VOLUME_BINDINGS};
     use crate::{
-        CancellationToken, CapturedOutput, ChildOutcome, EnforcementReceipt, PolicyError,
-        ProcessTreeUsage, ResourceLimits, RunReport, SandboxError, SandboxPolicy,
+        CancellationToken, CapturedOutput, ChildOutcome, CowVolumeDiff, EnforcementReceipt,
+        PolicyError, ProcessTreeUsage, ResourceLimits, RunReport, SandboxError, SandboxPolicy,
     };
     use sha2::{Digest, Sha256};
     use std::collections::{BTreeMap, BTreeSet};
@@ -335,6 +335,7 @@ mod x86_64 {
         target_relative: CString,
         access: VolumeAccess,
         cow_size: Option<CString>,
+        cow_diff_slot: Option<usize>,
     }
 
     struct PreparedSealedMount {
@@ -918,6 +919,7 @@ mod x86_64 {
         target: &Path,
         access: VolumeAccess,
         cow_bytes: Option<u64>,
+        cow_diff_slot: Option<usize>,
     ) -> Result<PreparedVolume, SandboxError> {
         let (source_field, source_label, target_label) = match access {
             VolumeAccess::ReadOnly => (
@@ -952,6 +954,7 @@ mod x86_64 {
             cow_size: cow_bytes
                 .map(|bytes| cstring_bytes("volume.cow_bytes", bytes.to_string().as_bytes()))
                 .transpose()?,
+            cow_diff_slot,
         })
     }
 
@@ -1696,6 +1699,7 @@ mod x86_64 {
                     &volume.target,
                     VolumeAccess::ReadOnly,
                     None,
+                    None,
                 )?);
             }
             for volume in &writable_volumes {
@@ -1705,15 +1709,17 @@ mod x86_64 {
                     &volume.target,
                     VolumeAccess::Writable,
                     None,
+                    None,
                 )?);
             }
-            for volume in cow_volumes {
+            for (cow_index, volume) in cow_volumes.iter().enumerate() {
                 volumes.push(prepare_volume(
                     root_fd.raw(),
                     &volume.source,
                     &volume.target,
                     VolumeAccess::CopyOnWrite,
                     Some(volume.bytes),
+                    volume.diff_bytes.map(|_| cow_index),
                 )?);
             }
 
@@ -1845,6 +1851,7 @@ mod x86_64 {
         capture_write_fd: RawFd,
         output_limit_fd: RawFd,
         cow_diff_state: *mut CowDiffState,
+        cow_volume_diff_states: [*mut CowDiffState; MAX_PERSISTENT_VOLUME_BINDINGS],
         wall_clock_milliseconds: u64,
     }
 
@@ -1929,6 +1936,26 @@ mod x86_64 {
                     "cannot allocate bounded copy-on-write diff state: {err}"
                 ))
             })?;
+        let mut cow_volume_diffs = Vec::with_capacity(policy.copy_on_write_volume_bindings.len());
+        for volume in &policy.copy_on_write_volume_bindings {
+            cow_volume_diffs.push(
+                volume
+                    .diff_bytes
+                    .map(SharedCowDiff::new)
+                    .transpose()
+                    .map_err(|err| {
+                        SandboxError::SetupFailed(format!(
+                            "cannot allocate bounded copy-on-write volume diff state: {err}"
+                        ))
+                    })?,
+            );
+        }
+        let mut cow_volume_diff_states = [ptr::null_mut(); MAX_PERSISTENT_VOLUME_BINDINGS];
+        for (index, state) in cow_volume_diffs.iter().enumerate() {
+            if let Some(state) = state {
+                cow_volume_diff_states[index] = state.raw();
+            }
+        }
         let output_limit_event = policy
             .stdout_total_bytes
             .map(|_| create_output_limit_eventfd())
@@ -1956,6 +1983,7 @@ mod x86_64 {
             cow_diff_state: cow_diff
                 .as_ref()
                 .map_or(ptr::null_mut(), SharedCowDiff::raw),
+            cow_volume_diff_states,
             wall_clock_milliseconds: policy.wall_clock_milliseconds.unwrap_or(0),
         };
 
@@ -2007,6 +2035,7 @@ mod x86_64 {
                 outcome,
                 stdout: None,
                 cow_diff: None,
+                cow_volume_diffs: Vec::new(),
                 reaped_descendants: 0,
                 process_tree_usage: ProcessTreeUsage::default(),
                 enforcement: EnforcementReceipt::default(),
@@ -2030,10 +2059,25 @@ mod x86_64 {
         };
         let outcome = resolve_lifecycle_outcome(&lifecycle_record, output_limit_observed)?;
         let cow_diff = cow_diff.as_ref().map(SharedCowDiff::snapshot).transpose()?;
+        let mut cow_volume_diff_reports = Vec::new();
+        for (binding, state) in policy
+            .copy_on_write_volume_bindings
+            .iter()
+            .zip(cow_volume_diffs.iter())
+        {
+            if let Some(state) = state {
+                cow_volume_diff_reports.push(CowVolumeDiff {
+                    target: binding.target.as_os_str().as_bytes().to_vec(),
+                    diff: state.snapshot()?,
+                });
+            }
+        }
+        cow_volume_diff_reports.sort_by(|left, right| left.target.cmp(&right.target));
         Ok(RunReport {
             outcome,
             stdout,
             cow_diff,
+            cow_volume_diffs: cow_volume_diff_reports,
             reaped_descendants: lifecycle_record.reaped_descendants,
             process_tree_usage: ProcessTreeUsage {
                 user_cpu_micros: lifecycle_record.user_cpu_micros,

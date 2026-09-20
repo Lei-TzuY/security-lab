@@ -330,6 +330,36 @@ mod imp {
         }
     }
 
+    #[derive(Debug)]
+    pub struct PreparedHostUnixSeqpacket {
+        fd: RawFd,
+        peer_pid: i32,
+        peer_uid: u32,
+        peer_gid: u32,
+    }
+
+    impl Drop for PreparedHostUnixSeqpacket {
+        fn drop(&mut self) {
+            unsafe {
+                libc::close(self.fd);
+            }
+        }
+    }
+
+    impl PreparedHostUnixSeqpacket {
+        pub fn peer_pid(&self) -> i32 {
+            self.peer_pid
+        }
+
+        pub fn peer_uid(&self) -> u32 {
+            self.peer_uid
+        }
+
+        pub fn peer_gid(&self) -> u32 {
+            self.peer_gid
+        }
+    }
+
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum HostUnixStreamRevocationState {
         Active,

@@ -234,7 +234,8 @@ fn fixture_root() -> &'static Path {
         std::fs::create_dir_all(root.join("proc")).expect("create sandbox procfs mountpoint");
         std::fs::create_dir_all(root.join("scratch")).expect("create sandbox scratch mountpoint");
         std::fs::create_dir_all(root.join("data")).expect("create sandbox volume mountpoint");
-        std::fs::create_dir_all(root.join("data2")).expect("create second sandbox volume mountpoint");
+        std::fs::create_dir_all(root.join("data2"))
+            .expect("create second sandbox volume mountpoint");
         std::fs::create_dir_all(root.join("persist"))
             .expect("create sandbox writable-volume mountpoint");
         std::fs::create_dir_all(root.join("persist2"))
@@ -497,8 +498,8 @@ fn readonly_volume_source_second() -> &'static Path {
     static SOURCE: OnceLock<PathBuf> = OnceLock::new();
     SOURCE
         .get_or_init(|| {
-            let source = std::env::temp_dir()
-                .join(format!("security-lab-volume-second-{}", process::id()));
+            let source =
+                std::env::temp_dir().join(format!("security-lab-volume-second-{}", process::id()));
             let _ = std::fs::remove_dir_all(&source);
             std::fs::create_dir_all(&source).expect("create second read-only volume source");
             std::fs::write(source.join("marker"), b"volume-marker-2\n")
@@ -512,8 +513,10 @@ fn writable_volume_source_second() -> &'static Path {
     static SOURCE: OnceLock<PathBuf> = OnceLock::new();
     SOURCE
         .get_or_init(|| {
-            let source = std::env::temp_dir()
-                .join(format!("security-lab-writable-volume-second-{}", process::id()));
+            let source = std::env::temp_dir().join(format!(
+                "security-lab-writable-volume-second-{}",
+                process::id()
+            ));
             let _ = std::fs::remove_dir_all(&source);
             std::fs::create_dir_all(&source).expect("create second writable volume source");
             source

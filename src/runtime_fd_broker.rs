@@ -468,7 +468,6 @@ mod imp {
         }
     }
 
-    #[derive(Debug)]
     pub struct RuntimeAuthenticatedCorrelatedMessageExchangeController {
         fd: RawFd,
         max_request_bytes: u64,
@@ -483,6 +482,22 @@ mod imp {
         challenge: [u8; super::RUNTIME_AUTH_CHALLENGE_BYTES],
         challenge_published: bool,
         failed: bool,
+    }
+
+    impl std::fmt::Debug for RuntimeAuthenticatedCorrelatedMessageExchangeController {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("RuntimeAuthenticatedCorrelatedMessageExchangeController")
+                .field("max_request_bytes", &self.max_request_bytes)
+                .field("max_response_bytes", &self.max_response_bytes)
+                .field("max_requests", &self.max_requests)
+                .field("max_in_flight", &self.max_in_flight)
+                .field("received_requests", &self.received_requests)
+                .field("completed_responses", &self.completed_responses)
+                .field("pending_requests", &self.pending_request_ids.len())
+                .field("challenge_published", &self.challenge_published)
+                .field("failed", &self.failed)
+                .finish_non_exhaustive()
+        }
     }
 
     impl Drop for RuntimeAuthenticatedCorrelatedMessageExchangeController {

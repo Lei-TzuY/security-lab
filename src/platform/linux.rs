@@ -3281,6 +3281,7 @@ mod x86_64 {
             capture_write_fd,
             output_limit_fd,
             cow_diff_state,
+            cow_volume_diff_states,
             wall_clock_milliseconds,
         } = control;
         if capture_read_fd >= FIRST_NON_STDIO_FD as RawFd && libc::close(capture_read_fd) == -1 {
@@ -3417,13 +3418,25 @@ mod x86_64 {
             child_fail(launch_error, PHASE_ROOT_FCHDIR, seccomp.error_exit_syscall);
         }
 
+        let mut cow_volume_upper_fds = [-1; MAX_PERSISTENT_VOLUME_BINDINGS];
         for volume in &prepared.volumes {
-            install_volume_or_fail(
+            let cow_upper = install_volume_or_fail(
                 volume,
                 root_tree_fd,
                 launch_error,
                 seccomp.error_exit_syscall,
             );
+            if let Some(slot) = volume.cow_diff_slot {
+                if slot >= cow_volume_upper_fds.len() || cow_upper < FIRST_NON_STDIO_FD as RawFd {
+                    child_fail_errno(
+                        launch_error,
+                        PHASE_COW_DIFF_EXPORT,
+                        libc::EINVAL,
+                        seccomp.error_exit_syscall,
+                    );
+                }
+                cow_volume_upper_fds[slot] = cow_upper;
+            }
         }
 
         if let (Some(scratch), Some(options)) =
@@ -3533,6 +3546,8 @@ mod x86_64 {
             CowDiffControl {
                 upper_fd: cow_upper_fd,
                 state: cow_diff_state,
+                volume_upper_fds: cow_volume_upper_fds,
+                volume_states: cow_volume_diff_states,
             },
             TargetSupervisionPhases {
                 fork: PHASE_TARGET_FORK,
@@ -3859,7 +3874,7 @@ mod x86_64 {
         cow_size: &CString,
         launch_error: *mut LaunchErrorRecord,
         error_exit_syscall: libc::c_long,
-    ) -> RawFd {
+    ) -> (RawFd, RawFd) {
         let state_fsfd = libc::syscall(
             libc::SYS_fsopen,
             b"tmpfs\0".as_ptr().cast::<libc::c_char>(),
@@ -4034,10 +4049,10 @@ mod x86_64 {
         }
         let overlay_fd = overlay_fd as RawFd;
 
-        for fd in [overlay_fsfd, work_fd, upper_fd, state_mount_fd] {
+        for fd in [overlay_fsfd, work_fd, state_mount_fd] {
             close_setup_fd(fd);
         }
-        overlay_fd
+        (overlay_fd, upper_fd)
     }
 
     unsafe fn install_volume_or_fail(
@@ -4045,7 +4060,7 @@ mod x86_64 {
         root_tree_fd: RawFd,
         launch_error: *mut LaunchErrorRecord,
         error_exit_syscall: libc::c_long,
-    ) {
+    ) -> RawFd {
         let source_how = OpenHow {
             flags: (libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
             mode: 0,
@@ -4128,7 +4143,7 @@ mod x86_64 {
         }
         let target_fd = target_fd as RawFd;
 
-        let attach_fd = if volume.access == VolumeAccess::CopyOnWrite {
+        let (attach_fd, cow_upper_fd) = if volume.access == VolumeAccess::CopyOnWrite {
             construct_cow_volume_overlay_or_fail(
                 volume_tree_fd,
                 volume
@@ -4139,7 +4154,7 @@ mod x86_64 {
                 error_exit_syscall,
             )
         } else {
-            volume_tree_fd
+            (volume_tree_fd, -1)
         };
         let attach_phase = if volume.access == VolumeAccess::CopyOnWrite {
             PHASE_COW_VOLUME_ATTACH
@@ -4162,11 +4177,20 @@ mod x86_64 {
         if attach_fd != volume_tree_fd {
             close_setup_fd(attach_fd);
         }
+        let retained_cow_upper = if volume.cow_diff_slot.is_some() {
+            cow_upper_fd
+        } else {
+            if cow_upper_fd >= FIRST_NON_STDIO_FD as RawFd {
+                close_setup_fd(cow_upper_fd);
+            }
+            -1
+        };
         for fd in [target_fd, volume_tree_fd, current_source_fd] {
             if libc::close(fd) == -1 {
                 child_fail(launch_error, attach_phase, error_exit_syscall);
             }
         }
+        retained_cow_upper
     }
 
     unsafe fn open_stdout_redirect_or_fail(

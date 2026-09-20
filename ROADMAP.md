@@ -1772,7 +1772,7 @@ After 74A integrates, do not farm shutdown-mode variants or revocation aliases. 
 
 ### Slice 75A — export requested COW-volume upper trees after process-tree convergence
 
-**Current implementation candidate.** Extends the existing 69A private COW-volume capability with an independently bounded observation channel; it does not change the target's mount authority or add a commit path.
+**Status: complete on `main`.** Extends the existing 69A private COW-volume capability with an independently bounded observation channel; it does not change the target's mount authority or add a commit path.
 
 Acceptance evidence is executable:
 

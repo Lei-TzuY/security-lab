@@ -138,6 +138,12 @@ pub struct SandboxPolicy {
     /// Root and transitive edges must resolve entirely within this sealed set.
     /// This is mutually exclusive with the legacy single pair above.
     pub executable_needed_bindings: Vec<ExecutableNeededBinding>,
+    /// Optional exact content-bound executable retained across the initial exec
+    /// as a process-lifetime later-exec capability. Linux exposes the sealed
+    /// image at descriptor `limit.open_files` after lowering RLIMIT_NOFILE,
+    /// so the target cannot replace that descriptor with another object.
+    pub later_executable: Option<PathBuf>,
+    pub later_executable_sha256: Option<[u8; 32]>,
     pub args: Vec<String>,
     pub environment: BTreeMap<String, String>,
     /// Absolute path interpreted inside `root_dir`.
@@ -358,6 +364,68 @@ impl SandboxPolicy {
         }
         let readonly_volumes = self.normalized_readonly_volume_bindings();
         let writable_volumes = self.normalized_writable_volume_bindings();
+
+        match (&self.later_executable, self.later_executable_sha256) {
+            (None, None) => {}
+            (Some(path), Some(_)) => {
+                validate_absolute_path("executable.later", path)?;
+                if path == Path::new("/") {
+                    return Err(PolicyError::new(
+                        "executable.later must not name the sandbox root",
+                    ));
+                }
+                if path == &self.executable {
+                    return Err(PolicyError::new(
+                        "executable.later must differ from the initial executable",
+                    ));
+                }
+                if self.seccomp.allowed_syscalls.contains("execve")
+                    || self.seccomp.allowed_syscalls.contains("execveat")
+                {
+                    return Err(PolicyError::new(
+                        "executable.later is mutually exclusive with general execve/execveat seccomp authority",
+                    ));
+                }
+                if self.limits.open_files >= (i32::MAX as u64 - 1) {
+                    return Err(PolicyError::new(
+                        "limit.open_files is too large for the sealed later-exec descriptor boundary",
+                    ));
+                }
+                let overlaps = |other: &Path| path.starts_with(other) || other.starts_with(path);
+                if self.procfs_enabled && overlaps(Path::new("/proc")) {
+                    return Err(PolicyError::new(
+                        "executable.later must not overlap filesystem.proc",
+                    ));
+                }
+                if let Some(scratch) = self.scratch_dir.as_deref() {
+                    if overlaps(scratch) {
+                        return Err(PolicyError::new(
+                            "executable.later must not overlap filesystem.scratch",
+                        ));
+                    }
+                }
+                for volume in &readonly_volumes {
+                    if overlaps(&volume.target) {
+                        return Err(PolicyError::new(
+                            "executable.later must not overlap volume.readonly_target",
+                        ));
+                    }
+                }
+                for volume in &writable_volumes {
+                    if overlaps(&volume.target) {
+                        return Err(PolicyError::new(
+                            "executable.later must not overlap volume.writable_target",
+                        ));
+                    }
+                }
+            }
+            _ => {
+                return Err(PolicyError::new(
+                    "executable.later and executable.later_sha256 must be specified together",
+                ));
+            }
+        }
+
         let volume_count = readonly_volumes
             .len()
             .checked_add(writable_volumes.len())
@@ -1411,6 +1479,8 @@ impl FromStr for SandboxPolicy {
         let mut executable_interpreter_sha256 = None;
         let mut executable_needed = Vec::new();
         let mut executable_needed_sha256 = Vec::new();
+        let mut later_executable = None;
+        let mut later_executable_sha256 = None;
         let mut args = Vec::new();
         let mut environment = BTreeMap::new();
         let mut working_dir = None;
@@ -1652,6 +1722,15 @@ impl FromStr for SandboxPolicy {
                 "executable.needed_sha256" => {
                     executable_needed_sha256.push(parse_sha256(value, line_no, key)?)
                 }
+                "executable.later" => {
+                    set_once(&mut later_executable, value.to_owned(), line_no, key)?
+                }
+                "executable.later_sha256" => set_once(
+                    &mut later_executable_sha256,
+                    parse_sha256(value, line_no, key)?,
+                    line_no,
+                    key,
+                )?,
                 "arg" => args.push(value.to_owned()),
                 "working_dir" => set_once(&mut working_dir, value.to_owned(), line_no, key)?,
                 "landlock.read_execute" => landlock_read_execute.push(value.to_owned()),
@@ -2007,6 +2086,8 @@ impl FromStr for SandboxPolicy {
             executable_needed: legacy_needed,
             executable_needed_sha256: legacy_needed_sha256,
             executable_needed_bindings,
+            later_executable: later_executable.map(PathBuf::from),
+            later_executable_sha256,
             args,
             environment,
             working_dir: PathBuf::from(required(working_dir, "working_dir")?),

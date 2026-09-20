@@ -86,6 +86,13 @@ pub enum RuntimeFdBrokerError {
     RuntimeAcknowledgmentMismatch {
         request_id: u64,
     },
+    HostUnixPeerCredentialMismatch {
+        expected_uid: u32,
+        expected_gid: u32,
+        actual_pid: i32,
+        actual_uid: u32,
+        actual_gid: u32,
+    },
     UnexpectedPeer {
         expected_pid: i32,
         expected_uid: u32,
@@ -167,6 +174,16 @@ impl fmt::Display for RuntimeFdBrokerError {
                 f,
                 "runtime FD broker acknowledgment does not match published response for request id {request_id}"
             ),
+            Self::HostUnixPeerCredentialMismatch {
+                expected_uid,
+                expected_gid,
+                actual_pid,
+                actual_uid,
+                actual_gid,
+            } => write!(
+                f,
+                "runtime host UNIX peer mismatch: expected uid/gid {expected_uid}/{expected_gid}, got pid/uid/gid {actual_pid}/{actual_uid}/{actual_gid}"
+            ),
             Self::UnexpectedPeer {
                 expected_pid,
                 expected_uid,
@@ -211,6 +228,28 @@ mod imp {
     const MAX_UNIX_PATH_BYTES: usize = 107;
     const MFD_CLOEXEC: libc::c_uint = 0x0001;
     const MFD_ALLOW_SEALING: libc::c_uint = 0x0002;
+
+    #[derive(Debug)]
+    pub struct PreparedHostUnixStream {
+        stream: UnixStream,
+        peer_pid: i32,
+        peer_uid: u32,
+        peer_gid: u32,
+    }
+
+    impl PreparedHostUnixStream {
+        pub fn peer_pid(&self) -> i32 {
+            self.peer_pid
+        }
+
+        pub fn peer_uid(&self) -> u32 {
+            self.peer_uid
+        }
+
+        pub fn peer_gid(&self) -> u32 {
+            self.peer_gid
+        }
+    }
 
     #[derive(Debug)]
     pub struct PreparedReadOnlyRegularFile {
@@ -2283,6 +2322,20 @@ mod imp {
             })
         }
 
+        /// Connect one exact host filesystem-path AF_UNIX stream before transfer.
+        ///
+        /// The trusted caller chooses the pathname. Optional expected UID/GID
+        /// credentials are checked with Linux SO_PEERCRED before the connected
+        /// socket can become a prepared runtime grant. The target receives only
+        /// the connected socket object after the normal readiness handshake; it
+        /// does not receive pathname lookup, socket creation, or connect authority.
+        pub fn prepare_host_unix_stream(
+            path: impl AsRef<Path>,
+            expected_peer: Option<(u32, u32)>,
+        ) -> Result<PreparedHostUnixStream, RuntimeFdBrokerError> {
+            prepare_host_unix_stream(path.as_ref(), expected_peer)
+        }
+
         /// Pin one regular-file source as a separate read-only open file
         /// description suitable for later SCM_RIGHTS transfer.
         ///
@@ -2496,6 +2549,14 @@ mod imp {
             Ok(())
         }
 
+        /// Transfer exactly one previously prepared connected host AF_UNIX stream.
+        pub fn send_host_unix_stream(
+            &mut self,
+            grant: PreparedHostUnixStream,
+        ) -> Result<(), RuntimeFdBrokerError> {
+            self.send_prepared_fd(grant.stream.as_raw_fd())
+        }
+
         /// Transfer exactly one previously prepared read-only regular-file grant.
         pub fn send_readonly_regular_file(
             &mut self,
@@ -2633,6 +2694,34 @@ mod imp {
             ));
         }
         Ok((credentials.pid, credentials.uid, credentials.gid))
+    }
+
+    fn prepare_host_unix_stream(
+        path: &Path,
+        expected_peer: Option<(u32, u32)>,
+    ) -> Result<PreparedHostUnixStream, RuntimeFdBrokerError> {
+        validate_socket_path(path)?;
+        let stream = UnixStream::connect(path).map_err(|error| {
+            RuntimeFdBrokerError::io("cannot connect runtime host UNIX stream", error)
+        })?;
+        let (peer_pid, peer_uid, peer_gid) = peer_credentials(stream.as_raw_fd())?;
+        if let Some((expected_uid, expected_gid)) = expected_peer {
+            if peer_uid != expected_uid || peer_gid != expected_gid {
+                return Err(RuntimeFdBrokerError::HostUnixPeerCredentialMismatch {
+                    expected_uid,
+                    expected_gid,
+                    actual_pid: peer_pid,
+                    actual_uid: peer_uid,
+                    actual_gid: peer_gid,
+                });
+            }
+        }
+        Ok(PreparedHostUnixStream {
+            stream,
+            peer_pid,
+            peer_uid,
+            peer_gid,
+        })
     }
 
     fn prepare_readonly_regular_file(
@@ -3337,6 +3426,23 @@ mod imp {
     use super::{File, Path, RuntimeCorrelatedRequest, RuntimeFdBrokerError, SandboxPolicy};
 
     #[derive(Debug)]
+    pub struct PreparedHostUnixStream;
+
+    impl PreparedHostUnixStream {
+        pub fn peer_pid(&self) -> i32 {
+            0
+        }
+
+        pub fn peer_uid(&self) -> u32 {
+            0
+        }
+
+        pub fn peer_gid(&self) -> u32 {
+            0
+        }
+    }
+
+    #[derive(Debug)]
     pub struct PreparedReadOnlyRegularFile;
 
     #[derive(Debug)]
@@ -3709,6 +3815,15 @@ mod imp {
             ))
         }
 
+        pub fn prepare_host_unix_stream(
+            _path: impl AsRef<Path>,
+            _expected_peer: Option<(u32, u32)>,
+        ) -> Result<PreparedHostUnixStream, RuntimeFdBrokerError> {
+            Err(RuntimeFdBrokerError::UnsupportedPlatform(
+                "runtime host UNIX stream grants currently require Linux x86_64".to_owned(),
+            ))
+        }
+
         pub fn prepare_readonly_regular_file(
             _source: &File,
         ) -> Result<PreparedReadOnlyRegularFile, RuntimeFdBrokerError> {
@@ -3840,6 +3955,15 @@ mod imp {
             ))
         }
 
+        pub fn send_host_unix_stream(
+            &mut self,
+            _grant: PreparedHostUnixStream,
+        ) -> Result<(), RuntimeFdBrokerError> {
+            Err(RuntimeFdBrokerError::UnsupportedPlatform(
+                "runtime host UNIX stream grants currently require Linux x86_64".to_owned(),
+            ))
+        }
+
         pub fn send_readonly_regular_file(
             &mut self,
             _grant: PreparedReadOnlyRegularFile,
@@ -3888,9 +4012,9 @@ mod imp {
 }
 
 pub use imp::{
-    PreparedReadOnlyRegularFile, PreparedRevocableByteStream, PreparedRuntimeMessageChannel,
-    PreparedSealedRegularFileSnapshot, PreparedSealedSnapshotBundle, RevocableByteStreamController,
-    RuntimeAcknowledgedCorrelatedMessageExchangeController,
+    PreparedHostUnixStream, PreparedReadOnlyRegularFile, PreparedRevocableByteStream,
+    PreparedRuntimeMessageChannel, PreparedSealedRegularFileSnapshot, PreparedSealedSnapshotBundle,
+    RevocableByteStreamController, RuntimeAcknowledgedCorrelatedMessageExchangeController,
     RuntimeAuthenticatedCorrelatedMessageExchangeController,
     RuntimeCorrelatedMessageExchangeController, RuntimeFdBroker, RuntimeFdSession,
     RuntimeMessageExchangeController, RuntimeMultiMessageExchangeController,

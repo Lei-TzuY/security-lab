@@ -1679,7 +1679,7 @@ After 68A integrates, do not farm deeper graph shapes, larger node ceilings, or 
 
 ### Slice 69A — private bounded writable overlays over trusted host directories
 
-**Status: complete on `main` once this candidate integrates.** Promotes the 67A persistent-volume set from only immutable host exposure or explicit host write-through into a third materially different storage mode: bounded target-side mutation over a trusted host directory without mutating that host lower tree.
+**Status: complete on `main`.** Promotes the 67A persistent-volume set from only immutable host exposure or explicit host write-through into a third materially different storage mode: bounded target-side mutation over a trusted host directory without mutating that host lower tree.
 
 Acceptance evidence is executable:
 
@@ -1697,8 +1697,30 @@ Boundary: 69A is an ephemeral per-volume OverlayFS capability, not a persistence
 
 ### Milestone 69 promotion rule
 
-After 69A integrates, do not farm larger volume ceilings, fixed additional COW slots, alternate tmpfs sizes, or more copy-up permutations. A further storage promotion must add a materially new lifecycle property such as bounded per-volume diff/export plus explicit commit/replay semantics, or move to another independent architecture frontier.
+69A is sealed on `main`. Do not farm larger volume ceilings, fixed additional COW slots, alternate tmpfs sizes, or more copy-up permutations. A further storage promotion must add a materially new lifecycle property such as bounded per-volume diff/export plus explicit commit/replay semantics, or move to another independent architecture frontier.
+
+## Milestone 71 — post-launch host-local stream capability
+
+### Slice 71A — readiness-gated exact host AF_UNIX stream grant
+
+**Status: complete on `main`.** Extends the existing RuntimeFdBroker from file/private-channel grants to one externally connected host-local stream object without widening target pathname or connect authority.
+
+Acceptance evidence is executable:
+
+- `prepare_host_unix_stream(path, expected_peer)` accepts one absolute bounded filesystem AF_UNIX pathname, connects in the trusted caller's host namespace, and snapshots Linux `SO_PEERCRED`;
+- optional expected UID/GID mismatch returns a typed fail-closed error before a grant exists, while the prepared object exposes observed peer PID/UID/GID to the trusted caller;
+- transfer reuses the existing exact target readiness byte, one-successful-grant session state, and one-descriptor `SCM_RIGHTS` path;
+- the sandbox policy needs only the already-existing runtime broker `recvmsg` plus ordinary I/O syscalls; no `socket`, `connect`, or persistent target `execveat` grant is added;
+- a raw-syscall target receives the connected descriptor after exec, exchanges exact request/response bytes with a real host AF_UNIX service, and independently requires `ENOENT` for the original host socket pathname inside the chroot;
+- local regression proves peer credential evidence, typed mismatch, bidirectional stream behavior, and one-shot session reuse rejection;
+- stable rustfmt, Clippy with `-D warnings`, complete stable tests, and Rust 1.74 are the integration gate.
+
+Boundary: 71A is one trusted-caller-selected connected stream object, not a target-selected service-discovery or routing API. It does not support abstract addresses, datagram/seqpacket modes, multiple connections per session, reconnect/failover, revocation after transfer, cryptographic service identity, or a general post-launch host IPC graph.
+
+### Milestone 71 promotion rule
+
+After 71A integrates, do not farm socket-type variants or fixed extra stream slots. A further host-local IPC promotion must add a materially different lifecycle such as a bounded trusted-controller connection set/reconnect policy or another independently mediated object class, or move to another architecture frontier.
 
 ## Later frontiers
 
-Supplementary-group isolation with a viable mapping architecture, routed/broader network authority beyond the bounded IPv4 brokers, broader host-local IPC mediation beyond the bounded one-shot read-only and sealed-byte regular-file grants, bounded loader search/interpreter closure or later-exec authority, per-volume COW diff/commit or stronger storage lifecycle semantics, and delegated aggregate cgroup accounting remain separate evidence-backed frontiers. Do not add configuration-only names without executable kernel behavior and integration evidence.
+Supplementary-group isolation with a viable mapping architecture, routed/broader network authority beyond the bounded IPv4 brokers, broader dynamic host-local IPC mediation beyond the one-shot connected-stream grant, bounded loader search/interpreter closure or later-exec authority, per-volume COW diff/commit or stronger storage lifecycle semantics, and delegated aggregate cgroup accounting remain separate evidence-backed frontiers. Do not add configuration-only names without executable kernel behavior and integration evidence.

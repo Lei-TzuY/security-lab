@@ -25,6 +25,7 @@
 #   3 receive an ordered two-FD sealed snapshot bundle and reject truncated ancillary control
 #   4 receive a write-disabled runtime stream, read bounded bytes, then observe revoke EOF
 #   5 exchange one bounded request/response packet over a runtime SOCK_SEQPACKET channel
+#   6 receive one post-launch connected host AF_UNIX stream and exchange exact bytes
 #   1 prove launcher bootstrap execveat is one-shot when target execveat is not granted
 #   2 prove an explicit target execveat grant still permits a later exec
 #   q accept one connection through a launcher-brokered host-loopback TCP listening fd
@@ -104,6 +105,8 @@ _start:
     je .brokered_revocable_runtime_stream
     cmp $53, %al
     je .brokered_runtime_message_exchange
+    cmp $54, %al
+    je .brokered_runtime_host_unix_stream
     cmp $49, %al
     je .bootstrap_execveat_one_shot
     cmp $50, %al
@@ -1519,6 +1522,131 @@ _start:
     mov %r12d, %edi
     syscall
 .brokered_runtime_message_exchange_restore:
+    add $192, %rsp
+    jmp .fail29
+
+.brokered_runtime_host_unix_stream:
+    # argv[2] is the original host socket pathname. The target receives only
+    # a connected socket capability and must still observe ENOENT for that path.
+    mov 24(%rsp), %r13
+    test %r13, %r13
+    je .fail29
+    sub $192, %rsp
+    mov $-1, %r12
+
+    # Publish post-exec readiness on the runtime broker connection at fd 10.
+    movb $82, 191(%rsp)
+    mov $1, %eax
+    mov $10, %edi
+    lea 191(%rsp), %rsi
+    mov $1, %edx
+    syscall
+    cmp $1, %rax
+    jne .brokered_runtime_host_unix_stream_fail
+
+    # Receive exactly one SCM_RIGHTS descriptor with MSG_CMSG_CLOEXEC.
+    xor %eax, %eax
+    mov %rax, 0(%rsp)
+    mov %rax, 8(%rsp)
+    lea 64(%rsp), %rax
+    mov %rax, 16(%rsp)
+    movq $1, 24(%rsp)
+    lea 80(%rsp), %rax
+    mov %rax, 32(%rsp)
+    movq $24, 40(%rsp)
+    movq $0, 48(%rsp)
+
+    lea 144(%rsp), %rax
+    mov %rax, 64(%rsp)
+    movq $1, 72(%rsp)
+    movq $0, 80(%rsp)
+    movq $0, 88(%rsp)
+    movq $0, 96(%rsp)
+
+    mov $47, %eax
+    mov $10, %edi
+    mov %rsp, %rsi
+    mov $0x40000000, %edx
+    syscall
+    cmp $1, %rax
+    jne .brokered_runtime_host_unix_stream_fail
+    cmpb $70, 144(%rsp)
+    jne .brokered_runtime_host_unix_stream_fail
+    testl $8, 48(%rsp)
+    jne .brokered_runtime_host_unix_stream_fail
+    cmpq $20, 80(%rsp)
+    jne .brokered_runtime_host_unix_stream_fail
+    cmpl $1, 88(%rsp)
+    jne .brokered_runtime_host_unix_stream_fail
+    cmpl $1, 92(%rsp)
+    jne .brokered_runtime_host_unix_stream_fail
+    mov 96(%rsp), %r12d
+    test %r12d, %r12d
+    js .brokered_runtime_host_unix_stream_fail
+
+    # Prove the received object is a live bidirectional connected stream.
+    mov $1, %eax
+    mov %r12d, %edi
+    lea runtime_host_unix_request(%rip), %rsi
+    mov $runtime_host_unix_request_len, %edx
+    syscall
+    cmp $runtime_host_unix_request_len, %rax
+    jne .brokered_runtime_host_unix_stream_fail
+
+    xor %r14d, %r14d
+.brokered_runtime_host_unix_stream_read:
+    xor %eax, %eax
+    mov %r12d, %edi
+    lea 112(%rsp), %rsi
+    add %r14, %rsi
+    mov $runtime_host_unix_reply_len, %edx
+    sub %r14d, %edx
+    syscall
+    test %rax, %rax
+    jle .brokered_runtime_host_unix_stream_fail
+    add %rax, %r14
+    cmp $runtime_host_unix_reply_len, %r14d
+    jne .brokered_runtime_host_unix_stream_read
+
+    lea 112(%rsp), %rdi
+    lea runtime_host_unix_reply(%rip), %rsi
+    mov $runtime_host_unix_reply_len, %ecx
+    repe cmpsb
+    jne .brokered_runtime_host_unix_stream_fail
+
+    mov $3, %eax
+    mov %r12d, %edi
+    syscall
+    test %rax, %rax
+    js .brokered_runtime_host_unix_stream_fail
+    mov $-1, %r12
+
+    # The host pathname itself remains outside the chroot namespace.
+    mov $257, %eax
+    mov $-100, %edi
+    mov %r13, %rsi
+    xor %edx, %edx
+    xor %r10d, %r10d
+    syscall
+    cmp $-2, %rax
+    jne .brokered_runtime_host_unix_stream_fail
+
+    mov $3, %eax
+    mov $10, %edi
+    syscall
+    test %rax, %rax
+    js .brokered_runtime_host_unix_stream_fail
+    add $192, %rsp
+    xor %edi, %edi
+    jmp .exit
+
+.brokered_runtime_host_unix_stream_fail:
+    test %r12d, %r12d
+    js .brokered_runtime_host_unix_stream_restore
+    mov $3, %eax
+    mov %r12d, %edi
+    syscall
+.brokered_runtime_host_unix_stream_restore:
     add $192, %rsp
     jmp .fail29
 
@@ -3438,6 +3566,12 @@ runtime_message_request:
 runtime_message_response:
     .ascii "runtime-response\n"
 .set runtime_message_response_len, . - runtime_message_response
+runtime_host_unix_request:
+    .ascii "runtime-host-unix-request\n"
+.set runtime_host_unix_request_len, . - runtime_host_unix_request
+runtime_host_unix_reply:
+    .ascii "runtime-host-unix-ok\n"
+.set runtime_host_unix_reply_len, . - runtime_host_unix_reply
 brokered_host_unix_reply:
     .ascii "host-unix-reply"
 .set brokered_host_unix_reply_len, . - brokered_host_unix_reply

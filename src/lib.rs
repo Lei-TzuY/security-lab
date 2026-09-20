@@ -44,9 +44,9 @@ pub use report::{
     RunReport,
 };
 pub use runtime_fd_broker::{
-    PreparedReadOnlyRegularFile, PreparedRevocableByteStream, PreparedRuntimeMessageChannel,
-    PreparedSealedRegularFileSnapshot, PreparedSealedSnapshotBundle, RevocableByteStreamController,
-    RuntimeAcknowledgedCorrelatedMessageExchangeController,
+    PreparedHostUnixStream, PreparedReadOnlyRegularFile, PreparedRevocableByteStream,
+    PreparedRuntimeMessageChannel, PreparedSealedRegularFileSnapshot, PreparedSealedSnapshotBundle,
+    RevocableByteStreamController, RuntimeAcknowledgedCorrelatedMessageExchangeController,
     RuntimeAuthenticatedCorrelatedMessageExchangeController,
     RuntimeCorrelatedMessageExchangeController, RuntimeCorrelatedRequest, RuntimeFdBroker,
     RuntimeFdBrokerError, RuntimeFdSession, RuntimeMessageExchangeController,

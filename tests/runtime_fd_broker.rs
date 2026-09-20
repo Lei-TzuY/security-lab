@@ -15,10 +15,10 @@ use security_lab::{
 use sha2::{Digest, Sha256};
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{self, Command};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -535,6 +535,91 @@ fn broker_attenuates_rw_regular_file_to_readonly_independent_description() {
     std::fs::remove_dir(&directory_path).expect("remove broker source directory");
 }
 
+#[test]
+fn prepared_host_unix_stream_connects_exact_peer_and_reuses_one_shot_grant_state() {
+    let service_path = unique_path("runtime-host-unix-local-service.sock");
+    let broker_path = unique_path("runtime-host-unix-local-broker.sock");
+    let _ = std::fs::remove_file(&service_path);
+    let _ = std::fs::remove_file(&broker_path);
+
+    let listener = UnixListener::bind(&service_path).expect("bind host UNIX service");
+    let expected_uid = unsafe { libc::geteuid() };
+    let expected_gid = unsafe { libc::getegid() };
+    let grant = RuntimeFdBroker::prepare_host_unix_stream(
+        &service_path,
+        Some((expected_uid, expected_gid)),
+    )
+    .expect("prepare exact host UNIX stream");
+    assert_eq!(grant.peer_uid(), expected_uid);
+    assert_eq!(grant.peer_gid(), expected_gid);
+    assert!(grant.peer_pid() > 0);
+
+    let (mut service, _) = listener.accept().expect("accept prepared host UNIX stream");
+    let broker = RuntimeFdBroker::bind(&broker_path).expect("bind runtime broker");
+    let mut client = UnixStream::connect(broker.path()).expect("connect runtime broker");
+    let mut session = broker.accept().expect("accept runtime broker");
+    client.write_all(b"R").unwrap();
+    session.wait_for_ready(b'R').unwrap();
+    session
+        .send_host_unix_stream(grant)
+        .expect("send prepared host UNIX stream");
+    let received = receive_one_fd(&client);
+
+    let request = b"runtime-host-unix-request\n";
+    assert_eq!(
+        unsafe {
+            libc::write(
+                received.raw(),
+                request.as_ptr().cast::<libc::c_void>(),
+                request.len(),
+            )
+        },
+        request.len() as isize
+    );
+    let mut observed = vec![0u8; request.len()];
+    service.read_exact(&mut observed).unwrap();
+    assert_eq!(observed, request);
+    service.write_all(b"runtime-host-unix-ok\n").unwrap();
+    assert_eq!(
+        read_exact_fd(received.raw(), b"runtime-host-unix-ok\n".len()),
+        b"runtime-host-unix-ok\n"
+    );
+
+    let second_listener_path = unique_path("runtime-host-unix-local-second.sock");
+    let _ = std::fs::remove_file(&second_listener_path);
+    let second_listener = UnixListener::bind(&second_listener_path).unwrap();
+    let second_grant =
+        RuntimeFdBroker::prepare_host_unix_stream(&second_listener_path, None).unwrap();
+    let _second_service = second_listener.accept().unwrap();
+    assert!(matches!(
+        session.send_host_unix_stream(second_grant),
+        Err(RuntimeFdBrokerError::Protocol(message)) if message.contains("exactly one")
+    ));
+
+    let wrong_uid = expected_uid.wrapping_add(1);
+    assert!(matches!(
+        RuntimeFdBroker::prepare_host_unix_stream(
+            &service_path,
+            Some((wrong_uid, expected_gid))
+        ),
+        Err(RuntimeFdBrokerError::HostUnixPeerCredentialMismatch {
+            expected_uid: uid,
+            expected_gid: gid,
+            ..
+        }) if uid == wrong_uid && gid == expected_gid
+    ));
+
+    drop(received);
+    drop(session);
+    drop(client);
+    drop(broker);
+    drop(service);
+    drop(listener);
+    drop(second_listener);
+    std::fs::remove_file(&service_path).unwrap();
+    std::fs::remove_file(&second_listener_path).unwrap();
+}
+
 fn build_probe_root() -> PathBuf {
     let root = unique_path("runtime-rights-root");
     let _ = std::fs::remove_dir_all(&root);
@@ -614,6 +699,83 @@ fn mediated_grant_arrives_only_after_exec_and_host_path_stays_hidden() {
     drop(broker);
     std::fs::remove_file(&marker_path).expect("remove runtime broker marker");
     std::fs::remove_dir_all(&root).expect("remove runtime broker root");
+}
+
+#[test]
+fn post_launch_host_unix_stream_grant_reaches_target_without_path_authority() {
+    let root = build_probe_root();
+    let broker_path = unique_path("runtime-host-unix-sandbox-broker.sock");
+    let service_path = unique_path("runtime-host-unix-sandbox-service.sock");
+    let _ = std::fs::remove_file(&broker_path);
+    let _ = std::fs::remove_file(&service_path);
+
+    let listener = UnixListener::bind(&service_path).expect("bind sandbox host UNIX service");
+    let broker = RuntimeFdBroker::bind(&broker_path).expect("bind sandbox runtime broker");
+    let text = format!(
+        "filesystem.root = {}\n\
+         identity.hostname = security-lab\n\
+         executable = /probe\n\
+         arg = 6\n\
+         arg = {}\n\
+         working_dir = /work\n\
+         stdio.stdin = closed\n\
+         stdio.stdout = closed\n\
+         stdio.stderr = closed\n\
+         limit.wall_clock_milliseconds = 3000\n\
+         limit.cpu_seconds = 2\n\
+         limit.address_space_bytes = 134217728\n\
+         limit.file_size_bytes = 1048576\n\
+         limit.open_files = 32\n\
+         seccomp.allow = write,recvmsg,read,close,openat,exit\n",
+        root.display(),
+        service_path.display()
+    );
+    let mut policy: SandboxPolicy = text.parse().expect("parse host UNIX grant policy");
+    broker
+        .configure_policy(&mut policy, 10)
+        .expect("configure runtime broker policy");
+    for syscall in ["socket", "connect", "execveat"] {
+        assert!(
+            !policy.seccomp.allowed_syscalls.contains(syscall),
+            "host UNIX object grant must not require target {syscall} authority"
+        );
+    }
+
+    let grant = RuntimeFdBroker::prepare_host_unix_stream(
+        &service_path,
+        Some((unsafe { libc::geteuid() }, unsafe { libc::getegid() })),
+    )
+    .expect("prepare sandbox host UNIX stream");
+    let peer = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept target host UNIX grant");
+        let mut request = vec![0u8; b"runtime-host-unix-request\n".len()];
+        stream.read_exact(&mut request).unwrap();
+        assert_eq!(request, b"runtime-host-unix-request\n");
+        stream.write_all(b"runtime-host-unix-ok\n").unwrap();
+    });
+
+    let runner = thread::spawn(move || run(&policy));
+    let mut session = broker.accept().expect("accept sandbox runtime connection");
+    if let Err(readiness_error) = session.wait_for_ready(b'R') {
+        let runner_result = runner.join().expect("host UNIX target runner panicked");
+        panic!(
+            "host UNIX grant target failed before readiness: {readiness_error}; runner result: {runner_result:?}"
+        );
+    }
+    session
+        .send_host_unix_stream(grant)
+        .expect("transfer host UNIX stream grant");
+
+    assert_eq!(
+        runner.join().expect("host UNIX runner panicked").unwrap(),
+        ChildOutcome::Exited(0)
+    );
+    peer.join().expect("host UNIX service thread panicked");
+
+    drop(session);
+    drop(broker);
+    std::fs::remove_file(&service_path).unwrap();
+    std::fs::remove_dir_all(&root).unwrap();
 }
 
 #[test]

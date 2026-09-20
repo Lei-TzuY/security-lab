@@ -111,6 +111,9 @@ pub struct CopyOnWriteVolumeBinding {
     pub source: PathBuf,
     pub target: PathBuf,
     pub bytes: u64,
+    /// Optional bounded canonical export ceiling for this volume's private
+    /// OverlayFS upper tree after process-tree convergence.
+    pub diff_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1033,6 +1036,13 @@ impl SandboxPolicy {
         for volume in cow_volumes {
             validate_absolute_path("volume.cow_source", &volume.source)?;
             validate_absolute_path("volume.cow_target", &volume.target)?;
+            if let Some(diff_bytes) = volume.diff_bytes {
+                if !(MIN_COW_DIFF_BYTES..=MAX_COW_DIFF_BYTES).contains(&diff_bytes) {
+                    return Err(PolicyError::new(format!(
+                        "volume.cow_diff_bytes must be between {MIN_COW_DIFF_BYTES} and {MAX_COW_DIFF_BYTES}"
+                    )));
+                }
+            }
             if volume.source.starts_with(&self.root_dir)
                 || self.root_dir.starts_with(&volume.source)
             {
@@ -1504,6 +1514,7 @@ impl FromStr for SandboxPolicy {
         let mut cow_volume_source = Vec::new();
         let mut cow_volume_target = Vec::new();
         let mut cow_volume_bytes = Vec::new();
+        let mut cow_volume_diff_bytes = Vec::new();
         let mut scratch_dir = None;
         let mut scratch_bytes = None;
         let mut stdin = None;
@@ -1690,6 +1701,9 @@ impl FromStr for SandboxPolicy {
                 "volume.cow_source" => cow_volume_source.push(value.to_owned()),
                 "volume.cow_target" => cow_volume_target.push(value.to_owned()),
                 "volume.cow_bytes" => cow_volume_bytes.push(parse_u64(value, line_no, key)?),
+                "volume.cow_diff_bytes" => {
+                    cow_volume_diff_bytes.push(parse_u64(value, line_no, key)?)
+                }
                 "filesystem.scratch" => set_once(&mut scratch_dir, value.to_owned(), line_no, key)?,
                 "filesystem.scratch_bytes" => set_once(
                     &mut scratch_bytes,
@@ -2025,6 +2039,13 @@ impl FromStr for SandboxPolicy {
                 "volume.cow_source, volume.cow_target, and volume.cow_bytes must have the same number of entries",
             ));
         }
+        if !cow_volume_diff_bytes.is_empty()
+            && cow_volume_diff_bytes.len() != cow_volume_source.len()
+        {
+            return Err(PolicyError::new(
+                "volume.cow_diff_bytes must be omitted entirely or have one entry for every copy-on-write volume",
+            ));
+        }
         let volume_count = readonly_volume_source
             .len()
             .checked_add(writable_volume_source.len())
@@ -2068,14 +2089,21 @@ impl FromStr for SandboxPolicy {
                 (None, None, parsed_writable_volumes)
             };
 
+        let cow_diff_limits = if cow_volume_diff_bytes.is_empty() {
+            vec![None; cow_volume_source.len()]
+        } else {
+            cow_volume_diff_bytes.into_iter().map(Some).collect::<Vec<_>>()
+        };
         let copy_on_write_volume_bindings = cow_volume_source
             .into_iter()
             .zip(cow_volume_target)
             .zip(cow_volume_bytes)
-            .map(|((source, target), bytes)| CopyOnWriteVolumeBinding {
+            .zip(cow_diff_limits)
+            .map(|(((source, target), bytes), diff_bytes)| CopyOnWriteVolumeBinding {
                 source: PathBuf::from(source),
                 target: PathBuf::from(target),
                 bytes,
+                diff_bytes,
             })
             .collect::<Vec<_>>();
 

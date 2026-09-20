@@ -755,7 +755,8 @@ fn dropping_active_host_unix_revocation_controller_fails_closed() {
         .expect("accept drop-revoke host UNIX stream");
 
     let broker = RuntimeFdBroker::bind(&broker_path).expect("bind drop-revoke runtime broker");
-    let mut client = UnixStream::connect(broker.path()).expect("connect drop-revoke runtime broker");
+    let mut client =
+        UnixStream::connect(broker.path()).expect("connect drop-revoke runtime broker");
     let mut session = broker.accept().expect("accept drop-revoke runtime broker");
     client.write_all(b"R").unwrap();
     session.wait_for_ready(b'R').unwrap();

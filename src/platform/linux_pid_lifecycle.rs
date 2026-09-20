@@ -155,20 +155,21 @@ pub(super) unsafe fn become_direct_target_or_reap(
     wall_clock_milliseconds: u64,
     cancellation_fd: libc::c_int,
     output_limit_fd: libc::c_int,
-    cow_diff: CowDiffControl,
+    cow_diffs: &[CowDiffControl],
     phases: TargetSupervisionPhases,
 ) {
-    let CowDiffControl {
-        upper_fd: cow_upper_fd,
-        state: cow_diff_state,
-    } = cow_diff;
     let pid = libc::syscall(libc::SYS_fork);
     if pid == -1 {
         fail(launch_error, phases.fork);
     }
     if pid == 0 {
-        for control_fd in [cancellation_fd, output_limit_fd, cow_upper_fd] {
+        for control_fd in [cancellation_fd, output_limit_fd] {
             if control_fd >= 3 && libc::close(control_fd) == -1 {
+                fail(launch_error, phases.close);
+            }
+        }
+        for cow_diff in cow_diffs {
+            if cow_diff.upper_fd >= 3 && libc::close(cow_diff.upper_fd) == -1 {
                 fail(launch_error, phases.close);
             }
         }
@@ -176,7 +177,9 @@ pub(super) unsafe fn become_direct_target_or_reap(
     }
     let pid = pid as libc::pid_t;
 
-    if let Err(errno) = close_nonstdio_except(cancellation_fd, output_limit_fd, cow_upper_fd) {
+    if let Err(errno) =
+        close_nonstdio_except(cancellation_fd, output_limit_fd, cow_diffs)
+    {
         libc::syscall(libc::SYS_kill, pid, libc::SIGKILL);
         let _ = wait_specific(pid);
         let _ = kill_and_reap_remaining(launch_error, phases.kill, phases.reap);
@@ -197,16 +200,18 @@ pub(super) unsafe fn become_direct_target_or_reap(
         Ok(usage) => usage,
         Err(errno) => fail_errno(launch_error, phases.usage, errno),
     };
-    if !cow_diff_state.is_null() {
-        if cow_upper_fd < 3 {
+    for cow_diff_control in cow_diffs {
+        if cow_diff_control.state.is_null() || cow_diff_control.upper_fd < 3 {
             fail_errno(launch_error, phases.cow_diff_export, libc::EINVAL);
         }
-        if let Err(errno) = cow_diff::export_upper(cow_upper_fd, cow_diff_state) {
+        if let Err(errno) =
+            cow_diff::export_upper(cow_diff_control.upper_fd, cow_diff_control.state)
+        {
             fail_errno(launch_error, phases.cow_diff_export, errno);
         }
-    }
-    if cow_upper_fd >= 3 && libc::close(cow_upper_fd) == -1 {
-        fail(launch_error, phases.close);
+        if libc::close(cow_diff_control.upper_fd) == -1 {
+            fail(launch_error, phases.close);
+        }
     }
 
     ptr::write_volatile(ptr::addr_of_mut!((*lifecycle).status), direct_status);
@@ -456,18 +461,34 @@ fn timeval_to_micros(value: libc::timeval) -> u64 {
 unsafe fn close_nonstdio_except(
     keep_a: libc::c_int,
     keep_b: libc::c_int,
-    keep_c: libc::c_int,
+    cow_diffs: &[CowDiffControl],
 ) -> Result<(), i32> {
-    let mut keep = [keep_a, keep_b, keep_c];
-    keep.sort_unstable();
     let mut cursor = 3u64;
-    let mut previous = -1;
-    for fd in keep {
-        if fd < 3 || fd == previous {
-            continue;
+    loop {
+        let mut next_keep: Option<u32> = None;
+        for fd in [keep_a, keep_b]
+            .into_iter()
+            .chain(cow_diffs.iter().map(|control| control.upper_fd))
+        {
+            if fd < 3 {
+                continue;
+            }
+            let fd = fd as u32;
+            if u64::from(fd) < cursor {
+                continue;
+            }
+            next_keep = Some(next_keep.map_or(fd, |current| current.min(fd)));
         }
-        previous = fd;
-        let keep_fd = fd as u32;
+
+        let Some(keep_fd) = next_keep else {
+            if cursor <= u64::from(u32::MAX)
+                && libc::syscall(libc::SYS_close_range, cursor as u32, u32::MAX, 0u32) == -1
+            {
+                return Err(*libc::__errno_location());
+            }
+            return Ok(());
+        };
+
         if cursor < u64::from(keep_fd)
             && libc::syscall(libc::SYS_close_range, cursor as u32, keep_fd - 1, 0u32) == -1
         {
@@ -475,12 +496,6 @@ unsafe fn close_nonstdio_except(
         }
         cursor = u64::from(keep_fd) + 1;
     }
-    if cursor <= u64::from(u32::MAX)
-        && libc::syscall(libc::SYS_close_range, cursor as u32, u32::MAX, 0u32) == -1
-    {
-        return Err(*libc::__errno_location());
-    }
-    Ok(())
 }
 
 unsafe fn wait_specific_nohang(pid: libc::pid_t) -> Result<Option<libc::c_int>, i32> {

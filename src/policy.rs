@@ -3073,6 +3073,50 @@ mod tests {
     }
 
     #[test]
+    fn parses_bounded_exact_needed_binding_set_and_rejects_invalid_sets() {
+        let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let second = "1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let multi = format!(
+            "{VALID}\nexecutable.sha256 = {digest}\nexecutable.interpreter = /loader\nexecutable.interpreter_sha256 = {digest}\nexecutable.needed = /dependency\nexecutable.needed = /dependency-extra\nexecutable.needed_sha256 = {digest}\nexecutable.needed_sha256 = {second}"
+        );
+        let policy: SandboxPolicy = multi.parse().unwrap();
+        assert!(policy.executable_needed.is_none());
+        assert!(policy.executable_needed_sha256.is_none());
+        assert_eq!(policy.executable_needed_bindings.len(), 2);
+        assert_eq!(
+            policy.executable_needed_bindings[0].path,
+            PathBuf::from("/dependency")
+        );
+        assert_eq!(
+            policy.executable_needed_bindings[1].path,
+            PathBuf::from("/dependency-extra")
+        );
+        assert_eq!(
+            policy.normalized_executable_needed_bindings(),
+            policy.executable_needed_bindings
+        );
+
+        let unequal = format!(
+            "{VALID}\nexecutable.sha256 = {digest}\nexecutable.interpreter = /loader\nexecutable.interpreter_sha256 = {digest}\nexecutable.needed = /dependency\nexecutable.needed = /dependency-extra\nexecutable.needed_sha256 = {digest}"
+        );
+        assert!(unequal.parse::<SandboxPolicy>().is_err());
+
+        let duplicate = format!(
+            "{VALID}\nexecutable.sha256 = {digest}\nexecutable.interpreter = /loader\nexecutable.interpreter_sha256 = {digest}\nexecutable.needed = /dependency\nexecutable.needed = /dependency\nexecutable.needed_sha256 = {digest}\nexecutable.needed_sha256 = {second}"
+        );
+        assert!(duplicate.parse::<SandboxPolicy>().is_err());
+
+        let mut oversized = format!(
+            "{VALID}\nexecutable.sha256 = {digest}\nexecutable.interpreter = /loader\nexecutable.interpreter_sha256 = {digest}\n"
+        );
+        for index in 0..=MAX_EXECUTABLE_NEEDED_BINDINGS {
+            oversized.push_str(&format!("executable.needed = /dependency-{index}\n"));
+            oversized.push_str(&format!("executable.needed_sha256 = {digest}\n"));
+        }
+        assert!(oversized.parse::<SandboxPolicy>().is_err());
+    }
+
+    #[test]
     fn parses_stdout_redirect_inside_scratch() {
         let text = VALID.replace(
             "stdio.stdout = inherit",

@@ -1963,6 +1963,189 @@ mod imp {
         }
     }
 
+    impl RuntimeAcknowledgedCorrelatedMessageExchangeController {
+        pub fn is_complete(&self) -> bool {
+            self.controller.is_complete()
+                && self.acknowledged_responses == self.controller.max_requests()
+                && self.awaiting_acknowledgment.is_none()
+        }
+
+        pub fn received_requests(&self) -> u32 {
+            self.controller.received_requests()
+        }
+
+        pub fn published_responses(&self) -> u32 {
+            self.controller.completed_responses()
+        }
+
+        pub fn acknowledged_responses(&self) -> u32 {
+            self.acknowledged_responses
+        }
+
+        pub fn pending_requests(&self) -> u32 {
+            self.controller.pending_requests()
+        }
+
+        pub fn max_requests(&self) -> u32 {
+            self.controller.max_requests()
+        }
+
+        pub fn max_in_flight(&self) -> u32 {
+            self.controller.max_in_flight()
+        }
+
+        pub fn challenge_published(&self) -> bool {
+            self.controller.challenge_published()
+        }
+
+        pub fn awaiting_acknowledgment_request_id(&self) -> Option<u64> {
+            self.awaiting_acknowledgment
+                .as_ref()
+                .map(|expectation| expectation.request_id)
+        }
+
+        pub fn publish_challenge(&mut self) -> Result<(), RuntimeFdBrokerError> {
+            self.controller.publish_challenge()
+        }
+
+        pub fn receive_request(
+            &mut self,
+        ) -> Result<RuntimeCorrelatedRequest, RuntimeFdBrokerError> {
+            self.controller.reject_if_failed()?;
+            if self.awaiting_acknowledgment.is_some() {
+                return Err(RuntimeFdBrokerError::InvalidConfiguration(
+                    "acknowledged runtime exchange must consume the outstanding response acknowledgment before receiving another request"
+                        .to_owned(),
+                ));
+            }
+            self.controller.receive_request()
+        }
+
+        pub fn send_response(
+            &mut self,
+            request_id: u64,
+            bytes: &[u8],
+        ) -> Result<(), RuntimeFdBrokerError> {
+            self.controller.reject_if_failed()?;
+            if self.awaiting_acknowledgment.is_some() {
+                return Err(RuntimeFdBrokerError::InvalidConfiguration(
+                    "acknowledged runtime exchange permits only one published response awaiting acknowledgment"
+                        .to_owned(),
+                ));
+            }
+
+            let response_sha256 = runtime_response_sha256(bytes);
+            self.controller.send_response(request_id, bytes)?;
+            self.awaiting_acknowledgment = Some(RuntimeResponseAcknowledgmentExpectation {
+                request_id,
+                response_sha256,
+            });
+            Ok(())
+        }
+
+        /// Consume one authenticated acknowledgment for the exact response bytes
+        /// most recently published by this controller.
+        ///
+        /// The acknowledgment frame is fixed-size:
+        /// `A || version=1 || request_id_le || sha256(response) || hmac_tag`.
+        /// No later request is consumed while this barrier is outstanding.
+        pub fn receive_acknowledgment(&mut self) -> Result<u64, RuntimeFdBrokerError> {
+            self.controller.reject_if_failed()?;
+            let (expected_request_id, expected_response_sha256) =
+                match self.awaiting_acknowledgment.as_ref() {
+                    Some(expectation) => (expectation.request_id, expectation.response_sha256),
+                    None => {
+                        return Err(RuntimeFdBrokerError::InvalidConfiguration(
+                            "acknowledged runtime exchange has no published response awaiting acknowledgment"
+                                .to_owned(),
+                        ));
+                    }
+                };
+
+            const ACK_FRAME_BYTES: usize = 2 + 8 + 32 + super::RUNTIME_AUTH_TAG_BYTES;
+            let mut frame = [0u8; ACK_FRAME_BYTES];
+            let mut iovec = libc::iovec {
+                iov_base: frame.as_mut_ptr().cast::<libc::c_void>(),
+                iov_len: frame.len(),
+            };
+            let mut message = unsafe { std::mem::zeroed::<libc::msghdr>() };
+            message.msg_iov = &mut iovec;
+            message.msg_iovlen = 1;
+
+            loop {
+                message.msg_flags = 0;
+                let received = unsafe { libc::recvmsg(self.controller.fd, &mut message, 0) };
+                if received == -1 {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() == Some(libc::EINTR) {
+                        continue;
+                    }
+                    self.controller.failed = true;
+                    return Err(RuntimeFdBrokerError::io(
+                        "cannot receive authenticated runtime response acknowledgment",
+                        error,
+                    ));
+                }
+                if received == 0 {
+                    self.controller.failed = true;
+                    return Err(RuntimeFdBrokerError::Protocol(
+                        "authenticated runtime response acknowledgment must arrive before peer shutdown"
+                            .to_owned(),
+                    ));
+                }
+                if message.msg_flags & libc::MSG_TRUNC != 0
+                    || received as usize != ACK_FRAME_BYTES
+                {
+                    self.controller.failed = true;
+                    return Err(RuntimeFdBrokerError::Protocol(
+                        "authenticated runtime response acknowledgment has invalid packet length"
+                            .to_owned(),
+                    ));
+                }
+                if frame[0] != RUNTIME_AUTH_ACKNOWLEDGMENT_KIND
+                    || frame[1] != RUNTIME_AUTH_PROTOCOL_VERSION
+                {
+                    self.controller.failed = true;
+                    return Err(RuntimeFdBrokerError::Protocol(
+                        "authenticated runtime response acknowledgment has an unsupported frame type or version"
+                            .to_owned(),
+                    ));
+                }
+
+                let mut request_id_bytes = [0u8; 8];
+                request_id_bytes.copy_from_slice(&frame[2..10]);
+                let request_id = u64::from_le_bytes(request_id_bytes);
+                let mut response_sha256 = [0u8; 32];
+                response_sha256.copy_from_slice(&frame[10..42]);
+                let tag = &frame[42..];
+
+                if !runtime_auth_verify(
+                    &self.controller.key,
+                    &self.controller.challenge,
+                    RUNTIME_AUTH_ACKNOWLEDGMENT_KIND,
+                    request_id,
+                    &response_sha256,
+                    tag,
+                ) {
+                    self.controller.failed = true;
+                    return Err(RuntimeFdBrokerError::RuntimeAuthenticationFailed);
+                }
+                if request_id != expected_request_id
+                    || response_sha256 != expected_response_sha256
+                {
+                    self.controller.failed = true;
+                    return Err(RuntimeFdBrokerError::RuntimeAcknowledgmentMismatch {
+                        request_id: expected_request_id,
+                    });
+                }
+
+                self.awaiting_acknowledgment = None;
+                self.acknowledged_responses += 1;
+                return Ok(request_id);
+            }
+        }
+    }
+
     #[derive(Debug)]
     pub struct RuntimeFdBroker {
         path: PathBuf,

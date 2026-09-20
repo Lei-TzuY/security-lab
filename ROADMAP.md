@@ -1819,7 +1819,7 @@ Boundary: 76A publishes a new snapshot only; it never writes back into or overwr
 
 ### Slice 77A — authenticate the complete guarded publication report under an explicit signer policy
 
-**Current implementation candidate.** Connects the existing Ed25519 and bounded signer-trust machinery to 76A without weakening any of its base-freshness, replay, or no-replace publication gates.
+**Status: complete on `main`.** Connects the existing Ed25519 and bounded signer-trust machinery to 76A without weakening any of its base-freshness, replay, or no-replace publication gates.
 
 Acceptance evidence is executable:
 

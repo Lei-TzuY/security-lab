@@ -646,7 +646,7 @@ impl SandboxPolicy {
                     .any(|volume| path.starts_with(&volume.target));
                 if !in_scratch && !in_writable_volume && !in_copy_on_write_volume {
                     return Err(PolicyError::new(
-                        "landlock.file_mutate must be within filesystem.scratch, volume.writable_target, or volume.cow_target",
+                        "landlock.file_mutate must be within filesystem.scratch or volume.writable_target or volume.cow_target",
                     ));
                 }
             }

@@ -2175,7 +2175,10 @@ impl FromStr for SandboxPolicy {
             .zip(cow_diff_limits)
             .zip(cow_identity_limits)
             .map(
-                |((((source, target), bytes), diff_bytes), (base_identity_bytes, base_identity_nodes))| {
+                |(
+                    (((source, target), bytes), diff_bytes),
+                    (base_identity_bytes, base_identity_nodes),
+                )| {
                     CopyOnWriteVolumeBinding {
                         source: PathBuf::from(source),
                         target: PathBuf::from(target),

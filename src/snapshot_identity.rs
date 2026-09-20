@@ -1,9 +1,9 @@
 use sha2::{Digest, Sha256};
 use std::error::Error;
 use std::fmt;
-use std::path::Path;
 #[cfg(target_os = "linux")]
 use std::os::unix::io::RawFd;
+use std::path::Path;
 
 const MAX_IDENTITY_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_IDENTITY_NODES: u64 = 100_000;

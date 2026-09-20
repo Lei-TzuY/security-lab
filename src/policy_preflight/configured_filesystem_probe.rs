@@ -491,13 +491,11 @@ mod linux_x86_64 {
                         );
                     }
                 };
-                dependency_graph.insert(
-                    dependency.as_os_str().as_bytes().to_vec(),
-                    node_needed,
-                );
+                dependency_graph.insert(dependency.as_os_str().as_bytes().to_vec(), node_needed);
             }
 
-            if elf_needed::validate_exact_dependency_graph(&root_needed, &dependency_graph).is_err() {
+            if elf_needed::validate_exact_dependency_graph(&root_needed, &dependency_graph).is_err()
+            {
                 return ConfiguredFilesystemProbe::unavailable(
                     "executable_needed_graph_closure",
                     None,

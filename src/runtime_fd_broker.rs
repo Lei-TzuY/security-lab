@@ -2434,6 +2434,33 @@ mod imp {
                 key,
             )
         }
+
+        /// Prepare authenticated correlated messaging with an acknowledgment
+        /// barrier for every published response.
+        ///
+        /// The target must authenticate the SHA-256 of the exact response bytes
+        /// before the trusted controller can consume another request.
+        pub fn prepare_runtime_acknowledged_correlated_exchange(
+            max_request_bytes: u64,
+            max_response_bytes: u64,
+            max_requests: u32,
+            max_in_flight: u32,
+            key: [u8; super::RUNTIME_AUTH_KEY_BYTES],
+        ) -> Result<
+            (
+                PreparedRuntimeMessageChannel,
+                RuntimeAcknowledgedCorrelatedMessageExchangeController,
+            ),
+            RuntimeFdBrokerError,
+        > {
+            prepare_runtime_acknowledged_correlated_exchange(
+                max_request_bytes,
+                max_response_bytes,
+                max_requests,
+                max_in_flight,
+                key,
+            )
+        }
     }
 
     impl RuntimeFdSession {
@@ -3086,6 +3113,36 @@ mod imp {
         ))
     }
 
+    fn prepare_runtime_acknowledged_correlated_exchange(
+        max_request_bytes: u64,
+        max_response_bytes: u64,
+        max_requests: u32,
+        max_in_flight: u32,
+        key: [u8; super::RUNTIME_AUTH_KEY_BYTES],
+    ) -> Result<
+        (
+            PreparedRuntimeMessageChannel,
+            RuntimeAcknowledgedCorrelatedMessageExchangeController,
+        ),
+        RuntimeFdBrokerError,
+    > {
+        let (grant, controller) = prepare_runtime_authenticated_correlated_exchange(
+            max_request_bytes,
+            max_response_bytes,
+            max_requests,
+            max_in_flight,
+            key,
+        )?;
+        Ok((
+            grant,
+            RuntimeAcknowledgedCorrelatedMessageExchangeController {
+                controller,
+                awaiting_acknowledgment: None,
+                acknowledged_responses: 0,
+            },
+        ))
+    }
+
     fn prepare_runtime_multi_message_exchange(
         max_request_bytes: u64,
         max_response_bytes: u64,
@@ -3306,6 +3363,9 @@ mod imp {
     #[derive(Debug)]
     pub struct RuntimeAuthenticatedCorrelatedMessageExchangeController;
 
+    #[derive(Debug)]
+    pub struct RuntimeAcknowledgedCorrelatedMessageExchangeController;
+
     impl RuntimeCorrelatedMessageExchangeController {
         pub fn is_complete(&self) -> bool {
             false
@@ -3402,6 +3462,78 @@ mod imp {
         ) -> Result<(), RuntimeFdBrokerError> {
             Err(RuntimeFdBrokerError::UnsupportedPlatform(
                 "authenticated runtime correlated exchanges currently require Linux x86_64"
+                    .to_owned(),
+            ))
+        }
+    }
+
+    impl RuntimeAcknowledgedCorrelatedMessageExchangeController {
+        pub fn is_complete(&self) -> bool {
+            false
+        }
+
+        pub fn received_requests(&self) -> u32 {
+            0
+        }
+
+        pub fn published_responses(&self) -> u32 {
+            0
+        }
+
+        pub fn acknowledged_responses(&self) -> u32 {
+            0
+        }
+
+        pub fn pending_requests(&self) -> u32 {
+            0
+        }
+
+        pub fn max_requests(&self) -> u32 {
+            0
+        }
+
+        pub fn max_in_flight(&self) -> u32 {
+            0
+        }
+
+        pub fn challenge_published(&self) -> bool {
+            false
+        }
+
+        pub fn awaiting_acknowledgment_request_id(&self) -> Option<u64> {
+            None
+        }
+
+        pub fn publish_challenge(&mut self) -> Result<(), RuntimeFdBrokerError> {
+            Err(RuntimeFdBrokerError::UnsupportedPlatform(
+                "acknowledged runtime correlated exchanges currently require Linux x86_64"
+                    .to_owned(),
+            ))
+        }
+
+        pub fn receive_request(
+            &mut self,
+        ) -> Result<RuntimeCorrelatedRequest, RuntimeFdBrokerError> {
+            Err(RuntimeFdBrokerError::UnsupportedPlatform(
+                "acknowledged runtime correlated exchanges currently require Linux x86_64"
+                    .to_owned(),
+            ))
+        }
+
+        pub fn send_response(
+            &mut self,
+            _request_id: u64,
+            _bytes: &[u8],
+        ) -> Result<(), RuntimeFdBrokerError> {
+            Err(RuntimeFdBrokerError::UnsupportedPlatform(
+                "acknowledged runtime correlated exchanges currently require Linux x86_64"
+                    .to_owned(),
+            ))
+        }
+
+        pub fn receive_acknowledgment(&mut self) -> Result<u64, RuntimeFdBrokerError> {
+            Err(RuntimeFdBrokerError::UnsupportedPlatform(
+                "acknowledged runtime correlated exchanges currently require Linux x86_64"
                     .to_owned(),
             ))
         }
@@ -3677,6 +3809,25 @@ mod imp {
                     .to_owned(),
             ))
         }
+
+        pub fn prepare_runtime_acknowledged_correlated_exchange(
+            _max_request_bytes: u64,
+            _max_response_bytes: u64,
+            _max_requests: u32,
+            _max_in_flight: u32,
+            _key: [u8; super::RUNTIME_AUTH_KEY_BYTES],
+        ) -> Result<
+            (
+                PreparedRuntimeMessageChannel,
+                RuntimeAcknowledgedCorrelatedMessageExchangeController,
+            ),
+            RuntimeFdBrokerError,
+        > {
+            Err(RuntimeFdBrokerError::UnsupportedPlatform(
+                "acknowledged runtime correlated exchanges currently require Linux x86_64"
+                    .to_owned(),
+            ))
+        }
     }
 
     impl RuntimeFdSession {
@@ -3736,6 +3887,7 @@ mod imp {
 pub use imp::{
     PreparedReadOnlyRegularFile, PreparedRevocableByteStream, PreparedRuntimeMessageChannel,
     PreparedSealedRegularFileSnapshot, PreparedSealedSnapshotBundle, RevocableByteStreamController,
+    RuntimeAcknowledgedCorrelatedMessageExchangeController,
     RuntimeAuthenticatedCorrelatedMessageExchangeController,
     RuntimeCorrelatedMessageExchangeController, RuntimeFdBroker, RuntimeFdSession,
     RuntimeMessageExchangeController, RuntimeMultiMessageExchangeController,

@@ -162,6 +162,51 @@ fn direct_needed_binding_is_modeled_as_an_exact_execution_restriction() {
 }
 
 #[test]
+fn bounded_needed_binding_set_is_order_independent_exact_restriction() {
+    let root = unique_absent_root("needed-set");
+    let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let second = "1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let changed = "2123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let sealed = format!(
+        "{}executable.sha256 = {digest}\nexecutable.interpreter = /loader\nexecutable.interpreter_sha256 = {digest}\n",
+        base_policy(&root)
+    );
+    let first_order = format!(
+        "{sealed}executable.needed = /z-dependency\nexecutable.needed = /a-dependency\nexecutable.needed_sha256 = {second}\nexecutable.needed_sha256 = {digest}\n"
+    );
+    let second_order = format!(
+        "{sealed}executable.needed = /a-dependency\nexecutable.needed = /z-dependency\nexecutable.needed_sha256 = {digest}\nexecutable.needed_sha256 = {second}\n"
+    );
+    let changed_digest = format!(
+        "{sealed}executable.needed = /a-dependency\nexecutable.needed = /z-dependency\nexecutable.needed_sha256 = {changed}\nexecutable.needed_sha256 = {second}\n"
+    );
+
+    let baseline = TempPolicy::new("needed-set-baseline", &sealed);
+    let first = TempPolicy::new("needed-set-first", &first_order);
+    let reordered = TempPolicy::new("needed-set-reordered", &second_order);
+    let changed = TempPolicy::new("needed-set-changed", &changed_digest);
+
+    let reduced = run_json(&baseline, &first);
+    assert_eq!(reduced.status.code(), Some(0));
+    let stdout = String::from_utf8(reduced.stdout).expect("utf8 output");
+    assert!(stdout.contains(
+        "\"field\":\"execution.executable_needed_binding\",\"class\":\"reduced\""
+    ));
+
+    let same = run_json(&first, &reordered);
+    assert_eq!(same.status.code(), Some(0));
+    let stdout = String::from_utf8(same.stdout).expect("utf8 output");
+    assert!(!stdout.contains("\"field\":\"execution.executable_needed_binding\""));
+
+    let incomparable = run_json(&first, &changed);
+    assert_eq!(incomparable.status.code(), Some(6));
+    let stdout = String::from_utf8(incomparable.stdout).expect("utf8 output");
+    assert!(stdout.contains(
+        "\"field\":\"execution.executable_needed_binding\",\"class\":\"incomparable\""
+    ));
+}
+
+#[test]
 fn copy_on_write_root_is_modeled_as_ephemeral_write_authority() {
     let root = unique_absent_root("cow-root");
     let baseline_text = base_policy(&root);

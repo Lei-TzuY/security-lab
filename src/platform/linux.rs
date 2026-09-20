@@ -2111,6 +2111,7 @@ mod x86_64 {
             if let Some(state) = state {
                 let (base_identity, base_identity_limits) = cow_volume_base_evidence[index];
                 cow_volume_diff_reports.push(CowVolumeDiff {
+                    source: binding.source.as_os_str().as_bytes().to_vec(),
                     target: binding.target.as_os_str().as_bytes().to_vec(),
                     base_identity,
                     base_identity_limits,

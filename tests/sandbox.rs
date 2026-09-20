@@ -431,6 +431,7 @@ fn fixture_root() -> &'static Path {
                 "-Wl,--build-id=none",
                 "-Wl,--dynamic-linker=/loader",
                 "-Wl,-e,_start",
+                "-Wl,--allow-shlib-undefined",
                 "-o",
             ])
             .arg(&dynamic_needed_transitive_output)

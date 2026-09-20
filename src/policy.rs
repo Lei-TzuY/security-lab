@@ -1431,10 +1431,10 @@ impl FromStr for SandboxPolicy {
         let mut host_unix_stream_peer_gid = None;
         let mut host_loopback_tcp_listen_port = None;
         let mut host_loopback_tcp_listen_target_fd = None;
-        let mut readonly_volume_source = None;
-        let mut readonly_volume_target = None;
-        let mut writable_volume_source = None;
-        let mut writable_volume_target = None;
+        let mut readonly_volume_source = Vec::new();
+        let mut readonly_volume_target = Vec::new();
+        let mut writable_volume_source = Vec::new();
+        let mut writable_volume_target = Vec::new();
         let mut scratch_dir = None;
         let mut scratch_bytes = None;
         let mut stdin = None;
@@ -1614,18 +1614,10 @@ impl FromStr for SandboxPolicy {
                     line_no,
                     key,
                 )?,
-                "volume.readonly_source" => {
-                    set_once(&mut readonly_volume_source, value.to_owned(), line_no, key)?
-                }
-                "volume.readonly_target" => {
-                    set_once(&mut readonly_volume_target, value.to_owned(), line_no, key)?
-                }
-                "volume.writable_source" => {
-                    set_once(&mut writable_volume_source, value.to_owned(), line_no, key)?
-                }
-                "volume.writable_target" => {
-                    set_once(&mut writable_volume_target, value.to_owned(), line_no, key)?
-                }
+                "volume.readonly_source" => readonly_volume_source.push(value.to_owned()),
+                "volume.readonly_target" => readonly_volume_target.push(value.to_owned()),
+                "volume.writable_source" => writable_volume_source.push(value.to_owned()),
+                "volume.writable_target" => writable_volume_target.push(value.to_owned()),
                 "filesystem.scratch" => set_once(&mut scratch_dir, value.to_owned(), line_no, key)?,
                 "filesystem.scratch_bytes" => set_once(
                     &mut scratch_bytes,
@@ -1944,6 +1936,58 @@ impl FromStr for SandboxPolicy {
                 (None, None, parsed_needed_bindings)
             };
 
+        if readonly_volume_source.len() != readonly_volume_target.len() {
+            return Err(PolicyError::new(
+                "volume.readonly_source and volume.readonly_target must have the same number of entries",
+            ));
+        }
+        if writable_volume_source.len() != writable_volume_target.len() {
+            return Err(PolicyError::new(
+                "volume.writable_source and volume.writable_target must have the same number of entries",
+            ));
+        }
+        let volume_count = readonly_volume_source
+            .len()
+            .checked_add(writable_volume_source.len())
+            .ok_or_else(|| PolicyError::new("persistent volume binding count overflow"))?;
+        if volume_count > MAX_PERSISTENT_VOLUME_BINDINGS {
+            return Err(PolicyError::new(format!(
+                "too many persistent volume bindings: {volume_count} > {MAX_PERSISTENT_VOLUME_BINDINGS}"
+            )));
+        }
+
+        let mut parsed_readonly_volumes = readonly_volume_source
+            .into_iter()
+            .zip(readonly_volume_target)
+            .map(|(source, target)| PersistentVolumeBinding {
+                source: PathBuf::from(source),
+                target: PathBuf::from(target),
+            })
+            .collect::<Vec<_>>();
+        let (legacy_readonly_source, legacy_readonly_target, readonly_volume_bindings) =
+            if parsed_readonly_volumes.len() == 1 {
+                let binding = parsed_readonly_volumes.pop().expect("one binding exists");
+                (Some(binding.source), Some(binding.target), Vec::new())
+            } else {
+                (None, None, parsed_readonly_volumes)
+            };
+
+        let mut parsed_writable_volumes = writable_volume_source
+            .into_iter()
+            .zip(writable_volume_target)
+            .map(|(source, target)| PersistentVolumeBinding {
+                source: PathBuf::from(source),
+                target: PathBuf::from(target),
+            })
+            .collect::<Vec<_>>();
+        let (legacy_writable_source, legacy_writable_target, writable_volume_bindings) =
+            if parsed_writable_volumes.len() == 1 {
+                let binding = parsed_writable_volumes.pop().expect("one binding exists");
+                (Some(binding.source), Some(binding.target), Vec::new())
+            } else {
+                (None, None, parsed_writable_volumes)
+            };
+
         let policy = Self {
             root_dir: PathBuf::from(required(root_dir, "filesystem.root")?),
             cow_root_bytes,
@@ -1996,10 +2040,12 @@ impl FromStr for SandboxPolicy {
             host_unix_stream_peer_gid,
             host_loopback_tcp_listen_port,
             host_loopback_tcp_listen_target_fd,
-            readonly_volume_source: readonly_volume_source.map(PathBuf::from),
-            readonly_volume_target: readonly_volume_target.map(PathBuf::from),
-            writable_volume_source: writable_volume_source.map(PathBuf::from),
-            writable_volume_target: writable_volume_target.map(PathBuf::from),
+            readonly_volume_source: legacy_readonly_source,
+            readonly_volume_target: legacy_readonly_target,
+            readonly_volume_bindings,
+            writable_volume_source: legacy_writable_source,
+            writable_volume_target: legacy_writable_target,
+            writable_volume_bindings,
             scratch_dir: scratch_dir.map(PathBuf::from),
             scratch_bytes,
             stdio: StdioPolicy {

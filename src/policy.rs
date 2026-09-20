@@ -956,7 +956,9 @@ impl SandboxPolicy {
         for volume in &readonly_volumes {
             validate_absolute_path("volume.readonly_source", &volume.source)?;
             validate_absolute_path("volume.readonly_target", &volume.target)?;
-            if volume.source.starts_with(&self.root_dir) || self.root_dir.starts_with(&volume.source) {
+            if volume.source.starts_with(&self.root_dir)
+                || self.root_dir.starts_with(&volume.source)
+            {
                 return Err(PolicyError::new(
                     "volume.readonly_source must not overlap filesystem.root",
                 ));
@@ -1016,12 +1018,14 @@ impl SandboxPolicy {
             .collect::<Vec<_>>();
         for (index, left) in all_volumes.iter().enumerate() {
             for right in all_volumes.iter().skip(index + 1) {
-                if left.target.starts_with(&right.target) || right.target.starts_with(&left.target) {
+                if left.target.starts_with(&right.target) || right.target.starts_with(&left.target)
+                {
                     return Err(PolicyError::new(
                         "persistent volume targets must not overlap each other",
                     ));
                 }
-                if left.source.starts_with(&right.source) || right.source.starts_with(&left.source) {
+                if left.source.starts_with(&right.source) || right.source.starts_with(&left.source)
+                {
                     return Err(PolicyError::new(
                         "persistent volume sources must not overlap each other",
                     ));
@@ -3211,9 +3215,9 @@ volume.readonly_target = /data-{index}"
         mixed.readonly_volume_source = Some(PathBuf::from("/srv/legacy"));
         mixed.readonly_volume_target = Some(PathBuf::from("/legacy"));
         let err = mixed.validate().unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("legacy read-only volume pair and readonly_volume_bindings are mutually exclusive"));
+        assert!(err.to_string().contains(
+            "legacy read-only volume pair and readonly_volume_bindings are mutually exclusive"
+        ));
     }
 
     #[test]

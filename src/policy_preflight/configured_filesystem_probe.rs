@@ -544,6 +544,16 @@ mod linux_x86_64 {
                 return result;
             }
         }
+        for volume in &policy.copy_on_write_volume_bindings {
+            if let Err(result) = require_host_directory(&volume.source, "cow_volume_source_open") {
+                return result;
+            }
+            if let Err(result) =
+                require_beneath_directory(root.raw(), &volume.target, "cow_volume_target_open")
+            {
+                return result;
+            }
+        }
 
         ConfiguredFilesystemProbe::available()
     }

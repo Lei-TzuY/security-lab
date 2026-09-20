@@ -1675,6 +1675,30 @@ Boundary: 68A models only the already-bounded set of 1–8 literal absolute path
 
 After 68A integrates, do not farm deeper graph shapes, larger node ceilings, or more traversal-order variants. A further execution-integrity promotion must model a materially new loader-resolution surface such as bounded SONAME/search semantics or interpreter closure, or move to later-exec authority or another independent architectural frontier.
 
+## Milestone 69 — bounded copy-on-write persistent volumes
+
+### Slice 69A — private bounded writable overlays over trusted host directories
+
+**Status: complete on `main` once this candidate integrates.** Promotes the 67A persistent-volume set from only immutable host exposure or explicit host write-through into a third materially different storage mode: bounded target-side mutation over a trusted host directory without mutating that host lower tree.
+
+Acceptance evidence is executable:
+
+- repeated `volume.cow_source`, `volume.cow_target`, and `volume.cow_bytes` entries form occurrence-indexed triples; every byte ceiling is 4 KiB–1 GiB and COW/RO/RW members share the existing aggregate ceiling of eight persistent-volume grants;
+- validation requires equal triple counts, rejects source overlap with `filesystem.root`, root/scratch/executable/working-directory conflicts, and enforces pairwise non-overlap across every RO/RW/COW source and target; Landlock file-mutation paths may select directories only inside scratch, an explicit writable target, or an explicit COW target;
+- parent preparation pins every COW source and target before fork. After namespace creation, launch reopens the absolute host source without symlink/magic-link traversal, revalidates `(st_dev, st_ino)`, recursively clones it, and applies recursive `MOUNT_ATTR_RDONLY` before any writable overlay is constructed;
+- each COW member receives a private size-bounded `nosuid,nodev,noexec` tmpfs upper/work backing plus an OverlayFS merged mount with `metacopy=off` and `redirect_dir=nofollow`; only that merged mount is attached at the declared sandbox target, so target copy-up/new-file writes cannot write through to the configured host source;
+- configured-filesystem preflight independently verifies every COW source and target anchor but reports the actual OverlayFS mount requirement as `unprobed` until a real user/mount-namespace launch succeeds, avoiding a false static compatibility claim;
+- authority JSON canonicalizes COW bindings including byte ceilings; authority-delta comparison treats `(source,target)` as capability identity, added bindings or larger ceilings as widening, removed bindings or smaller ceilings as reduction, and partial replacement as incomparable;
+- one raw-syscall executable reads lower bytes, mutates/copy-ups an existing file, creates another file, observes the private changes inside the run, and is executed twice while the host source remains byte-for-byte/topology unchanged between runs;
+- a separate raw-syscall executable drives a 4-KiB COW backing until the kernel returns `ENOSPC`, proving the declared byte ceiling is enforced rather than documented only;
+- exact-head stable rustfmt, Clippy with `-D warnings`, complete stable tests including the real namespace/mount integration oracles, and Rust 1.74 are the integration gate.
+
+Boundary: 69A is an ephemeral per-volume OverlayFS capability, not a persistence/transaction layer. It does not export or replay a per-volume COW diff, commit changes back to the host source, provide overwrite transactions or fsync-backed crash durability, freeze the lower tree against concurrent hostile host mutation, preserve/attest metadata beyond normal filesystem semantics, prove filesystem alias separation beyond the existing lexical/inode checks, or claim the merged volume is globally `noexec`.
+
+### Milestone 69 promotion rule
+
+After 69A integrates, do not farm larger volume ceilings, fixed additional COW slots, alternate tmpfs sizes, or more copy-up permutations. A further storage promotion must add a materially new lifecycle property such as bounded per-volume diff/export plus explicit commit/replay semantics, or move to another independent architecture frontier.
+
 ## Later frontiers
 
-Supplementary-group isolation with a viable mapping architecture, routed/broader network authority beyond the bounded IPv4 brokers, broader host-local IPC mediation beyond the bounded one-shot read-only and sealed-byte regular-file grants, bounded loader search/interpreter closure or later-exec authority, per-volume storage accounting/snapshot semantics, and delegated aggregate cgroup accounting remain separate evidence-backed frontiers. Do not add configuration-only names without executable kernel behavior and integration evidence.
+Supplementary-group isolation with a viable mapping architecture, routed/broader network authority beyond the bounded IPv4 brokers, broader host-local IPC mediation beyond the bounded one-shot read-only and sealed-byte regular-file grants, bounded loader search/interpreter closure or later-exec authority, per-volume COW diff/commit or stronger storage lifecycle semantics, and delegated aggregate cgroup accounting remain separate evidence-backed frontiers. Do not add configuration-only names without executable kernel behavior and integration evidence.

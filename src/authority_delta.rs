@@ -198,6 +198,7 @@ pub(crate) fn compare(baseline: &SandboxPolicy, candidate: &SandboxPolicy) -> Au
         candidate.normalized_writable_volume_bindings(),
         &mut changes,
     );
+    compare_bounded_cow_volume_set(baseline, candidate, &mut changes);
 
     compare_positive_bool(
         "network.isolated_loopback_enabled",
@@ -698,6 +699,51 @@ fn compare_optional_capability<T: PartialEq>(
         (Some(_), Some(_)) => DeltaClass::Incomparable,
     };
     push_change(field, class, changes);
+}
+
+fn compare_bounded_cow_volume_set(
+    baseline: &SandboxPolicy,
+    candidate: &SandboxPolicy,
+    changes: &mut Vec<Change>,
+) {
+    let baseline = baseline
+        .copy_on_write_volume_bindings
+        .iter()
+        .map(|binding| {
+            (
+                (binding.source.clone(), binding.target.clone()),
+                binding.bytes,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let candidate = candidate
+        .copy_on_write_volume_bindings
+        .iter()
+        .map(|binding| {
+            (
+                (binding.source.clone(), binding.target.clone()),
+                binding.bytes,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    let candidate_covers_baseline = baseline.iter().all(|(key, bytes)| {
+        candidate
+            .get(key)
+            .is_some_and(|candidate_bytes| candidate_bytes >= bytes)
+    });
+    let baseline_covers_candidate = candidate.iter().all(|(key, bytes)| {
+        baseline
+            .get(key)
+            .is_some_and(|baseline_bytes| baseline_bytes >= bytes)
+    });
+    let class = match (candidate_covers_baseline, baseline_covers_candidate) {
+        (true, true) => DeltaClass::Unchanged,
+        (true, false) => DeltaClass::Widened,
+        (false, true) => DeltaClass::Reduced,
+        (false, false) => DeltaClass::Incomparable,
+    };
+    push_change("filesystem.copy_on_write_volume", class, changes);
 }
 
 fn compare_capability_set<T: Ord>(

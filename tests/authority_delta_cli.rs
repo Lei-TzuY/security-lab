@@ -261,6 +261,54 @@ volume.writable_target = /persist-a
 }
 
 #[test]
+fn copy_on_write_volume_sets_compare_bindings_and_private_byte_ceilings() {
+    let root = unique_absent_root("cow-volume-set");
+    let base = base_policy(&root);
+    let first = format!(
+        "{base}volume.cow_source = /srv/base-a
+volume.cow_target = /state-a
+volume.cow_bytes = 1048576
+"
+    );
+    let expanded = format!(
+        "{base}volume.cow_source = /srv/base-a
+volume.cow_source = /srv/base-b
+volume.cow_target = /state-a
+volume.cow_target = /state-b
+volume.cow_bytes = 2097152
+volume.cow_bytes = 1048576
+"
+    );
+    let changed = format!(
+        "{base}volume.cow_source = /srv/base-a
+volume.cow_source = /srv/base-c
+volume.cow_target = /state-a
+volume.cow_target = /state-c
+volume.cow_bytes = 2097152
+volume.cow_bytes = 1048576
+"
+    );
+    let first = TempPolicy::new("cow-volume-first", &first);
+    let expanded = TempPolicy::new("cow-volume-expanded", &expanded);
+    let changed = TempPolicy::new("cow-volume-changed", &changed);
+
+    let widened = run_json(&first, &expanded);
+    assert_eq!(widened.status.code(), Some(5));
+    let stdout = String::from_utf8(widened.stdout).expect("utf8 output");
+    assert!(stdout.contains(r#""field":"filesystem.copy_on_write_volume","class":"widened""#));
+
+    let reduced = run_json(&expanded, &first);
+    assert_eq!(reduced.status.code(), Some(0));
+    let stdout = String::from_utf8(reduced.stdout).expect("utf8 output");
+    assert!(stdout.contains(r#""field":"filesystem.copy_on_write_volume","class":"reduced""#));
+
+    let incomparable = run_json(&expanded, &changed);
+    assert_eq!(incomparable.status.code(), Some(6));
+    let stdout = String::from_utf8(incomparable.stdout).expect("utf8 output");
+    assert!(stdout.contains(r#""field":"filesystem.copy_on_write_volume","class":"incomparable""#));
+}
+
+#[test]
 fn copy_on_write_root_is_modeled_as_ephemeral_write_authority() {
     let root = unique_absent_root("cow-root");
     let baseline_text = base_policy(&root);

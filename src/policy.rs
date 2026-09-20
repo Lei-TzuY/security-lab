@@ -106,6 +106,13 @@ pub struct PersistentVolumeBinding {
     pub target: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CopyOnWriteVolumeBinding {
+    pub source: PathBuf,
+    pub target: PathBuf,
+    pub bytes: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxPolicy {
     /// Host path pinned as the sandbox filesystem root before fork.
@@ -212,6 +219,10 @@ pub struct SandboxPolicy {
     /// Optional bounded writable volume set. Mutually exclusive with the
     /// legacy single writable pair above.
     pub writable_volume_bindings: Vec<PersistentVolumeBinding>,
+    /// Optional bounded copy-on-write persistent-volume set. Each trusted host
+    /// source becomes a recursively read-only lower layer while target writes
+    /// go only to a private size-bounded tmpfs-backed OverlayFS upper.
+    pub copy_on_write_volume_bindings: Vec<CopyOnWriteVolumeBinding>,
     /// Optional absolute path inside `root_dir` replaced by a private writable
     /// tmpfs after the root mount tree has been made recursively read-only.
     pub scratch_dir: Option<PathBuf>,
@@ -358,9 +369,11 @@ impl SandboxPolicy {
         }
         let readonly_volumes = self.normalized_readonly_volume_bindings();
         let writable_volumes = self.normalized_writable_volume_bindings();
+        let cow_volumes = &self.copy_on_write_volume_bindings;
         let volume_count = readonly_volumes
             .len()
             .checked_add(writable_volumes.len())
+            .and_then(|count| count.checked_add(cow_volumes.len()))
             .ok_or_else(|| PolicyError::new("persistent volume binding count overflow"))?;
         if volume_count > MAX_PERSISTENT_VOLUME_BINDINGS {
             return Err(PolicyError::new(format!(
@@ -628,9 +641,12 @@ impl SandboxPolicy {
                 let in_writable_volume = writable_volumes
                     .iter()
                     .any(|volume| path.starts_with(&volume.target));
-                if !in_scratch && !in_writable_volume {
+                let in_copy_on_write_volume = cow_volumes
+                    .iter()
+                    .any(|volume| path.starts_with(&volume.target));
+                if !in_scratch && !in_writable_volume && !in_copy_on_write_volume {
                     return Err(PolicyError::new(
-                        "landlock.file_mutate must be within filesystem.scratch or volume.writable_target",
+                        "landlock.file_mutate must be within filesystem.scratch or volume.writable_target or volume.cow_target",
                     ));
                 }
             }
@@ -1014,21 +1030,64 @@ impl SandboxPolicy {
                 }
             }
         }
+        for volume in cow_volumes {
+            validate_absolute_path("volume.cow_source", &volume.source)?;
+            validate_absolute_path("volume.cow_target", &volume.target)?;
+            if volume.source.starts_with(&self.root_dir)
+                || self.root_dir.starts_with(&volume.source)
+            {
+                return Err(PolicyError::new(
+                    "volume.cow_source must not overlap filesystem.root",
+                ));
+            }
+            if volume.target == Path::new("/") {
+                return Err(PolicyError::new(
+                    "volume.cow_target must not replace the sandbox root",
+                ));
+            }
+            if self.executable.starts_with(&volume.target)
+                || self.working_dir.starts_with(&volume.target)
+            {
+                return Err(PolicyError::new(
+                    "volume.cow_target must not contain the executable or working_dir",
+                ));
+            }
+            if !(MIN_COW_ROOT_BYTES..=MAX_COW_ROOT_BYTES).contains(&volume.bytes) {
+                return Err(PolicyError::new(format!(
+                    "volume.cow_bytes must be between {MIN_COW_ROOT_BYTES} and {MAX_COW_ROOT_BYTES}"
+                )));
+            }
+            if let Some(scratch) = &self.scratch_dir {
+                if volume.target.starts_with(scratch) || scratch.starts_with(&volume.target) {
+                    return Err(PolicyError::new(
+                        "volume.cow_target must not overlap filesystem.scratch",
+                    ));
+                }
+            }
+        }
 
-        let all_volumes = readonly_volumes
+        let all_volume_paths = readonly_volumes
             .iter()
-            .chain(writable_volumes.iter())
+            .map(|volume| (&volume.source, &volume.target))
+            .chain(
+                writable_volumes
+                    .iter()
+                    .map(|volume| (&volume.source, &volume.target)),
+            )
+            .chain(
+                cow_volumes
+                    .iter()
+                    .map(|volume| (&volume.source, &volume.target)),
+            )
             .collect::<Vec<_>>();
-        for (index, left) in all_volumes.iter().enumerate() {
-            for right in all_volumes.iter().skip(index + 1) {
-                if left.target.starts_with(&right.target) || right.target.starts_with(&left.target)
-                {
+        for (index, (left_source, left_target)) in all_volume_paths.iter().enumerate() {
+            for (right_source, right_target) in all_volume_paths.iter().skip(index + 1) {
+                if left_target.starts_with(right_target) || right_target.starts_with(left_target) {
                     return Err(PolicyError::new(
                         "persistent volume targets must not overlap each other",
                     ));
                 }
-                if left.source.starts_with(&right.source) || right.source.starts_with(&left.source)
-                {
+                if left_source.starts_with(right_source) || right_source.starts_with(left_source) {
                     return Err(PolicyError::new(
                         "persistent volume sources must not overlap each other",
                     ));
@@ -1442,6 +1501,9 @@ impl FromStr for SandboxPolicy {
         let mut readonly_volume_target = Vec::new();
         let mut writable_volume_source = Vec::new();
         let mut writable_volume_target = Vec::new();
+        let mut cow_volume_source = Vec::new();
+        let mut cow_volume_target = Vec::new();
+        let mut cow_volume_bytes = Vec::new();
         let mut scratch_dir = None;
         let mut scratch_bytes = None;
         let mut stdin = None;
@@ -1625,6 +1687,9 @@ impl FromStr for SandboxPolicy {
                 "volume.readonly_target" => readonly_volume_target.push(value.to_owned()),
                 "volume.writable_source" => writable_volume_source.push(value.to_owned()),
                 "volume.writable_target" => writable_volume_target.push(value.to_owned()),
+                "volume.cow_source" => cow_volume_source.push(value.to_owned()),
+                "volume.cow_target" => cow_volume_target.push(value.to_owned()),
+                "volume.cow_bytes" => cow_volume_bytes.push(parse_u64(value, line_no, key)?),
                 "filesystem.scratch" => set_once(&mut scratch_dir, value.to_owned(), line_no, key)?,
                 "filesystem.scratch_bytes" => set_once(
                     &mut scratch_bytes,
@@ -1953,9 +2018,17 @@ impl FromStr for SandboxPolicy {
                 "volume.writable_source and volume.writable_target must have the same number of entries",
             ));
         }
+        if cow_volume_source.len() != cow_volume_target.len()
+            || cow_volume_source.len() != cow_volume_bytes.len()
+        {
+            return Err(PolicyError::new(
+                "volume.cow_source, volume.cow_target, and volume.cow_bytes must have the same number of entries",
+            ));
+        }
         let volume_count = readonly_volume_source
             .len()
             .checked_add(writable_volume_source.len())
+            .and_then(|count| count.checked_add(cow_volume_source.len()))
             .ok_or_else(|| PolicyError::new("persistent volume binding count overflow"))?;
         if volume_count > MAX_PERSISTENT_VOLUME_BINDINGS {
             return Err(PolicyError::new(format!(
@@ -1994,6 +2067,17 @@ impl FromStr for SandboxPolicy {
             } else {
                 (None, None, parsed_writable_volumes)
             };
+
+        let copy_on_write_volume_bindings = cow_volume_source
+            .into_iter()
+            .zip(cow_volume_target)
+            .zip(cow_volume_bytes)
+            .map(|((source, target), bytes)| CopyOnWriteVolumeBinding {
+                source: PathBuf::from(source),
+                target: PathBuf::from(target),
+                bytes,
+            })
+            .collect::<Vec<_>>();
 
         let policy = Self {
             root_dir: PathBuf::from(required(root_dir, "filesystem.root")?),
@@ -2053,6 +2137,7 @@ impl FromStr for SandboxPolicy {
             writable_volume_source: legacy_writable_source,
             writable_volume_target: legacy_writable_target,
             writable_volume_bindings,
+            copy_on_write_volume_bindings,
             scratch_dir: scratch_dir.map(PathBuf::from),
             scratch_bytes,
             stdio: StdioPolicy {
@@ -3221,6 +3306,89 @@ volume.readonly_target = /data-{index}"
         assert!(err.to_string().contains(
             "legacy read-only volume pair and readonly_volume_bindings are mutually exclusive"
         ));
+    }
+
+    #[test]
+    fn parses_bounded_copy_on_write_volume_sets_and_rejects_invalid_sets() {
+        let base = volume_valid();
+        let text = format!(
+            "{base}
+volume.cow_source = /srv/base-a
+volume.cow_source = /srv/base-b
+volume.cow_target = /state-a
+volume.cow_target = /state-b
+volume.cow_bytes = 1048576
+volume.cow_bytes = 2097152
+landlock.file_mutate = /state-b/subdir"
+        );
+        let policy: SandboxPolicy = text.parse().unwrap();
+        assert_eq!(
+            policy.copy_on_write_volume_bindings,
+            vec![
+                CopyOnWriteVolumeBinding {
+                    source: PathBuf::from("/srv/base-a"),
+                    target: PathBuf::from("/state-a"),
+                    bytes: 1048576,
+                },
+                CopyOnWriteVolumeBinding {
+                    source: PathBuf::from("/srv/base-b"),
+                    target: PathBuf::from("/state-b"),
+                    bytes: 2097152,
+                },
+            ]
+        );
+
+        let unequal = format!(
+            "{base}
+volume.cow_source = /srv/base
+volume.cow_target = /state"
+        );
+        assert!(unequal.parse::<SandboxPolicy>().is_err());
+
+        let too_small = format!(
+            "{base}
+volume.cow_source = /srv/base
+volume.cow_target = /state
+volume.cow_bytes = 4095"
+        );
+        assert!(too_small.parse::<SandboxPolicy>().is_err());
+
+        let overlap = format!(
+            "{base}
+volume.readonly_source = /srv/shared
+volume.readonly_target = /data
+volume.cow_source = /srv/shared/base
+volume.cow_target = /state
+volume.cow_bytes = 1048576"
+        );
+        let err = overlap.parse::<SandboxPolicy>().unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("persistent volume sources must not overlap"));
+
+        let target_overlap = format!(
+            "{base}
+volume.writable_source = /srv/write
+volume.writable_target = /persist
+volume.cow_source = /srv/base
+volume.cow_target = /persist/private
+volume.cow_bytes = 1048576"
+        );
+        let err = target_overlap.parse::<SandboxPolicy>().unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("persistent volume targets must not overlap"));
+
+        let mut oversized = base.clone();
+        for index in 0..=MAX_PERSISTENT_VOLUME_BINDINGS {
+            oversized.push_str(&format!(
+                "
+volume.cow_source = /srv/cow-{index}
+volume.cow_target = /cow-{index}
+volume.cow_bytes = 1048576"
+            ));
+        }
+        assert!(oversized.parse::<SandboxPolicy>().is_err());
     }
 
     #[test]

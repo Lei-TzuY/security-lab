@@ -194,6 +194,12 @@ mod x86_64 {
     const PHASE_NEEDED_TARGET_PIN: u32 = 77;
     const PHASE_NEEDED_READONLY: u32 = 78;
     const PHASE_NEEDED_ATTACH: u32 = 79;
+    const PHASE_COW_VOLUME_TMPFS_CREATE: u32 = 80;
+    const PHASE_COW_VOLUME_TMPFS_MOUNT: u32 = 81;
+    const PHASE_COW_VOLUME_UPPER_WORK: u32 = 82;
+    const PHASE_COW_VOLUME_OVERLAY_CREATE: u32 = 83;
+    const PHASE_COW_VOLUME_OVERLAY_MOUNT: u32 = 84;
+    const PHASE_COW_VOLUME_ATTACH: u32 = 85;
 
     const SYS_LANDLOCK_CREATE_RULESET: libc::c_long = 444;
     const SYS_LANDLOCK_ADD_RULE: libc::c_long = 445;
@@ -320,6 +326,7 @@ mod x86_64 {
     enum VolumeAccess {
         ReadOnly,
         Writable,
+        CopyOnWrite,
     }
 
     struct PreparedVolume {
@@ -327,6 +334,7 @@ mod x86_64 {
         source_path: CString,
         target_relative: CString,
         access: VolumeAccess,
+        cow_size: Option<CString>,
     }
 
     struct PreparedSealedMount {
@@ -908,11 +916,26 @@ mod x86_64 {
         root_fd: RawFd,
         source: &Path,
         target: &Path,
-        source_field: &str,
-        source_label: &str,
-        target_label: &str,
         access: VolumeAccess,
+        cow_bytes: Option<u64>,
     ) -> Result<PreparedVolume, SandboxError> {
+        let (source_field, source_label, target_label) = match access {
+            VolumeAccess::ReadOnly => (
+                "volume.readonly_source",
+                "read-only volume source",
+                "read-only volume target",
+            ),
+            VolumeAccess::Writable => (
+                "volume.writable_source",
+                "writable volume source",
+                "writable volume target",
+            ),
+            VolumeAccess::CopyOnWrite => (
+                "volume.cow_source",
+                "copy-on-write volume source",
+                "copy-on-write volume target",
+            ),
+        };
         let source_fd = open_host_directory(source, source_label)?;
         let target_check = open_beneath_root(
             root_fd,
@@ -926,6 +949,9 @@ mod x86_64 {
             source_path: cstring_bytes(source_field, source.as_os_str().as_bytes())?,
             target_relative: sandbox_relative(target)?,
             access,
+            cow_size: cow_bytes
+                .map(|bytes| cstring_bytes("volume.cow_bytes", bytes.to_string().as_bytes()))
+                .transpose()?,
         })
     }
 
@@ -1659,16 +1685,17 @@ mod x86_64 {
 
             let readonly_volumes = policy.normalized_readonly_volume_bindings();
             let writable_volumes = policy.normalized_writable_volume_bindings();
-            let mut volumes = Vec::with_capacity(readonly_volumes.len() + writable_volumes.len());
+            let cow_volumes = &policy.copy_on_write_volume_bindings;
+            let mut volumes = Vec::with_capacity(
+                readonly_volumes.len() + writable_volumes.len() + cow_volumes.len(),
+            );
             for volume in &readonly_volumes {
                 volumes.push(prepare_volume(
                     root_fd.raw(),
                     &volume.source,
                     &volume.target,
-                    "volume.readonly_source",
-                    "read-only volume source",
-                    "read-only volume target",
                     VolumeAccess::ReadOnly,
+                    None,
                 )?);
             }
             for volume in &writable_volumes {
@@ -1676,10 +1703,17 @@ mod x86_64 {
                     root_fd.raw(),
                     &volume.source,
                     &volume.target,
-                    "volume.writable_source",
-                    "writable volume source",
-                    "writable volume target",
                     VolumeAccess::Writable,
+                    None,
+                )?);
+            }
+            for volume in cow_volumes {
+                volumes.push(prepare_volume(
+                    root_fd.raw(),
+                    &volume.source,
+                    &volume.target,
+                    VolumeAccess::CopyOnWrite,
+                    Some(volume.bytes),
                 )?);
             }
 
@@ -3776,6 +3810,192 @@ mod x86_64 {
         close_setup_fd(state_mount_fd);
     }
 
+    unsafe fn construct_cow_volume_overlay_or_fail(
+        lower_tree_fd: RawFd,
+        cow_size: &CString,
+        launch_error: *mut LaunchErrorRecord,
+        error_exit_syscall: libc::c_long,
+    ) -> RawFd {
+        let state_fsfd = libc::syscall(
+            libc::SYS_fsopen,
+            b"tmpfs\0".as_ptr().cast::<libc::c_char>(),
+            FSOPEN_CLOEXEC,
+        );
+        if state_fsfd == -1 {
+            child_fail(
+                launch_error,
+                PHASE_COW_VOLUME_TMPFS_CREATE,
+                error_exit_syscall,
+            );
+        }
+        let state_fsfd = state_fsfd as RawFd;
+        fsconfig_string_or_fail(
+            state_fsfd,
+            b"size\0",
+            cow_size.as_ptr(),
+            PHASE_COW_VOLUME_TMPFS_CREATE,
+            launch_error,
+            error_exit_syscall,
+        );
+        fsconfig_string_or_fail(
+            state_fsfd,
+            b"mode\0",
+            b"0700\0".as_ptr().cast::<libc::c_char>(),
+            PHASE_COW_VOLUME_TMPFS_CREATE,
+            launch_error,
+            error_exit_syscall,
+        );
+        if libc::syscall(
+            libc::SYS_fsconfig,
+            state_fsfd,
+            FSCONFIG_CMD_CREATE,
+            ptr::null::<libc::c_char>(),
+            ptr::null::<libc::c_char>(),
+            0,
+        ) == -1
+        {
+            child_fail(
+                launch_error,
+                PHASE_COW_VOLUME_TMPFS_CREATE,
+                error_exit_syscall,
+            );
+        }
+        let state_mount_fd = libc::syscall(
+            libc::SYS_fsmount,
+            state_fsfd,
+            FSMOUNT_CLOEXEC,
+            MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV | MOUNT_ATTR_NOEXEC,
+        );
+        if state_mount_fd == -1 {
+            child_fail(
+                launch_error,
+                PHASE_COW_VOLUME_TMPFS_MOUNT,
+                error_exit_syscall,
+            );
+        }
+        let state_mount_fd = state_mount_fd as RawFd;
+        close_setup_fd(state_fsfd);
+
+        for name in [b"upper\0".as_slice(), b"work\0".as_slice()] {
+            if libc::syscall(
+                libc::SYS_mkdirat,
+                state_mount_fd,
+                name.as_ptr().cast::<libc::c_char>(),
+                0o700,
+            ) == -1
+            {
+                child_fail(
+                    launch_error,
+                    PHASE_COW_VOLUME_UPPER_WORK,
+                    error_exit_syscall,
+                );
+            }
+        }
+
+        let upper_fd = libc::syscall(
+            libc::SYS_openat,
+            state_mount_fd,
+            b"upper\0".as_ptr().cast::<libc::c_char>(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            0,
+        );
+        if upper_fd == -1 {
+            child_fail(
+                launch_error,
+                PHASE_COW_VOLUME_UPPER_WORK,
+                error_exit_syscall,
+            );
+        }
+        let upper_fd = upper_fd as RawFd;
+        let work_fd = libc::syscall(
+            libc::SYS_openat,
+            state_mount_fd,
+            b"work\0".as_ptr().cast::<libc::c_char>(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            0,
+        );
+        if work_fd == -1 {
+            child_fail(
+                launch_error,
+                PHASE_COW_VOLUME_UPPER_WORK,
+                error_exit_syscall,
+            );
+        }
+        let work_fd = work_fd as RawFd;
+
+        let mut lower_path_buffer = [0u8; 32];
+        let mut upper_path_buffer = [0u8; 32];
+        let mut work_path_buffer = [0u8; 32];
+        let lower_path = proc_fd_path(lower_tree_fd, &mut lower_path_buffer);
+        let upper_path = proc_fd_path(upper_fd, &mut upper_path_buffer);
+        let work_path = proc_fd_path(work_fd, &mut work_path_buffer);
+
+        let overlay_fsfd = libc::syscall(
+            libc::SYS_fsopen,
+            b"overlay\0".as_ptr().cast::<libc::c_char>(),
+            FSOPEN_CLOEXEC,
+        );
+        if overlay_fsfd == -1 {
+            child_fail(
+                launch_error,
+                PHASE_COW_VOLUME_OVERLAY_CREATE,
+                error_exit_syscall,
+            );
+        }
+        let overlay_fsfd = overlay_fsfd as RawFd;
+        for (key, value) in [
+            (b"lowerdir\0".as_slice(), lower_path),
+            (b"upperdir\0".as_slice(), upper_path),
+            (b"workdir\0".as_slice(), work_path),
+            (
+                b"metacopy\0".as_slice(),
+                b"off\0".as_ptr().cast::<libc::c_char>(),
+            ),
+            (
+                b"redirect_dir\0".as_slice(),
+                b"nofollow\0".as_ptr().cast::<libc::c_char>(),
+            ),
+        ] {
+            fsconfig_string_or_fail(
+                overlay_fsfd,
+                key,
+                value,
+                PHASE_COW_VOLUME_OVERLAY_CREATE,
+                launch_error,
+                error_exit_syscall,
+            );
+        }
+        if libc::syscall(
+            libc::SYS_fsconfig,
+            overlay_fsfd,
+            FSCONFIG_CMD_CREATE,
+            ptr::null::<libc::c_char>(),
+            ptr::null::<libc::c_char>(),
+            0,
+        ) == -1
+        {
+            child_fail(
+                launch_error,
+                PHASE_COW_VOLUME_OVERLAY_CREATE,
+                error_exit_syscall,
+            );
+        }
+        let overlay_fd = libc::syscall(libc::SYS_fsmount, overlay_fsfd, FSMOUNT_CLOEXEC, 0u64);
+        if overlay_fd == -1 {
+            child_fail(
+                launch_error,
+                PHASE_COW_VOLUME_OVERLAY_MOUNT,
+                error_exit_syscall,
+            );
+        }
+        let overlay_fd = overlay_fd as RawFd;
+
+        for fd in [overlay_fsfd, work_fd, upper_fd, state_mount_fd] {
+            close_setup_fd(fd);
+        }
+        overlay_fd
+    }
+
     unsafe fn install_volume_or_fail(
         volume: &PreparedVolume,
         root_tree_fd: RawFd,
@@ -3821,7 +4041,10 @@ mod x86_64 {
         }
         let volume_tree_fd = volume_tree_fd as RawFd;
 
-        if volume.access == VolumeAccess::ReadOnly {
+        if matches!(
+            volume.access,
+            VolumeAccess::ReadOnly | VolumeAccess::CopyOnWrite
+        ) {
             let volume_attr = MountAttr {
                 attr_set: MOUNT_ATTR_RDONLY,
                 attr_clr: 0,
@@ -3861,21 +4084,43 @@ mod x86_64 {
         }
         let target_fd = target_fd as RawFd;
 
+        let attach_fd = if volume.access == VolumeAccess::CopyOnWrite {
+            construct_cow_volume_overlay_or_fail(
+                volume_tree_fd,
+                volume
+                    .cow_size
+                    .as_ref()
+                    .expect("copy-on-write volume has a byte ceiling"),
+                launch_error,
+                error_exit_syscall,
+            )
+        } else {
+            volume_tree_fd
+        };
+        let attach_phase = if volume.access == VolumeAccess::CopyOnWrite {
+            PHASE_COW_VOLUME_ATTACH
+        } else {
+            PHASE_VOLUME_ATTACH
+        };
+
         if libc::syscall(
             libc::SYS_move_mount,
-            volume_tree_fd,
+            attach_fd,
             b"\0".as_ptr().cast::<libc::c_char>(),
             target_fd,
             b"\0".as_ptr().cast::<libc::c_char>(),
             MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_EMPTY_PATH,
         ) == -1
         {
-            child_fail(launch_error, PHASE_VOLUME_ATTACH, error_exit_syscall);
+            child_fail(launch_error, attach_phase, error_exit_syscall);
         }
 
+        if attach_fd != volume_tree_fd {
+            close_setup_fd(attach_fd);
+        }
         for fd in [target_fd, volume_tree_fd, current_source_fd] {
             if libc::close(fd) == -1 {
-                child_fail(launch_error, PHASE_VOLUME_ATTACH, error_exit_syscall);
+                child_fail(launch_error, attach_phase, error_exit_syscall);
             }
         }
     }
@@ -4486,6 +4731,12 @@ mod x86_64 {
             PHASE_NEEDED_TARGET_PIN => "sealed ELF DT_NEEDED target pin",
             PHASE_NEEDED_READONLY => "sealed ELF DT_NEEDED mount hardening",
             PHASE_NEEDED_ATTACH => "sealed ELF DT_NEEDED mount attachment",
+            PHASE_COW_VOLUME_TMPFS_CREATE => "copy-on-write volume tmpfs state creation",
+            PHASE_COW_VOLUME_TMPFS_MOUNT => "copy-on-write volume tmpfs state mount",
+            PHASE_COW_VOLUME_UPPER_WORK => "copy-on-write volume upper/work preparation",
+            PHASE_COW_VOLUME_OVERLAY_CREATE => "copy-on-write volume OverlayFS creation",
+            PHASE_COW_VOLUME_OVERLAY_MOUNT => "copy-on-write volume OverlayFS mount",
+            PHASE_COW_VOLUME_ATTACH => "copy-on-write volume mount attachment",
             _ => "unknown launch phase",
         };
         format!(

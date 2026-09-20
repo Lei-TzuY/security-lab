@@ -1,9 +1,10 @@
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 
 use security_lab::{
-    run, run_report, run_report_with_cancel, CancellationToken, ChildOutcome, CowDiffEntry,
-    ExecutableNeededBinding, PersistentVolumeBinding, ResourceLimits, SandboxError, SandboxPolicy,
-    SeccompArgRangeRule, SeccompArgRule, SeccompPolicy, StdioMode, StdioPolicy,
+    run, run_report, run_report_with_cancel, CancellationToken, ChildOutcome,
+    CopyOnWriteVolumeBinding, CowDiffEntry, ExecutableNeededBinding, PersistentVolumeBinding,
+    ResourceLimits, SandboxError, SandboxPolicy, SeccompArgRangeRule, SeccompArgRule,
+    SeccompPolicy, StdioMode, StdioPolicy,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -240,6 +241,8 @@ fn fixture_root() -> &'static Path {
             .expect("create sandbox writable-volume mountpoint");
         std::fs::create_dir_all(root.join("persist2"))
             .expect("create second sandbox writable-volume mountpoint");
+        std::fs::create_dir_all(root.join("cowdata"))
+            .expect("create sandbox copy-on-write volume mountpoint");
         std::fs::create_dir_all(root.join("devices"))
             .expect("create sandbox device-volume mountpoint");
         std::fs::create_dir_all(root.join("landlock-allowed"))
@@ -286,6 +289,23 @@ fn fixture_root() -> &'static Path {
             multi_volume_status.success(),
             "failed to assemble bounded persistent-volume fixture"
         );
+
+        for (name, source_name) in [
+            ("cow-volume-probe", "cow_volume_probe.S"),
+            ("cow-volume-budget-probe", "cow_volume_budget_probe.S"),
+        ] {
+            let output = root.join(name);
+            let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures")
+                .join(source_name);
+            let status = Command::new("cc")
+                .args(["-nostdlib", "-static", "-Wl,--build-id=none", "-o"])
+                .arg(&output)
+                .arg(&source)
+                .status()
+                .expect("Linux x86_64 integration tests require a C toolchain with cc");
+            assert!(status.success(), "failed to assemble {source_name}");
+        }
 
         let loader_source = std::fs::canonicalize("/lib64/ld-linux-x86-64.so.2")
             .expect("Ubuntu x86_64 integration tests require the system ELF interpreter");
@@ -509,6 +529,21 @@ fn readonly_volume_source_second() -> &'static Path {
         .as_path()
 }
 
+fn cow_volume_source() -> &'static Path {
+    static SOURCE: OnceLock<PathBuf> = OnceLock::new();
+    SOURCE
+        .get_or_init(|| {
+            let source =
+                std::env::temp_dir().join(format!("security-lab-cow-volume-{}", process::id()));
+            let _ = std::fs::remove_dir_all(&source);
+            std::fs::create_dir_all(&source).expect("create copy-on-write volume source");
+            std::fs::write(source.join("original"), b"host-original\n")
+                .expect("seed copy-on-write volume source");
+            source
+        })
+        .as_path()
+}
+
 fn writable_volume_source_second() -> &'static Path {
     static SOURCE: OnceLock<PathBuf> = OnceLock::new();
     SOURCE
@@ -599,6 +634,7 @@ fn policy(mode: &str, extra_args: &[&str], syscalls: &[&str]) -> SandboxPolicy {
         writable_volume_source: None,
         writable_volume_target: None,
         writable_volume_bindings: Vec::new(),
+        copy_on_write_volume_bindings: Vec::new(),
         scratch_dir: Some(PathBuf::from("/scratch")),
         scratch_bytes: Some(SCRATCH_BYTES),
         stdio: StdioPolicy {
@@ -1731,6 +1767,50 @@ fn bounded_persistent_volume_sets_mount_all_declared_members() {
     );
     assert!(!readonly_one.join("write-must-fail").exists());
     assert!(!readonly_two.join("write-must-fail").exists());
+}
+
+#[test]
+fn copy_on_write_persistent_volume_is_private_and_ephemeral() {
+    let source = cow_volume_source().to_path_buf();
+    let original = source.join("original");
+    let created = source.join("created");
+    let too_big = source.join("too-big");
+    let _ = std::fs::remove_file(&created);
+    let _ = std::fs::remove_file(&too_big);
+    std::fs::write(&original, b"host-original\n").unwrap();
+
+    for _ in 0..2 {
+        let mut mounted = policy("unused", &[], &["openat", "read", "write", "close", "exit"]);
+        mounted.executable = PathBuf::from("/cow-volume-probe");
+        mounted.copy_on_write_volume_bindings = vec![CopyOnWriteVolumeBinding {
+            source: source.clone(),
+            target: PathBuf::from("/cowdata"),
+            bytes: 1024 * 1024,
+        }];
+
+        assert_eq!(run(&mounted).unwrap(), ChildOutcome::Exited(0));
+        assert_eq!(std::fs::read(&original).unwrap(), b"host-original\n");
+        assert!(!created.exists());
+        assert!(!too_big.exists());
+    }
+}
+
+#[test]
+fn copy_on_write_persistent_volume_enforces_private_byte_ceiling() {
+    let source = cow_volume_source().to_path_buf();
+    let too_big = source.join("too-big");
+    let _ = std::fs::remove_file(&too_big);
+
+    let mut mounted = policy("unused", &[], &["openat", "write", "close", "exit"]);
+    mounted.executable = PathBuf::from("/cow-volume-budget-probe");
+    mounted.copy_on_write_volume_bindings = vec![CopyOnWriteVolumeBinding {
+        source,
+        target: PathBuf::from("/cowdata"),
+        bytes: 4096,
+    }];
+
+    assert_eq!(run(&mounted).unwrap(), ChildOutcome::Exited(0));
+    assert!(!too_big.exists());
 }
 
 #[test]

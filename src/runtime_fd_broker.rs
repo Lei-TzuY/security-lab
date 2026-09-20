@@ -291,6 +291,14 @@ mod imp {
         state: HostUnixStreamRevocationState,
     }
 
+    impl Drop for HostUnixStreamRevocationController {
+        fn drop(&mut self) {
+            if self.state == HostUnixStreamRevocationState::Active {
+                let _ = self.stream.shutdown(std::net::Shutdown::Both);
+            }
+        }
+    }
+
     impl HostUnixStreamRevocationController {
         pub fn peer_credentials(&self) -> HostUnixPeerCredentials {
             self.credentials
@@ -308,8 +316,10 @@ mod imp {
         /// object that was already transferred to the target.
         ///
         /// This changes socket shutdown state shared by every descriptor
-        /// reference to that socket object. It does not close the target's fd
-        /// number, roll back bytes already consumed, or undo remote side effects.
+        /// reference to that socket object. Dropping an active controller also
+        /// attempts the same shutdown so controller loss fails closed. This does
+        /// not close the target's fd number, roll back bytes already consumed,
+        /// or undo remote side effects.
         pub fn revoke(&mut self) -> Result<(), RuntimeFdBrokerError> {
             if self.state != HostUnixStreamRevocationState::Active {
                 let message = match self.state {

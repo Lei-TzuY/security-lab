@@ -83,6 +83,9 @@ pub enum RuntimeFdBrokerError {
         request_id: u64,
     },
     RuntimeAuthenticationFailed,
+    RuntimeAcknowledgmentMismatch {
+        request_id: u64,
+    },
     UnexpectedPeer {
         expected_pid: i32,
         expected_uid: u32,
@@ -160,6 +163,10 @@ impl fmt::Display for RuntimeFdBrokerError {
             Self::RuntimeAuthenticationFailed => f.write_str(
                 "runtime FD broker authenticated message failed HMAC verification",
             ),
+            Self::RuntimeAcknowledgmentMismatch { request_id } => write!(
+                f,
+                "runtime FD broker acknowledgment does not match published response for request id {request_id}"
+            ),
             Self::UnexpectedPeer {
                 expected_pid,
                 expected_uid,
@@ -191,7 +198,7 @@ impl Error for RuntimeFdBrokerError {
 mod imp {
     use super::{File, Path, RuntimeCorrelatedRequest, RuntimeFdBrokerError, SandboxPolicy};
     use hmac::{Hmac, Mac};
-    use sha2::Sha256;
+    use sha2::{Digest, Sha256};
     use std::collections::BTreeSet;
     use std::ffi::CString;
     use std::io::Read;
@@ -508,10 +515,38 @@ mod imp {
         }
     }
 
+    struct RuntimeResponseAcknowledgmentExpectation {
+        request_id: u64,
+        response_sha256: [u8; 32],
+    }
+
+    pub struct RuntimeAcknowledgedCorrelatedMessageExchangeController {
+        controller: RuntimeAuthenticatedCorrelatedMessageExchangeController,
+        awaiting_acknowledgment: Option<RuntimeResponseAcknowledgmentExpectation>,
+        acknowledged_responses: u32,
+    }
+
+    impl std::fmt::Debug for RuntimeAcknowledgedCorrelatedMessageExchangeController {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("RuntimeAcknowledgedCorrelatedMessageExchangeController")
+                .field("controller", &self.controller)
+                .field(
+                    "awaiting_acknowledgment_request_id",
+                    &self
+                        .awaiting_acknowledgment
+                        .as_ref()
+                        .map(|expectation| expectation.request_id),
+                )
+                .field("acknowledged_responses", &self.acknowledged_responses)
+                .finish_non_exhaustive()
+        }
+    }
+
     const RUNTIME_AUTH_PROTOCOL_VERSION: u8 = 1;
     const RUNTIME_AUTH_CHALLENGE_KIND: u8 = b'C';
     const RUNTIME_AUTH_REQUEST_KIND: u8 = b'Q';
     const RUNTIME_AUTH_RESPONSE_KIND: u8 = b'S';
+    const RUNTIME_AUTH_ACKNOWLEDGMENT_KIND: u8 = b'A';
     const RUNTIME_AUTH_DOMAIN: &[u8] = b"security-lab-runtime-correlated-hmac-sha256-v1\0";
     type RuntimeHmacSha256 = Hmac<Sha256>;
 
@@ -544,6 +579,13 @@ mod imp {
         let mut tag = [0u8; super::RUNTIME_AUTH_TAG_BYTES];
         tag.copy_from_slice(&result.into_bytes());
         tag
+    }
+
+    fn runtime_response_sha256(payload: &[u8]) -> [u8; 32] {
+        let digest = Sha256::digest(payload);
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(&digest);
+        bytes
     }
 
     fn runtime_auth_verify(

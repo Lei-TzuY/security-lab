@@ -75,6 +75,16 @@ pub struct CowDiff {
     pub encoded_bytes: u64,
 }
 
+/// One bounded canonical diff exported from a requested copy-on-write
+/// persistent volume after launcher-owned process-tree convergence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CowVolumeDiff {
+    /// Exact sandbox target pathname bytes for the volume whose private upper
+    /// produced this change-set.
+    pub target: Vec<u8>,
+    pub diff: CowDiff,
+}
+
 /// Kernel resource usage attributed to the terminated/waited-for sandbox process tree.
 ///
 /// CPU fields are cumulative `RUSAGE_CHILDREN` values observed by launcher-owned
@@ -127,6 +137,9 @@ pub struct RunReport {
     pub stdout: Option<CapturedOutput>,
     /// Present exactly when `filesystem.cow_diff_bytes` requested the bounded COW content/topology/permission-mode export.
     pub cow_diff: Option<CowDiff>,
+    /// Canonically target-sorted per-volume COW exports requested through
+    /// `volume.cow_diff_bytes`. Volumes without an export request are absent.
+    pub cow_volume_diffs: Vec<CowVolumeDiff>,
     /// Additional orphaned descendants reaped by the launcher-owned PID 1 after the direct target terminated.
     pub reaped_descendants: u32,
     /// Kernel resource telemetry collected by namespace PID 1 only after the sandbox tree converges.

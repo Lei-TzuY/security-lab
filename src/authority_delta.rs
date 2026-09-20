@@ -712,7 +712,7 @@ fn compare_bounded_cow_volume_set(
         .map(|binding| {
             (
                 (binding.source.clone(), binding.target.clone()),
-                binding.bytes,
+                (binding.bytes, binding.diff_bytes),
             )
         })
         .collect::<BTreeMap<_, _>>();
@@ -722,21 +722,25 @@ fn compare_bounded_cow_volume_set(
         .map(|binding| {
             (
                 (binding.source.clone(), binding.target.clone()),
-                binding.bytes,
+                (binding.bytes, binding.diff_bytes),
             )
         })
         .collect::<BTreeMap<_, _>>();
 
-    let candidate_covers_baseline = baseline.iter().all(|(key, bytes)| {
-        candidate
-            .get(key)
-            .is_some_and(|candidate_bytes| candidate_bytes >= bytes)
-    });
-    let baseline_covers_candidate = candidate.iter().all(|(key, bytes)| {
-        baseline
-            .get(key)
-            .is_some_and(|baseline_bytes| baseline_bytes >= bytes)
-    });
+    let covers = |candidate: &(u64, Option<u64>), baseline: &(u64, Option<u64>)| {
+        candidate.0 >= baseline.0
+            && match (baseline.1, candidate.1) {
+                (None, _) => true,
+                (Some(_), None) => false,
+                (Some(base), Some(new)) => new >= base,
+            }
+    };
+    let candidate_covers_baseline = baseline
+        .iter()
+        .all(|(key, allowance)| candidate.get(key).is_some_and(|value| covers(value, allowance)));
+    let baseline_covers_candidate = candidate
+        .iter()
+        .all(|(key, allowance)| baseline.get(key).is_some_and(|value| covers(value, allowance)));
     let class = match (candidate_covers_baseline, baseline_covers_candidate) {
         (true, true) => DeltaClass::Unchanged,
         (true, false) => DeltaClass::Widened,

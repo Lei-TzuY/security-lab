@@ -1386,8 +1386,8 @@ mod x86_64 {
                         "executable.needed_sha256",
                         "security-lab-needed",
                     )?;
-                    let transitive_needed =
-                        elf_needed::read_elf64_x86_64_dt_needed(image_fd.raw()).map_err(|error| {
+                    let transitive_needed = elf_needed::read_elf64_x86_64_dt_needed(image_fd.raw())
+                        .map_err(|error| {
                             SandboxError::SetupFailed(format!(
                                 "cannot parse sealed direct dependency DT_NEEDED: {error}"
                             ))

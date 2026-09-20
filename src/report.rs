@@ -80,6 +80,8 @@ pub struct CowDiff {
 /// persistent volume after launcher-owned process-tree convergence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CowVolumeDiff {
+    /// Exact trusted host source pathname bytes from the validated policy.
+    pub source: Vec<u8>,
     /// Exact sandbox target pathname bytes for the volume whose private upper
     /// produced this change-set.
     pub target: Vec<u8>,

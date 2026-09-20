@@ -3426,6 +3426,23 @@ mod imp {
     use super::{File, Path, RuntimeCorrelatedRequest, RuntimeFdBrokerError, SandboxPolicy};
 
     #[derive(Debug)]
+    pub struct PreparedHostUnixStream;
+
+    impl PreparedHostUnixStream {
+        pub fn peer_pid(&self) -> i32 {
+            0
+        }
+
+        pub fn peer_uid(&self) -> u32 {
+            0
+        }
+
+        pub fn peer_gid(&self) -> u32 {
+            0
+        }
+    }
+
+    #[derive(Debug)]
     pub struct PreparedReadOnlyRegularFile;
 
     #[derive(Debug)]
@@ -3798,6 +3815,15 @@ mod imp {
             ))
         }
 
+        pub fn prepare_host_unix_stream(
+            _path: impl AsRef<Path>,
+            _expected_peer: Option<(u32, u32)>,
+        ) -> Result<PreparedHostUnixStream, RuntimeFdBrokerError> {
+            Err(RuntimeFdBrokerError::UnsupportedPlatform(
+                "runtime host UNIX stream grants currently require Linux x86_64".to_owned(),
+            ))
+        }
+
         pub fn prepare_readonly_regular_file(
             _source: &File,
         ) -> Result<PreparedReadOnlyRegularFile, RuntimeFdBrokerError> {
@@ -3929,6 +3955,15 @@ mod imp {
             ))
         }
 
+        pub fn send_host_unix_stream(
+            &mut self,
+            _grant: PreparedHostUnixStream,
+        ) -> Result<(), RuntimeFdBrokerError> {
+            Err(RuntimeFdBrokerError::UnsupportedPlatform(
+                "runtime host UNIX stream grants currently require Linux x86_64".to_owned(),
+            ))
+        }
+
         pub fn send_readonly_regular_file(
             &mut self,
             _grant: PreparedReadOnlyRegularFile,
@@ -3977,7 +4012,8 @@ mod imp {
 }
 
 pub use imp::{
-    PreparedReadOnlyRegularFile, PreparedRevocableByteStream, PreparedRuntimeMessageChannel,
+    PreparedHostUnixStream, PreparedReadOnlyRegularFile, PreparedRevocableByteStream,
+    PreparedRuntimeMessageChannel,
     PreparedSealedRegularFileSnapshot, PreparedSealedSnapshotBundle, RevocableByteStreamController,
     RuntimeAcknowledgedCorrelatedMessageExchangeController,
     RuntimeAuthenticatedCorrelatedMessageExchangeController,

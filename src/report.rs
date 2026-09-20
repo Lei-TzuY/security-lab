@@ -1,3 +1,4 @@
+use crate::snapshot_identity::{SnapshotIdentity, SnapshotIdentityLimits};
 use std::fmt;
 
 /// Observable terminal status of the direct sandbox target.
@@ -82,6 +83,10 @@ pub struct CowVolumeDiff {
     /// Exact sandbox target pathname bytes for the volume whose private upper
     /// produced this change-set.
     pub target: Vec<u8>,
+    /// Canonical identity of the exact pre-fork pinned host lower when source
+    /// binding was requested. Diff-only legacy exports leave both fields absent.
+    pub base_identity: Option<SnapshotIdentity>,
+    pub base_identity_limits: Option<SnapshotIdentityLimits>,
     pub diff: CowDiff,
 }
 

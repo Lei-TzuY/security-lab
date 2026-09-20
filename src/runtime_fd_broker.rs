@@ -1425,7 +1425,8 @@ mod imp {
                 if !self.pending_request_ids.insert(request_id) {
                     self.failed = true;
                     return Err(RuntimeFdBrokerError::Protocol(
-                        "runtime correlated request pending-set insertion was inconsistent".to_owned(),
+                        "runtime correlated request pending-set insertion was inconsistent"
+                            .to_owned(),
                     ));
                 }
                 self.received_requests += 1;

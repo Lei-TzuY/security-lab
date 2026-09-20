@@ -1652,6 +1652,29 @@ Boundary: 67A still exposes only trusted-policy host directories as explicit bin
 
 After 67A integrates, do not farm larger volume-count ceilings or fixed third/fourth slots. Promote to a distinct storage architecture capability such as per-volume bounded resource accounting/snapshot semantics, or move to another independent frontier.
 
+## Milestone 68 — bounded exact dynamic-loader dependency graph
+
+### Slice 68A — close a bounded reachable graph of sealed path-qualified DT_NEEDED nodes
+
+**Current implementation candidate.** Promotes the 66A exact direct set into one bounded transitive graph without adding fixed depth slots or claiming general dynamic-loader name resolution.
+
+Acceptance evidence is executable:
+
+- the existing repeated `executable.needed` / `executable.needed_sha256` surface remains the only dependency declaration and still normalizes to at most eight exact path/digest bindings; those bindings now define the complete sealed graph-node set rather than only direct leaves;
+- a shared graph validator requires every main-image and transitive `DT_NEEDED` edge to be a literal absolute path naming one declared node, rejects duplicate edges, bounds cycles with visited-node tracking, and rejects declared nodes that are unreachable from the main executable;
+- launch validates all main root edges against the declared node set before opening dependency objects, then independently pins, executable-shape checks, SHA-256 verifies, and seals every node before parsing that node's `DT_NEEDED` edges from the exact sealed bytes;
+- only after full graph closure succeeds are all sealed graph nodes installed as private read-only `nosuid,nodev` mounts at their exact paths before the dynamic loader runs;
+- configured-filesystem preflight uses the same root/graph validator after read-only per-node shape and digest verification, preventing policy/runtime closure drift;
+- pure regressions cover reachable cycles plus undeclared, unreachable, duplicate, and non-literal edges;
+- executable integration upgrades the existing transitive fixture: a main PIE reaches `/dependency-transitive -> /dependency-extra` and succeeds only when both exact sealed graph nodes are declared; missing the transitive node fails closed, and an extra unreachable declared node also fails closed;
+- stable rustfmt, Clippy with `-D warnings`, complete stable tests, and Rust 1.74 are the integration gate.
+
+Boundary: 68A models only the already-bounded set of 1–8 literal absolute path-qualified graph nodes. It does not resolve slashless SONAMEs, `DT_RPATH`/`DT_RUNPATH`, loader cache/default search, the interpreter's own dependency graph, dynamic-string expansion, `LD_PRELOAD`, `dlopen`, or later target exec transitions.
+
+### Milestone 68 promotion rule
+
+After 68A integrates, do not farm deeper graph shapes, larger node ceilings, or more traversal-order variants. A further execution-integrity promotion must model a materially new loader-resolution surface such as bounded SONAME/search semantics or interpreter closure, or move to later-exec authority or another independent architectural frontier.
+
 ## Later frontiers
 
-Supplementary-group isolation with a viable mapping architecture, routed/broader network authority beyond the bounded IPv4 brokers, broader host-local IPC mediation beyond the bounded one-shot read-only and sealed-byte regular-file grants, bounded dynamic-loader graph resolution or later-exec authority, per-volume storage accounting/snapshot semantics, and delegated aggregate cgroup accounting remain separate evidence-backed frontiers. Do not add configuration-only names without executable kernel behavior and integration evidence.
+Supplementary-group isolation with a viable mapping architecture, routed/broader network authority beyond the bounded IPv4 brokers, broader host-local IPC mediation beyond the bounded one-shot read-only and sealed-byte regular-file grants, bounded loader search/interpreter closure or later-exec authority, per-volume storage accounting/snapshot semantics, and delegated aggregate cgroup accounting remain separate evidence-backed frontiers. Do not add configuration-only names without executable kernel behavior and integration evidence.

@@ -1386,6 +1386,19 @@ mod x86_64 {
                         "executable.needed_sha256",
                         "security-lab-needed",
                     )?;
+                    let transitive_needed = elf_needed::read_elf64_x86_64_dt_needed(image_fd.raw())
+                        .map_err(|error| {
+                            SandboxError::SetupFailed(format!(
+                                "cannot parse sealed direct dependency DT_NEEDED: {error}"
+                            ))
+                        })?;
+                    if !transitive_needed.is_empty() {
+                        return Err(SandboxError::SetupFailed(format!(
+                            "sealed direct dependency {} must be a DT_NEEDED leaf but declares {} transitive dependency entries",
+                            path.display(),
+                            transitive_needed.len()
+                        )));
+                    }
                     Some(PreparedSealedMount {
                         image_fd,
                         target_relative: sandbox_relative(path)?,

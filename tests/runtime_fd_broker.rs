@@ -746,6 +746,26 @@ fn host_unix_reconnect_controller_requires_readiness_before_connect_and_fails_te
     std::fs::remove_file(&service_path).unwrap();
 }
 
+fn build_reconnect_probe_root() -> PathBuf {
+    let root = unique_path("runtime-host-unix-reconnect-root");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("work")).expect("create reconnect work directory");
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/runtime_host_unix_reconnect_probe.S");
+    let output = root.join("reconnect-probe");
+    let status = Command::new("cc")
+        .args(["-nostdlib", "-static", "-Wl,--build-id=none", "-o"])
+        .arg(&output)
+        .arg(&source)
+        .status()
+        .expect("Linux x86_64 reconnect integration requires cc");
+    assert!(
+        status.success(),
+        "failed to assemble runtime host UNIX reconnect fixture"
+    );
+    root
+}
+
 fn build_probe_root() -> PathBuf {
     let root = unique_path("runtime-rights-root");
     let _ = std::fs::remove_dir_all(&root);
@@ -899,6 +919,105 @@ fn post_launch_host_unix_stream_grant_reaches_target_without_path_authority() {
     peer.join().expect("host UNIX service thread panicked");
 
     drop(session);
+    drop(broker);
+    std::fs::remove_file(&service_path).unwrap();
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn post_launch_host_unix_reconnects_twice_without_target_connect_authority() {
+    let root = build_reconnect_probe_root();
+    let broker_path = unique_path("runtime-host-unix-reconnect-sandbox-broker.sock");
+    let service_path = unique_path("runtime-host-unix-reconnect-sandbox-service.sock");
+    let _ = std::fs::remove_file(&broker_path);
+    let _ = std::fs::remove_file(&service_path);
+
+    let listener = UnixListener::bind(&service_path).expect("bind reconnect sandbox service");
+    let broker = RuntimeFdBroker::bind(&broker_path).expect("bind reconnect sandbox broker");
+    let text = format!(
+        "filesystem.root = {}\n\
+         identity.hostname = security-lab\n\
+         executable = /reconnect-probe\n\
+         arg = {}\n\
+         working_dir = /work\n\
+         stdio.stdin = closed\n\
+         stdio.stdout = closed\n\
+         stdio.stderr = closed\n\
+         limit.wall_clock_milliseconds = 5000\n\
+         limit.cpu_seconds = 2\n\
+         limit.address_space_bytes = 134217728\n\
+         limit.file_size_bytes = 1048576\n\
+         limit.open_files = 32\n\
+         seccomp.allow = write,recvmsg,read,close,openat,exit\n",
+        root.display(),
+        service_path.display()
+    );
+    let mut policy: SandboxPolicy = text.parse().expect("parse reconnect sandbox policy");
+    broker
+        .configure_policy(&mut policy, 10)
+        .expect("configure reconnect runtime broker policy");
+    for syscall in ["socket", "connect", "execveat"] {
+        assert!(
+            !policy.seccomp.allowed_syscalls.contains(syscall),
+            "bounded reconnect must not require target {syscall} authority"
+        );
+    }
+
+    let peer = thread::spawn(move || {
+        for (expected_request, reply) in [
+            (
+                b"runtime-reconnect-one\n".as_slice(),
+                b"runtime-reconnect-one-ok\n".as_slice(),
+            ),
+            (
+                b"runtime-reconnect-two\n".as_slice(),
+                b"runtime-reconnect-two-ok\n".as_slice(),
+            ),
+        ] {
+            let (mut stream, _) = listener.accept().expect("accept reconnect service round");
+            let mut request = vec![0u8; expected_request.len()];
+            stream.read_exact(&mut request).unwrap();
+            assert_eq!(request, expected_request);
+            stream.write_all(reply).unwrap();
+        }
+    });
+
+    let runner = thread::spawn(move || run(&policy));
+    let expected_uid = unsafe { libc::geteuid() };
+    let expected_gid = unsafe { libc::getegid() };
+    let mut controller = broker
+        .accept_host_unix_reconnect_controller(
+            &service_path,
+            Some((expected_uid, expected_gid)),
+            2,
+        )
+        .expect("accept sandbox reconnect controller");
+
+    for round in 1..=2 {
+        let credentials = match controller.grant_next(b'R') {
+            Ok(credentials) => credentials,
+            Err(error) => {
+                let runner_result = runner.join().expect("reconnect target runner panicked");
+                panic!(
+                    "reconnect round {round} failed before grant: {error}; runner result: {runner_result:?}"
+                );
+            }
+        };
+        assert_eq!(credentials.uid(), expected_uid);
+        assert_eq!(credentials.gid(), expected_gid);
+        assert!(credentials.pid() > 0);
+        assert_eq!(controller.granted_connections(), round);
+    }
+    assert!(controller.is_complete());
+    assert!(!controller.is_failed());
+
+    assert_eq!(
+        runner.join().expect("reconnect runner panicked").unwrap(),
+        ChildOutcome::Exited(0)
+    );
+    peer.join().expect("reconnect service thread panicked");
+
+    drop(controller);
     drop(broker);
     std::fs::remove_file(&service_path).unwrap();
     std::fs::remove_dir_all(&root).unwrap();

@@ -83,6 +83,9 @@ pub enum RuntimeFdBrokerError {
         request_id: u64,
     },
     RuntimeAuthenticationFailed,
+    RuntimeAcknowledgmentMismatch {
+        request_id: u64,
+    },
     UnexpectedPeer {
         expected_pid: i32,
         expected_uid: u32,
@@ -160,6 +163,10 @@ impl fmt::Display for RuntimeFdBrokerError {
             Self::RuntimeAuthenticationFailed => f.write_str(
                 "runtime FD broker authenticated message failed HMAC verification",
             ),
+            Self::RuntimeAcknowledgmentMismatch { request_id } => write!(
+                f,
+                "runtime FD broker acknowledgment does not match published response for request id {request_id}"
+            ),
             Self::UnexpectedPeer {
                 expected_pid,
                 expected_uid,
@@ -191,7 +198,7 @@ impl Error for RuntimeFdBrokerError {
 mod imp {
     use super::{File, Path, RuntimeCorrelatedRequest, RuntimeFdBrokerError, SandboxPolicy};
     use hmac::{Hmac, Mac};
-    use sha2::Sha256;
+    use sha2::{Digest, Sha256};
     use std::collections::BTreeSet;
     use std::ffi::CString;
     use std::io::Read;
@@ -508,10 +515,38 @@ mod imp {
         }
     }
 
+    struct RuntimeResponseAcknowledgmentExpectation {
+        request_id: u64,
+        response_sha256: [u8; 32],
+    }
+
+    pub struct RuntimeAcknowledgedCorrelatedMessageExchangeController {
+        controller: RuntimeAuthenticatedCorrelatedMessageExchangeController,
+        awaiting_acknowledgment: Option<RuntimeResponseAcknowledgmentExpectation>,
+        acknowledged_responses: u32,
+    }
+
+    impl std::fmt::Debug for RuntimeAcknowledgedCorrelatedMessageExchangeController {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("RuntimeAcknowledgedCorrelatedMessageExchangeController")
+                .field("controller", &self.controller)
+                .field(
+                    "awaiting_acknowledgment_request_id",
+                    &self
+                        .awaiting_acknowledgment
+                        .as_ref()
+                        .map(|expectation| expectation.request_id),
+                )
+                .field("acknowledged_responses", &self.acknowledged_responses)
+                .finish_non_exhaustive()
+        }
+    }
+
     const RUNTIME_AUTH_PROTOCOL_VERSION: u8 = 1;
     const RUNTIME_AUTH_CHALLENGE_KIND: u8 = b'C';
     const RUNTIME_AUTH_REQUEST_KIND: u8 = b'Q';
     const RUNTIME_AUTH_RESPONSE_KIND: u8 = b'S';
+    const RUNTIME_AUTH_ACKNOWLEDGMENT_KIND: u8 = b'A';
     const RUNTIME_AUTH_DOMAIN: &[u8] = b"security-lab-runtime-correlated-hmac-sha256-v1\0";
     type RuntimeHmacSha256 = Hmac<Sha256>;
 
@@ -544,6 +579,13 @@ mod imp {
         let mut tag = [0u8; super::RUNTIME_AUTH_TAG_BYTES];
         tag.copy_from_slice(&result.into_bytes());
         tag
+    }
+
+    fn runtime_response_sha256(payload: &[u8]) -> [u8; 32] {
+        let digest = Sha256::digest(payload);
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(&digest);
+        bytes
     }
 
     fn runtime_auth_verify(
@@ -1921,6 +1963,192 @@ mod imp {
         }
     }
 
+    impl RuntimeAcknowledgedCorrelatedMessageExchangeController {
+        pub fn is_complete(&self) -> bool {
+            self.controller.is_complete()
+                && self.acknowledged_responses == self.controller.max_requests()
+                && self.awaiting_acknowledgment.is_none()
+        }
+
+        pub fn received_requests(&self) -> u32 {
+            self.controller.received_requests()
+        }
+
+        pub fn published_responses(&self) -> u32 {
+            self.controller.completed_responses()
+        }
+
+        pub fn acknowledged_responses(&self) -> u32 {
+            self.acknowledged_responses
+        }
+
+        pub fn pending_requests(&self) -> u32 {
+            self.controller.pending_requests()
+        }
+
+        pub fn max_requests(&self) -> u32 {
+            self.controller.max_requests()
+        }
+
+        pub fn max_in_flight(&self) -> u32 {
+            self.controller.max_in_flight()
+        }
+
+        pub fn challenge_published(&self) -> bool {
+            self.controller.challenge_published()
+        }
+
+        pub fn awaiting_acknowledgment_request_id(&self) -> Option<u64> {
+            self.awaiting_acknowledgment
+                .as_ref()
+                .map(|expectation| expectation.request_id)
+        }
+
+        pub fn publish_challenge(&mut self) -> Result<(), RuntimeFdBrokerError> {
+            self.controller.publish_challenge()
+        }
+
+        pub fn receive_request(
+            &mut self,
+        ) -> Result<RuntimeCorrelatedRequest, RuntimeFdBrokerError> {
+            self.controller.reject_if_failed()?;
+            if self.awaiting_acknowledgment.is_some() {
+                return Err(RuntimeFdBrokerError::InvalidConfiguration(
+                    "acknowledged runtime exchange must consume the outstanding response acknowledgment before receiving another request"
+                        .to_owned(),
+                ));
+            }
+            self.controller.receive_request()
+        }
+
+        pub fn send_response(
+            &mut self,
+            request_id: u64,
+            bytes: &[u8],
+        ) -> Result<(), RuntimeFdBrokerError> {
+            self.controller.reject_if_failed()?;
+            if self.awaiting_acknowledgment.is_some() {
+                return Err(RuntimeFdBrokerError::InvalidConfiguration(
+                    "acknowledged runtime exchange permits only one published response awaiting acknowledgment"
+                        .to_owned(),
+                ));
+            }
+
+            let response_sha256 = runtime_response_sha256(bytes);
+            self.controller.send_response(request_id, bytes)?;
+            self.awaiting_acknowledgment = Some(RuntimeResponseAcknowledgmentExpectation {
+                request_id,
+                response_sha256,
+            });
+            Ok(())
+        }
+
+        /// Consume one authenticated acknowledgment for the exact response bytes
+        /// most recently published by this controller.
+        ///
+        /// The acknowledgment frame is fixed-size:
+        /// `A || version=1 || request_id_le || sha256(response) || hmac_tag`.
+        /// While this barrier is outstanding, the acknowledgment must be the
+        /// peer's next packet; any request or other frame is a terminal protocol
+        /// violation rather than a packet the controller can reorder or skip.
+        pub fn receive_acknowledgment(&mut self) -> Result<u64, RuntimeFdBrokerError> {
+            self.controller.reject_if_failed()?;
+            let (expected_request_id, expected_response_sha256) = match self
+                .awaiting_acknowledgment
+                .as_ref()
+            {
+                Some(expectation) => (expectation.request_id, expectation.response_sha256),
+                None => {
+                    return Err(RuntimeFdBrokerError::InvalidConfiguration(
+                        "acknowledged runtime exchange has no published response awaiting acknowledgment"
+                            .to_owned(),
+                    ));
+                }
+            };
+
+            const ACK_FRAME_BYTES: usize = 2 + 8 + 32 + super::RUNTIME_AUTH_TAG_BYTES;
+            let mut frame = [0u8; ACK_FRAME_BYTES];
+            let mut iovec = libc::iovec {
+                iov_base: frame.as_mut_ptr().cast::<libc::c_void>(),
+                iov_len: frame.len(),
+            };
+            let mut message = unsafe { std::mem::zeroed::<libc::msghdr>() };
+            message.msg_iov = &mut iovec;
+            message.msg_iovlen = 1;
+
+            loop {
+                message.msg_flags = 0;
+                let received = unsafe { libc::recvmsg(self.controller.fd, &mut message, 0) };
+                if received == -1 {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() == Some(libc::EINTR) {
+                        continue;
+                    }
+                    self.controller.failed = true;
+                    return Err(RuntimeFdBrokerError::io(
+                        "cannot receive authenticated runtime response acknowledgment",
+                        error,
+                    ));
+                }
+                if received == 0 {
+                    self.controller.failed = true;
+                    return Err(RuntimeFdBrokerError::Protocol(
+                        "authenticated runtime response acknowledgment must arrive before peer shutdown"
+                            .to_owned(),
+                    ));
+                }
+                if received >= 2
+                    && (frame[0] != RUNTIME_AUTH_ACKNOWLEDGMENT_KIND
+                        || frame[1] != RUNTIME_AUTH_PROTOCOL_VERSION)
+                {
+                    self.controller.failed = true;
+                    return Err(RuntimeFdBrokerError::Protocol(
+                        "authenticated runtime response acknowledgment must be the peer's next packet"
+                            .to_owned(),
+                    ));
+                }
+                if message.msg_flags & libc::MSG_TRUNC != 0 || received as usize != ACK_FRAME_BYTES
+                {
+                    self.controller.failed = true;
+                    return Err(RuntimeFdBrokerError::Protocol(
+                        "authenticated runtime response acknowledgment has invalid packet length"
+                            .to_owned(),
+                    ));
+                }
+
+                let mut request_id_bytes = [0u8; 8];
+                request_id_bytes.copy_from_slice(&frame[2..10]);
+                let request_id = u64::from_le_bytes(request_id_bytes);
+                let mut response_sha256 = [0u8; 32];
+                response_sha256.copy_from_slice(&frame[10..42]);
+                let tag = &frame[42..];
+
+                if !runtime_auth_verify(
+                    &self.controller.key,
+                    &self.controller.challenge,
+                    RUNTIME_AUTH_ACKNOWLEDGMENT_KIND,
+                    request_id,
+                    &response_sha256,
+                    tag,
+                ) {
+                    self.controller.failed = true;
+                    return Err(RuntimeFdBrokerError::RuntimeAuthenticationFailed);
+                }
+                if request_id != expected_request_id || response_sha256 != expected_response_sha256
+                {
+                    self.controller.failed = true;
+                    return Err(RuntimeFdBrokerError::RuntimeAcknowledgmentMismatch {
+                        request_id: expected_request_id,
+                    });
+                }
+
+                self.awaiting_acknowledgment = None;
+                self.acknowledged_responses += 1;
+                return Ok(request_id);
+            }
+        }
+    }
+
     #[derive(Debug)]
     pub struct RuntimeFdBroker {
         path: PathBuf,
@@ -2202,6 +2430,33 @@ mod imp {
             RuntimeFdBrokerError,
         > {
             prepare_runtime_authenticated_correlated_exchange(
+                max_request_bytes,
+                max_response_bytes,
+                max_requests,
+                max_in_flight,
+                key,
+            )
+        }
+
+        /// Prepare authenticated correlated messaging with an acknowledgment
+        /// barrier for every published response.
+        ///
+        /// The target must authenticate the SHA-256 of the exact response bytes
+        /// before the trusted controller can consume another request.
+        pub fn prepare_runtime_acknowledged_correlated_exchange(
+            max_request_bytes: u64,
+            max_response_bytes: u64,
+            max_requests: u32,
+            max_in_flight: u32,
+            key: [u8; super::RUNTIME_AUTH_KEY_BYTES],
+        ) -> Result<
+            (
+                PreparedRuntimeMessageChannel,
+                RuntimeAcknowledgedCorrelatedMessageExchangeController,
+            ),
+            RuntimeFdBrokerError,
+        > {
+            prepare_runtime_acknowledged_correlated_exchange(
                 max_request_bytes,
                 max_response_bytes,
                 max_requests,
@@ -2861,6 +3116,36 @@ mod imp {
         ))
     }
 
+    fn prepare_runtime_acknowledged_correlated_exchange(
+        max_request_bytes: u64,
+        max_response_bytes: u64,
+        max_requests: u32,
+        max_in_flight: u32,
+        key: [u8; super::RUNTIME_AUTH_KEY_BYTES],
+    ) -> Result<
+        (
+            PreparedRuntimeMessageChannel,
+            RuntimeAcknowledgedCorrelatedMessageExchangeController,
+        ),
+        RuntimeFdBrokerError,
+    > {
+        let (grant, controller) = prepare_runtime_authenticated_correlated_exchange(
+            max_request_bytes,
+            max_response_bytes,
+            max_requests,
+            max_in_flight,
+            key,
+        )?;
+        Ok((
+            grant,
+            RuntimeAcknowledgedCorrelatedMessageExchangeController {
+                controller,
+                awaiting_acknowledgment: None,
+                acknowledged_responses: 0,
+            },
+        ))
+    }
+
     fn prepare_runtime_multi_message_exchange(
         max_request_bytes: u64,
         max_response_bytes: u64,
@@ -3081,6 +3366,9 @@ mod imp {
     #[derive(Debug)]
     pub struct RuntimeAuthenticatedCorrelatedMessageExchangeController;
 
+    #[derive(Debug)]
+    pub struct RuntimeAcknowledgedCorrelatedMessageExchangeController;
+
     impl RuntimeCorrelatedMessageExchangeController {
         pub fn is_complete(&self) -> bool {
             false
@@ -3177,6 +3465,78 @@ mod imp {
         ) -> Result<(), RuntimeFdBrokerError> {
             Err(RuntimeFdBrokerError::UnsupportedPlatform(
                 "authenticated runtime correlated exchanges currently require Linux x86_64"
+                    .to_owned(),
+            ))
+        }
+    }
+
+    impl RuntimeAcknowledgedCorrelatedMessageExchangeController {
+        pub fn is_complete(&self) -> bool {
+            false
+        }
+
+        pub fn received_requests(&self) -> u32 {
+            0
+        }
+
+        pub fn published_responses(&self) -> u32 {
+            0
+        }
+
+        pub fn acknowledged_responses(&self) -> u32 {
+            0
+        }
+
+        pub fn pending_requests(&self) -> u32 {
+            0
+        }
+
+        pub fn max_requests(&self) -> u32 {
+            0
+        }
+
+        pub fn max_in_flight(&self) -> u32 {
+            0
+        }
+
+        pub fn challenge_published(&self) -> bool {
+            false
+        }
+
+        pub fn awaiting_acknowledgment_request_id(&self) -> Option<u64> {
+            None
+        }
+
+        pub fn publish_challenge(&mut self) -> Result<(), RuntimeFdBrokerError> {
+            Err(RuntimeFdBrokerError::UnsupportedPlatform(
+                "acknowledged runtime correlated exchanges currently require Linux x86_64"
+                    .to_owned(),
+            ))
+        }
+
+        pub fn receive_request(
+            &mut self,
+        ) -> Result<RuntimeCorrelatedRequest, RuntimeFdBrokerError> {
+            Err(RuntimeFdBrokerError::UnsupportedPlatform(
+                "acknowledged runtime correlated exchanges currently require Linux x86_64"
+                    .to_owned(),
+            ))
+        }
+
+        pub fn send_response(
+            &mut self,
+            _request_id: u64,
+            _bytes: &[u8],
+        ) -> Result<(), RuntimeFdBrokerError> {
+            Err(RuntimeFdBrokerError::UnsupportedPlatform(
+                "acknowledged runtime correlated exchanges currently require Linux x86_64"
+                    .to_owned(),
+            ))
+        }
+
+        pub fn receive_acknowledgment(&mut self) -> Result<u64, RuntimeFdBrokerError> {
+            Err(RuntimeFdBrokerError::UnsupportedPlatform(
+                "acknowledged runtime correlated exchanges currently require Linux x86_64"
                     .to_owned(),
             ))
         }
@@ -3452,6 +3812,25 @@ mod imp {
                     .to_owned(),
             ))
         }
+
+        pub fn prepare_runtime_acknowledged_correlated_exchange(
+            _max_request_bytes: u64,
+            _max_response_bytes: u64,
+            _max_requests: u32,
+            _max_in_flight: u32,
+            _key: [u8; super::RUNTIME_AUTH_KEY_BYTES],
+        ) -> Result<
+            (
+                PreparedRuntimeMessageChannel,
+                RuntimeAcknowledgedCorrelatedMessageExchangeController,
+            ),
+            RuntimeFdBrokerError,
+        > {
+            Err(RuntimeFdBrokerError::UnsupportedPlatform(
+                "acknowledged runtime correlated exchanges currently require Linux x86_64"
+                    .to_owned(),
+            ))
+        }
     }
 
     impl RuntimeFdSession {
@@ -3511,6 +3890,7 @@ mod imp {
 pub use imp::{
     PreparedReadOnlyRegularFile, PreparedRevocableByteStream, PreparedRuntimeMessageChannel,
     PreparedSealedRegularFileSnapshot, PreparedSealedSnapshotBundle, RevocableByteStreamController,
+    RuntimeAcknowledgedCorrelatedMessageExchangeController,
     RuntimeAuthenticatedCorrelatedMessageExchangeController,
     RuntimeCorrelatedMessageExchangeController, RuntimeFdBroker, RuntimeFdSession,
     RuntimeMessageExchangeController, RuntimeMultiMessageExchangeController,

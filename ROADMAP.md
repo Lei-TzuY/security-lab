@@ -1539,7 +1539,31 @@ Boundary: 62A provides shared-key frame authentication plus per-session freshnes
 
 ### Milestone 62 promotion rule
 
-After 62A integrates, do not farm tag sizes, alternate MAC encodings, nonce widths, or direction-byte variants. Further runtime-protocol work must add a materially different property such as authenticated target acknowledgment/processing evidence, a genuinely concurrent host execution surface, or move to another independent architecture frontier.
+62A is sealed on `main`. Do not farm tag sizes, alternate MAC encodings, nonce widths, or direction-byte variants. Further runtime-protocol work must add a materially different property such as authenticated target acknowledgment/processing evidence, a genuinely concurrent host execution surface, or move to another independent architecture frontier.
+
+## Milestone 63 — authenticated exact-response acknowledgment
+
+### Slice 63A — one-response acknowledgment barrier
+
+**Status: complete on `main`.** Composes 62A instead of duplicating its transport and adds a distinct peer-evidence step after each authenticated response publication.
+
+Acceptance evidence is executable:
+
+- `prepare_runtime_acknowledged_correlated_exchange(...)` reuses the exact 62A request/response bounds, fresh challenge, HMAC framing, request-ID uniqueness, and out-of-order response selection through a wrapper around the authenticated controller;
+- after a successful authenticated response publication, the wrapper records exactly one outstanding tuple of request ID plus SHA-256 of the complete response bytes. No second response may be published while that barrier is active, and the peer's next packet must be the matching acknowledgment; any request or other frame before that acknowledgment is a terminal protocol-ordering failure;
+- the peer acknowledgment frame is fixed-size `A || version=1 || request_id_le || sha256(response) || tag`. Its HMAC uses the same versioned domain/session challenge but a distinct acknowledgment direction byte and authenticates the full 32-byte response digest as payload;
+- acknowledgment HMAC verification occurs before expected request-ID/digest comparison. A bad MAC inherits 62A's terminal `RuntimeAuthenticationFailed`; a validly authenticated but wrong request ID or response digest returns typed `RuntimeAcknowledgmentMismatch` and terminally closes the controller;
+- successful acknowledgment increments a separate acknowledgment count and clears the barrier. Controller completion requires every configured request to have been accepted, every response to have been published, and every published response to have received its exact matching authenticated acknowledgment;
+- broker-level integration uses the real readiness handshake and `SCM_RIGHTS` endpoint grant, refuses host-side request/response progression while response 42 awaits acknowledgment, clears that barrier only after the exact response digest is authenticated, then accepts the next request and completes later response/acknowledgment pairs;
+- a dedicated ordering regression sends another valid authenticated request packet before the required acknowledgment and proves the shared ordered `SOCK_SEQPACKET` stream fails closed rather than skipping/reordering peer packets;
+- a dedicated negative regression signs the SHA-256 of different response bytes with the correct session key/challenge and proves that cryptographic authenticity alone does not bypass exact-response binding;
+- exact-head stable rustfmt, Clippy with `-D warnings`, complete stable tests, and the Rust 1.74 suite are the integration gate.
+
+Boundary: 63A proves only that a peer possessing the shared session key emitted a valid acknowledgment frame bound to the exact response digest and session challenge. It does not prove that the peer actually performed a kernel read, executed business logic, committed side effects, durably persisted state, or could not precompute an acknowledgment for response bytes it already knew. The acknowledgment wait has no independent deadline in this slice, only one published response may await acknowledgment at a time, and the protocol remains non-encrypted shared-key messaging rather than attestation or general RPC.
+
+### Milestone 63 promotion rule
+
+After 63A integrates, do not farm acknowledgment digest algorithms, extra ACK flags, or larger outstanding-ACK counts. Further runtime work must change the host execution/liveness model materially—such as a bounded acknowledgment deadline or genuinely event-oriented concurrent host API—or move to another independent architecture frontier.
 
 ## Later frontiers
 

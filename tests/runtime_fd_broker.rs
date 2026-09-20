@@ -12,7 +12,7 @@ use security_lab::{
     MIN_RUNTIME_MULTI_MESSAGE_ROUNDS, RUNTIME_AUTH_CHALLENGE_BYTES, RUNTIME_AUTH_KEY_BYTES,
     RUNTIME_AUTH_TAG_BYTES,
 };
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -142,6 +142,7 @@ const TEST_RUNTIME_AUTH_VERSION: u8 = 1;
 const TEST_RUNTIME_AUTH_CHALLENGE_KIND: u8 = b'C';
 const TEST_RUNTIME_AUTH_REQUEST_KIND: u8 = b'Q';
 const TEST_RUNTIME_AUTH_RESPONSE_KIND: u8 = b'S';
+const TEST_RUNTIME_AUTH_ACKNOWLEDGMENT_KIND: u8 = b'A';
 const TEST_RUNTIME_AUTH_DOMAIN: &[u8] = b"security-lab-runtime-correlated-hmac-sha256-v1\0";
 
 type TestRuntimeHmacSha256 = Hmac<Sha256>;
@@ -276,6 +277,65 @@ fn receive_authenticated_runtime_response(
     .verify_slice(tag)
     .expect("authenticated runtime response tag must verify");
     (request_id, payload)
+}
+
+fn test_runtime_response_sha256(payload: &[u8]) -> [u8; 32] {
+    let digest = Sha256::digest(payload);
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(&digest);
+    bytes
+}
+
+fn send_authenticated_runtime_acknowledgment_digest(
+    fd: RawFd,
+    key: &[u8; RUNTIME_AUTH_KEY_BYTES],
+    challenge: &[u8; RUNTIME_AUTH_CHALLENGE_BYTES],
+    request_id: u64,
+    response_sha256: &[u8; 32],
+) {
+    let tag = test_runtime_auth_tag(
+        key,
+        challenge,
+        TEST_RUNTIME_AUTH_ACKNOWLEDGMENT_KIND,
+        request_id,
+        response_sha256,
+    );
+    let mut frame = Vec::with_capacity(2 + 8 + response_sha256.len() + tag.len());
+    frame.push(TEST_RUNTIME_AUTH_ACKNOWLEDGMENT_KIND);
+    frame.push(TEST_RUNTIME_AUTH_VERSION);
+    frame.extend_from_slice(&request_id.to_le_bytes());
+    frame.extend_from_slice(response_sha256);
+    frame.extend_from_slice(&tag);
+    assert_eq!(
+        unsafe {
+            libc::send(
+                fd,
+                frame.as_ptr().cast::<libc::c_void>(),
+                frame.len(),
+                libc::MSG_NOSIGNAL,
+            )
+        },
+        frame.len() as isize,
+        "send authenticated response acknowledgment failed: {}",
+        std::io::Error::last_os_error()
+    );
+}
+
+fn send_authenticated_runtime_acknowledgment(
+    fd: RawFd,
+    key: &[u8; RUNTIME_AUTH_KEY_BYTES],
+    challenge: &[u8; RUNTIME_AUTH_CHALLENGE_BYTES],
+    request_id: u64,
+    response_payload: &[u8],
+) {
+    let response_sha256 = test_runtime_response_sha256(response_payload);
+    send_authenticated_runtime_acknowledgment_digest(
+        fd,
+        key,
+        challenge,
+        request_id,
+        &response_sha256,
+    );
 }
 
 #[repr(C, align(8))]
@@ -1799,6 +1859,175 @@ fn runtime_multi_message_session_deadline_also_bounds_response_publication() {
     ));
     assert!(matches!(
         controller.send_response_with_deadline(b"retry", 1000),
+        Err(RuntimeFdBrokerError::Protocol(message)) if message.contains("closed after")
+    ));
+}
+
+#[test]
+fn acknowledged_correlated_runtime_exchange_requires_exact_response_ack() {
+    let socket_path = unique_path("runtime-auth-ack-success.sock");
+    let _ = std::fs::remove_file(&socket_path);
+    let broker = RuntimeFdBroker::bind(&socket_path).unwrap();
+    let mut client = UnixStream::connect(broker.path()).unwrap();
+    let mut session = broker.accept().unwrap();
+    client.write_all(b"R").unwrap();
+    session.wait_for_ready(b'R').unwrap();
+
+    let key = [0x6cu8; RUNTIME_AUTH_KEY_BYTES];
+    let (grant, mut controller) =
+        RuntimeFdBroker::prepare_runtime_acknowledged_correlated_exchange(16, 16, 3, 2, key)
+            .unwrap();
+    session.send_runtime_message_channel(grant).unwrap();
+    let endpoint = receive_one_fd(&client);
+    controller.publish_challenge().unwrap();
+    let challenge = receive_runtime_auth_challenge(endpoint.raw());
+
+    send_authenticated_runtime_request(endpoint.raw(), &key, &challenge, 41, b"one");
+    send_authenticated_runtime_request(endpoint.raw(), &key, &challenge, 42, b"two");
+    assert_eq!(controller.receive_request().unwrap().request_id(), 41);
+    assert_eq!(controller.receive_request().unwrap().request_id(), 42);
+
+    controller.send_response(42, b"TWO").unwrap();
+    assert_eq!(
+        receive_authenticated_runtime_response(endpoint.raw(), &key, &challenge),
+        (42, b"TWO".to_vec())
+    );
+    assert_eq!(controller.published_responses(), 1);
+    assert_eq!(controller.acknowledged_responses(), 0);
+    assert_eq!(controller.awaiting_acknowledgment_request_id(), Some(42));
+    assert!(!controller.is_complete());
+
+    assert!(matches!(
+        controller.receive_request(),
+        Err(RuntimeFdBrokerError::InvalidConfiguration(message))
+            if message.contains("outstanding response acknowledgment")
+    ));
+    assert!(matches!(
+        controller.send_response(41, b"ONE"),
+        Err(RuntimeFdBrokerError::InvalidConfiguration(message))
+            if message.contains("one published response")
+    ));
+
+    send_authenticated_runtime_acknowledgment(endpoint.raw(), &key, &challenge, 42, b"TWO");
+    assert_eq!(controller.receive_acknowledgment().unwrap(), 42);
+    assert_eq!(controller.acknowledged_responses(), 1);
+    assert_eq!(controller.awaiting_acknowledgment_request_id(), None);
+
+    send_authenticated_runtime_request(endpoint.raw(), &key, &challenge, 43, b"three");
+    let third = controller.receive_request().unwrap();
+    assert_eq!(third.request_id(), 43);
+    assert_eq!(third.payload(), b"three");
+
+    controller.send_response(43, b"THREE").unwrap();
+    assert_eq!(
+        receive_authenticated_runtime_response(endpoint.raw(), &key, &challenge),
+        (43, b"THREE".to_vec())
+    );
+    send_authenticated_runtime_acknowledgment(endpoint.raw(), &key, &challenge, 43, b"THREE");
+    assert_eq!(controller.receive_acknowledgment().unwrap(), 43);
+
+    controller.send_response(41, b"ONE").unwrap();
+    assert_eq!(
+        receive_authenticated_runtime_response(endpoint.raw(), &key, &challenge),
+        (41, b"ONE".to_vec())
+    );
+    send_authenticated_runtime_acknowledgment(endpoint.raw(), &key, &challenge, 41, b"ONE");
+    assert_eq!(controller.receive_acknowledgment().unwrap(), 41);
+
+    assert_eq!(controller.received_requests(), 3);
+    assert_eq!(controller.published_responses(), 3);
+    assert_eq!(controller.acknowledged_responses(), 3);
+    assert_eq!(controller.pending_requests(), 0);
+    assert_eq!(controller.max_requests(), 3);
+    assert_eq!(controller.max_in_flight(), 2);
+    assert!(controller.challenge_published());
+    assert!(controller.is_complete());
+}
+
+#[test]
+fn acknowledged_correlated_runtime_exchange_rejects_request_before_ack_terminally() {
+    let socket_path = unique_path("runtime-auth-ack-ordering.sock");
+    let _ = std::fs::remove_file(&socket_path);
+    let broker = RuntimeFdBroker::bind(&socket_path).unwrap();
+    let mut client = UnixStream::connect(broker.path()).unwrap();
+    let mut session = broker.accept().unwrap();
+    client.write_all(b"R").unwrap();
+    session.wait_for_ready(b'R').unwrap();
+
+    let key = [0x44u8; RUNTIME_AUTH_KEY_BYTES];
+    let (grant, mut controller) =
+        RuntimeFdBroker::prepare_runtime_acknowledged_correlated_exchange(16, 16, 2, 2, key)
+            .unwrap();
+    session.send_runtime_message_channel(grant).unwrap();
+    let endpoint = receive_one_fd(&client);
+    controller.publish_challenge().unwrap();
+    let challenge = receive_runtime_auth_challenge(endpoint.raw());
+
+    send_authenticated_runtime_request(endpoint.raw(), &key, &challenge, 11, b"one");
+    assert_eq!(controller.receive_request().unwrap().request_id(), 11);
+    controller.send_response(11, b"ONE").unwrap();
+    assert_eq!(
+        receive_authenticated_runtime_response(endpoint.raw(), &key, &challenge),
+        (11, b"ONE".to_vec())
+    );
+
+    send_authenticated_runtime_request(endpoint.raw(), &key, &challenge, 12, b"too-early");
+    assert!(matches!(
+        controller.receive_acknowledgment(),
+        Err(RuntimeFdBrokerError::Protocol(message))
+            if message.contains("must be the peer's next packet")
+    ));
+    assert_eq!(controller.acknowledged_responses(), 0);
+    assert!(!controller.is_complete());
+    assert!(matches!(
+        controller.receive_acknowledgment(),
+        Err(RuntimeFdBrokerError::Protocol(message)) if message.contains("closed after")
+    ));
+}
+
+#[test]
+fn acknowledged_correlated_runtime_exchange_rejects_wrong_response_digest_terminally() {
+    let socket_path = unique_path("runtime-auth-ack-mismatch.sock");
+    let _ = std::fs::remove_file(&socket_path);
+    let broker = RuntimeFdBroker::bind(&socket_path).unwrap();
+    let mut client = UnixStream::connect(broker.path()).unwrap();
+    let mut session = broker.accept().unwrap();
+    client.write_all(b"R").unwrap();
+    session.wait_for_ready(b'R').unwrap();
+
+    let key = [0x91u8; RUNTIME_AUTH_KEY_BYTES];
+    let (grant, mut controller) =
+        RuntimeFdBroker::prepare_runtime_acknowledged_correlated_exchange(16, 16, 2, 2, key)
+            .unwrap();
+    session.send_runtime_message_channel(grant).unwrap();
+    let endpoint = receive_one_fd(&client);
+    controller.publish_challenge().unwrap();
+    let challenge = receive_runtime_auth_challenge(endpoint.raw());
+
+    send_authenticated_runtime_request(endpoint.raw(), &key, &challenge, 7, b"request");
+    assert_eq!(controller.receive_request().unwrap().request_id(), 7);
+    controller.send_response(7, b"OK").unwrap();
+    assert_eq!(
+        receive_authenticated_runtime_response(endpoint.raw(), &key, &challenge),
+        (7, b"OK".to_vec())
+    );
+
+    let wrong_digest = test_runtime_response_sha256(b"WRONG");
+    send_authenticated_runtime_acknowledgment_digest(
+        endpoint.raw(),
+        &key,
+        &challenge,
+        7,
+        &wrong_digest,
+    );
+    assert!(matches!(
+        controller.receive_acknowledgment(),
+        Err(RuntimeFdBrokerError::RuntimeAcknowledgmentMismatch { request_id }) if request_id == 7
+    ));
+    assert_eq!(controller.acknowledged_responses(), 0);
+    assert!(!controller.is_complete());
+    assert!(matches!(
+        controller.receive_acknowledgment(),
         Err(RuntimeFdBrokerError::Protocol(message)) if message.contains("closed after")
     ));
 }

@@ -1520,7 +1520,7 @@ Boundary: 61A is bounded correlation over one already-granted endpoint. It does 
 
 ### Slice 62A — fresh-challenge HMAC-SHA256 request/response authentication
 
-**Current implementation candidate.** Adds application-frame authenticity and bounded cross-session replay separation to the 61A correlated exchange without changing target syscall authority or replacing its bounded in-flight lifecycle.
+**Status: complete on `main`.** Adds application-frame authenticity and bounded cross-session replay separation to the 61A correlated exchange without changing target syscall authority or replacing its bounded in-flight lifecycle.
 
 Acceptance evidence is executable:
 

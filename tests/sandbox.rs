@@ -1,9 +1,9 @@
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 
 use security_lab::{
-    publish_cow_volume_diff_atomic, publish_cow_volume_diff_trusted_ed25519_atomic, run, run_report,
-    run_report_with_cancel, sign_cow_volume_diff_ed25519, CancellationToken, ChildOutcome,
-    CopyOnWriteVolumeBinding, CowDiffApplyError, CowDiffApplyLimits, CowDiffEntry,
+    publish_cow_volume_diff_atomic, publish_cow_volume_diff_trusted_ed25519_atomic, run,
+    run_report, run_report_with_cancel, sign_cow_volume_diff_ed25519, CancellationToken,
+    ChildOutcome, CopyOnWriteVolumeBinding, CowDiffApplyError, CowDiffApplyLimits, CowDiffEntry,
     CowVolumePublicationError, CowVolumeTrustedPublicationError, ExecutableNeededBinding,
     PersistentVolumeBinding, ResourceLimits, SandboxError, SandboxPolicy, SeccompArgRangeRule,
     SeccompArgRule, SeccompPolicy, SnapshotTrustKey, SnapshotTrustKeyId, SnapshotTrustKeyState,
@@ -2018,7 +2018,10 @@ fn copy_on_write_volume_diff_trusted_ed25519_publication_authenticates_exact_rep
     }];
 
     let report = run_report(&mounted).unwrap();
-    let bound = report.cow_volume_diffs.first().expect("bound COW volume diff");
+    let bound = report
+        .cow_volume_diffs
+        .first()
+        .expect("bound COW volume diff");
     let seed = [0x77; SNAPSHOT_ED25519_SIGNING_KEY_BYTES];
     let evidence = sign_cow_volume_diff_ed25519(bound, &seed).unwrap();
     let signer = SnapshotTrustKeyId::from_public_key(&evidence.public_key);

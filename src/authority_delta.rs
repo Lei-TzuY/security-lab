@@ -816,14 +816,18 @@ fn compare_bounded_cow_volume_base_identity_export(
     let candidate = collect(candidate);
 
     let candidate_covers_baseline = baseline.iter().all(|(key, (bytes, nodes))| {
-        candidate.get(key).is_some_and(|(candidate_bytes, candidate_nodes)| {
-            candidate_bytes >= bytes && candidate_nodes >= nodes
-        })
+        candidate
+            .get(key)
+            .is_some_and(|(candidate_bytes, candidate_nodes)| {
+                candidate_bytes >= bytes && candidate_nodes >= nodes
+            })
     });
     let baseline_covers_candidate = candidate.iter().all(|(key, (bytes, nodes))| {
-        baseline.get(key).is_some_and(|(baseline_bytes, baseline_nodes)| {
-            baseline_bytes >= bytes && baseline_nodes >= nodes
-        })
+        baseline
+            .get(key)
+            .is_some_and(|(baseline_bytes, baseline_nodes)| {
+                baseline_bytes >= bytes && baseline_nodes >= nodes
+            })
     });
     let class = match (candidate_covers_baseline, baseline_covers_candidate) {
         (true, true) => DeltaClass::Unchanged,

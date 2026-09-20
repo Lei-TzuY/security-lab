@@ -418,13 +418,17 @@ mod graph_tests {
         let mut missing = BTreeMap::new();
         missing.insert(bytes("/a"), vec![bytes("/b")]);
         let err = validate_exact_dependency_graph(&root, &missing).unwrap_err();
-        assert!(err.to_string().contains("requires undeclared DT_NEEDED edge /b"));
+        assert!(err
+            .to_string()
+            .contains("requires undeclared DT_NEEDED edge /b"));
 
         let mut unreachable = BTreeMap::new();
         unreachable.insert(bytes("/a"), Vec::new());
         unreachable.insert(bytes("/unused"), Vec::new());
         let err = validate_exact_dependency_graph(&root, &unreachable).unwrap_err();
-        assert!(err.to_string().contains("is unreachable from the main executable"));
+        assert!(err
+            .to_string()
+            .contains("is unreachable from the main executable"));
     }
 
     #[test]
@@ -433,10 +437,11 @@ mod graph_tests {
         graph.insert(bytes("/a"), Vec::new());
 
         let err = validate_exact_dependency_graph(&[bytes("liba.so")], &graph).unwrap_err();
-        assert!(err.to_string().contains("non-literal path-qualified DT_NEEDED"));
+        assert!(err
+            .to_string()
+            .contains("non-literal path-qualified DT_NEEDED"));
 
-        let err =
-            validate_exact_dependency_graph(&[bytes("/a"), bytes("/a")], &graph).unwrap_err();
+        let err = validate_exact_dependency_graph(&[bytes("/a"), bytes("/a")], &graph).unwrap_err();
         assert!(err.to_string().contains("duplicate DT_NEEDED edge /a"));
     }
 }

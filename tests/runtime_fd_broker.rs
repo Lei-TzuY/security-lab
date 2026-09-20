@@ -1,5 +1,6 @@
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 
+use hmac::{Hmac, Mac};
 use security_lab::{
     run, ChildOutcome, RuntimeFdBroker, RuntimeFdBrokerError, SandboxPolicy,
     MAX_RUNTIME_CORRELATED_IN_FLIGHT, MAX_RUNTIME_CORRELATED_REQUESTS, MAX_RUNTIME_MESSAGE_BYTES,
@@ -8,8 +9,10 @@ use security_lab::{
     MAX_RUNTIME_REVOCABLE_STREAM_BYTES, MAX_RUNTIME_SEALED_BUNDLE_BYTES,
     MAX_RUNTIME_SEALED_BUNDLE_ITEMS, MAX_RUNTIME_SEALED_SNAPSHOT_BYTES,
     MIN_RUNTIME_CORRELATED_IN_FLIGHT, MIN_RUNTIME_CORRELATED_REQUESTS,
-    MIN_RUNTIME_MULTI_MESSAGE_ROUNDS,
+    MIN_RUNTIME_MULTI_MESSAGE_ROUNDS, RUNTIME_AUTH_CHALLENGE_BYTES, RUNTIME_AUTH_KEY_BYTES,
+    RUNTIME_AUTH_TAG_BYTES,
 };
+use sha2::Sha256;
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -133,6 +136,149 @@ fn receive_correlated_packet(fd: RawFd) -> (u64, Vec<u8>) {
     let mut request_id_bytes = [0u8; 8];
     request_id_bytes.copy_from_slice(&frame[..8]);
     (u64::from_le_bytes(request_id_bytes), frame[8..].to_vec())
+}
+
+const TEST_RUNTIME_AUTH_VERSION: u8 = 1;
+const TEST_RUNTIME_AUTH_CHALLENGE_KIND: u8 = b'C';
+const TEST_RUNTIME_AUTH_REQUEST_KIND: u8 = b'Q';
+const TEST_RUNTIME_AUTH_RESPONSE_KIND: u8 = b'S';
+const TEST_RUNTIME_AUTH_DOMAIN: &[u8] = b"security-lab-runtime-correlated-hmac-sha256-v1\0";
+
+type TestRuntimeHmacSha256 = Hmac<Sha256>;
+
+fn test_runtime_auth_mac(
+    key: &[u8; RUNTIME_AUTH_KEY_BYTES],
+    challenge: &[u8; RUNTIME_AUTH_CHALLENGE_BYTES],
+    kind: u8,
+    request_id: u64,
+    payload: &[u8],
+) -> TestRuntimeHmacSha256 {
+    let mut mac = TestRuntimeHmacSha256::new_from_slice(key).unwrap();
+    mac.update(TEST_RUNTIME_AUTH_DOMAIN);
+    mac.update(challenge);
+    mac.update(&[kind, TEST_RUNTIME_AUTH_VERSION]);
+    mac.update(&request_id.to_le_bytes());
+    mac.update(&(payload.len() as u64).to_le_bytes());
+    mac.update(payload);
+    mac
+}
+
+fn test_runtime_auth_tag(
+    key: &[u8; RUNTIME_AUTH_KEY_BYTES],
+    challenge: &[u8; RUNTIME_AUTH_CHALLENGE_BYTES],
+    kind: u8,
+    request_id: u64,
+    payload: &[u8],
+) -> [u8; RUNTIME_AUTH_TAG_BYTES] {
+    let mut tag = [0u8; RUNTIME_AUTH_TAG_BYTES];
+    tag.copy_from_slice(
+        &test_runtime_auth_mac(key, challenge, kind, request_id, payload)
+            .finalize()
+            .into_bytes(),
+    );
+    tag
+}
+
+fn receive_runtime_auth_challenge(fd: RawFd) -> [u8; RUNTIME_AUTH_CHALLENGE_BYTES] {
+    let mut frame = [0u8; 2 + RUNTIME_AUTH_CHALLENGE_BYTES];
+    let received = unsafe {
+        libc::recv(
+            fd,
+            frame.as_mut_ptr().cast::<libc::c_void>(),
+            frame.len(),
+            0,
+        )
+    };
+    assert_eq!(
+        received,
+        frame.len() as isize,
+        "receive authenticated runtime challenge failed: {}",
+        std::io::Error::last_os_error()
+    );
+    assert_eq!(frame[0], TEST_RUNTIME_AUTH_CHALLENGE_KIND);
+    assert_eq!(frame[1], TEST_RUNTIME_AUTH_VERSION);
+    let mut challenge = [0u8; RUNTIME_AUTH_CHALLENGE_BYTES];
+    challenge.copy_from_slice(&frame[2..]);
+    challenge
+}
+
+fn send_authenticated_runtime_request(
+    fd: RawFd,
+    key: &[u8; RUNTIME_AUTH_KEY_BYTES],
+    challenge: &[u8; RUNTIME_AUTH_CHALLENGE_BYTES],
+    request_id: u64,
+    payload: &[u8],
+) {
+    assert!(!payload.is_empty());
+    let tag = test_runtime_auth_tag(
+        key,
+        challenge,
+        TEST_RUNTIME_AUTH_REQUEST_KIND,
+        request_id,
+        payload,
+    );
+    let mut frame = Vec::with_capacity(2 + 8 + payload.len() + tag.len());
+    frame.push(TEST_RUNTIME_AUTH_REQUEST_KIND);
+    frame.push(TEST_RUNTIME_AUTH_VERSION);
+    frame.extend_from_slice(&request_id.to_le_bytes());
+    frame.extend_from_slice(payload);
+    frame.extend_from_slice(&tag);
+    assert_eq!(
+        unsafe {
+            libc::send(
+                fd,
+                frame.as_ptr().cast::<libc::c_void>(),
+                frame.len(),
+                libc::MSG_NOSIGNAL,
+            )
+        },
+        frame.len() as isize,
+        "send authenticated runtime request failed: {}",
+        std::io::Error::last_os_error()
+    );
+}
+
+fn receive_authenticated_runtime_response(
+    fd: RawFd,
+    key: &[u8; RUNTIME_AUTH_KEY_BYTES],
+    challenge: &[u8; RUNTIME_AUTH_CHALLENGE_BYTES],
+) -> (u64, Vec<u8>) {
+    let mut frame = vec![
+        0u8;
+        MAX_RUNTIME_MESSAGE_BYTES as usize + 2 + 8 + RUNTIME_AUTH_TAG_BYTES
+    ];
+    let received = unsafe {
+        libc::recv(
+            fd,
+            frame.as_mut_ptr().cast::<libc::c_void>(),
+            frame.len(),
+            0,
+        )
+    };
+    assert!(
+        received > (2 + 8 + RUNTIME_AUTH_TAG_BYTES) as isize,
+        "receive authenticated runtime response failed or malformed: received={received}, error={}",
+        std::io::Error::last_os_error()
+    );
+    frame.truncate(received as usize);
+    assert_eq!(frame[0], TEST_RUNTIME_AUTH_RESPONSE_KIND);
+    assert_eq!(frame[1], TEST_RUNTIME_AUTH_VERSION);
+    let mut request_id_bytes = [0u8; 8];
+    request_id_bytes.copy_from_slice(&frame[2..10]);
+    let request_id = u64::from_le_bytes(request_id_bytes);
+    let payload_end = frame.len() - RUNTIME_AUTH_TAG_BYTES;
+    let payload = frame[10..payload_end].to_vec();
+    let tag = &frame[payload_end..];
+    test_runtime_auth_mac(
+        key,
+        challenge,
+        TEST_RUNTIME_AUTH_RESPONSE_KIND,
+        request_id,
+        &payload,
+    )
+    .verify_slice(tag)
+    .expect("authenticated runtime response tag must verify");
+    (request_id, payload)
 }
 
 #[repr(C, align(8))]
@@ -1658,6 +1804,172 @@ fn runtime_multi_message_session_deadline_also_bounds_response_publication() {
         controller.send_response_with_deadline(b"retry", 1000),
         Err(RuntimeFdBrokerError::Protocol(message)) if message.contains("closed after")
     ));
+}
+
+#[test]
+fn authenticated_correlated_runtime_exchange_authenticates_and_correlates() {
+    let socket_path = unique_path("runtime-auth-correlated-success.sock");
+    let _ = std::fs::remove_file(&socket_path);
+    let broker = RuntimeFdBroker::bind(&socket_path).unwrap();
+    let mut client = UnixStream::connect(broker.path()).unwrap();
+    let mut session = broker.accept().unwrap();
+    client.write_all(b"R").unwrap();
+    session.wait_for_ready(b'R').unwrap();
+
+    let key = [0x5au8; RUNTIME_AUTH_KEY_BYTES];
+    let (grant, mut controller) =
+        RuntimeFdBroker::prepare_runtime_authenticated_correlated_exchange(16, 16, 3, 2, key)
+            .unwrap();
+    session.send_runtime_message_channel(grant).unwrap();
+    let endpoint = receive_one_fd(&client);
+
+    assert!(matches!(
+        controller.receive_request(),
+        Err(RuntimeFdBrokerError::InvalidConfiguration(message))
+            if message.contains("challenge")
+    ));
+    controller.publish_challenge().unwrap();
+    assert!(controller.challenge_published());
+    assert!(matches!(
+        controller.publish_challenge(),
+        Err(RuntimeFdBrokerError::InvalidConfiguration(message))
+            if message.contains("exactly once")
+    ));
+    let challenge = receive_runtime_auth_challenge(endpoint.raw());
+
+    send_authenticated_runtime_request(endpoint.raw(), &key, &challenge, 41, b"one");
+    send_authenticated_runtime_request(endpoint.raw(), &key, &challenge, 42, b"two");
+
+    let first = controller.receive_request().unwrap();
+    assert_eq!(first.request_id(), 41);
+    assert_eq!(first.payload(), b"one");
+    let second = controller.receive_request().unwrap();
+    assert_eq!(second.request_id(), 42);
+    assert_eq!(second.payload(), b"two");
+    assert_eq!(controller.pending_requests(), 2);
+    assert!(matches!(
+        controller.receive_request(),
+        Err(RuntimeFdBrokerError::InvalidConfiguration(message))
+            if message.contains("in-flight request limit")
+    ));
+
+    controller.send_response(42, b"TWO").unwrap();
+    assert_eq!(
+        receive_authenticated_runtime_response(endpoint.raw(), &key, &challenge),
+        (42, b"TWO".to_vec())
+    );
+
+    send_authenticated_runtime_request(endpoint.raw(), &key, &challenge, 43, b"three");
+    let third = controller.receive_request().unwrap();
+    assert_eq!(third.request_id(), 43);
+    assert_eq!(third.payload(), b"three");
+
+    controller.send_response(43, b"THREE").unwrap();
+    assert_eq!(
+        receive_authenticated_runtime_response(endpoint.raw(), &key, &challenge),
+        (43, b"THREE".to_vec())
+    );
+    controller.send_response(41, b"ONE").unwrap();
+    assert_eq!(
+        receive_authenticated_runtime_response(endpoint.raw(), &key, &challenge),
+        (41, b"ONE".to_vec())
+    );
+
+    assert_eq!(controller.received_requests(), 3);
+    assert_eq!(controller.completed_responses(), 3);
+    assert_eq!(controller.pending_requests(), 0);
+    assert_eq!(controller.max_requests(), 3);
+    assert_eq!(controller.max_in_flight(), 2);
+    assert!(controller.is_complete());
+}
+
+#[test]
+fn authenticated_correlated_runtime_exchange_rejects_bad_mac_terminally() {
+    let socket_path = unique_path("runtime-auth-correlated-bad-mac.sock");
+    let _ = std::fs::remove_file(&socket_path);
+    let broker = RuntimeFdBroker::bind(&socket_path).unwrap();
+    let mut client = UnixStream::connect(broker.path()).unwrap();
+    let mut session = broker.accept().unwrap();
+    client.write_all(b"R").unwrap();
+    session.wait_for_ready(b'R').unwrap();
+
+    let key = [0x33u8; RUNTIME_AUTH_KEY_BYTES];
+    let (grant, mut controller) =
+        RuntimeFdBroker::prepare_runtime_authenticated_correlated_exchange(16, 16, 2, 2, key)
+            .unwrap();
+    session.send_runtime_message_channel(grant).unwrap();
+    let endpoint = receive_one_fd(&client);
+    controller.publish_challenge().unwrap();
+    let challenge = receive_runtime_auth_challenge(endpoint.raw());
+
+    let request_id = 7u64;
+    let payload = b"tamper";
+    let mut tag = test_runtime_auth_tag(
+        &key,
+        &challenge,
+        TEST_RUNTIME_AUTH_REQUEST_KIND,
+        request_id,
+        payload,
+    );
+    tag[0] ^= 0x80;
+    let mut frame = Vec::new();
+    frame.push(TEST_RUNTIME_AUTH_REQUEST_KIND);
+    frame.push(TEST_RUNTIME_AUTH_VERSION);
+    frame.extend_from_slice(&request_id.to_le_bytes());
+    frame.extend_from_slice(payload);
+    frame.extend_from_slice(&tag);
+    assert_eq!(
+        unsafe {
+            libc::send(
+                endpoint.raw(),
+                frame.as_ptr().cast::<libc::c_void>(),
+                frame.len(),
+                libc::MSG_NOSIGNAL,
+            )
+        },
+        frame.len() as isize
+    );
+
+    assert!(matches!(
+        controller.receive_request(),
+        Err(RuntimeFdBrokerError::RuntimeAuthenticationFailed)
+    ));
+    send_authenticated_runtime_request(endpoint.raw(), &key, &challenge, 8, b"valid");
+    assert!(matches!(
+        controller.receive_request(),
+        Err(RuntimeFdBrokerError::Protocol(message)) if message.contains("closed after")
+    ));
+}
+
+#[test]
+fn authenticated_correlated_runtime_exchange_binds_session_challenge() {
+    let socket_path = unique_path("runtime-auth-correlated-replay.sock");
+    let _ = std::fs::remove_file(&socket_path);
+    let broker = RuntimeFdBroker::bind(&socket_path).unwrap();
+    let mut client = UnixStream::connect(broker.path()).unwrap();
+    let mut session = broker.accept().unwrap();
+    client.write_all(b"R").unwrap();
+    session.wait_for_ready(b'R').unwrap();
+
+    let key = [0xa5u8; RUNTIME_AUTH_KEY_BYTES];
+    let (grant, mut controller) =
+        RuntimeFdBroker::prepare_runtime_authenticated_correlated_exchange(16, 16, 2, 2, key)
+            .unwrap();
+    session.send_runtime_message_channel(grant).unwrap();
+    let endpoint = receive_one_fd(&client);
+    controller.publish_challenge().unwrap();
+    let challenge = receive_runtime_auth_challenge(endpoint.raw());
+
+    let mut stale_challenge = challenge;
+    stale_challenge[0] ^= 0x01;
+    send_authenticated_runtime_request(endpoint.raw(), &key, &stale_challenge, 9, b"replay");
+
+    assert!(matches!(
+        controller.receive_request(),
+        Err(RuntimeFdBrokerError::RuntimeAuthenticationFailed)
+    ));
+    assert_eq!(controller.received_requests(), 0);
+    assert_eq!(controller.pending_requests(), 0);
 }
 
 #[test]

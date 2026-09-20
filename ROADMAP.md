@@ -1796,7 +1796,7 @@ Boundary: 75A is observation of private post-run COW upper state, not target fil
 
 ### Slice 76A — bind per-volume COW publication to launch-time canonical lower identity
 
-**Current implementation candidate.** Extends 75A's observation-only per-volume diff into one explicit guarded new-snapshot publication path without overwriting or mutating the configured host lower.
+**Status: complete on `main`.** Extends 75A's observation-only per-volume diff into one explicit guarded new-snapshot publication path without overwriting or mutating the configured host lower.
 
 Acceptance evidence is executable:
 

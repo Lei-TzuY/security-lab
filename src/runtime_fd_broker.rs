@@ -588,7 +588,8 @@ mod imp {
             }
             if read == 0 {
                 return Err(RuntimeFdBrokerError::Protocol(
-                    "authenticated runtime session challenge generation made no progress".to_owned(),
+                    "authenticated runtime session challenge generation made no progress"
+                        .to_owned(),
                 ));
             }
             offset += read as usize;
@@ -1690,7 +1691,8 @@ mod imp {
             self.reject_if_failed()?;
             if self.challenge_published {
                 return Err(RuntimeFdBrokerError::InvalidConfiguration(
-                    "authenticated runtime session challenge may be published exactly once".to_owned(),
+                    "authenticated runtime session challenge may be published exactly once"
+                        .to_owned(),
                 ));
             }
             let mut frame = [0u8; 2 + super::RUNTIME_AUTH_CHALLENGE_BYTES];
@@ -1798,7 +1800,8 @@ mod imp {
                 {
                     self.failed = true;
                     return Err(RuntimeFdBrokerError::Protocol(
-                        "authenticated runtime request has an unsupported frame type or version".to_owned(),
+                        "authenticated runtime request has an unsupported frame type or version"
+                            .to_owned(),
                     ));
                 }
                 let mut request_id_bytes = [0u8; 8];
@@ -1825,7 +1828,8 @@ mod imp {
                 if !self.pending_request_ids.insert(request_id) {
                     self.failed = true;
                     return Err(RuntimeFdBrokerError::Protocol(
-                        "authenticated runtime request pending-set insertion was inconsistent".to_owned(),
+                        "authenticated runtime request pending-set insertion was inconsistent"
+                            .to_owned(),
                     ));
                 }
                 self.received_requests += 1;

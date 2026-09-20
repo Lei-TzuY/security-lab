@@ -1725,7 +1725,7 @@ After 71A integrates, do not farm socket-type variants or fixed extra stream slo
 
 ### Slice 73A — trusted-controller reconnects to one exact host AF_UNIX service
 
-**Current implementation candidate.** Promotes the 71A one-shot connected-stream grant into one explicitly bounded reconnect lifecycle without changing the existing one-shot `RuntimeFdSession` contract.
+**Status: complete on `main`.** Promotes the 71A one-shot connected-stream grant into one explicitly bounded reconnect lifecycle without changing the existing one-shot `RuntimeFdSession` contract.
 
 Acceptance evidence is executable:
 

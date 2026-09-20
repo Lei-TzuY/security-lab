@@ -1,9 +1,8 @@
 use crate::{
-    publish_cow_volume_diff_atomic, CowDiffEntry, CowDiffApplyLimits, CowVolumeDiff,
+    publish_cow_volume_diff_atomic, CowDiffApplyLimits, CowDiffEntry, CowVolumeDiff,
     CowVolumePublicationError, CowVolumePublicationReport, SnapshotTrustDecision,
-    SnapshotTrustError, SnapshotTrustKeyId, SnapshotTrustPolicy,
-    SNAPSHOT_ED25519_PUBLIC_KEY_BYTES, SNAPSHOT_ED25519_SIGNATURE_BYTES,
-    SNAPSHOT_ED25519_SIGNING_KEY_BYTES,
+    SnapshotTrustError, SnapshotTrustKeyId, SnapshotTrustPolicy, SNAPSHOT_ED25519_PUBLIC_KEY_BYTES,
+    SNAPSHOT_ED25519_SIGNATURE_BYTES, SNAPSHOT_ED25519_SIGNING_KEY_BYTES,
 };
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use sha2::{Digest, Sha256};
@@ -11,10 +10,8 @@ use std::error::Error;
 use std::fmt;
 use std::path::Path;
 
-const COW_VOLUME_EVIDENCE_DOMAIN: &[u8] =
-    b"security-lab-cow-volume-publication-evidence-v1\0";
-const COW_VOLUME_SIGNATURE_DOMAIN: &[u8] =
-    b"security-lab-cow-volume-publication-ed25519-v1\0";
+const COW_VOLUME_EVIDENCE_DOMAIN: &[u8] = b"security-lab-cow-volume-publication-evidence-v1\0";
+const COW_VOLUME_SIGNATURE_DOMAIN: &[u8] = b"security-lab-cow-volume-publication-ed25519-v1\0";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CowVolumeEd25519Signature {
@@ -44,15 +41,11 @@ impl fmt::Display for CowVolumeEd25519Error {
             Self::IncompleteBinding => {
                 f.write_str("COW volume Ed25519 evidence has inconsistent base identity evidence")
             }
-            Self::InvalidPublicKey => {
-                f.write_str("COW volume Ed25519 public key is invalid")
-            }
+            Self::InvalidPublicKey => f.write_str("COW volume Ed25519 public key is invalid"),
             Self::EvidenceDigestMismatch { .. } => {
                 f.write_str("COW volume Ed25519 evidence digest does not match the report")
             }
-            Self::VerificationFailed => {
-                f.write_str("COW volume Ed25519 verification failed")
-            }
+            Self::VerificationFailed => f.write_str("COW volume Ed25519 verification failed"),
         }
     }
 }
@@ -195,14 +188,12 @@ pub fn publish_cow_volume_diff_trusted_ed25519_atomic(
 fn cow_volume_evidence_sha256(
     volume_diff: &CowVolumeDiff,
 ) -> Result<[u8; 32], CowVolumeEd25519Error> {
-    let (base_identity, limits) = match (
-        volume_diff.base_identity,
-        volume_diff.base_identity_limits,
-    ) {
-        (Some(identity), Some(limits)) => (identity, limits),
-        (None, None) => return Err(CowVolumeEd25519Error::UnboundDiff),
-        _ => return Err(CowVolumeEd25519Error::IncompleteBinding),
-    };
+    let (base_identity, limits) =
+        match (volume_diff.base_identity, volume_diff.base_identity_limits) {
+            (Some(identity), Some(limits)) => (identity, limits),
+            (None, None) => return Err(CowVolumeEd25519Error::UnboundDiff),
+            _ => return Err(CowVolumeEd25519Error::IncompleteBinding),
+        };
 
     let mut hasher = Sha256::new();
     hasher.update(COW_VOLUME_EVIDENCE_DOMAIN);
@@ -266,7 +257,9 @@ fn signature_message(evidence_sha256: [u8; 32]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{CowDiff, SnapshotIdentity, SnapshotIdentityLimits, SnapshotTrustKey, SnapshotTrustKeyState};
+    use crate::{
+        CowDiff, SnapshotIdentity, SnapshotIdentityLimits, SnapshotTrustKey, SnapshotTrustKeyState,
+    };
 
     fn bound_diff() -> CowVolumeDiff {
         CowVolumeDiff {

@@ -1634,7 +1634,7 @@ After 66A integrates, do not farm larger set ceilings or more declaration-order 
 
 ### Slice 67A — generalize persistent host-directory grants into bounded RO/RW sets
 
-**Current implementation candidate.** Generalizes the legacy one-read-only plus one-writable volume surface into one bounded declarative set while preserving the same pinned-object mount architecture.
+**Status: complete on `main`.** Generalizes the legacy one-read-only plus one-writable volume surface into one bounded declarative set while preserving the same pinned-object mount architecture.
 
 Acceptance evidence is executable:
 

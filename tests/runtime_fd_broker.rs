@@ -2,7 +2,7 @@
 
 use hmac::{Hmac, Mac};
 use security_lab::{
-    run, ChildOutcome, RuntimeFdBroker, RuntimeFdBrokerError, SandboxPolicy,
+    run, ChildOutcome, RuntimeFdBroker, RuntimeFdBrokerError, RuntimeHostUnixRoute, SandboxPolicy,
     MAX_RUNTIME_CORRELATED_IN_FLIGHT, MAX_RUNTIME_CORRELATED_REQUESTS, MAX_RUNTIME_MESSAGE_BYTES,
     MAX_RUNTIME_MESSAGE_REQUEST_WAIT_MILLISECONDS, MAX_RUNTIME_MESSAGE_RESPONSE_WAIT_MILLISECONDS,
     MAX_RUNTIME_MULTI_MESSAGE_ROUNDS, MAX_RUNTIME_MULTI_MESSAGE_SESSION_MILLISECONDS,
@@ -802,6 +802,223 @@ fn dropping_active_host_unix_revocation_controller_fails_closed() {
     drop(broker);
     drop(listener);
     std::fs::remove_file(&service_path).unwrap();
+}
+
+#[test]
+fn host_unix_router_routes_target_selection_and_enforces_route_bounds() {
+    let service_a_path = unique_path("runtime-host-unix-router-a.sock");
+    let service_b_path = unique_path("runtime-host-unix-router-b.sock");
+    let broker_path = unique_path("runtime-host-unix-router-broker.sock");
+    for path in [&service_a_path, &service_b_path, &broker_path] {
+        let _ = std::fs::remove_file(path);
+    }
+
+    let listener_a = UnixListener::bind(&service_a_path).expect("bind router service A");
+    let listener_b = UnixListener::bind(&service_b_path).expect("bind router service B");
+    let broker = RuntimeFdBroker::bind(&broker_path).expect("bind router runtime broker");
+    let mut client = UnixStream::connect(broker.path()).expect("connect router runtime broker");
+    let expected_peer = Some((unsafe { libc::geteuid() }, unsafe { libc::getegid() }));
+    let mut controller = broker
+        .accept_host_unix_router_controller(vec![
+            RuntimeHostUnixRoute::new(&service_a_path, expected_peer, 1),
+            RuntimeHostUnixRoute::new(&service_b_path, expected_peer, 2),
+        ])
+        .expect("accept bounded router controller");
+
+    assert_eq!(controller.route_count(), 2);
+    assert_eq!(controller.max_connections(0), Some(1));
+    assert_eq!(controller.max_connections(1), Some(2));
+    assert_eq!(controller.total_granted_connections(), 0);
+
+    for (route_index, listener, request, reply) in [
+        (0u8, &listener_a, b"a-one".as_slice(), b"a-ok".as_slice()),
+        (1u8, &listener_b, b"b-one".as_slice(), b"b1-ok".as_slice()),
+        (1u8, &listener_b, b"b-two".as_slice(), b"b2-ok".as_slice()),
+    ] {
+        client.write_all(&[b'R', route_index]).unwrap();
+        let grant = controller
+            .grant_next(b'R')
+            .expect("grant selected host UNIX route");
+        assert_eq!(grant.route_index(), route_index as usize);
+        assert_eq!(grant.credentials().uid(), unsafe { libc::geteuid() });
+        assert_eq!(grant.credentials().gid(), unsafe { libc::getegid() });
+        assert!(grant.credentials().pid() > 0);
+
+        let (mut service, _) = listener.accept().expect("accept selected route connection");
+        let received = receive_one_fd(&client);
+        assert_eq!(
+            unsafe {
+                libc::write(
+                    received.raw(),
+                    request.as_ptr().cast::<libc::c_void>(),
+                    request.len(),
+                )
+            },
+            request.len() as isize
+        );
+        let mut observed = vec![0u8; request.len()];
+        service.read_exact(&mut observed).unwrap();
+        assert_eq!(observed, request);
+        service.write_all(reply).unwrap();
+        assert_eq!(read_exact_fd(received.raw(), reply.len()), reply);
+    }
+
+    assert_eq!(controller.granted_connections(0), Some(1));
+    assert_eq!(controller.granted_connections(1), Some(2));
+    assert_eq!(controller.total_granted_connections(), 3);
+    assert!(controller.is_complete());
+    assert!(!controller.is_failed());
+    assert!(matches!(
+        controller.grant_next(b'R'),
+        Err(RuntimeFdBrokerError::Protocol(message))
+            if message.contains("exhausted all route bounds")
+    ));
+
+    drop(controller);
+    drop(client);
+    drop(broker);
+    drop(listener_a);
+    drop(listener_b);
+    for path in [service_a_path, service_b_path] {
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
+#[test]
+fn host_unix_router_rejects_invalid_configuration_before_accepting_channel() {
+    let service_a_path = unique_path("runtime-host-unix-router-invalid-a.sock");
+    let service_b_path = unique_path("runtime-host-unix-router-invalid-b.sock");
+    let broker_path = unique_path("runtime-host-unix-router-invalid-broker.sock");
+    for path in [&service_a_path, &service_b_path, &broker_path] {
+        let _ = std::fs::remove_file(path);
+    }
+
+    let _listener_a = UnixListener::bind(&service_a_path).unwrap();
+    let _listener_b = UnixListener::bind(&service_b_path).unwrap();
+    let broker = RuntimeFdBroker::bind(&broker_path).unwrap();
+
+    assert!(matches!(
+        broker.accept_host_unix_router_controller(vec![RuntimeHostUnixRoute::new(
+            &service_a_path,
+            None,
+            1
+        )]),
+        Err(RuntimeFdBrokerError::InvalidConfiguration(message))
+            if message.contains("service count must be between")
+    ));
+    assert!(matches!(
+        broker.accept_host_unix_router_controller(vec![
+            RuntimeHostUnixRoute::new(&service_a_path, None, 1),
+            RuntimeHostUnixRoute::new(&service_a_path, None, 1),
+        ]),
+        Err(RuntimeFdBrokerError::InvalidConfiguration(message))
+            if message.contains("service paths must be unique")
+    ));
+    assert!(matches!(
+        broker.accept_host_unix_router_controller(vec![
+            RuntimeHostUnixRoute::new(&service_a_path, None, 0),
+            RuntimeHostUnixRoute::new(&service_b_path, None, 1),
+        ]),
+        Err(RuntimeFdBrokerError::InvalidConfiguration(message))
+            if message.contains("per-route connection bound must be between")
+    ));
+
+    drop(broker);
+    for path in [service_a_path, service_b_path] {
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
+#[test]
+fn host_unix_router_unknown_or_exhausted_selection_is_terminal() {
+    let service_a_path = unique_path("runtime-host-unix-router-terminal-a.sock");
+    let service_b_path = unique_path("runtime-host-unix-router-terminal-b.sock");
+    let broker_path = unique_path("runtime-host-unix-router-terminal-broker.sock");
+    for path in [&service_a_path, &service_b_path, &broker_path] {
+        let _ = std::fs::remove_file(path);
+    }
+
+    let listener_a = UnixListener::bind(&service_a_path).unwrap();
+    let listener_b = UnixListener::bind(&service_b_path).unwrap();
+    listener_b.set_nonblocking(true).unwrap();
+    let broker = RuntimeFdBroker::bind(&broker_path).unwrap();
+    let mut client = UnixStream::connect(broker.path()).unwrap();
+    let mut controller = broker
+        .accept_host_unix_router_controller(vec![
+            RuntimeHostUnixRoute::new(&service_a_path, None, 1),
+            RuntimeHostUnixRoute::new(&service_b_path, None, 1),
+        ])
+        .unwrap();
+
+    client.write_all(&[b'R', 0]).unwrap();
+    controller.grant_next(b'R').unwrap();
+    let (_service, _) = listener_a.accept().unwrap();
+    let _received = receive_one_fd(&client);
+
+    client.write_all(&[b'R', 0]).unwrap();
+    assert!(matches!(
+        controller.grant_next(b'R'),
+        Err(RuntimeFdBrokerError::Protocol(message))
+            if message.contains("route 0 exhausted its connection bound")
+    ));
+    assert!(controller.is_failed());
+    assert_eq!(controller.granted_connections(0), Some(1));
+    assert_eq!(controller.granted_connections(1), Some(0));
+    assert!(matches!(
+        listener_b.accept(),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+    ));
+
+    drop(controller);
+    drop(client);
+    drop(broker);
+    drop(listener_a);
+    drop(listener_b);
+    for path in [service_a_path, service_b_path] {
+        std::fs::remove_file(path).unwrap();
+    }
+
+    let service_a_path = unique_path("runtime-host-unix-router-unknown-a.sock");
+    let service_b_path = unique_path("runtime-host-unix-router-unknown-b.sock");
+    let broker_path = unique_path("runtime-host-unix-router-unknown-broker.sock");
+    for path in [&service_a_path, &service_b_path, &broker_path] {
+        let _ = std::fs::remove_file(path);
+    }
+    let listener_a = UnixListener::bind(&service_a_path).unwrap();
+    let listener_b = UnixListener::bind(&service_b_path).unwrap();
+    listener_a.set_nonblocking(true).unwrap();
+    listener_b.set_nonblocking(true).unwrap();
+    let broker = RuntimeFdBroker::bind(&broker_path).unwrap();
+    let mut client = UnixStream::connect(broker.path()).unwrap();
+    let mut controller = broker
+        .accept_host_unix_router_controller(vec![
+            RuntimeHostUnixRoute::new(&service_a_path, None, 1),
+            RuntimeHostUnixRoute::new(&service_b_path, None, 1),
+        ])
+        .unwrap();
+
+    client.write_all(&[b'R', 7]).unwrap();
+    assert!(matches!(
+        controller.grant_next(b'R'),
+        Err(RuntimeFdBrokerError::Protocol(message))
+            if message.contains("unknown route index 7")
+    ));
+    assert!(controller.is_failed());
+    for listener in [&listener_a, &listener_b] {
+        assert!(matches!(
+            listener.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+    }
+
+    drop(controller);
+    drop(client);
+    drop(broker);
+    drop(listener_a);
+    drop(listener_b);
+    for path in [service_a_path, service_b_path] {
+        std::fs::remove_file(path).unwrap();
+    }
 }
 
 #[test]

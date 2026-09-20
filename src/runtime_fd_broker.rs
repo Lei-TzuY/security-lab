@@ -2107,7 +2107,8 @@ mod imp {
                             .to_owned(),
                     ));
                 }
-                if message.msg_flags & libc::MSG_TRUNC != 0 || received as usize != ACK_FRAME_BYTES {
+                if message.msg_flags & libc::MSG_TRUNC != 0 || received as usize != ACK_FRAME_BYTES
+                {
                     self.controller.failed = true;
                     return Err(RuntimeFdBrokerError::Protocol(
                         "authenticated runtime response acknowledgment has invalid packet length"

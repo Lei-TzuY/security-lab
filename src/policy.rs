@@ -2092,19 +2092,24 @@ impl FromStr for SandboxPolicy {
         let cow_diff_limits = if cow_volume_diff_bytes.is_empty() {
             vec![None; cow_volume_source.len()]
         } else {
-            cow_volume_diff_bytes.into_iter().map(Some).collect::<Vec<_>>()
+            cow_volume_diff_bytes
+                .into_iter()
+                .map(Some)
+                .collect::<Vec<_>>()
         };
         let copy_on_write_volume_bindings = cow_volume_source
             .into_iter()
             .zip(cow_volume_target)
             .zip(cow_volume_bytes)
             .zip(cow_diff_limits)
-            .map(|(((source, target), bytes), diff_bytes)| CopyOnWriteVolumeBinding {
-                source: PathBuf::from(source),
-                target: PathBuf::from(target),
-                bytes,
-                diff_bytes,
-            })
+            .map(
+                |(((source, target), bytes), diff_bytes)| CopyOnWriteVolumeBinding {
+                    source: PathBuf::from(source),
+                    target: PathBuf::from(target),
+                    bytes,
+                    diff_bytes,
+                },
+            )
             .collect::<Vec<_>>();
 
         let policy = Self {
@@ -3380,8 +3385,14 @@ volume.cow_diff_bytes = 4096
 volume.cow_diff_bytes = 8192"
         );
         let policy: SandboxPolicy = with_diff.parse().unwrap();
-        assert_eq!(policy.copy_on_write_volume_bindings[0].diff_bytes, Some(4096));
-        assert_eq!(policy.copy_on_write_volume_bindings[1].diff_bytes, Some(8192));
+        assert_eq!(
+            policy.copy_on_write_volume_bindings[0].diff_bytes,
+            Some(4096)
+        );
+        assert_eq!(
+            policy.copy_on_write_volume_bindings[1].diff_bytes,
+            Some(8192)
+        );
 
         let partial_diff = format!(
             "{base}

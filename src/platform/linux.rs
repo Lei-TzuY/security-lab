@@ -3887,7 +3887,7 @@ mod x86_64 {
         cow_size: &CString,
         launch_error: *mut LaunchErrorRecord,
         error_exit_syscall: libc::c_long,
-    ) -> RawFd {
+    ) -> (RawFd, RawFd) {
         let state_fsfd = libc::syscall(
             libc::SYS_fsopen,
             b"tmpfs\0".as_ptr().cast::<libc::c_char>(),
@@ -4062,10 +4062,10 @@ mod x86_64 {
         }
         let overlay_fd = overlay_fd as RawFd;
 
-        for fd in [overlay_fsfd, work_fd, upper_fd, state_mount_fd] {
+        for fd in [overlay_fsfd, work_fd, state_mount_fd] {
             close_setup_fd(fd);
         }
-        overlay_fd
+        (overlay_fd, upper_fd)
     }
 
     unsafe fn install_volume_or_fail(
@@ -4073,7 +4073,7 @@ mod x86_64 {
         root_tree_fd: RawFd,
         launch_error: *mut LaunchErrorRecord,
         error_exit_syscall: libc::c_long,
-    ) {
+    ) -> Option<(usize, RawFd)> {
         let source_how = OpenHow {
             flags: (libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
             mode: 0,
@@ -4156,7 +4156,7 @@ mod x86_64 {
         }
         let target_fd = target_fd as RawFd;
 
-        let attach_fd = if volume.access == VolumeAccess::CopyOnWrite {
+        let (attach_fd, cow_upper_fd) = if volume.access == VolumeAccess::CopyOnWrite {
             construct_cow_volume_overlay_or_fail(
                 volume_tree_fd,
                 volume
@@ -4167,7 +4167,7 @@ mod x86_64 {
                 error_exit_syscall,
             )
         } else {
-            volume_tree_fd
+            (volume_tree_fd, -1)
         };
         let attach_phase = if volume.access == VolumeAccess::CopyOnWrite {
             PHASE_COW_VOLUME_ATTACH
@@ -4190,11 +4190,21 @@ mod x86_64 {
         if attach_fd != volume_tree_fd {
             close_setup_fd(attach_fd);
         }
+        let retained_cow_upper = match volume.cow_diff_slot {
+            Some(slot) => Some((slot, cow_upper_fd)),
+            None => {
+                if cow_upper_fd >= 3 {
+                    close_setup_fd(cow_upper_fd);
+                }
+                None
+            }
+        };
         for fd in [target_fd, volume_tree_fd, current_source_fd] {
             if libc::close(fd) == -1 {
                 child_fail(launch_error, attach_phase, error_exit_syscall);
             }
         }
+        retained_cow_upper
     }
 
     unsafe fn open_stdout_redirect_or_fail(

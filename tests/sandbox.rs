@@ -1822,14 +1822,8 @@ fn copy_on_write_persistent_volume_enforces_private_byte_ceiling() {
 
 #[test]
 fn copy_on_write_volume_diffs_are_isolated_and_target_sorted() {
-    let first = std::env::temp_dir().join(format!(
-        "security-lab-cow-diff-a-{}",
-        process::id()
-    ));
-    let second = std::env::temp_dir().join(format!(
-        "security-lab-cow-diff-b-{}",
-        process::id()
-    ));
+    let first = std::env::temp_dir().join(format!("security-lab-cow-diff-a-{}", process::id()));
+    let second = std::env::temp_dir().join(format!("security-lab-cow-diff-b-{}", process::id()));
     for source in [&first, &second] {
         let _ = std::fs::remove_dir_all(source);
         std::fs::create_dir_all(source).unwrap();

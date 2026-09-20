@@ -4010,8 +4010,7 @@ mod imp {
             _max_connections: u32,
         ) -> Result<RuntimeHostUnixReconnectController, RuntimeFdBrokerError> {
             Err(RuntimeFdBrokerError::UnsupportedPlatform(
-                "runtime host UNIX reconnect controllers currently require Linux x86_64"
-                    .to_owned(),
+                "runtime host UNIX reconnect controllers currently require Linux x86_64".to_owned(),
             ))
         }
 

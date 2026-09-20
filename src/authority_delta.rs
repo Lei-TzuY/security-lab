@@ -200,6 +200,7 @@ pub(crate) fn compare(baseline: &SandboxPolicy, candidate: &SandboxPolicy) -> Au
     );
     compare_bounded_cow_volume_set(baseline, candidate, &mut changes);
     compare_bounded_cow_volume_diff_export(baseline, candidate, &mut changes);
+    compare_bounded_cow_volume_base_identity_export(baseline, candidate, &mut changes);
 
     compare_positive_bool(
         "network.isolated_loopback_enabled",
@@ -789,6 +790,49 @@ fn compare_bounded_cow_volume_diff_export(
     };
     push_change(
         "filesystem.copy_on_write_volume_diff_export",
+        class,
+        changes,
+    );
+}
+
+fn compare_bounded_cow_volume_base_identity_export(
+    baseline: &SandboxPolicy,
+    candidate: &SandboxPolicy,
+    changes: &mut Vec<Change>,
+) {
+    let collect = |policy: &SandboxPolicy| {
+        policy
+            .copy_on_write_volume_bindings
+            .iter()
+            .filter_map(|binding| {
+                binding
+                    .base_identity_bytes
+                    .zip(binding.base_identity_nodes)
+                    .map(|limits| ((binding.source.clone(), binding.target.clone()), limits))
+            })
+            .collect::<BTreeMap<_, _>>()
+    };
+    let baseline = collect(baseline);
+    let candidate = collect(candidate);
+
+    let candidate_covers_baseline = baseline.iter().all(|(key, (bytes, nodes))| {
+        candidate.get(key).is_some_and(|(candidate_bytes, candidate_nodes)| {
+            candidate_bytes >= bytes && candidate_nodes >= nodes
+        })
+    });
+    let baseline_covers_candidate = candidate.iter().all(|(key, (bytes, nodes))| {
+        baseline.get(key).is_some_and(|(baseline_bytes, baseline_nodes)| {
+            baseline_bytes >= bytes && baseline_nodes >= nodes
+        })
+    });
+    let class = match (candidate_covers_baseline, baseline_covers_candidate) {
+        (true, true) => DeltaClass::Unchanged,
+        (true, false) => DeltaClass::Widened,
+        (false, true) => DeltaClass::Reduced,
+        (false, false) => DeltaClass::Incomparable,
+    };
+    push_change(
+        "filesystem.copy_on_write_volume_base_identity_export",
         class,
         changes,
     );

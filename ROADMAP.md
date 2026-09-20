@@ -1839,6 +1839,30 @@ Boundary: 77A establishes cryptographic signature validity for the exact modeled
 
 After 77A integrates, do not add alternate signature aliases or larger evidence fields. A further provenance/lifecycle promotion must materially strengthen authority persistence or publication semantics, such as gating trusted COW publication through authenticated persisted trust-state, or durably/versionedly publishing the authenticated result through the existing snapshot-store lifecycle.
 
+## Milestone 79 — bounded host-local service routing
+
+### Slice 79A — target selects among an exact trusted AF_UNIX service allowlist
+
+**Current implementation candidate.** Promotes the 73A single-service reconnect lifecycle into bounded target selection across a small fixed allowlist without granting target pathname lookup or socket creation authority.
+
+Acceptance evidence is executable:
+
+- `RuntimeHostUnixRoute` declares one exact filesystem AF_UNIX service path, an optional expected peer UID/GID pair, and a per-route fresh-connection ceiling from 1 through 8;
+- `accept_host_unix_router_controller(routes)` accepts only 2–4 routes, validates every bounded pathname and connection ceiling before accepting the broker channel, and rejects duplicate service paths;
+- each round consumes exactly two target bytes `[expected_readiness, route_index]`; only then may the trusted controller connect to the selected route in the host namespace;
+- every fresh selected connection independently re-reads Linux `SO_PEERCRED` and re-applies that route's optional UID/GID pin before one descriptor is transferred with `SCM_RIGHTS`;
+- unknown or already-exhausted route selection, readiness mismatch, broker I/O failure, service connect failure, credential mismatch, or descriptor-transfer failure makes the router terminally failed; successful completion requires every route to reach its declared ceiling;
+- local kernel regressions prove route selection, independent per-route accounting, invalid service-count/path/bound rejection, and terminal unknown/exhausted selection without connecting an unselected service;
+- a dedicated raw-syscall sandbox target selects route 0 and route 1 over one long-lived broker control fd, exchanges distinct exact bytes with two different trusted host services, and still observes both original service pathnames as `ENOENT`;
+- the target policy needs `recvmsg` plus ordinary stream I/O only and explicitly carries no `socket`, `connect`, or persistent `execveat` authority;
+- stable rustfmt, Clippy with `-D warnings`, complete stable tests, and Rust 1.74 are the integration gate.
+
+Boundary: 79A authorizes target choice only among the trusted caller's fixed indexed allowlist and within each route's independent fresh-connection ceiling. It does not accept target-supplied pathnames, discover services, retry or fail over after an ambiguous failed round, revoke already-transferred descriptors, support abstract/datagram/seqpacket sockets, cryptographically identify services, or model a general IPC graph.
+
+### Milestone 79 promotion rule
+
+After 79A integrates, do not farm larger route-count ceilings, larger selector widths, or fixed extra routing aliases. A further host-local IPC promotion must add a materially different property such as application-level grant acknowledgment/revocation coordination, cryptographic service identity, another mediated socket/object class, or move to another architecture frontier.
+
 ## Later frontiers
 
-Supplementary-group isolation with a viable mapping architecture, routed/broader network authority beyond the bounded IPv4 brokers, broader dynamic host-local IPC mediation beyond one exact bounded reconnect/revocation lifecycle, bounded loader search/interpreter closure or later-exec authority, persisted-trust or durable/versioned authenticated COW publication semantics, and delegated aggregate cgroup accounting remain separate evidence-backed frontiers. Do not add configuration-only names without executable kernel behavior and integration evidence.
+Supplementary-group isolation with a viable mapping architecture, routed/broader network authority beyond the bounded IPv4 brokers, richer host-local IPC semantics beyond bounded exact service routing/revocation, bounded loader search/interpreter closure or later-exec authority, persisted-trust or durable/versioned authenticated COW publication semantics, and delegated aggregate cgroup accounting remain separate evidence-backed frontiers. Do not add configuration-only names without executable kernel behavior and integration evidence.

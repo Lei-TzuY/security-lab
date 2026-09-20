@@ -215,7 +215,9 @@ pub(crate) fn validate_exact_dependency_graph(
     Ok(())
 }
 
-pub(crate) fn read_elf64_x86_64_dt_needed(fd: RawFd) -> Result<Vec<Vec<u8>>, ElfNeededError> {
+pub(crate) fn read_elf64_x86_64_dynamic_links(
+    fd: RawFd,
+) -> Result<ElfDynamicLinks, ElfNeededError> {
     let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
     if unsafe { libc::fstat(fd, &mut stat) } == -1 {
         return Err(ElfNeededError(format!(
@@ -253,7 +255,7 @@ pub(crate) fn read_elf64_x86_64_dt_needed(fd: RawFd) -> Result<Vec<Vec<u8>>, Elf
         ));
     }
     if phnum == 0 {
-        return Ok(Vec::new());
+        return Ok(ElfDynamicLinks::empty());
     }
     if phentsize as usize != ELF64_PROGRAM_HEADER_BYTES {
         return Err(ElfNeededError(format!(
@@ -300,9 +302,11 @@ pub(crate) fn read_elf64_x86_64_dt_needed(fd: RawFd) -> Result<Vec<Vec<u8>>, Elf
     }
 
     let Some((dynamic_offset, dynamic_size)) = dynamic else {
-        return Ok(Vec::new());
+        return Ok(ElfDynamicLinks::empty());
     };
     let mut needed_offsets = Vec::new();
+    let mut runpath_offset = None;
+    let mut rpath_offset = None;
     let mut strtab_vaddr = None;
     let mut strtab_size = None;
     let mut terminated = false;
@@ -342,6 +346,22 @@ pub(crate) fn read_elf64_x86_64_dt_needed(fd: RawFd) -> Result<Vec<Vec<u8>>, Elf
                 }
                 None => strtab_size = Some(value),
             },
+            DT_RPATH => match rpath_offset {
+                Some(_) => {
+                    return Err(ElfNeededError(
+                        "ELF image contains multiple DT_RPATH entries".to_owned(),
+                    ));
+                }
+                None => rpath_offset = Some(value),
+            },
+            DT_RUNPATH => match runpath_offset {
+                Some(_) => {
+                    return Err(ElfNeededError(
+                        "ELF image contains multiple DT_RUNPATH entries".to_owned(),
+                    ));
+                }
+                None => runpath_offset = Some(value),
+            },
             _ => {}
         }
     }
@@ -350,14 +370,14 @@ pub(crate) fn read_elf64_x86_64_dt_needed(fd: RawFd) -> Result<Vec<Vec<u8>>, Elf
             "PT_DYNAMIC has no DT_NULL terminator".to_owned(),
         ));
     }
-    if needed_offsets.is_empty() {
-        return Ok(Vec::new());
+    if needed_offsets.is_empty() && runpath_offset.is_none() && rpath_offset.is_none() {
+        return Ok(ElfDynamicLinks::empty());
     }
 
-    let strtab_vaddr =
-        strtab_vaddr.ok_or_else(|| ElfNeededError("DT_NEEDED requires DT_STRTAB".to_owned()))?;
+    let strtab_vaddr = strtab_vaddr
+        .ok_or_else(|| ElfNeededError("dynamic strings require DT_STRTAB".to_owned()))?;
     let strtab_size =
-        strtab_size.ok_or_else(|| ElfNeededError("DT_NEEDED requires DT_STRSZ".to_owned()))?;
+        strtab_size.ok_or_else(|| ElfNeededError("dynamic strings require DT_STRSZ".to_owned()))?;
     if strtab_size == 0 || strtab_size > MAX_STRING_TABLE_BYTES {
         return Err(ElfNeededError(
             "DT_STRTAB size is outside the bounded range".to_owned(),
@@ -383,24 +403,55 @@ pub(crate) fn read_elf64_x86_64_dt_needed(fd: RawFd) -> Result<Vec<Vec<u8>>, Elf
 
     let mut strings = vec![0u8; strtab_size as usize];
     pread_exact(fd, strtab_offset, &mut strings)?;
-    let mut result = Vec::with_capacity(needed_offsets.len());
-    for needed in needed_offsets {
-        if needed >= strtab_size {
-            return Err(ElfNeededError(
-                "DT_NEEDED string offset is outside DT_STRTAB".to_owned(),
-            ));
+    fn extract_dynamic_string(
+        strings: &[u8],
+        offset: u64,
+        strtab_size: u64,
+        label: &str,
+        allow_empty: bool,
+    ) -> Result<Vec<u8>, ElfNeededError> {
+        if offset >= strtab_size {
+            return Err(ElfNeededError(format!(
+                "{label} string offset is outside DT_STRTAB"
+            )));
         }
-        let tail = &strings[needed as usize..];
+        let tail = &strings[offset as usize..];
         let end = tail
             .iter()
             .position(|byte| *byte == 0)
-            .ok_or_else(|| ElfNeededError("DT_NEEDED string is not NUL terminated".to_owned()))?;
-        if end == 0 {
-            return Err(ElfNeededError("DT_NEEDED string is empty".to_owned()));
+            .ok_or_else(|| ElfNeededError(format!("{label} string is not NUL terminated")))?;
+        if end == 0 && !allow_empty {
+            return Err(ElfNeededError(format!("{label} string is empty")));
         }
-        result.push(tail[..end].to_vec());
+        Ok(tail[..end].to_vec())
     }
-    Ok(result)
+
+    let mut needed = Vec::with_capacity(needed_offsets.len());
+    for offset in needed_offsets {
+        needed.push(extract_dynamic_string(
+            &strings,
+            offset,
+            strtab_size,
+            "DT_NEEDED",
+            false,
+        )?);
+    }
+    let runpath = runpath_offset
+        .map(|offset| extract_dynamic_string(&strings, offset, strtab_size, "DT_RUNPATH", true))
+        .transpose()?;
+    let rpath = rpath_offset
+        .map(|offset| extract_dynamic_string(&strings, offset, strtab_size, "DT_RPATH", true))
+        .transpose()?;
+
+    Ok(ElfDynamicLinks {
+        needed,
+        runpath,
+        rpath,
+    })
+}
+
+pub(crate) fn read_elf64_x86_64_dt_needed(fd: RawFd) -> Result<Vec<Vec<u8>>, ElfNeededError> {
+    Ok(read_elf64_x86_64_dynamic_links(fd)?.needed)
 }
 
 #[cfg(test)]

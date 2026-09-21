@@ -1889,7 +1889,7 @@ After 80A integrates, do not farm additional fixed socket types or packet-count 
 
 ### Slice 82A — serialize trusted COW publication under authenticated persisted policy identity
 
-**Current implementation candidate.** Connects the already-complete 41B persisted trust-state authority to the 77A authenticated COW publication lifecycle without changing the signed evidence format or weakening any 76A publication gate.
+**Status: complete on `main`.** Connects the already-complete 41B persisted trust-state authority to the 77A authenticated COW publication lifecycle without changing the signed evidence format or weakening any 76A publication gate.
 
 Acceptance evidence is executable:
 

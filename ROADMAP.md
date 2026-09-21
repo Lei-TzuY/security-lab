@@ -1885,6 +1885,28 @@ Boundary: 80A grants one already-connected exact filesystem `SOCK_SEQPACKET` obj
 
 After 80A integrates, do not farm additional fixed socket types or packet-count variants. A further host-local IPC promotion must add a materially stronger lifecycle, identity, or protocol property, or move to another independent architecture frontier.
 
+## Milestone 82 — persisted-trust authenticated COW publication
+
+### Slice 82A — serialize trusted COW publication under authenticated persisted policy identity
+
+**Status: complete on `main`.** Connects the already-complete 41B persisted trust-state authority to the 77A authenticated COW publication lifecycle without changing the signed evidence format or weakening any 76A publication gate.
+
+Acceptance evidence is executable:
+
+- `publish_cow_volume_diff_persisted_trust_ed25519_atomic` accepts the existing `SnapshotTrustStateContext`, bound COW report, Ed25519 evidence, signer ID, and replay limits; no parallel trust-policy or publication format is introduced;
+- on Linux the API acquires the same shared trust-state lock used by existing 41B state-backed store/materialization operations, authenticates the persisted HMAC-protected policy identity, and requires exact equality with the context policy before entering COW signature or filesystem work;
+- that shared lock remains live through 77A active-signer resolution and strict evidence verification plus the complete 76A source-path, current-base identity, materialized-staging identity, bounded replay, destination exclusion, and `RENAME_NOREPLACE` publication lifecycle, so a cooperating rotation cannot overtake an accepted operation;
+- a real launcher-produced bound per-volume COW diff is signed under generation-1 key A, persisted state is rotated to generation 2 with A revoked and key B active, and a generation-1 context supplied with a deliberately corrupted signature plus missing base/destination paths must still fail first as `StalePolicy` without creating or inspecting those filesystem paths;
+- the generation-2 context with key B then publishes the same real bound diff successfully, reports the exact generation-2 policy identity/signer/evidence digest, leaves the configured lower unchanged, and inherits all existing guarded publication invariants;
+- existing wrong-HMAC-key/tampered-state authentication, stale-rotation rejection, and exact rotation-retry convergence remain unchanged; 82A adds no independent rollback mechanism beyond 41B's authenticated local state boundary;
+- exact-head stable rustfmt, Clippy with `-D warnings`, complete stable tests, and Rust 1.74 are the integration gate.
+
+Boundary: 82A prevents stale cooperating callers and cooperating rotations from bypassing the persisted policy identity while the trusted state directory and host-held HMAC key remain intact. It does not persist the full trust policy, resist privileged whole-directory rollback/restoration or state-key disclosure, provide hardware/external monotonicity, establish key custody or certificate identity, freeze the COW lower against hostile writers, make the COW destination fsync-durable, or add overwrite/merge transactions.
+
+### Milestone 82 promotion rule
+
+After 82A integrates, do not farm additional wrappers around the same local persisted-identity gate. A further storage/provenance promotion must add a materially stronger lifecycle property such as durable/versioned authenticated COW publication through the existing snapshot-store/head-state machinery, or an independently anchored rollback guarantee; otherwise move to another architecture frontier.
+
 ## Later frontiers
 
-Supplementary-group isolation with a viable mapping architecture, routed/broader network authority beyond the bounded IPv4 brokers, richer host-local IPC semantics beyond bounded exact service routing/revocation, bounded loader search/interpreter closure or later-exec authority, persisted-trust or durable/versioned authenticated COW publication semantics, and delegated aggregate cgroup accounting remain separate evidence-backed frontiers. Do not add configuration-only names without executable kernel behavior and integration evidence.
+Supplementary-group isolation with a viable mapping architecture, routed/broader network authority beyond the bounded IPv4 brokers, richer host-local IPC semantics beyond bounded exact service routing/revocation, bounded loader search/interpreter closure or later-exec authority, durable/versioned authenticated COW publication semantics, and delegated aggregate cgroup accounting remain separate evidence-backed frontiers. Do not add configuration-only names without executable kernel behavior and integration evidence.

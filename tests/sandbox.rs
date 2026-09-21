@@ -1,13 +1,16 @@
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 
 use security_lab::{
-    publish_cow_volume_diff_atomic, publish_cow_volume_diff_trusted_ed25519_atomic, run,
-    run_report, run_report_with_cancel, sign_cow_volume_diff_ed25519, CancellationToken,
-    ChildOutcome, CopyOnWriteVolumeBinding, CowDiffApplyError, CowDiffApplyLimits, CowDiffEntry,
+    initialize_snapshot_trust_state, publish_cow_volume_diff_atomic,
+    publish_cow_volume_diff_persisted_trust_ed25519_atomic,
+    publish_cow_volume_diff_trusted_ed25519_atomic, rotate_snapshot_trust_state, run, run_report,
+    run_report_with_cancel, sign_cow_volume_diff_ed25519, CancellationToken, ChildOutcome,
+    CopyOnWriteVolumeBinding, CowDiffApplyError, CowDiffApplyLimits, CowDiffEntry,
     CowVolumePublicationError, CowVolumeTrustedPublicationError, ExecutableNeededBinding,
     PersistentVolumeBinding, ResourceLimits, SandboxError, SandboxPolicy, SeccompArgRangeRule,
     SeccompArgRule, SeccompPolicy, SnapshotTrustKey, SnapshotTrustKeyId, SnapshotTrustKeyState,
-    SnapshotTrustPolicy, StdioMode, StdioPolicy, SNAPSHOT_ED25519_SIGNING_KEY_BYTES,
+    SnapshotTrustPolicy, SnapshotTrustStateContext, SnapshotTrustStateError, SnapshotTrustStateKey,
+    StdioMode, StdioPolicy, SNAPSHOT_ED25519_SIGNING_KEY_BYTES,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -2081,6 +2084,142 @@ fn copy_on_write_volume_diff_trusted_ed25519_publication_authenticates_exact_rep
     let _ = std::fs::remove_dir_all(source);
     let _ = std::fs::remove_dir_all(destination);
     let _ = std::fs::remove_dir_all(rejected_destination);
+}
+
+#[test]
+fn copy_on_write_volume_diff_persisted_trust_state_gates_before_publication_work() {
+    let source = std::env::temp_dir().join(format!(
+        "security-lab-cow-persisted-trust-source-{}",
+        process::id()
+    ));
+    let destination = std::env::temp_dir().join(format!(
+        "security-lab-cow-persisted-trust-published-{}",
+        process::id()
+    ));
+    let stale_base = std::env::temp_dir().join(format!(
+        "security-lab-cow-persisted-trust-missing-base-{}",
+        process::id()
+    ));
+    let stale_parent = std::env::temp_dir().join(format!(
+        "security-lab-cow-persisted-trust-missing-parent-{}",
+        process::id()
+    ));
+    let stale_destination = stale_parent.join("published");
+    let state_root = std::env::temp_dir().join(format!(
+        "security-lab-cow-persisted-trust-state-{}",
+        process::id()
+    ));
+    for path in [
+        &source,
+        &destination,
+        &stale_base,
+        &stale_parent,
+        &state_root,
+    ] {
+        let _ = std::fs::remove_dir_all(path);
+    }
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::create_dir_all(&state_root).unwrap();
+
+    let mut mounted = policy("unused", &[], &["openat", "write", "close", "exit"]);
+    mounted.executable = PathBuf::from("/cow-volume-diff-probe");
+    mounted.copy_on_write_volume_bindings = vec![CopyOnWriteVolumeBinding {
+        source: source.clone(),
+        target: PathBuf::from("/cowa"),
+        bytes: 1024 * 1024,
+        diff_bytes: Some(4096),
+        base_identity_bytes: Some(1024 * 1024),
+        base_identity_nodes: Some(100),
+    }];
+
+    let report = run_report(&mounted).unwrap();
+    let bound = report
+        .cow_volume_diffs
+        .first()
+        .expect("bound COW volume diff");
+
+    let old_evidence =
+        sign_cow_volume_diff_ed25519(bound, &[0x81; SNAPSHOT_ED25519_SIGNING_KEY_BYTES]).unwrap();
+    let new_evidence =
+        sign_cow_volume_diff_ed25519(bound, &[0x82; SNAPSHOT_ED25519_SIGNING_KEY_BYTES]).unwrap();
+    let old_id = SnapshotTrustKeyId::from_public_key(&old_evidence.public_key);
+    let new_id = SnapshotTrustKeyId::from_public_key(&new_evidence.public_key);
+    let generation_one = SnapshotTrustPolicy::new(
+        1,
+        vec![SnapshotTrustKey {
+            public_key: old_evidence.public_key,
+            state: SnapshotTrustKeyState::Active,
+        }],
+    )
+    .unwrap();
+    let state_key = SnapshotTrustStateKey::new([0xA2; 32]);
+    initialize_snapshot_trust_state(&state_root, &state_key, &generation_one).unwrap();
+    let generation_two = rotate_snapshot_trust_state(
+        &state_root,
+        &state_key,
+        &generation_one,
+        2,
+        vec![new_evidence.public_key],
+        &[old_id],
+    )
+    .unwrap();
+
+    let replay_limits = CowDiffApplyLimits {
+        max_bytes: 1024 * 1024,
+        max_nodes: 100,
+    };
+    let stale_context = SnapshotTrustStateContext::new(&state_root, &state_key, &generation_one);
+    let mut invalid_evidence = old_evidence;
+    invalid_evidence.signature[0] ^= 0x40;
+    match publish_cow_volume_diff_persisted_trust_ed25519_atomic(
+        &stale_context,
+        &stale_base,
+        &stale_destination,
+        bound,
+        &invalid_evidence,
+        old_id,
+        replay_limits,
+    )
+    .expect_err("stale persisted policy must fail before signature/filesystem work")
+    {
+        SnapshotTrustStateError::StalePolicy {
+            persisted,
+            supplied,
+        } => {
+            assert_eq!(persisted, generation_two.identity());
+            assert_eq!(supplied, generation_one.identity());
+        }
+        other => panic!("unexpected stale persisted COW publication result: {other}"),
+    }
+    assert!(!stale_base.exists());
+    assert!(
+        !stale_parent.exists(),
+        "stale persisted-trust publication must not inspect/create destination parent"
+    );
+
+    let current_context = SnapshotTrustStateContext::new(&state_root, &state_key, &generation_two);
+    let published = publish_cow_volume_diff_persisted_trust_ed25519_atomic(
+        &current_context,
+        &source,
+        &destination,
+        bound,
+        &new_evidence,
+        new_id,
+        replay_limits,
+    )
+    .unwrap();
+    assert_eq!(published.trust.policy, generation_two.identity());
+    assert_eq!(published.trust.signer, new_id);
+    assert_eq!(published.evidence_sha256, new_evidence.evidence_sha256);
+    assert_eq!(
+        std::fs::read(destination.join("first")).unwrap(),
+        b"alpha\n"
+    );
+    assert!(!source.join("first").exists());
+
+    let _ = std::fs::remove_dir_all(source);
+    let _ = std::fs::remove_dir_all(destination);
+    let _ = std::fs::remove_dir_all(state_root);
 }
 
 #[test]

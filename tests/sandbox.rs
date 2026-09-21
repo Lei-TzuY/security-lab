@@ -2168,8 +2168,7 @@ fn copy_on_write_volume_diff_persisted_trust_state_gates_before_publication_work
         max_bytes: 1024 * 1024,
         max_nodes: 100,
     };
-    let stale_context =
-        SnapshotTrustStateContext::new(&state_root, &state_key, &generation_one);
+    let stale_context = SnapshotTrustStateContext::new(&state_root, &state_key, &generation_one);
     let mut invalid_evidence = old_evidence;
     invalid_evidence.signature[0] ^= 0x40;
     match publish_cow_volume_diff_persisted_trust_ed25519_atomic(
@@ -2198,8 +2197,7 @@ fn copy_on_write_volume_diff_persisted_trust_state_gates_before_publication_work
         "stale persisted-trust publication must not inspect/create destination parent"
     );
 
-    let current_context =
-        SnapshotTrustStateContext::new(&state_root, &state_key, &generation_two);
+    let current_context = SnapshotTrustStateContext::new(&state_root, &state_key, &generation_two);
     let published = publish_cow_volume_diff_persisted_trust_ed25519_atomic(
         &current_context,
         &source,
